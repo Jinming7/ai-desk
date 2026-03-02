@@ -1,4 +1,10 @@
-import type { TicketAssignInput, TicketCreateInput, TicketReplyInput, TicketStatus } from "../../contracts/tickets.js";
+import type {
+  TicketAssignInput,
+  TicketCreateInput,
+  TicketInternalTransitionInput,
+  TicketReplyInput,
+  TicketStatus
+} from "../../contracts/tickets.js";
 import { canTransition } from "../../domain/state-machine.js";
 import * as repo from "./repository.js";
 
@@ -38,6 +44,10 @@ export async function addReply(id: string, input: TicketReplyInput) {
   if (ticket.status === "WAITING_CUSTOMER") {
     if (canTransition("WAITING_CUSTOMER", "IN_PROGRESS")) {
       await repo.transitionTicket(id, "WAITING_CUSTOMER", "IN_PROGRESS");
+      await repo.addAuditLog(id, "workflow_stage_changed", "WAITING_CUSTOMER", "IN_PROGRESS", {
+        reasonCode: "customer_reply",
+        sla_effect: "resume_active_timer"
+      });
     }
   }
 }
@@ -66,6 +76,21 @@ export async function transition(id: string, to: TicketStatus) {
   await repo.transitionTicket(id, ticket.status, to);
 }
 
+export async function transitionInternal(id: string, input: TicketInternalTransitionInput) {
+  const ticket = await repo.getTicketById(id);
+  if (!ticket) {
+    throw new Error("Ticket not found");
+  }
+  if (!canTransition(ticket.status, input.to)) {
+    throw new Error(`Invalid transition ${ticket.status} -> ${input.to}`);
+  }
+  await repo.transitionTicket(id, ticket.status, input.to);
+  await repo.addAuditLog(id, "internal_transition", ticket.status, input.to, {
+    reasonCode: input.reasonCode,
+    sla_effect: input.to === "WAITING_CUSTOMER" ? "pause_active_timer" : "none"
+  });
+}
+
 export async function assign(id: string, input: TicketAssignInput) {
   const ticket = await repo.getTicketById(id);
   if (!ticket) {
@@ -74,6 +99,7 @@ export async function assign(id: string, input: TicketAssignInput) {
   await repo.setTicketAssignee(id, input.assigneeType, input.assigneeName);
   await repo.addAuditLog(id, "assignee_changed", null, null, {
     assigneeType: input.assigneeType,
-    assigneeName: input.assigneeName
+    assigneeName: input.assigneeName,
+    reasonCode: input.reasonCode
   });
 }

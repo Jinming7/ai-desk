@@ -85,26 +85,44 @@ export async function listAgentTickets(queue: "pending" | "mine" | "all", assign
   params.set("queue", queue);
   if (assignee) params.set("assignee", assignee);
 
-  const res = await fetch(`${API}/api/v1/agent/tickets?${params.toString()}`);
+  const res = await fetch(`${API}/api/v1/agent/tickets?${params.toString()}`, {
+    headers: { "x-portal-surface": "internal" }
+  });
   if (!res.ok) throw new Error("Failed to load agent queue");
   const data = await res.json();
   return data.tickets;
 }
 
-export async function transitionTicket(id: string, to: TicketStatus) {
+export async function transitionTicket(
+  id: string,
+  to: TicketStatus,
+  reasonCode: "manual_escalation" | "manual_resolution" | "manual_waiting_customer" | "customer_reply"
+) {
   const res = await fetch(`${API}/api/v1/tickets/${id}/transition`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ to })
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ to, reasonCode })
   });
   if (!res.ok) throw new Error("Failed to transition ticket");
 }
 
-export async function assignTicket(id: string, assigneeType: "SUPPORT_TEAM" | "RND_TEAM", assigneeName: string) {
+export async function assignTicket(
+  id: string,
+  assigneeType: "SUPPORT_TEAM" | "RND_TEAM",
+  assigneeName: string,
+  reasonCode:
+    | "manual_claim"
+    | "manual_escalation"
+    | "manual_resolution"
+    | "manual_waiting_customer"
+    | "ai_model_escalation"
+    | "integration_failure"
+    | "customer_reply"
+) {
   const res = await fetch(`${API}/api/v1/tickets/${id}/assign`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ assigneeType, assigneeName })
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ assigneeType, assigneeName, reasonCode })
   });
   if (!res.ok) throw new Error("Failed to assign ticket");
 }

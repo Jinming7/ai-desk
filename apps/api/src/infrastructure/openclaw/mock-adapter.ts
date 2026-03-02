@@ -2,6 +2,10 @@ import type { OpenClawAdapter, OpenClawAnalyzeInput, OpenClawAnalyzeOutput } fro
 
 export class MockOpenClawAdapter implements OpenClawAdapter {
   async analyzeTicket(input: OpenClawAnalyzeInput): Promise<OpenClawAnalyzeOutput> {
+    if (/simulate_openclaw_failure/i.test(`${input.title} ${input.description}`)) {
+      throw new Error("Simulated OpenClaw failure");
+    }
+
     const needsEscalation = /error|failed|urgent|production/i.test(`${input.title} ${input.description}`);
     const likelyFixable = /how to|cannot login|permission|billing|api key|setup/i.test(`${input.title} ${input.description}`);
 

@@ -28,6 +28,7 @@ export async function listQueue(params: { queue: "pending" | "mine" | "all"; ass
       latest.response_json->>'reasoning_summary' AS triage_reasoning_summary,
       latest.response_json->'evidence' AS triage_evidence,
       (latest.response_json->>'confidence')::numeric AS triage_confidence
+      ,handoff.payload->>'reasonCode' AS handoff_reason_code
      FROM tickets t
      LEFT JOIN LATERAL (
        SELECT response_json
@@ -36,6 +37,14 @@ export async function listQueue(params: { queue: "pending" | "mine" | "all"; ass
        ORDER BY created_at DESC
        LIMIT 1
      ) latest ON true
+     LEFT JOIN LATERAL (
+       SELECT payload
+       FROM ticket_audit_logs
+       WHERE ticket_audit_logs.ticket_id = t.id
+         AND event_type IN ('assignee_changed', 'internal_transition', 'ai_triage_escalated', 'ai_triage_fallback_escalated')
+       ORDER BY created_at DESC
+       LIMIT 1
+     ) handoff ON true
      ${whereSql.replace(/status/g, "t.status").replace(/assignee_name/g, "t.assignee_name")}
      ORDER BY t.updated_at DESC
      LIMIT 200`,

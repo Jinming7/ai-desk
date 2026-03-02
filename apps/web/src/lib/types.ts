@@ -34,4 +34,5 @@ export interface AgentQueueTicket {
   triage_reasoning_summary: string | null;
   triage_evidence: string[] | null;
   triage_confidence: number | null;
+  handoff_reason_code: string | null;
 }

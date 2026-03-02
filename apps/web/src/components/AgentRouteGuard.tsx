@@ -3,16 +3,27 @@ import { useMemo, useState } from "react";
 
 const STORAGE_KEY = "nexusflow_agent_access_ok";
 
-export function AgentRouteGuard({ children }: { children: ReactNode }) {
+export function AgentRouteGuard({ children, requestedPath }: { children: ReactNode; requestedPath: string }) {
   const passcode = import.meta.env.VITE_AGENT_ACCESS_CODE;
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  const hasGate = useMemo(() => !!passcode, [passcode]);
+  const hasGate = useMemo(() => typeof passcode === "string" && passcode.trim().length > 0, [passcode]);
   const isVerified = useMemo(() => window.localStorage.getItem(STORAGE_KEY) === "true", []);
 
-  if (!hasGate || isVerified) {
+  if (isVerified) {
     return <>{children}</>;
+  }
+
+  if (!hasGate) {
+    return (
+      <div className="mx-auto mt-20 max-w-md rounded-2xl border border-rose-200 bg-rose-50 p-6 shadow-sm">
+        <h1 className="text-xl font-semibold text-rose-900">403 Forbidden</h1>
+        <p className="mt-2 text-sm text-rose-800">
+          Internal portal access is not configured. Requested route: <code>{requestedPath}</code>
+        </p>
+      </div>
+    );
   }
 
   return (

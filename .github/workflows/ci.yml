@@ -50,3 +50,6 @@ jobs:
 
       - name: API integration tests
         run: npm run test:api-integration
+
+      - name: Web route isolation tests
+        run: npm run test:routes -w apps/web

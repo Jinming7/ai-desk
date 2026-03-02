@@ -47,14 +47,14 @@ export function AgentDashboardPage() {
     setError(null);
     try {
       if (action === "resolve") {
-        await transitionTicket(ticketId, "RESOLVED");
+        await transitionTicket(ticketId, "RESOLVED", "manual_resolution");
       } else if (action === "waiting") {
-        await transitionTicket(ticketId, "WAITING_CUSTOMER");
+        await transitionTicket(ticketId, "WAITING_CUSTOMER", "manual_waiting_customer");
       } else if (action === "escalate") {
-        await transitionTicket(ticketId, "ESCALATED_RND");
-        await assignTicket(ticketId, "RND_TEAM", "R&D Team");
+        await transitionTicket(ticketId, "ESCALATED_RND", "manual_escalation");
+        await assignTicket(ticketId, "RND_TEAM", "R&D Team", "manual_escalation");
       } else {
-        await assignTicket(ticketId, "SUPPORT_TEAM", assigneeFilter);
+        await assignTicket(ticketId, "SUPPORT_TEAM", assigneeFilter, "manual_claim");
       }
       await load();
     } catch (err) {
@@ -122,7 +122,8 @@ export function AgentDashboardPage() {
                       </div>
                       <div>{row.triage_reasoning_summary ?? "No summary."}</div>
                       <div className="mt-1 text-[11px] text-slate-600">
-                        Confidence: {row.triage_confidence ?? "-"} | Evidence: {row.triage_evidence?.join(", ") || "-"}
+                        Confidence: {row.triage_confidence ?? "-"} | Evidence: {row.triage_evidence?.join(", ") || "-"} |
+                        Handoff Reason: {row.handoff_reason_code ?? "-"}
                       </div>
                     </div>
                   )}

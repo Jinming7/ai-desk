@@ -108,3 +108,47 @@ test("customer reply moves WAITING_CUSTOMER ticket back to IN_PROGRESS", async (
   const detail = (await detailRes.json()) as { ticket: { status: string } };
   assert.equal(detail.ticket.status, "IN_PROGRESS");
 });
+
+test("submit lifecycle fallback escalates ticket when triage integration fails", async () => {
+  const created = await fetch(`${baseUrl}/api/v1/tickets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: "simulate_openclaw_failure",
+      description: "simulate_openclaw_failure while creating ticket",
+      serviceCategory: "technical_support",
+      priority: "P2",
+      customer: { id: "customer_test_3", name: "Test User" }
+    })
+  });
+  assert.equal(created.status, 201);
+  const payload = (await created.json()) as { ticket: { id: string }; triageError: string | null };
+  assert.equal(Boolean(payload.triageError), true);
+
+  const detailRes = await fetch(`${baseUrl}/api/v1/tickets/${payload.ticket.id}`);
+  const detail = (await detailRes.json()) as { ticket: { status: string; assignee_name: string } };
+  assert.equal(detail.ticket.status, "ESCALATED_RND");
+  assert.equal(detail.ticket.assignee_name, "R&D Team");
+});
+
+test("internal-only endpoints reject requests without internal surface header", async () => {
+  const created = await fetch(`${baseUrl}/api/v1/tickets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: "Need billing setup",
+      description: "Need help to setup permission for billing role",
+      serviceCategory: "account_issue",
+      priority: "P3",
+      customer: { id: "customer_test_4", name: "Test User" }
+    })
+  });
+  const payload = (await created.json()) as { ticket: { id: string } };
+
+  const transitionRes = await fetch(`${baseUrl}/api/v1/tickets/${payload.ticket.id}/transition`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ to: "RESOLVED", reasonCode: "manual_resolution" })
+  });
+  assert.equal(transitionRes.status, 403);
+});

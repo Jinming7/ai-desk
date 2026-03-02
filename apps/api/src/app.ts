@@ -5,6 +5,7 @@ import {
   agentQueueQuerySchema,
   ticketAssignSchema,
   ticketCreateSchema,
+  ticketInternalTransitionSchema,
   ticketListQuerySchema,
   ticketReplySchema,
   ticketStatusSchema
@@ -12,6 +13,7 @@ import {
 import * as ticketService from "./modules/tickets/service.js";
 import * as agentService from "./modules/agent/service.js";
 import * as aiService from "./modules/ai/service.js";
+import * as workflowService from "./modules/workflow/service.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
 import { env } from "./config/env.js";
@@ -22,6 +24,15 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 const aiAdapter = env.OPENCLAW_GATEWAY_TOKEN ? new WsOpenClawAdapter() : new MockOpenClawAdapter();
+
+function requireInternalRequest(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const surface = req.header("x-portal-surface");
+  if (surface !== "internal") {
+    res.status(403).json({ error: "Forbidden: internal portal access required" });
+    return;
+  }
+  next();
+}
 
 app.get("/api/v1/health", (_req, res) => {
   res.json({ ok: true, service: "nexusflow-api", openclaw: env.OPENCLAW_GATEWAY_TOKEN ? "ws" : "mock" });
@@ -39,17 +50,8 @@ app.post(
   "/api/v1/tickets",
   asyncHandler(async (req, res) => {
     const input = ticketCreateSchema.parse(req.body);
-    const ticket = await ticketService.createTicket(input);
-    let triage: unknown = null;
-    let triageError: string | null = null;
-
-    try {
-      triage = await aiService.runTicketTriage(ticket.id, aiAdapter);
-    } catch (error) {
-      triageError = (error as Error).message;
-    }
-
-    res.status(201).json({ ticket, triage, triageError });
+    const result = await workflowService.submitTicketWorkflow(input, aiAdapter);
+    res.status(201).json(result);
   })
 );
 
@@ -101,16 +103,18 @@ app.post(
 
 app.post(
   "/api/v1/tickets/:id/transition",
+  requireInternalRequest,
   asyncHandler(async (req, res) => {
     const id = z.string().parse(req.params.id);
-    const body = z.object({ to: ticketStatusSchema }).parse(req.body);
-    await ticketService.transition(id, body.to);
+    const body = ticketInternalTransitionSchema.parse(req.body);
+    await ticketService.transitionInternal(id, body);
     res.status(204).send();
   })
 );
 
 app.post(
   "/api/v1/tickets/:id/assign",
+  requireInternalRequest,
   asyncHandler(async (req, res) => {
     const id = z.string().parse(req.params.id);
     const input = ticketAssignSchema.parse(req.body);
@@ -139,6 +143,7 @@ app.post(
 
 app.get(
   "/api/v1/agent/tickets",
+  requireInternalRequest,
   asyncHandler(async (req, res) => {
     const query = agentQueueQuerySchema.parse(req.query);
     const tickets = await agentService.listQueue(query);

@@ -30,6 +30,24 @@ API: `http://localhost:4000`
 - Internal Agent Portal: `http://localhost:5173/agent`
 
 If `VITE_AGENT_ACCESS_CODE` is set in `.env`, `/agent` requires the temporary passcode.
+Customer shell contains no link or hint to `/agent`.
+
+## Submit Lifecycle
+```mermaid
+flowchart LR
+  A["Customer Submit Ticket"] --> B["OPEN"]
+  B --> C["IN_PROGRESS (AI/Support triage)"]
+  C -->|resolve / ask_user| D["WAITING_CUSTOMER"]
+  C -->|escalate or integration failure| E["ESCALATED_RND"]
+  D -->|customer reply| C
+  C --> F["RESOLVED"]
+  F --> G["CLOSED"]
+```
+
+Internal-only APIs require header `x-portal-surface: internal`:
+- `GET /api/v1/agent/tickets`
+- `POST /api/v1/tickets/:id/transition`
+- `POST /api/v1/tickets/:id/assign`
 
 ## API Contract
 - OpenAPI: `apps/api/openapi.yaml`

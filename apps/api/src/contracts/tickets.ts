@@ -42,10 +42,30 @@ export const agentQueueQuerySchema = z.object({
 
 export const ticketAssignSchema = z.object({
   assigneeType: z.enum(["SUPPORT_TEAM", "RND_TEAM"]),
-  assigneeName: z.string().min(1)
+  assigneeName: z.string().min(1),
+  reasonCode: z.enum([
+    "manual_claim",
+    "manual_escalation",
+    "manual_resolution",
+    "manual_waiting_customer",
+    "ai_model_escalation",
+    "integration_failure",
+    "customer_reply"
+  ])
+});
+
+export const ticketInternalTransitionSchema = z.object({
+  to: ticketStatusSchema,
+  reasonCode: z.enum([
+    "manual_escalation",
+    "manual_resolution",
+    "manual_waiting_customer",
+    "customer_reply"
+  ])
 });
 
 export type TicketStatus = z.infer<typeof ticketStatusSchema>;
 export type TicketCreateInput = z.infer<typeof ticketCreateSchema>;
 export type TicketReplyInput = z.infer<typeof ticketReplySchema>;
 export type TicketAssignInput = z.infer<typeof ticketAssignSchema>;
+export type TicketInternalTransitionInput = z.infer<typeof ticketInternalTransitionSchema>;

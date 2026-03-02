@@ -128,6 +128,12 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
       await tickets.setTicketAssignee(ticketId, "RND_TEAM", "R&D Team");
       await tickets.addAuditLog(ticketId, "ai_triage_escalated", null, null, {
         reason: "model_escalation",
+        reasonCode: "ai_model_escalation",
+        stage: "escalated_rnd",
+        status: "ESCALATED_RND",
+        assignee: "R&D Team",
+        customer_message_policy: "none",
+        sla_effect: "continue_active_timer",
         confidence: result.confidence,
         evidence: result.evidence
       });
@@ -162,6 +168,11 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
     await tickets.setTicketAssignee(ticketId, "SUPPORT_TEAM", "Support Team");
     await tickets.addAuditLog(ticketId, "ai_triage_replied", null, "WAITING_CUSTOMER", {
       action: result.action,
+      stage: "waiting_customer",
+      status: "WAITING_CUSTOMER",
+      assignee: "Support Team",
+      customer_message_policy: "reply_from_support_team",
+      sla_effect: "pause_active_timer",
       confidence: result.confidence,
       evidence: result.evidence
     });
@@ -175,6 +186,12 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
       await tickets.setTicketAssignee(ticketId, "RND_TEAM", "R&D Team");
       await tickets.addAuditLog(ticketId, "ai_triage_fallback_escalated", latest.status, "ESCALATED_RND", {
         reason: "openclaw_failure",
+        reasonCode: "integration_failure",
+        stage: "escalated_rnd",
+        status: "ESCALATED_RND",
+        assignee: "R&D Team",
+        customer_message_policy: "none",
+        sla_effect: "continue_active_timer",
         error: (error as Error).message
       });
     }

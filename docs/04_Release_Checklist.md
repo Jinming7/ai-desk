@@ -13,6 +13,7 @@
 
 ## Manual Smoke
 - Execute [apps/web/e2e/smoke-flow.md](/Users/jeremypeng/Downloads/Workspace/Ticket%20Management/apps/web/e2e/smoke-flow.md).
+- Confirm customer shell has zero entry points to `/agent`.
 
 ## Rollback
 - Roll back web deployment first if UI-only regression.
