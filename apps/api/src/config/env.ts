@@ -15,6 +15,7 @@ const envSchema = z.object({
   OPENCLAW_BASIC_USER: z.string().optional(),
   OPENCLAW_BASIC_PASS: z.string().optional(),
   OPENCLAW_GATEWAY_TOKEN: z.string().optional(),
+  OPENCLAW_REQUEST_SCOPES: z.string().default("operator.admin,operator.read,operator.write,operator.approvals,operator.pairing"),
   OPENCLAW_ALLOW_SELF_SIGNED: z.coerce.boolean().default(false),
   OPENCLAW_SEARCH_INDEX: z.string().default("public_kb"),
   OPENCLAW_CONNECT_TIMEOUT_MS: z.coerce.number().default(10000),

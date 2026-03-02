@@ -52,6 +52,10 @@ Internal-only APIs require header `x-portal-surface: internal`:
 ## API Contract
 - OpenAPI: `apps/api/openapi.yaml`
 - OpenClaw health check: `GET /api/v1/integrations/openclaw/health`
+- Grounded search: `POST /api/v1/ai/search`
+- Quick escalation: `POST /api/v1/ai/escalations`
+- Escalation status: `GET /api/v1/ai/escalations/:id`
+- Internal AI metrics summary: `GET /api/v1/ai/metrics/summary` (`x-portal-surface: internal`)
 
 ## Vercel Integrated Deployment (Web + API)
 - This repo is configured to deploy:
@@ -66,6 +70,7 @@ Required Vercel Environment Variables:
 - `OPENCLAW_BASIC_USER`
 - `OPENCLAW_BASIC_PASS`
 - `OPENCLAW_GATEWAY_TOKEN`
+- `OPENCLAW_REQUEST_SCOPES` (comma-separated, default includes `operator.admin`)
 - `OPENCLAW_ALLOW_SELF_SIGNED` (set `true` only when OpenClaw uses self-signed cert)
 - `OPENCLAW_CONNECT_TIMEOUT_MS`
 - `OPENCLAW_METHOD_TIMEOUT_MS`
@@ -77,3 +82,5 @@ Required Vercel Environment Variables:
 - Secrets are loaded from environment only.
 - OpenClaw integration is behind `OPENCLAW_*` env values with safe fallback behavior.
 - Release checklist: `docs/04_Release_Checklist.md`
+- Rollout plan: `docs/05_AI_Search_Escalation_Rollout.md`
+- Rollback runbook: `docs/06_AI_Search_Rollback_Runbook.md`

@@ -25,6 +25,7 @@ interface RpcRes {
 
 export class WsOpenClawAdapter implements OpenClawAdapter {
   private consecutiveFailures = 0;
+  private readonly requestedScopes = env.OPENCLAW_REQUEST_SCOPES.split(",").map((item) => item.trim()).filter(Boolean);
 
   async healthCheck() {
     try {
@@ -116,7 +117,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
               instanceId: "ticket-core"
             },
             role: "operator",
-            scopes: ["operator.admin"],
+            scopes: this.requestedScopes,
             caps: [],
             auth: {
               token: env.OPENCLAW_GATEWAY_TOKEN
@@ -227,7 +228,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
               instanceId: "ticket-core-health"
             },
             role: "operator",
-            scopes: ["operator.admin"],
+            scopes: this.requestedScopes,
             caps: [],
             auth: {
               token: env.OPENCLAW_GATEWAY_TOKEN
