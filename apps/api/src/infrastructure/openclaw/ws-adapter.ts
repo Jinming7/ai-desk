@@ -1,6 +1,12 @@
 import { WebSocket } from "ws";
 import { env } from "../../config/env.js";
-import type { OpenClawAdapter, OpenClawAnalyzeInput, OpenClawAnalyzeOutput } from "./types.js";
+import type {
+  OpenClawAdapter,
+  OpenClawAnalyzeInput,
+  OpenClawAnalyzeOutput,
+  OpenClawSearchInput,
+  OpenClawSearchOutput
+} from "./types.js";
 
 interface RpcReq {
   type: "req";
@@ -30,13 +36,34 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   }
 
   async analyzeTicket(input: OpenClawAnalyzeInput, idempotencyKey: string): Promise<OpenClawAnalyzeOutput> {
+    const result = await this.withRetry(() => this.callMethod("ticket.analyze", { ...input, idempotency_key: idempotencyKey }));
+    return result as OpenClawAnalyzeOutput;
+  }
+
+  async searchKnowledge(input: OpenClawSearchInput, idempotencyKey: string): Promise<OpenClawSearchOutput> {
+    const result = await this.withRetry(() =>
+      this.callMethod(
+        "kb.search",
+        {
+          query: input.query,
+          top_k: input.topK,
+          index: input.index,
+          idempotency_key: idempotencyKey
+        },
+        env.OPENCLAW_SEARCH_TIMEOUT_MS
+      )
+    );
+    return result as OpenClawSearchOutput;
+  }
+
+  private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
     if (this.consecutiveFailures >= env.OPENCLAW_CIRCUIT_BREAKER_THRESHOLD) {
       throw new Error("OpenClaw circuit breaker open");
     }
 
     for (let attempt = 0; attempt <= env.OPENCLAW_MAX_RETRIES; attempt += 1) {
       try {
-        const result = await this.callAnalyze(input, idempotencyKey);
+        const result = await fn();
         this.consecutiveFailures = 0;
         return result;
       } catch (error) {
@@ -52,22 +79,20 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     throw new Error("OpenClaw retry loop exhausted");
   }
 
-  private async callAnalyze(input: OpenClawAnalyzeInput, idempotencyKey: string): Promise<OpenClawAnalyzeOutput> {
+  private async callMethod(method: string, params: Record<string, unknown>, timeoutMs = env.OPENCLAW_METHOD_TIMEOUT_MS): Promise<unknown> {
     const authHeader =
       env.OPENCLAW_BASIC_USER && env.OPENCLAW_BASIC_PASS
         ? `Basic ${Buffer.from(`${env.OPENCLAW_BASIC_USER}:${env.OPENCLAW_BASIC_PASS}`).toString("base64")}`
         : undefined;
 
-    const ws = new WebSocket(env.OPENCLAW_WS_URL, {
-      headers: authHeader ? { Authorization: authHeader } : undefined
-    });
-
-    const closeWithError = (msg: string): never => {
-      ws.close();
-      throw new Error(msg);
+    const wsOptions = {
+      headers: authHeader ? { Authorization: authHeader } : undefined,
+      rejectUnauthorized: !env.OPENCLAW_ALLOW_SELF_SIGNED
     };
 
-    return await new Promise<OpenClawAnalyzeOutput>((resolve, reject) => {
+    const ws = new WebSocket(env.OPENCLAW_WS_URL, wsOptions);
+
+    return await new Promise<unknown>((resolve, reject) => {
       const connectTimeout = setTimeout(() => {
         reject(new Error("OpenClaw connect timeout"));
         ws.close();
@@ -119,33 +144,31 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
             return;
           }
 
-          const analyzeReq: RpcReq = {
+          const requestId = "method-1";
+          const request: RpcReq = {
             type: "req",
-            id: "analyze-1",
-            method: "ticket.analyze",
-            params: {
-              ...input,
-              idempotency_key: idempotencyKey
-            }
+            id: requestId,
+            method,
+            params
           };
           requestTimeout = setTimeout(() => {
-            reject(new Error("OpenClaw method timeout"));
+            reject(new Error(`OpenClaw ${method} timeout`));
             ws.close();
-          }, env.OPENCLAW_METHOD_TIMEOUT_MS);
-          ws.send(JSON.stringify(analyzeReq));
+          }, timeoutMs);
+          ws.send(JSON.stringify(request));
           return;
         }
 
-        if (data.type === "res" && data.id === "analyze-1") {
+        if (data.type === "res" && data.id === "method-1") {
           if (requestTimeout) {
             clearTimeout(requestTimeout);
           }
           ws.close();
           if (!data.ok) {
-            reject(new Error(`OpenClaw analyze failed: ${data.error?.message ?? "UNKNOWN"}`));
+            reject(new Error(`OpenClaw ${method} failed: ${data.error?.message ?? "UNKNOWN"}`));
             return;
           }
-          resolve(data.result as OpenClawAnalyzeOutput);
+          resolve(data.result);
         }
       });
 
@@ -165,11 +188,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       });
 
       if (!env.OPENCLAW_GATEWAY_TOKEN) {
-        try {
-          closeWithError("OPENCLAW_GATEWAY_TOKEN is not configured");
-        } catch (error) {
-          reject(error as Error);
-        }
+        reject(new Error("OPENCLAW_GATEWAY_TOKEN is not configured"));
+        ws.close();
       }
     });
   }
@@ -181,7 +201,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         : undefined;
 
     const ws = new WebSocket(env.OPENCLAW_WS_URL, {
-      headers: authHeader ? { Authorization: authHeader } : undefined
+      headers: authHeader ? { Authorization: authHeader } : undefined,
+      rejectUnauthorized: !env.OPENCLAW_ALLOW_SELF_SIGNED
     });
 
     return await new Promise<void>((resolve, reject) => {

@@ -66,6 +66,7 @@ Required Vercel Environment Variables:
 - `OPENCLAW_BASIC_USER`
 - `OPENCLAW_BASIC_PASS`
 - `OPENCLAW_GATEWAY_TOKEN`
+- `OPENCLAW_ALLOW_SELF_SIGNED` (set `true` only when OpenClaw uses self-signed cert)
 - `OPENCLAW_CONNECT_TIMEOUT_MS`
 - `OPENCLAW_METHOD_TIMEOUT_MS`
 - `OPENCLAW_MAX_RETRIES`
