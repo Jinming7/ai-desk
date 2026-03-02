@@ -1,0 +1,158 @@
+openapi: 3.0.3
+info:
+  title: NexusFlow API
+  version: 0.1.0
+servers:
+  - url: http://localhost:4000
+paths:
+  /api/v1/health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+  /api/v1/tickets:
+    post:
+      summary: Create ticket
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTicketRequest"
+      responses:
+        "201":
+          description: Created
+    get:
+      summary: List tickets
+      parameters:
+        - in: query
+          name: customerId
+          schema:
+            type: string
+        - in: query
+          name: status
+          schema:
+            $ref: "#/components/schemas/TicketStatus"
+        - in: query
+          name: sort
+          schema:
+            type: string
+            enum: [created_desc, updated_desc]
+      responses:
+        "200":
+          description: OK
+  /api/v1/tickets/{id}:
+    get:
+      summary: Get ticket detail
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "404":
+          description: Not Found
+  /api/v1/tickets/{id}/replies:
+    post:
+      summary: Add ticket reply
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddReplyRequest"
+      responses:
+        "204":
+          description: No Content
+  /api/v1/tickets/{id}/close:
+    post:
+      summary: Close ticket
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: No Content
+  /api/v1/tickets/{id}/ai/analyze:
+    post:
+      summary: Trigger AI analysis
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: AI result
+  /api/v1/agent/tickets:
+    get:
+      summary: Agent queue list
+      parameters:
+        - in: query
+          name: queue
+          schema:
+            type: string
+            enum: [pending, mine, all]
+        - in: query
+          name: assignee
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+components:
+  schemas:
+    TicketStatus:
+      type: string
+      enum: [NEW, AI_REVIEWING, WAITING_CUSTOMER, ESCALATED, RESOLVED, CLOSED]
+    CreateTicketRequest:
+      type: object
+      required: [title, description, serviceCategory, priority, customer]
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        serviceCategory:
+          type: string
+          enum: [technical_support, feature_consulting, account_issue]
+        priority:
+          type: string
+          enum: [P1, P2, P3, P4]
+        customer:
+          type: object
+          required: [id, name]
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+    AddReplyRequest:
+      type: object
+      required: [body, authorType, authorName]
+      properties:
+        body:
+          type: string
+        authorType:
+          type: string
+          enum: [CUSTOMER, AGENT]
+        authorName:
+          type: string
+        attachments:
+          type: array
+          items:
+            type: string
