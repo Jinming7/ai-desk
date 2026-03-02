@@ -1,4 +1,5 @@
 import * as Dialog from "@radix-ui/react-dialog";
+import { motion } from "framer-motion";
 import { Search, X, Wrench, Lightbulb, ShieldAlert } from "lucide-react";
 import { useState } from "react";
 import { createTicket } from "../lib/api";
@@ -7,19 +8,19 @@ const services = [
   {
     key: "technical_support" as const,
     title: "Technical Support",
-    description: "Troubleshoot runtime issues and diagnose failures.",
+    description: "Troubleshoot production incidents and platform instability with guided diagnostics.",
     icon: Wrench
   },
   {
     key: "feature_consulting" as const,
     title: "Feature Request",
-    description: "Share product ideas and discuss capability enhancements.",
+    description: "Propose enhancements and discuss workflow design with product specialists.",
     icon: Lightbulb
   },
   {
     key: "account_issue" as const,
     title: "Account Issue",
-    description: "Handle access, SSO, permission, and billing issues.",
+    description: "Resolve login, access control, and billing permissions with secure verification.",
     icon: ShieldAlert
   }
 ];
@@ -39,70 +40,108 @@ export function PortalPage() {
   };
 
   return (
-    <div className="mx-auto max-w-[1280px] px-4 pb-16 pt-24 md:px-8">
-      <section className="text-center">
-        <h1 className="mb-12 text-5xl font-bold tracking-tight text-ink">How can we help?</h1>
-        <div className="mx-auto mb-16 flex h-14 w-full items-center gap-4 rounded-xl border border-[#D1D5DB] bg-white px-4 transition duration-300 hover:border-[#9CA3AF] focus-within:border-brand-500 focus-within:shadow-[0_0_0_2px_#3B82F6] md:w-[60%]">
-          <Search size={24} className="text-[#9CA3AF]" />
-          <input
-            placeholder="Search knowledge base or services..."
-            className="w-full border-none bg-transparent text-base font-normal text-ink placeholder:text-[#9CA3AF] outline-none"
-          />
-        </div>
-      </section>
+    <div className="nexus-portal-bg">
+      <main className="mx-auto max-w-[1200px] px-4 pb-20 md:px-8">
+        <section className="flex min-h-[50vh] flex-col items-center justify-center pt-24 text-center md:pt-28">
+          <motion.h1
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.65, delay: 0, ease: "easeOut" }}
+            className="nexus-hero-title"
+          >
+            How can we help you?
+          </motion.h1>
 
-      <section className="grid gap-8 md:grid-cols-3">
-        {services.map((item) => {
-          const Icon = item.icon;
-          return (
-            <button
-              key={item.key}
-              onClick={() => {
-                setService(item);
-                setOpen(true);
-              }}
-              className="rounded-2xl border border-line bg-white p-8 text-left transition duration-300 hover:-translate-y-1 hover:border-brand-500 hover:shadow-[0_10px_15px_-3px_rgb(0_0_0_/_0.1),0_4px_6px_-4px_rgb(0_0_0_/_0.1)]"
-            >
-              <Icon className="text-brand-500" size={48} strokeWidth={1.8} />
-              <h3 className="mt-6 text-[20px] font-semibold text-ink">{item.title}</h3>
-              <p className="mt-2 text-base font-normal text-muted">{item.description}</p>
-            </button>
-          );
-        })}
-      </section>
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.65, delay: 0.12, ease: "easeOut" }}
+            className="search-shell mt-16 flex h-[60px] w-full items-center rounded-full bg-gradient-to-b from-white to-[#FBFCFF] px-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.84)] md:w-[60%]"
+          >
+            <Search size={24} className="text-[#9CA3AF]" />
+            <input
+              placeholder="Search knowledge base or services..."
+              className="ml-4 w-full border-none bg-transparent text-base font-normal text-[#111827] outline-none placeholder:text-[#9CA3AF]"
+            />
+          </motion.div>
+        </section>
+
+        <motion.section
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.65, delay: 0.24, ease: "easeOut" }}
+          className="mt-16 grid gap-8 md:grid-cols-3"
+        >
+          {services.map((item, index) => {
+            const Icon = item.icon;
+            return (
+              <motion.button
+                key={item.key}
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.65, delay: 0.3 + index * 0.08, ease: "easeOut" }}
+                onClick={() => {
+                  setService(item);
+                  setOpen(true);
+                }}
+                whileHover={{ y: -6, backgroundColor: "#F5F8FF" }}
+                whileTap={{ scale: 0.995 }}
+                className="group rounded-2xl bg-white p-8 text-left [box-shadow:0_1px_2px_rgba(22,23,26,0.06),0_18px_38px_rgba(0,100,255,0.08),0_2px_10px_rgba(51,221,255,0.1)] transition-all duration-300"
+              >
+                <motion.div
+                  className="inline-flex"
+                  whileHover={{ scale: 1.06, rotate: -3 }}
+                  transition={{ duration: 0.35, ease: "easeOut" }}
+                >
+                  <Icon className="text-brand-500" size={48} strokeWidth={1.7} />
+                </motion.div>
+                <h3 className="mt-6 text-[20px] font-semibold text-[#1F2937]">{item.title}</h3>
+                <p className="mt-2 text-[14px] font-normal leading-6 text-[#6B7280]">{item.description}</p>
+              </motion.button>
+            );
+          })}
+        </motion.section>
+      </main>
 
       <Dialog.Root open={open} onOpenChange={setOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-slate-900/40" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 w-[95vw] max-w-3xl -translate-x-1/2 -translate-y-1/2 rounded-mdplus bg-white p-6 shadow-soft md:p-8">
+          <Dialog.Content className="fixed left-1/2 top-1/2 w-[95vw] max-w-3xl -translate-x-1/2 -translate-y-1/2 rounded-2xl bg-white p-6 shadow-[0_30px_60px_rgba(17,24,39,0.2)] md:p-8">
             <div className="mb-6 flex items-center justify-between">
-              <Dialog.Title className="text-xl font-semibold">Submit {service?.title}</Dialog.Title>
-              <Dialog.Close className="rounded-mdplus p-2 hover:bg-slate-100">
+              <Dialog.Title className="text-xl font-semibold text-[#1F2937]">Submit {service?.title}</Dialog.Title>
+              <Dialog.Close className="rounded-lg p-2 text-[#6B7280] hover:bg-slate-100">
                 <X size={18} />
               </Dialog.Close>
             </div>
 
             <div className="space-y-4">
               <div>
-                <label className="mb-1 block text-sm font-medium">Title</label>
-                <input value={title} onChange={(e) => setTitle(e.target.value)} className="w-full rounded-mdplus border border-slate-200 px-3 py-2" />
+                <label className="mb-2 block text-sm font-medium text-[#1F2937]">Title</label>
+                <input
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  className="h-11 w-full rounded-xl border border-line px-3"
+                />
               </div>
               <div>
-                <label className="mb-1 block text-sm font-medium">Description (Markdown supported)</label>
+                <label className="mb-2 block text-sm font-medium text-[#1F2937]">Description (Markdown supported)</label>
                 <textarea
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   rows={8}
-                  className="w-full rounded-mdplus border border-slate-200 px-3 py-2"
+                  className="w-full rounded-xl border border-line px-3 py-2"
                 />
               </div>
-              <div className="rounded-mdplus border border-dashed border-slate-300 px-4 py-8 text-center text-sm text-slate-500">
+              <div className="rounded-xl border border-dashed border-[#D1D5DB] px-4 py-8 text-center text-sm text-[#6B7280]">
                 Drag and drop attachments here
               </div>
             </div>
 
             <div className="mt-6 flex justify-end">
-              <button onClick={submit} className="rounded-mdplus bg-brand-500 px-5 py-2 text-sm font-medium text-white hover:bg-brand-600">
+              <button
+                onClick={submit}
+                className="rounded-lg bg-brand-500 px-5 py-2 text-sm font-medium text-white transition hover:bg-brand-600"
+              >
                 Submit Ticket
               </button>
             </div>

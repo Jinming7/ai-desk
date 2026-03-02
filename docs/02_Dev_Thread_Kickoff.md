@@ -11,6 +11,11 @@ Use this as the first message in the new development thread.
 6. Add SLA timer basics.
 7. Add API endpoints for portal and console.
 
+## 1.1 Design Baseline (Mandatory)
+- All frontend implementation must follow:
+  - `docs/03_Frontend_Design_Standards_Figma.md`
+- If any UI decision conflicts with existing pages, follow the Figma standards doc and note migration impact.
+
 ## 2. Mandatory Acceptance Criteria
 - Creating a ticket triggers AI pipeline asynchronously.
 - AI output can move ticket to one of: `WAITING_CUSTOMER`, `ESCALATED`, `RESOLVED`.

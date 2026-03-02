@@ -1,5 +1,6 @@
 import { ChevronDown, CircleUserRound } from "lucide-react";
 import { Link, useLocation } from "react-router-dom";
+import { BrandLogoUsage } from "./BrandLogoUsage";
 
 const links = [
   { to: "/requests", label: "My Requests" },
@@ -12,10 +13,7 @@ export function TopNav() {
   return (
     <header className="sticky top-0 z-30 border-b border-line bg-white">
       <div className="mx-auto flex w-full max-w-[1280px] items-center justify-between px-4 py-4 md:px-8">
-        <Link to="/" className="flex items-center gap-3 text-lg font-semibold text-ink">
-          <img src="https://ones.com/favicon.ico" alt="ONES logo" className="h-6 w-6 rounded" />
-          <span>NexusFlow</span>
-        </Link>
+        <BrandLogoUsage title="NexusFlow" />
         <nav className="hidden items-center gap-8 md:flex">
           {links.map((link) => (
             <Link
