@@ -46,7 +46,7 @@ export async function createTicket(input: TicketCreateInput): Promise<TicketReco
   const result = await pool.query<TicketRecord>(
     `INSERT INTO tickets (
       id, ticket_no, title, description, service_category, priority, status, customer_id, customer_name, assignee_type, assignee_name, sla_due_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,'NEW',$7,$8,'AI_AGENT','AI Agent',$9)
+    ) VALUES ($1,$2,$3,$4,$5,$6,'OPEN',$7,$8,'SUPPORT_TEAM','Support Team',$9)
     RETURNING *`,
     [id, no, input.title, input.description, input.serviceCategory, input.priority, input.customer.id, input.customer.name, slaDue]
   );
@@ -61,7 +61,7 @@ export async function createTicket(input: TicketCreateInput): Promise<TicketReco
     aiConfidence: null
   });
 
-  await addAuditLog(id, "ticket_created", null, "NEW", { source: "portal" });
+  await addAuditLog(id, "ticket_created", null, "OPEN", { source: "portal" });
 
   return result.rows[0];
 }
@@ -106,7 +106,7 @@ export async function listTicketMessages(ticketId: string): Promise<TicketMessag
 
 export async function addMessage(input: {
   ticketId: string;
-  authorType: "CUSTOMER" | "AGENT" | "AI_AGENT";
+  authorType: "CUSTOMER" | "AGENT";
   authorName: string;
   body: string;
   attachments: string[];
@@ -142,7 +142,7 @@ export async function transitionTicket(id: string, from: TicketStatus, to: Ticke
   await addAuditLog(id, "status_changed", from, to, {});
 }
 
-export async function setTicketAssignee(id: string, type: "AI_AGENT" | "HUMAN_TEAM", name: string): Promise<void> {
+export async function setTicketAssignee(id: string, type: "SUPPORT_TEAM" | "RND_TEAM", name: string): Promise<void> {
   await pool.query("UPDATE tickets SET assignee_type = $2, assignee_name = $3, updated_at = NOW() WHERE id = $1", [id, type, name]);
 }
 

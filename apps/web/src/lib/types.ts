@@ -1,4 +1,4 @@
-export type TicketStatus = "NEW" | "AI_REVIEWING" | "WAITING_CUSTOMER" | "ESCALATED" | "RESOLVED" | "CLOSED";
+export type TicketStatus = "OPEN" | "IN_PROGRESS" | "WAITING_CUSTOMER" | "ESCALATED_RND" | "RESOLVED" | "CLOSED";
 
 export interface Ticket {
   id: string;
@@ -15,7 +15,7 @@ export interface Ticket {
 export interface TicketMessage {
   id: string;
   author_name: string;
-  author_type: "CUSTOMER" | "AGENT" | "AI_AGENT";
+  author_type: "CUSTOMER" | "AGENT";
   body: string;
   is_ai_generated: boolean;
   created_at: string;

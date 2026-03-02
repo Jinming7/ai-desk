@@ -5,7 +5,7 @@ export async function listQueue(params: { queue: "pending" | "mine" | "all"; ass
   const values: string[] = [];
 
   if (params.queue === "pending") {
-    where.push("status IN ('ESCALATED', 'AI_REVIEWING')");
+    where.push("status IN ('IN_PROGRESS', 'ESCALATED_RND')");
   }
 
   if (params.queue === "mine" && params.assignee) {

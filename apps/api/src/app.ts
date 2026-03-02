@@ -31,7 +31,25 @@ app.post(
   asyncHandler(async (req, res) => {
     const input = ticketCreateSchema.parse(req.body);
     const ticket = await ticketService.createTicket(input);
-    res.status(201).json({ ticket });
+    let triage: unknown = null;
+    let triageError: string | null = null;
+
+    try {
+      triage = await aiService.runTicketTriage(ticket.id, aiAdapter);
+    } catch (error) {
+      triageError = (error as Error).message;
+    }
+
+    res.status(201).json({ ticket, triage, triageError });
+  })
+);
+
+app.post(
+  "/api/v1/ai/search",
+  asyncHandler(async (req, res) => {
+    const body = z.object({ query: z.string().min(2) }).parse(req.body);
+    const result = await aiService.runSearchMode(body.query);
+    res.json({ result });
   })
 );
 
@@ -83,10 +101,19 @@ app.post(
 );
 
 app.post(
+  "/api/v1/tickets/:id/ai/triage",
+  asyncHandler(async (req, res) => {
+    const id = z.string().parse(req.params.id);
+    const result = await aiService.runTicketTriage(id, aiAdapter);
+    res.json({ result });
+  })
+);
+
+app.post(
   "/api/v1/tickets/:id/ai/analyze",
   asyncHandler(async (req, res) => {
     const id = z.string().parse(req.params.id);
-    const result = await aiService.runAiReview(id, aiAdapter);
+    const result = await aiService.runTicketTriage(id, aiAdapter);
     res.json({ result });
   })
 );

@@ -1,8 +1,8 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { motion } from "framer-motion";
-import { Search, X, Wrench, Lightbulb, ShieldAlert } from "lucide-react";
+import { Loader2, Search, X, Wrench, Lightbulb, ShieldAlert } from "lucide-react";
 import { useState } from "react";
-import { createTicket } from "../lib/api";
+import { createTicket, searchKnowledge } from "../lib/api";
 
 const services = [
   {
@@ -30,6 +30,14 @@ export function PortalPage() {
   const [service, setService] = useState<(typeof services)[number] | null>(null);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  const [query, setQuery] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searchResult, setSearchResult] = useState<{
+    answer: string;
+    suggested_next_step: "self_serve" | "submit_ticket";
+    citations: Array<{ id: string; title: string; excerpt: string }>;
+  } | null>(null);
 
   const submit = async () => {
     if (!service) return;
@@ -37,6 +45,23 @@ export function PortalPage() {
     setOpen(false);
     setTitle("");
     setDescription("");
+  };
+
+  const onSearch = async () => {
+    if (query.trim().length < 2) return;
+    setSearching(true);
+    setSearchError(null);
+    try {
+      const result = await searchKnowledge(query.trim());
+      setSearchResult(result);
+      if (!title) setTitle(query.trim());
+      if (!description) setDescription(`Issue summary:\n${query.trim()}`);
+    } catch (error) {
+      setSearchError((error as Error).message);
+      setSearchResult(null);
+    } finally {
+      setSearching(false);
+    }
   };
 
   return (
@@ -61,9 +86,51 @@ export function PortalPage() {
             <Search size={24} className="text-[#9CA3AF]" />
             <input
               placeholder="Search knowledge base or services..."
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  void onSearch();
+                }
+              }}
               className="ml-4 w-full border-none bg-transparent text-base font-normal text-[#111827] outline-none placeholder:text-[#9CA3AF]"
             />
+            <button
+              onClick={() => void onSearch()}
+              disabled={searching || query.trim().length < 2}
+              className="rounded-full bg-brand-500 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {searching ? <Loader2 size={16} className="animate-spin" /> : "Search"}
+            </button>
           </motion.div>
+          {searchError && <p className="mt-3 text-sm text-rose-600">{searchError}</p>}
+          {searchResult && (
+            <div className="mt-6 w-full rounded-2xl border border-[#D1D5DB] bg-white/90 p-5 text-left md:w-[60%]">
+              <p className="text-sm font-medium text-[#111827]">{searchResult.answer}</p>
+              {searchResult.citations.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  {searchResult.citations.map((item) => (
+                    <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <p className="text-sm font-semibold text-[#1F2937]">{item.title}</p>
+                      <p className="mt-1 text-xs text-[#6B7280]">{item.excerpt}...</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="mt-4 flex items-center gap-3">
+                <span className="text-xs text-[#6B7280]">Still need help?</span>
+                <button
+                  onClick={() => {
+                    setService(services[0]);
+                    setOpen(true);
+                  }}
+                  className="rounded-lg bg-brand-500 px-3 py-1.5 text-xs font-medium text-white"
+                >
+                  Submit Ticket
+                </button>
+              </div>
+            </div>
+          )}
         </section>
 
         <motion.section

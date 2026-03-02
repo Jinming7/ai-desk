@@ -118,7 +118,7 @@ components:
   schemas:
     TicketStatus:
       type: string
-      enum: [NEW, AI_REVIEWING, WAITING_CUSTOMER, ESCALATED, RESOLVED, CLOSED]
+      enum: [OPEN, IN_PROGRESS, WAITING_CUSTOMER, ESCALATED_RND, RESOLVED, CLOSED]
     CreateTicketRequest:
       type: object
       required: [title, description, serviceCategory, priority, customer]

@@ -1,10 +1,10 @@
 import { z } from "zod";
 
 export const ticketStatusSchema = z.enum([
-  "NEW",
-  "AI_REVIEWING",
+  "OPEN",
+  "IN_PROGRESS",
   "WAITING_CUSTOMER",
-  "ESCALATED",
+  "ESCALATED_RND",
   "RESOLVED",
   "CLOSED"
 ]);

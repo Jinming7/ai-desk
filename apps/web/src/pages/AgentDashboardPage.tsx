@@ -18,7 +18,7 @@ const rows = [
     customer: "Zen Labs",
     status: "In Progress",
     sla: "5h 02m",
-    assignee: "AI Agent",
+    assignee: "Support Team",
     created: "2026-03-02 09:40",
     ai: "Pattern suggests endpoint timeout from customer side. Awaiting environment details from user response."
   }

@@ -36,8 +36,8 @@ export async function addReply(id: string, input: TicketReplyInput) {
   });
 
   if (ticket.status === "WAITING_CUSTOMER") {
-    if (canTransition("WAITING_CUSTOMER", "AI_REVIEWING")) {
-      await repo.transitionTicket(id, "WAITING_CUSTOMER", "AI_REVIEWING");
+    if (canTransition("WAITING_CUSTOMER", "IN_PROGRESS")) {
+      await repo.transitionTicket(id, "WAITING_CUSTOMER", "IN_PROGRESS");
     }
   }
 }

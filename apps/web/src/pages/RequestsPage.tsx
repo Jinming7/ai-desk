@@ -6,7 +6,7 @@ import { StatusBadge } from "../components/StatusBadge";
 
 const statusOptions: Array<{ key: "ALL" | TicketStatus; label: string }> = [
   { key: "ALL", label: "All" },
-  { key: "AI_REVIEWING", label: "In Progress" },
+  { key: "IN_PROGRESS", label: "In Progress" },
   { key: "WAITING_CUSTOMER", label: "Waiting for Me" },
   { key: "RESOLVED", label: "Resolved" }
 ];

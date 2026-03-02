@@ -37,3 +37,18 @@ export async function createTicket(payload: {
   if (!res.ok) throw new Error("Failed to create ticket");
   return res.json();
 }
+
+export async function searchKnowledge(query: string): Promise<{
+  answer: string;
+  suggested_next_step: "self_serve" | "submit_ticket";
+  citations: Array<{ id: string; title: string; excerpt: string }>;
+}> {
+  const res = await fetch(`${API}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query })
+  });
+  if (!res.ok) throw new Error("Failed to search knowledge base");
+  const data = await res.json();
+  return data.result;
+}
