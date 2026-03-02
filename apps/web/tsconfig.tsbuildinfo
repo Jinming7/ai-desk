@@ -1,1 +1,0 @@
-{"root":["./src/main.tsx","./src/vite-env.d.ts","./src/app/app.tsx","./src/components/statusbadge.tsx","./src/components/topnav.tsx","./src/lib/api.ts","./src/lib/types.ts","./src/pages/agentdashboardpage.tsx","./src/pages/portalpage.tsx","./src/pages/requestspage.tsx","./src/pages/ticketdetailpage.tsx"],"version":"5.9.3"}
