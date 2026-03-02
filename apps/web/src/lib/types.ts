@@ -20,3 +20,18 @@ export interface TicketMessage {
   is_ai_generated: boolean;
   created_at: string;
 }
+
+export interface AgentQueueTicket {
+  id: string;
+  ticket_no: string;
+  title: string;
+  customer_name: string;
+  status: TicketStatus;
+  assignee_name: string;
+  created_at: string;
+  updated_at: string;
+  sla_due_at: string | null;
+  triage_reasoning_summary: string | null;
+  triage_evidence: string[] | null;
+  triage_confidence: number | null;
+}

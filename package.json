@@ -11,7 +11,8 @@
     "dev:api": "npm run dev -w apps/api",
     "dev:web": "npm run dev -w apps/web",
     "build": "npm run build -w apps/api && npm run build -w apps/web",
-    "db:migrate": "npm run db:migrate -w apps/api"
+    "db:migrate": "npm run db:migrate -w apps/api",
+    "test:api-integration": "npm run test:integration -w apps/api"
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

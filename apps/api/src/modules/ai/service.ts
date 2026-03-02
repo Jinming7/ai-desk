@@ -127,6 +127,15 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
       }
       await tickets.setTicketAssignee(ticketId, "RND_TEAM", "R&D Team");
       await tickets.addAuditLog(ticketId, "ai_triage_escalated", null, null, {
+        reason: "model_escalation",
+        confidence: result.confidence,
+        evidence: result.evidence
+      });
+      return result;
+    }
+
+    if (result.action === "none") {
+      await tickets.addAuditLog(ticketId, "ai_triage_no_action", null, null, {
         confidence: result.confidence,
         evidence: result.evidence
       });
@@ -164,6 +173,10 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
     if (latest && latest.status !== "ESCALATED_RND" && canTransition(latest.status, "ESCALATED_RND")) {
       await tickets.transitionTicket(ticketId, latest.status, "ESCALATED_RND");
       await tickets.setTicketAssignee(ticketId, "RND_TEAM", "R&D Team");
+      await tickets.addAuditLog(ticketId, "ai_triage_fallback_escalated", latest.status, "ESCALATED_RND", {
+        reason: "openclaw_failure",
+        error: (error as Error).message
+      });
     }
     throw error;
   }

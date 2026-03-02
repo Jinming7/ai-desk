@@ -1,4 +1,4 @@
-import type { TicketCreateInput, TicketReplyInput, TicketStatus } from "../../contracts/tickets.js";
+import type { TicketAssignInput, TicketCreateInput, TicketReplyInput, TicketStatus } from "../../contracts/tickets.js";
 import { canTransition } from "../../domain/state-machine.js";
 import * as repo from "./repository.js";
 
@@ -64,4 +64,16 @@ export async function transition(id: string, to: TicketStatus) {
     throw new Error(`Invalid transition ${ticket.status} -> ${to}`);
   }
   await repo.transitionTicket(id, ticket.status, to);
+}
+
+export async function assign(id: string, input: TicketAssignInput) {
+  const ticket = await repo.getTicketById(id);
+  if (!ticket) {
+    throw new Error("Ticket not found");
+  }
+  await repo.setTicketAssignee(id, input.assigneeType, input.assigneeName);
+  await repo.addAuditLog(id, "assignee_changed", null, null, {
+    assigneeType: input.assigneeType,
+    assigneeName: input.assigneeName
+  });
 }

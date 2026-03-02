@@ -40,6 +40,12 @@ export const agentQueueQuerySchema = z.object({
   assignee: z.string().optional()
 });
 
+export const ticketAssignSchema = z.object({
+  assigneeType: z.enum(["SUPPORT_TEAM", "RND_TEAM"]),
+  assigneeName: z.string().min(1)
+});
+
 export type TicketStatus = z.infer<typeof ticketStatusSchema>;
 export type TicketCreateInput = z.infer<typeof ticketCreateSchema>;
 export type TicketReplyInput = z.infer<typeof ticketReplySchema>;
+export type TicketAssignInput = z.infer<typeof ticketAssignSchema>;

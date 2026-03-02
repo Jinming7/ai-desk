@@ -22,4 +22,8 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       risk_flags: needsEscalation ? ["possible_prod_impact"] : []
     };
   }
+
+  async healthCheck() {
+    return { ok: true, mode: "mock" as const, detail: "Mock adapter active" };
+  }
 }

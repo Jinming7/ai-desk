@@ -2,13 +2,18 @@ import { ChevronDown, CircleUserRound } from "lucide-react";
 import { Link, useLocation } from "react-router-dom";
 import { BrandLogoUsage } from "./BrandLogoUsage";
 
-const links = [
-  { to: "/requests", label: "My Requests" },
-  { to: "/agent", label: "Agent Queue" }
-];
-
 export function TopNav() {
   const location = useLocation();
+  const isAgentPortal = location.pathname.startsWith("/agent");
+  const links = isAgentPortal
+    ? [
+        { to: "/agent", label: "Agent Queue" },
+        { to: "/", label: "Customer Portal" }
+      ]
+    : [
+        { to: "/requests", label: "My Requests" },
+        { to: "/agent", label: "Agent Queue" }
+      ];
 
   return (
     <header className="sticky top-0 z-30 border-b border-line bg-white">
@@ -27,10 +32,10 @@ export function TopNav() {
         </nav>
         <div className="flex items-center gap-4">
           <Link
-            to="/"
+            to={isAgentPortal ? "/agent" : "/"}
             className="rounded-lg bg-brand-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-brand-600"
           >
-            Submit New Request
+            {isAgentPortal ? "Internal Portal" : "Submit New Request"}
           </Link>
           <button className="flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-sm text-muted hover:bg-slate-50">
             <CircleUserRound size={18} />

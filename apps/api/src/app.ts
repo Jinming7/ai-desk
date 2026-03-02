@@ -3,6 +3,7 @@ import cors from "cors";
 import { z } from "zod";
 import {
   agentQueueQuerySchema,
+  ticketAssignSchema,
   ticketCreateSchema,
   ticketListQuerySchema,
   ticketReplySchema,
@@ -25,6 +26,14 @@ const aiAdapter = env.OPENCLAW_GATEWAY_TOKEN ? new WsOpenClawAdapter() : new Moc
 app.get("/api/v1/health", (_req, res) => {
   res.json({ ok: true, service: "nexusflow-api", openclaw: env.OPENCLAW_GATEWAY_TOKEN ? "ws" : "mock" });
 });
+
+app.get(
+  "/api/v1/integrations/openclaw/health",
+  asyncHandler(async (_req, res) => {
+    const health = await aiAdapter.healthCheck();
+    res.status(health.ok ? 200 : 503).json(health);
+  })
+);
 
 app.post(
   "/api/v1/tickets",
@@ -96,6 +105,16 @@ app.post(
     const id = z.string().parse(req.params.id);
     const body = z.object({ to: ticketStatusSchema }).parse(req.body);
     await ticketService.transition(id, body.to);
+    res.status(204).send();
+  })
+);
+
+app.post(
+  "/api/v1/tickets/:id/assign",
+  asyncHandler(async (req, res) => {
+    const id = z.string().parse(req.params.id);
+    const input = ticketAssignSchema.parse(req.body);
+    await ticketService.assign(id, input);
     res.status(204).send();
   })
 );

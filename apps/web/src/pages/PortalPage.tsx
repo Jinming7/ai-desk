@@ -2,6 +2,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { motion } from "framer-motion";
 import { Loader2, Search, X, Wrench, Lightbulb, ShieldAlert } from "lucide-react";
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { createTicket, searchKnowledge } from "../lib/api";
 
 const services = [
@@ -26,6 +27,7 @@ const services = [
 ];
 
 export function PortalPage() {
+  const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [service, setService] = useState<(typeof services)[number] | null>(null);
   const [title, setTitle] = useState("");
@@ -38,19 +40,41 @@ export function PortalPage() {
     suggested_next_step: "self_serve" | "submit_ticket";
     citations: Array<{ id: string; title: string; excerpt: string }>;
   } | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitLoading, setSubmitLoading] = useState(false);
+  const [submitSuccess, setSubmitSuccess] = useState<string | null>(null);
 
   const submit = async () => {
     if (!service) return;
-    await createTicket({ title, description, serviceCategory: service.key });
-    setOpen(false);
-    setTitle("");
-    setDescription("");
+    if (title.trim().length < 3) {
+      setSubmitError("Title must be at least 3 characters.");
+      return;
+    }
+    if (description.trim().length < 5) {
+      setSubmitError("Description must be at least 5 characters.");
+      return;
+    }
+    setSubmitError(null);
+    setSubmitLoading(true);
+    try {
+      const created = await createTicket({ title: title.trim(), description: description.trim(), serviceCategory: service.key });
+      setSubmitSuccess(`Ticket ${created.ticket.ticket_no} submitted successfully.`);
+      setOpen(false);
+      setTitle("");
+      setDescription("");
+      navigate(`/tickets/${created.ticket.id}`);
+    } catch (error) {
+      setSubmitError((error as Error).message);
+    } finally {
+      setSubmitLoading(false);
+    }
   };
 
   const onSearch = async () => {
     if (query.trim().length < 2) return;
     setSearching(true);
     setSearchError(null);
+    setSearchResult(null);
     try {
       const result = await searchKnowledge(query.trim());
       setSearchResult(result);
@@ -131,6 +155,10 @@ export function PortalPage() {
               </div>
             </div>
           )}
+          {!searching && query.trim().length >= 2 && !searchResult && !searchError && (
+            <p className="mt-3 text-sm text-slate-500">No results yet. Press Search to query the knowledge base.</p>
+          )}
+          {submitSuccess && <p className="mt-3 text-sm text-emerald-700">{submitSuccess}</p>}
         </section>
 
         <motion.section
@@ -199,17 +227,20 @@ export function PortalPage() {
                   className="w-full rounded-xl border border-line px-3 py-2"
                 />
               </div>
+              {!service && <p className="text-xs text-rose-600">Please select a service category before submitting.</p>}
+              {submitError && <p className="text-xs text-rose-600">{submitError}</p>}
               <div className="rounded-xl border border-dashed border-[#D1D5DB] px-4 py-8 text-center text-sm text-[#6B7280]">
-                Drag and drop attachments here
+                Attachments upload is planned for the next iteration. Please include key details in description for now.
               </div>
             </div>
 
             <div className="mt-6 flex justify-end">
               <button
                 onClick={submit}
-                className="rounded-lg bg-brand-500 px-5 py-2 text-sm font-medium text-white transition hover:bg-brand-600"
+                disabled={submitLoading}
+                className="rounded-lg bg-brand-500 px-5 py-2 text-sm font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-70"
               >
-                Submit Ticket
+                {submitLoading ? "Submitting..." : "Submit Ticket"}
               </button>
             </div>
           </Dialog.Content>

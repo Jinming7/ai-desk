@@ -24,4 +24,5 @@ export interface OpenClawAnalyzeOutput {
 
 export interface OpenClawAdapter {
   analyzeTicket(input: OpenClawAnalyzeInput, idempotencyKey: string): Promise<OpenClawAnalyzeOutput>;
+  healthCheck(): Promise<{ ok: boolean; mode: "ws" | "mock"; detail?: string }>;
 }

@@ -23,9 +23,19 @@ AI-first ticket management platform skeleton with:
 Web: `http://localhost:5173`
 API: `http://localhost:4000`
 
+## Portal Access Map
+- Customer Ticket Portal: `http://localhost:5173/`
+- Customer Requests: `http://localhost:5173/requests`
+- Customer Ticket Detail: `http://localhost:5173/tickets/:id`
+- Internal Agent Portal: `http://localhost:5173/agent`
+
+If `VITE_AGENT_ACCESS_CODE` is set in `.env`, `/agent` requires the temporary passcode.
+
 ## API Contract
 - OpenAPI: `apps/api/openapi.yaml`
+- OpenClaw health check: `GET /api/v1/integrations/openclaw/health`
 
 ## Notes
 - Secrets are loaded from environment only.
 - OpenClaw integration is behind `OPENCLAW_*` env values with safe fallback behavior.
+- Release checklist: `docs/04_Release_Checklist.md`

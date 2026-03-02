@@ -9,6 +9,15 @@ const statusTheme: Record<TicketStatus, string> = {
   CLOSED: "bg-slate-200 text-slate-700"
 };
 
+const statusLabel: Record<TicketStatus, string> = {
+  OPEN: "Open",
+  IN_PROGRESS: "In Progress",
+  WAITING_CUSTOMER: "Waiting Customer",
+  ESCALATED_RND: "Escalated R&D",
+  RESOLVED: "Resolved",
+  CLOSED: "Closed"
+};
+
 export function StatusBadge({ status }: { status: TicketStatus }) {
-  return <span className={`rounded-full px-2 py-1 text-xs font-medium ${statusTheme[status]}`}>{status}</span>;
+  return <span className={`rounded-full px-2 py-1 text-xs font-medium ${statusTheme[status]}`}>{statusLabel[status]}</span>;
 }

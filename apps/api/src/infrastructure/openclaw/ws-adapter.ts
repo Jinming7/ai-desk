@@ -20,6 +20,15 @@ interface RpcRes {
 export class WsOpenClawAdapter implements OpenClawAdapter {
   private consecutiveFailures = 0;
 
+  async healthCheck() {
+    try {
+      await this.connectOnly();
+      return { ok: true, mode: "ws" as const, detail: "Connected to OpenClaw gateway" };
+    } catch (error) {
+      return { ok: false, mode: "ws" as const, detail: (error as Error).message };
+    }
+  }
+
   async analyzeTicket(input: OpenClawAnalyzeInput, idempotencyKey: string): Promise<OpenClawAnalyzeOutput> {
     if (this.consecutiveFailures >= env.OPENCLAW_CIRCUIT_BREAKER_THRESHOLD) {
       throw new Error("OpenClaw circuit breaker open");
@@ -162,6 +171,76 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
           reject(error as Error);
         }
       }
+    });
+  }
+
+  private async connectOnly(): Promise<void> {
+    const authHeader =
+      env.OPENCLAW_BASIC_USER && env.OPENCLAW_BASIC_PASS
+        ? `Basic ${Buffer.from(`${env.OPENCLAW_BASIC_USER}:${env.OPENCLAW_BASIC_PASS}`).toString("base64")}`
+        : undefined;
+
+    const ws = new WebSocket(env.OPENCLAW_WS_URL, {
+      headers: authHeader ? { Authorization: authHeader } : undefined
+    });
+
+    return await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("OpenClaw health connect timeout"));
+        ws.close();
+      }, env.OPENCLAW_CONNECT_TIMEOUT_MS);
+
+      ws.on("open", () => {
+        const connectReq: RpcReq = {
+          type: "req",
+          id: "health-connect",
+          method: "connect",
+          params: {
+            minProtocol: 3,
+            maxProtocol: 3,
+            client: {
+              id: "gateway-client",
+              version: "1.0.0",
+              platform: "server",
+              mode: "backend",
+              instanceId: "ticket-core-health"
+            },
+            role: "operator",
+            scopes: ["operator.admin"],
+            caps: [],
+            auth: {
+              token: env.OPENCLAW_GATEWAY_TOKEN
+            },
+            userAgent: "ticket-core-health",
+            locale: "en-US"
+          }
+        };
+        ws.send(JSON.stringify(connectReq));
+      });
+
+      ws.on("message", (raw) => {
+        const data = JSON.parse(String(raw)) as RpcRes | { type: "event"; event: string };
+        if (data.type === "event") return;
+        if (data.type === "res" && data.id === "health-connect") {
+          clearTimeout(timeout);
+          if (!data.ok) {
+            reject(new Error(`OpenClaw health connect failed: ${data.error?.code ?? "UNKNOWN"}`));
+            ws.close();
+            return;
+          }
+          ws.close();
+          resolve();
+        }
+      });
+
+      ws.on("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+
+      ws.on("close", () => {
+        clearTimeout(timeout);
+      });
     });
   }
 }

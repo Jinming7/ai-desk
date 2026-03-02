@@ -1,35 +1,75 @@
 import * as Tabs from "@radix-ui/react-tabs";
-import { Bot, Sparkles } from "lucide-react";
+import { Sparkles } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { assignTicket, listAgentTickets, transitionTicket } from "../lib/api";
+import type { AgentQueueTicket } from "../lib/types";
+import { StatusBadge } from "../components/StatusBadge";
 
-const rows = [
-  {
-    id: "T-93012011",
-    title: "Login fails after SSO callback",
-    customer: "Acme Corp",
-    status: "Escalated",
-    sla: "1h 23m",
-    assignee: "R&D Team",
-    created: "2026-03-02 10:15",
-    ai: "Issue is highly related to KB #123. Base troubleshooting was auto-replied; customer confirmed no effect, so ticket was escalated."
-  },
-  {
-    id: "T-93011998",
-    title: "Webhook retries spike",
-    customer: "Zen Labs",
-    status: "In Progress",
-    sla: "5h 02m",
-    assignee: "Support Team",
-    created: "2026-03-02 09:40",
-    ai: "Pattern suggests endpoint timeout from customer side. Awaiting environment details from user response."
-  }
-];
+function formatRemaining(slaDueAt: string | null): string {
+  if (!slaDueAt) return "-";
+  const diff = new Date(slaDueAt).getTime() - Date.now();
+  if (diff <= 0) return "Overdue";
+  const hours = Math.floor(diff / (1000 * 60 * 60));
+  const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+  return `${hours}h ${minutes}m`;
+}
 
 export function AgentDashboardPage() {
+  const [tab, setTab] = useState<"pending" | "mine" | "all">("pending");
+  const [rows, setRows] = useState<AgentQueueTicket[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [workingId, setWorkingId] = useState<string | null>(null);
+  const [assigneeFilter, setAssigneeFilter] = useState("Support Team");
+
+  const load = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const list = await listAgentTickets(tab, tab === "mine" ? assigneeFilter : undefined);
+      setRows(list);
+    } catch (err) {
+      setError((err as Error).message);
+      setRows([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, [tab]);
+
+  const sortedRows = useMemo(() => rows, [rows]);
+
+  const runAction = async (ticketId: string, action: "resolve" | "waiting" | "escalate" | "claim") => {
+    setWorkingId(ticketId);
+    setError(null);
+    try {
+      if (action === "resolve") {
+        await transitionTicket(ticketId, "RESOLVED");
+      } else if (action === "waiting") {
+        await transitionTicket(ticketId, "WAITING_CUSTOMER");
+      } else if (action === "escalate") {
+        await transitionTicket(ticketId, "ESCALATED_RND");
+        await assignTicket(ticketId, "RND_TEAM", "R&D Team");
+      } else {
+        await assignTicket(ticketId, "SUPPORT_TEAM", assigneeFilter);
+      }
+      await load();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setWorkingId(null);
+    }
+  };
+
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 md:px-8 md:py-12">
       <h1 className="text-3xl font-bold text-ink">Agent Queue</h1>
+      <p className="mt-2 text-sm text-slate-600">Internal Portal Route: /agent</p>
 
-      <Tabs.Root className="mt-6" defaultValue="pending">
+      <Tabs.Root className="mt-6" value={tab} onValueChange={(v) => setTab(v as typeof tab)}>
         <Tabs.List className="flex gap-2 border-b border-slate-200 pb-2">
           <Tabs.Trigger value="pending" className="rounded-mdplus px-3 py-1.5 text-sm data-[state=active]:bg-brand-500 data-[state=active]:text-white">
             Pending Queue
@@ -41,55 +81,102 @@ export function AgentDashboardPage() {
             All Tickets
           </Tabs.Trigger>
         </Tabs.List>
-
-        <Tabs.Content value="pending" className="mt-4 overflow-hidden rounded-mdplus border border-slate-200 bg-white">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
-              <tr>
-                <th className="px-4 py-3">ID & Title</th>
-                <th className="px-4 py-3">Customer</th>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3">SLA</th>
-                <th className="px-4 py-3">Assignee</th>
-                <th className="px-4 py-3">Created</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <tr key={row.id} className="group border-t border-slate-100 align-top hover:bg-slate-50/60">
-                  <td className="px-4 py-4">
-                    <div className="font-medium text-brand-500">{row.id}</div>
-                    <div className="text-slate-700">{row.title}</div>
-                    <div className="mt-2 hidden rounded-mdplus border border-brand-100 bg-brand-50 p-2 text-xs text-slate-700 group-hover:block">
-                      <div className="mb-1 flex items-center gap-1 text-brand-600">
-                        <Sparkles size={12} /> AI Analysis
-                      </div>
-                      {row.ai}
-                    </div>
-                  </td>
-                  <td className="px-4 py-4">{row.customer}</td>
-                  <td className="px-4 py-4">{row.status}</td>
-                  <td className="px-4 py-4 text-rose-600">{row.sla}</td>
-                  <td className="px-4 py-4">
-                    <span className="inline-flex items-center gap-1">
-                      {row.assignee.includes("AI") && <Bot size={14} className="text-brand-500" />}
-                      {row.assignee}
-                    </span>
-                  </td>
-                  <td className="px-4 py-4 text-slate-500">{row.created}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </Tabs.Content>
-
-        <Tabs.Content value="mine" className="mt-4 rounded-mdplus border border-slate-200 bg-white p-6 text-sm text-slate-600">
-          Skeleton view for tickets assigned to current agent.
-        </Tabs.Content>
-        <Tabs.Content value="all" className="mt-4 rounded-mdplus border border-slate-200 bg-white p-6 text-sm text-slate-600">
-          Skeleton view for all tickets across queues.
-        </Tabs.Content>
       </Tabs.Root>
+
+      <div className="mt-4 flex items-center gap-3">
+        <input
+          value={assigneeFilter}
+          onChange={(e) => setAssigneeFilter(e.target.value)}
+          className="h-10 rounded-mdplus border border-slate-200 px-3 text-sm"
+          placeholder="Assignee for 'Mine'"
+        />
+        <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" onClick={() => void load()}>
+          Refresh
+        </button>
+      </div>
+      {error && <p className="mt-3 text-sm text-rose-600">{error}</p>}
+      {loading && <p className="mt-4 text-sm text-slate-600">Loading queue...</p>}
+
+      <div className="mt-4 overflow-hidden rounded-mdplus border border-slate-200 bg-white">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+            <tr>
+              <th className="px-4 py-3">ID & Title</th>
+              <th className="px-4 py-3">Customer</th>
+              <th className="px-4 py-3">Status</th>
+              <th className="px-4 py-3">SLA</th>
+              <th className="px-4 py-3">Assignee</th>
+              <th className="px-4 py-3">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sortedRows.map((row) => (
+              <tr key={row.id} className="group border-t border-slate-100 align-top hover:bg-slate-50/60">
+                <td className="px-4 py-4">
+                  <div className="font-medium text-brand-500">{row.ticket_no}</div>
+                  <div className="text-slate-700">{row.title}</div>
+                  {(row.triage_reasoning_summary || row.triage_evidence?.length) && (
+                    <div className="mt-2 rounded-mdplus border border-brand-100 bg-brand-50 p-2 text-xs text-slate-700">
+                      <div className="mb-1 flex items-center gap-1 text-brand-600">
+                        <Sparkles size={12} /> Triage
+                      </div>
+                      <div>{row.triage_reasoning_summary ?? "No summary."}</div>
+                      <div className="mt-1 text-[11px] text-slate-600">
+                        Confidence: {row.triage_confidence ?? "-"} | Evidence: {row.triage_evidence?.join(", ") || "-"}
+                      </div>
+                    </div>
+                  )}
+                </td>
+                <td className="px-4 py-4">{row.customer_name}</td>
+                <td className="px-4 py-4">
+                  <StatusBadge status={row.status} />
+                </td>
+                <td className="px-4 py-4">{formatRemaining(row.sla_due_at)}</td>
+                <td className="px-4 py-4">{row.assignee_name}</td>
+                <td className="px-4 py-4">
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      className="rounded border border-slate-200 px-2 py-1 text-xs"
+                      disabled={workingId === row.id}
+                      onClick={() => void runAction(row.id, "claim")}
+                    >
+                      Claim
+                    </button>
+                    <button
+                      className="rounded border border-slate-200 px-2 py-1 text-xs"
+                      disabled={workingId === row.id}
+                      onClick={() => void runAction(row.id, "waiting")}
+                    >
+                      Ask Customer
+                    </button>
+                    <button
+                      className="rounded border border-slate-200 px-2 py-1 text-xs"
+                      disabled={workingId === row.id}
+                      onClick={() => void runAction(row.id, "resolve")}
+                    >
+                      Resolve
+                    </button>
+                    <button
+                      className="rounded border border-rose-200 px-2 py-1 text-xs text-rose-700"
+                      disabled={workingId === row.id}
+                      onClick={() => void runAction(row.id, "escalate")}
+                    >
+                      Escalate R&D
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {!sortedRows.length && !loading && (
+              <tr>
+                <td className="px-4 py-10 text-center text-sm text-slate-500" colSpan={6}>
+                  No tickets in this queue.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
