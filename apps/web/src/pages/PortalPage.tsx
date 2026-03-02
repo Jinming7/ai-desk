@@ -12,8 +12,8 @@ const services = [
   },
   {
     key: "feature_consulting" as const,
-    title: "Feature Consulting",
-    description: "Ask product capability and integration questions.",
+    title: "Feature Request",
+    description: "Share product ideas and discuss capability enhancements.",
     icon: Lightbulb
   },
   {
@@ -39,19 +39,19 @@ export function PortalPage() {
   };
 
   return (
-    <div className="mx-auto max-w-7xl px-4 py-8 md:px-8 md:py-16">
-      <section className="space-y-6 text-center md:space-y-8">
-        <h1 className="text-4xl font-bold tracking-tight text-ink md:text-6xl">How can we help you today?</h1>
-        <div className="mx-auto flex max-w-3xl items-center gap-3 rounded-mdplus border border-slate-200 bg-white px-4 py-3 shadow-soft transition focus-within:border-brand-500 focus-within:shadow-[0_0_0_4px_rgba(51,102,255,0.2)]">
-          <Search size={18} className="text-slate-400" />
+    <div className="mx-auto max-w-[1280px] px-4 pb-16 pt-24 md:px-8">
+      <section className="text-center">
+        <h1 className="mb-12 text-5xl font-bold tracking-tight text-ink">How can we help?</h1>
+        <div className="mx-auto mb-16 flex h-14 w-full items-center gap-4 rounded-xl border border-[#D1D5DB] bg-white px-4 transition duration-300 hover:border-[#9CA3AF] focus-within:border-brand-500 focus-within:shadow-[0_0_0_2px_#3B82F6] md:w-[60%]">
+          <Search size={24} className="text-[#9CA3AF]" />
           <input
-            placeholder="Search knowledge base, guides, and FAQs"
-            className="w-full border-none text-sm text-ink outline-none"
+            placeholder="Search knowledge base or services..."
+            className="w-full border-none bg-transparent text-base font-normal text-ink placeholder:text-[#9CA3AF] outline-none"
           />
         </div>
       </section>
 
-      <section className="mt-12 grid gap-5 md:mt-16 md:grid-cols-3">
+      <section className="grid gap-8 md:grid-cols-3">
         {services.map((item) => {
           const Icon = item.icon;
           return (
@@ -61,11 +61,11 @@ export function PortalPage() {
                 setService(item);
                 setOpen(true);
               }}
-              className="rounded-mdplus border border-slate-200 bg-white p-6 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-soft"
+              className="rounded-2xl border border-line bg-white p-8 text-left transition duration-300 hover:-translate-y-1 hover:border-brand-500 hover:shadow-[0_10px_15px_-3px_rgb(0_0_0_/_0.1),0_4px_6px_-4px_rgb(0_0_0_/_0.1)]"
             >
-              <Icon className="mb-4 text-brand-500" size={22} />
-              <h3 className="text-lg font-semibold text-ink">{item.title}</h3>
-              <p className="mt-2 text-sm text-slate-600">{item.description}</p>
+              <Icon className="text-brand-500" size={48} strokeWidth={1.8} />
+              <h3 className="mt-6 text-[20px] font-semibold text-ink">{item.title}</h3>
+              <p className="mt-2 text-base font-normal text-muted">{item.description}</p>
             </button>
           );
         })}

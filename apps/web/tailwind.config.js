@@ -5,12 +5,14 @@ export default {
     extend: {
       colors: {
         brand: {
-          50: "#EEF3FF",
-          100: "#DCE7FF",
-          500: "#3366FF",
-          600: "#2451D6"
+          50: "#EFF6FF",
+          100: "#DBEAFE",
+          500: "#3B82F6",
+          600: "#2563EB"
         },
-        ink: "#1F2937"
+        ink: "#1F2937",
+        muted: "#6B7280",
+        line: "#E5E7EB"
       },
       boxShadow: {
         soft: "0 8px 32px rgba(31, 41, 55, 0.08)"
