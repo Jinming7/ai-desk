@@ -53,6 +53,25 @@ Internal-only APIs require header `x-portal-surface: internal`:
 - OpenAPI: `apps/api/openapi.yaml`
 - OpenClaw health check: `GET /api/v1/integrations/openclaw/health`
 
+## Vercel Integrated Deployment (Web + API)
+- This repo is configured to deploy:
+  - Frontend static site from `apps/web/dist`
+  - Backend API as serverless function at `api/index.ts`
+- API is served on same domain under `/api/*`.
+- Keep `VITE_API_BASE_URL` empty in Vercel to use same-origin routing.
+
+Required Vercel Environment Variables:
+- `DATABASE_URL`
+- `OPENCLAW_WS_URL`
+- `OPENCLAW_BASIC_USER`
+- `OPENCLAW_BASIC_PASS`
+- `OPENCLAW_GATEWAY_TOKEN`
+- `OPENCLAW_CONNECT_TIMEOUT_MS`
+- `OPENCLAW_METHOD_TIMEOUT_MS`
+- `OPENCLAW_MAX_RETRIES`
+- `OPENCLAW_CIRCUIT_BREAKER_THRESHOLD`
+- `VITE_AGENT_ACCESS_CODE` (optional, for `/agent` gate)
+
 ## Notes
 - Secrets are loaded from environment only.
 - OpenClaw integration is behind `OPENCLAW_*` env values with safe fallback behavior.

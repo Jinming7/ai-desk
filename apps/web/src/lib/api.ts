@@ -1,20 +1,35 @@
 import type { AgentQueueTicket, Ticket, TicketMessage, TicketStatus } from "./types";
 
-const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:4000";
+const API = import.meta.env.VITE_API_BASE_URL || "";
+
+function asUserError(error: unknown): Error {
+  if (error instanceof TypeError) {
+    return new Error(
+      API
+        ? `Cannot reach API server (${API}). Check API deployment and CORS/network.`
+        : "Cannot reach same-origin API. Ensure backend route /api/* is deployed."
+    );
+  }
+  return error instanceof Error ? error : new Error("Unexpected request error");
+}
 
 export async function listTickets(customerId?: string, status?: TicketStatus | "ALL"): Promise<Ticket[]> {
   const params = new URLSearchParams();
   if (customerId) params.set("customerId", customerId);
   if (status && status !== "ALL") params.set("status", status);
   const query = params.toString() ? `?${params.toString()}` : "";
-  const res = await fetch(`${API}/api/v1/tickets${query}`);
+  const res = await fetch(`${API}/api/v1/tickets${query}`).catch((error) => {
+    throw asUserError(error);
+  });
   if (!res.ok) throw new Error("Failed to load tickets");
   const data = await res.json();
   return data.tickets;
 }
 
 export async function getTicketDetail(id: string): Promise<{ ticket: Ticket; messages: TicketMessage[] }> {
-  const res = await fetch(`${API}/api/v1/tickets/${id}`);
+  const res = await fetch(`${API}/api/v1/tickets/${id}`).catch((error) => {
+    throw asUserError(error);
+  });
   if (!res.ok) throw new Error("Failed to load ticket detail");
   return res.json();
 }
@@ -35,6 +50,8 @@ export async function createTicket(payload: {
         name: "Acme User"
       }
     })
+  }).catch((error) => {
+    throw asUserError(error);
   });
 
   if (!res.ok) throw new Error("Failed to create ticket");
@@ -60,6 +77,8 @@ export async function searchKnowledge(query: string): Promise<{
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query })
+  }).catch((error) => {
+    throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to search knowledge base");
   const data = await res.json();
@@ -76,6 +95,8 @@ export async function replyTicket(id: string, body: string) {
       authorName: "Acme User",
       attachments: []
     })
+  }).catch((error) => {
+    throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to send reply");
 }
@@ -87,6 +108,8 @@ export async function listAgentTickets(queue: "pending" | "mine" | "all", assign
 
   const res = await fetch(`${API}/api/v1/agent/tickets?${params.toString()}`, {
     headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to load agent queue");
   const data = await res.json();
@@ -102,6 +125,8 @@ export async function transitionTicket(
     method: "POST",
     headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
     body: JSON.stringify({ to, reasonCode })
+  }).catch((error) => {
+    throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to transition ticket");
 }
@@ -123,6 +148,8 @@ export async function assignTicket(
     method: "POST",
     headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
     body: JSON.stringify({ assigneeType, assigneeName, reasonCode })
+  }).catch((error) => {
+    throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to assign ticket");
 }

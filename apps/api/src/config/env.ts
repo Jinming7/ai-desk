@@ -1,7 +1,11 @@
 import { config } from "dotenv";
+import path from "node:path";
 import { z } from "zod";
 
-config({ path: process.env.NODE_ENV === "test" ? ".env.test" : ".env" });
+const envFile = process.env.NODE_ENV === "test" ? ".env.test" : ".env";
+
+config({ path: path.resolve(process.cwd(), envFile) });
+config({ path: path.resolve(process.cwd(), "../../", envFile), override: false });
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
