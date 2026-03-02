@@ -1,5 +1,6 @@
 import { canTransition } from "../../domain/state-machine.js";
 import type { OpenClawAdapter, OpenClawAnalyzeOutput, OpenClawDecisionAction } from "../../infrastructure/openclaw/types.js";
+import { env } from "../../config/env.js";
 import * as aiRepo from "./repository.js";
 import { SearchOrchestrator } from "./search-orchestrator.js";
 import type { SearchModeResult } from "./types.js";
@@ -16,34 +17,6 @@ function normalizeAnalyzeOutput(raw: OpenClawAnalyzeOutput): OpenClawAnalyzeOutp
   return {
     ...raw,
     action: normalizeAction(raw.action)
-  };
-}
-
-function isOpenClawScopeOrAuthError(message: string): boolean {
-  const text = message.toLowerCase();
-  return text.includes("missing scope") || text.includes("token mismatch") || text.includes("auth_token_mismatch");
-}
-
-function localTriageFallback(input: { title: string; description: string }): OpenClawAnalyzeOutput {
-  const content = `${input.title} ${input.description}`;
-  const escalate = /urgent|production|outage|incident|failed|error/i.test(content);
-  if (escalate) {
-    return {
-      action: "escalate",
-      confidence: 0.52,
-      reply: "",
-      reasoning_summary: "OpenClaw permission degraded; fallback policy escalated high-risk wording.",
-      evidence: ["fallback_policy"],
-      risk_flags: ["possible_prod_impact"]
-    };
-  }
-  return {
-    action: "ask_user",
-    confidence: 0.41,
-    reply: "Thanks for the report. Please share exact error message, timestamp, and environment details so our support team can continue.",
-    reasoning_summary: "OpenClaw permission degraded; fallback policy requested additional details.",
-    evidence: ["fallback_policy"],
-    risk_flags: []
   };
 }
 
@@ -213,58 +186,23 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
     const message = (error as Error).message;
     await tickets.failAiRun(runId, message);
 
-    if (isOpenClawScopeOrAuthError(message)) {
-      const fallback = localTriageFallback({ title: input.title, description: input.description });
-      await tickets.completeAiRun(runId, {
-        ...fallback,
-        fallback_mode: "scope_or_auth_degraded",
-        original_error: message
-      });
-
-      if (fallback.action === "escalate") {
-        const latest = await tickets.getTicketById(ticketId);
-        if (latest && latest.status !== "ESCALATED_RND" && canTransition(latest.status, "ESCALATED_RND")) {
-          await tickets.transitionTicket(ticketId, latest.status, "ESCALATED_RND");
-          await tickets.setTicketAssignee(ticketId, "RND_TEAM", "R&D Team");
-          await tickets.addAuditLog(ticketId, "ai_triage_fallback_escalated", latest.status, "ESCALATED_RND", {
-            reason: "openclaw_scope_or_auth_error",
-            reasonCode: "integration_failure",
-            stage: "escalated_rnd",
-            status: "ESCALATED_RND",
-            assignee: "R&D Team",
-            customer_message_policy: "none",
-            sla_effect: "continue_active_timer",
-            error: message
-          });
-        }
-        return fallback;
-      }
-
-      await tickets.addMessage({
-        ticketId,
-        authorType: "AGENT",
-        authorName: "Support Team",
-        body: fallback.reply,
-        attachments: [],
-        isAiGenerated: true,
-        aiConfidence: fallback.confidence
-      });
+    if (env.DISABLE_AI_TRIAGE_FALLBACK) {
       const latest = await tickets.getTicketById(ticketId);
-      if (latest && canTransition(latest.status, "WAITING_CUSTOMER")) {
-        await tickets.transitionTicket(ticketId, latest.status, "WAITING_CUSTOMER");
+      if (latest && latest.status !== "ESCALATED_RND" && canTransition(latest.status, "ESCALATED_RND")) {
+        await tickets.transitionTicket(ticketId, latest.status, "ESCALATED_RND");
+        await tickets.setTicketAssignee(ticketId, "RND_TEAM", "R&D Team");
       }
-      await tickets.setTicketAssignee(ticketId, "SUPPORT_TEAM", "Support Team");
-      await tickets.addAuditLog(ticketId, "ai_triage_fallback_replied", null, "WAITING_CUSTOMER", {
-        reason: "openclaw_scope_or_auth_error",
+      await tickets.addAuditLog(ticketId, "ai_triage_escalated", null, "ESCALATED_RND", {
+        reason: "openclaw_failure",
         reasonCode: "integration_failure",
-        stage: "waiting_customer",
-        status: "WAITING_CUSTOMER",
-        assignee: "Support Team",
-        customer_message_policy: "reply_from_support_team",
-        sla_effect: "pause_active_timer",
+        stage: "escalated_rnd",
+        status: "ESCALATED_RND",
+        assignee: "R&D Team",
+        customer_message_policy: "none",
+        sla_effect: "continue_active_timer",
         error: message
       });
-      return fallback;
+      throw error;
     }
 
     const latest = await tickets.getTicketById(ticketId);
