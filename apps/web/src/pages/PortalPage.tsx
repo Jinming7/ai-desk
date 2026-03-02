@@ -1,9 +1,10 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { motion } from "framer-motion";
 import { Loader2, Search, X, Wrench, Lightbulb, ShieldAlert } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { createTicket, searchKnowledge } from "../lib/api";
+import { createQuickEscalation, createTicket, getEscalationStatus, searchKnowledge } from "../lib/api";
+import type { AiEscalation, SearchResult } from "../lib/types";
 
 const services = [
   {
@@ -35,14 +36,34 @@ export function PortalPage() {
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
-  const [searchResult, setSearchResult] = useState<{
-    answer: string;
-    suggested_next_step: "self_serve" | "submit_ticket";
-    citations: Array<{ id: string; title: string; excerpt: string }>;
-  } | null>(null);
+  const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitLoading, setSubmitLoading] = useState(false);
   const [submitSuccess, setSubmitSuccess] = useState<string | null>(null);
+  const [escalation, setEscalation] = useState<AiEscalation | null>(null);
+  const [escalating, setEscalating] = useState(false);
+  const [escalationError, setEscalationError] = useState<string | null>(null);
+
+  const unresolved = useMemo(
+    () => searchResult?.suggested_next_step === "submit_ticket" && Boolean(searchResult.unresolved_reason_code),
+    [searchResult]
+  );
+
+  useEffect(() => {
+    if (!escalation || (escalation.status !== "ESCALATED" && escalation.status !== "DEEP_RETRIEVING")) {
+      return;
+    }
+
+    const timer = setInterval(() => {
+      void getEscalationStatus(escalation.id)
+        .then(setEscalation)
+        .catch(() => {
+          // keep previous status for transient poll errors
+        });
+    }, 2500);
+
+    return () => clearInterval(timer);
+  }, [escalation]);
 
   const submit = async () => {
     if (!service) return;
@@ -75,6 +96,8 @@ export function PortalPage() {
     setSearching(true);
     setSearchError(null);
     setSearchResult(null);
+    setEscalation(null);
+    setEscalationError(null);
     try {
       const result = await searchKnowledge(query.trim());
       setSearchResult(result);
@@ -85,6 +108,28 @@ export function PortalPage() {
       setSearchResult(null);
     } finally {
       setSearching(false);
+    }
+  };
+
+  const onQuickEscalate = async () => {
+    if (!searchResult || !searchResult.unresolved_reason_code) {
+      return;
+    }
+
+    setEscalating(true);
+    setEscalationError(null);
+    try {
+      const created = await createQuickEscalation({
+        sessionId: searchResult.session_id,
+        question: query.trim(),
+        conversation: [query.trim(), searchResult.answer],
+        reasonCode: searchResult.unresolved_reason_code
+      });
+      setEscalation(created);
+    } catch (error) {
+      setEscalationError((error as Error).message);
+    } finally {
+      setEscalating(false);
     }
   };
 
@@ -130,29 +175,82 @@ export function PortalPage() {
           {searchError && <p className="mt-3 text-sm text-rose-600">{searchError}</p>}
           {searchResult && (
             <div className="mt-6 w-full rounded-2xl border border-[#D1D5DB] bg-white/90 p-5 text-left md:w-[60%]">
-              <p className="text-sm font-medium text-[#111827]">{searchResult.answer}</p>
-              {searchResult.citations.length > 0 && (
+              <div className="flex items-start justify-between gap-4">
+                <p className="text-sm font-medium text-[#111827]">{searchResult.answer}</p>
+                <span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-600">
+                  confidence {searchResult.confidence.toFixed(2)}
+                </span>
+              </div>
+              {searchResult.references.length > 0 && (
                 <div className="mt-3 space-y-2">
-                  {searchResult.citations.map((item) => (
-                    <div key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                      <p className="text-sm font-semibold text-[#1F2937]">{item.title}</p>
-                      <p className="mt-1 text-xs text-[#6B7280]">{item.excerpt}...</p>
+                  {searchResult.references.map((item) => (
+                    <div key={item.documentId} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-sm font-semibold text-[#1F2937]">{item.title}</p>
+                        <a className="text-xs text-brand-500 hover:underline" href={item.sourceUrl} target="_blank" rel="noreferrer">
+                          Reference
+                        </a>
+                      </div>
+                      <p className="mt-1 text-xs text-[#6B7280]">{item.snippet}</p>
                     </div>
                   ))}
                 </div>
               )}
-              <div className="mt-4 flex items-center gap-3">
-                <span className="text-xs text-[#6B7280]">Still need help?</span>
-                <button
-                  onClick={() => {
-                    setService(services[0]);
-                    setOpen(true);
-                  }}
-                  className="rounded-lg bg-brand-500 px-3 py-1.5 text-xs font-medium text-white"
-                >
-                  Submit Ticket
-                </button>
-              </div>
+
+              {unresolved && (
+                <div className="mt-4 rounded-xl border border-brand-100 bg-brand-50 p-3">
+                  <p className="text-xs text-slate-600">
+                    AI cannot provide a reliable answer ({searchResult.unresolved_reason_code}). Use quick ticket for agent deep retrieval.
+                  </p>
+                  <div className="mt-2 flex items-center gap-3">
+                    <button
+                      onClick={() => void onQuickEscalate()}
+                      disabled={escalating}
+                      className="rounded-lg bg-brand-500 px-3 py-1.5 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-70"
+                    >
+                      {escalating ? "Submitting..." : "Quick Ticket"}
+                    </button>
+                    {escalation && <span className="text-xs text-slate-500">Escalation: {escalation.status}</span>}
+                  </div>
+                  {escalationError && <p className="mt-2 text-xs text-rose-600">{escalationError}</p>}
+                </div>
+              )}
+
+              {escalation?.status === "RESOLVED_BY_AI" && (
+                <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+                  <p className="text-xs font-semibold text-emerald-700">Agent resolved using deep retrieval</p>
+                  <p className="mt-1 text-xs text-slate-700">{escalation.resolution?.answer ?? "Resolved answer generated."}</p>
+                </div>
+              )}
+
+              {escalation?.status === "TICKET_CREATED" && (
+                <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3">
+                  <p className="text-xs font-semibold text-amber-700">Deep retrieval could not resolve. Ticket created.</p>
+                  {escalation.ticketId && (
+                    <button
+                      className="mt-2 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white"
+                      onClick={() => navigate(`/tickets/${escalation.ticketId}`)}
+                    >
+                      Open Ticket
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {!unresolved && (
+                <div className="mt-4 flex items-center gap-3">
+                  <span className="text-xs text-[#6B7280]">Still need help?</span>
+                  <button
+                    onClick={() => {
+                      setService(services[0]);
+                      setOpen(true);
+                    }}
+                    className="rounded-lg bg-brand-500 px-3 py-1.5 text-xs font-medium text-white"
+                  >
+                    Submit Ticket
+                  </button>
+                </div>
+              )}
             </div>
           )}
           {!searching && query.trim().length >= 2 && !searchResult && !searchError && (
@@ -183,11 +281,7 @@ export function PortalPage() {
                 whileTap={{ scale: 0.995 }}
                 className="group rounded-2xl bg-white p-8 text-left [box-shadow:0_1px_2px_rgba(22,23,26,0.06),0_18px_38px_rgba(0,100,255,0.08),0_2px_10px_rgba(51,221,255,0.1)] transition-all duration-300"
               >
-                <motion.div
-                  className="inline-flex"
-                  whileHover={{ scale: 1.06, rotate: -3 }}
-                  transition={{ duration: 0.35, ease: "easeOut" }}
-                >
+                <motion.div className="inline-flex" whileHover={{ scale: 1.06, rotate: -3 }} transition={{ duration: 0.35, ease: "easeOut" }}>
                   <Icon className="text-brand-500" size={48} strokeWidth={1.7} />
                 </motion.div>
                 <h3 className="mt-6 text-[20px] font-semibold text-[#1F2937]">{item.title}</h3>
@@ -212,11 +306,7 @@ export function PortalPage() {
             <div className="space-y-4">
               <div>
                 <label className="mb-2 block text-sm font-medium text-[#1F2937]">Title</label>
-                <input
-                  value={title}
-                  onChange={(e) => setTitle(e.target.value)}
-                  className="h-11 w-full rounded-xl border border-line px-3"
-                />
+                <input value={title} onChange={(e) => setTitle(e.target.value)} className="h-11 w-full rounded-xl border border-line px-3" />
               </div>
               <div>
                 <label className="mb-2 block text-sm font-medium text-[#1F2937]">Description (Markdown supported)</label>

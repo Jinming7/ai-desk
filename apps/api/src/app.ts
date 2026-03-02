@@ -7,12 +7,14 @@ import {
   ticketCreateSchema,
   ticketInternalTransitionSchema,
   ticketListQuerySchema,
-  ticketReplySchema,
-  ticketStatusSchema
+  ticketReplySchema
 } from "./contracts/tickets.js";
+import { aiEscalateRequestSchema, aiSearchRequestSchema } from "./contracts/ai-search.js";
 import * as ticketService from "./modules/tickets/service.js";
 import * as agentService from "./modules/agent/service.js";
 import * as aiService from "./modules/ai/service.js";
+import * as aiRepo from "./modules/ai/repository.js";
+import * as escalationService from "./modules/escalation/service.js";
 import * as workflowService from "./modules/workflow/service.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
@@ -58,9 +60,46 @@ app.post(
 app.post(
   "/api/v1/ai/search",
   asyncHandler(async (req, res) => {
-    const body = z.object({ query: z.string().min(2) }).parse(req.body);
-    const result = await aiService.runSearchMode(body.query);
+    const body = aiSearchRequestSchema.parse(req.body);
+    const result = await aiService.runSearchMode(body.query, aiAdapter);
     res.json({ result });
+  })
+);
+
+app.post(
+  "/api/v1/ai/escalations",
+  asyncHandler(async (req, res) => {
+    const body = aiEscalateRequestSchema.parse(req.body);
+    const escalation = await escalationService.createOrGetEscalation({
+      sessionId: body.sessionId,
+      question: body.question,
+      conversation: body.conversation,
+      reasonCode: body.reasonCode,
+      adapter: aiAdapter
+    });
+    res.status(201).json({ escalation });
+  })
+);
+
+app.get(
+  "/api/v1/ai/escalations/:id",
+  asyncHandler(async (req, res) => {
+    const id = z.string().uuid().parse(req.params.id);
+    const escalation = await escalationService.getEscalation(id);
+    if (!escalation) {
+      res.status(404).json({ error: "Escalation not found" });
+      return;
+    }
+    res.json({ escalation });
+  })
+);
+
+app.get(
+  "/api/v1/ai/metrics/summary",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const metrics = await aiRepo.aggregateMetricsLast24h();
+    res.json({ metrics });
   })
 );
 

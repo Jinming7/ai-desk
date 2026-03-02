@@ -1,7 +1,7 @@
 import * as Tabs from "@radix-ui/react-tabs";
 import { Sparkles } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { assignTicket, listAgentTickets, transitionTicket } from "../lib/api";
+import { assignTicket, getAiMetricsSummary, listAgentTickets, transitionTicket } from "../lib/api";
 import type { AgentQueueTicket } from "../lib/types";
 import { StatusBadge } from "../components/StatusBadge";
 
@@ -21,6 +21,7 @@ export function AgentDashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [workingId, setWorkingId] = useState<string | null>(null);
   const [assigneeFilter, setAssigneeFilter] = useState("Support Team");
+  const [metrics, setMetrics] = useState<{ hitRate: number; citationCoverage: number; fallbackRate: number } | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -39,6 +40,12 @@ export function AgentDashboardPage() {
   useEffect(() => {
     void load();
   }, [tab]);
+
+  useEffect(() => {
+    getAiMetricsSummary()
+      .then(setMetrics)
+      .catch(() => setMetrics(null));
+  }, []);
 
   const sortedRows = useMemo(() => rows, [rows]);
 
@@ -94,6 +101,22 @@ export function AgentDashboardPage() {
           Refresh
         </button>
       </div>
+      {metrics && (
+        <div className="mt-4 grid gap-3 md:grid-cols-3">
+          <div className="rounded-mdplus border border-slate-200 bg-white p-3 text-sm text-slate-700">
+            <p className="text-xs text-slate-500">KB Hit Rate (24h)</p>
+            <p className="mt-1 text-xl font-semibold text-[#16171A]">{(metrics.hitRate * 100).toFixed(1)}%</p>
+          </div>
+          <div className="rounded-mdplus border border-slate-200 bg-white p-3 text-sm text-slate-700">
+            <p className="text-xs text-slate-500">Citation Coverage (24h)</p>
+            <p className="mt-1 text-xl font-semibold text-[#16171A]">{metrics.citationCoverage.toFixed(2)}</p>
+          </div>
+          <div className="rounded-mdplus border border-slate-200 bg-white p-3 text-sm text-slate-700">
+            <p className="text-xs text-slate-500">Fallback Rate (24h)</p>
+            <p className="mt-1 text-xl font-semibold text-[#16171A]">{(metrics.fallbackRate * 100).toFixed(1)}%</p>
+          </div>
+        </div>
+      )}
       {error && <p className="mt-3 text-sm text-rose-600">{error}</p>}
       {loading && <p className="mt-4 text-sm text-slate-600">Loading queue...</p>}
 
