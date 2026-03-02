@@ -1,14 +1,10 @@
-import type { AgentQueueTicket, Ticket, TicketMessage, TicketStatus } from "./types";
+import type { AgentQueueTicket, AiEscalation, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
 
-const API = import.meta.env.VITE_API_BASE_URL || "";
+const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:4000";
 
 function asUserError(error: unknown): Error {
   if (error instanceof TypeError) {
-    return new Error(
-      API
-        ? `Cannot reach API server (${API}). Check API deployment and CORS/network.`
-        : "Cannot reach same-origin API. Ensure backend route /api/* is deployed."
-    );
+    return new Error("Cannot reach API server. Ensure backend is running on http://localhost:4000.");
   }
   return error instanceof Error ? error : new Error("Unexpected request error");
 }
@@ -68,11 +64,7 @@ export async function createTicket(payload: {
   }>;
 }
 
-export async function searchKnowledge(query: string): Promise<{
-  answer: string;
-  suggested_next_step: "self_serve" | "submit_ticket";
-  citations: Array<{ id: string; title: string; excerpt: string }>;
-}> {
+export async function searchKnowledge(query: string): Promise<SearchResult> {
   const res = await fetch(`${API}/api/v1/ai/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -83,6 +75,48 @@ export async function searchKnowledge(query: string): Promise<{
   if (!res.ok) throw new Error("Failed to search knowledge base");
   const data = await res.json();
   return data.result;
+}
+
+export async function createQuickEscalation(input: {
+  sessionId: string;
+  question: string;
+  conversation: string[];
+  reasonCode: "NO_MATCHING_KB" | "LOW_CONFIDENCE" | "KB_RETRIEVAL_UNAVAILABLE";
+}): Promise<AiEscalation> {
+  const res = await fetch(`${API}/api/v1/ai/escalations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to create quick escalation");
+  const data = await res.json();
+  return data.escalation;
+}
+
+export async function getEscalationStatus(id: string): Promise<AiEscalation> {
+  const res = await fetch(`${API}/api/v1/ai/escalations/${id}`).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to fetch escalation status");
+  const data = await res.json();
+  return data.escalation;
+}
+
+export async function getAiMetricsSummary(): Promise<{
+  hitRate: number;
+  citationCoverage: number;
+  fallbackRate: number;
+}> {
+  const res = await fetch(`${API}/api/v1/ai/metrics/summary`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to fetch AI metrics");
+  const data = await res.json();
+  return data.metrics;
 }
 
 export async function replyTicket(id: string, body: string) {
