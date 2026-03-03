@@ -65,6 +65,12 @@ export interface AgentQueueTicket {
   ones_sync_status?: string | null;
   ai_mode_snapshot?: string | null;
   ai_last_trace_id?: string | null;
+  ai_last_action?: "resolve" | "ask_user" | "escalate" | null;
+  ai_last_confidence?: number | null;
+  ai_suggestion_pending?: boolean;
+  assigned_at?: string | null;
+  last_customer_reply_at?: string | null;
+  last_agent_reply_at?: string | null;
   sla_risk?: "healthy" | "at_risk" | "breached";
 }
 

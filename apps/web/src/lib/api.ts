@@ -164,7 +164,7 @@ export async function listAgentTickets(queue: "pending" | "mine" | "all", assign
 }
 
 export async function listSupportTickets(input: {
-  queue: "pending" | "mine" | "all";
+  queue: "pending" | "mine" | "all" | "sla_at_risk" | "ai_suggested" | "new_assigned" | "waiting_my_reply" | "my_all" | "resolved";
   assignee?: string;
   status?: TicketStatus;
   priority?: "P1" | "P2" | "P3" | "P4";
@@ -189,6 +189,59 @@ export async function listSupportTickets(input: {
   if (!res.ok) throw new Error("Failed to load support queue");
   const data = await res.json();
   return data.tickets;
+}
+
+export async function getSupportQueueCounts(assignee?: string): Promise<Record<string, number>> {
+  const params = new URLSearchParams();
+  if (assignee) params.set("assignee", assignee);
+  const query = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetch(`${API}/api/v1/support/queue-counts${query}`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load support queue counts");
+  return (await res.json()).counts;
+}
+
+export async function trackSupportUxEvent(input: {
+  actor: string;
+  eventType:
+    | "queue_selected"
+    | "ticket_opened"
+    | "ai_suggestion_viewed"
+    | "ai_suggestion_applied"
+    | "ai_suggestion_overridden"
+    | "action_executed"
+    | "response_sent";
+  ticketId?: string;
+  queueKey?: string;
+  traceId?: string;
+  payload?: Record<string, unknown>;
+}) {
+  const res = await fetch(`${API}/api/v1/internal/support/ux-events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(input)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to track support UX event");
+}
+
+export async function getSupportUxMetrics(): Promise<{
+  firstActionLatencySecondsAvg: number;
+  aiSuggestionAdoptionRate: number;
+  slaAtRiskQueueSelections: number;
+  actionsExecuted: number;
+}> {
+  const res = await fetch(`${API}/api/v1/internal/support/ux-metrics`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to fetch support UX metrics");
+  return (await res.json()).metrics;
 }
 
 export async function runBulkTicketAction(input: {

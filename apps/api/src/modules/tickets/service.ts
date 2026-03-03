@@ -60,6 +60,7 @@ export async function addReply(id: string, input: TicketReplyInput) {
         sla_effect: "pause_active_timer"
       });
     }
+    await repo.clearAiSuggestionPending(id);
   }
 }
 
@@ -100,6 +101,7 @@ export async function transitionInternal(id: string, input: TicketInternalTransi
     reasonCode: input.reasonCode,
     sla_effect: input.to === "WAITING_CUSTOMER" ? "pause_active_timer" : "none"
   });
+  await repo.clearAiSuggestionPending(id);
 }
 
 export async function assign(id: string, input: TicketAssignInput) {
@@ -113,6 +115,7 @@ export async function assign(id: string, input: TicketAssignInput) {
     assigneeName: input.assigneeName,
     reasonCode: input.reasonCode
   });
+  await repo.clearAiSuggestionPending(id);
 }
 
 export async function applyBulkAction(input: TicketBulkActionInput) {

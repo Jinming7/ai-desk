@@ -42,7 +42,19 @@ export const ticketListQuerySchema = z.object({
 });
 
 export const agentQueueQuerySchema = z.object({
-  queue: z.enum(["pending", "mine", "all"]).default("pending"),
+  queue: z
+    .enum([
+      "pending",
+      "mine",
+      "all",
+      "sla_at_risk",
+      "ai_suggested",
+      "new_assigned",
+      "waiting_my_reply",
+      "my_all",
+      "resolved"
+    ])
+    .default("pending"),
   assignee: z.string().optional(),
   status: ticketStatusSchema.optional(),
   priority: ticketPrioritySchema.optional(),

@@ -19,6 +19,7 @@ import * as escalationService from "./modules/escalation/service.js";
 import * as workflowService from "./modules/workflow/service.js";
 import * as settingsService from "./modules/settings/service.js";
 import * as onesSyncService from "./modules/ones-sync/service.js";
+import * as supportUxService from "./modules/support-ux/service.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
 import { env } from "./config/env.js";
@@ -232,6 +233,34 @@ app.get(
     const query = agentQueueQuerySchema.parse(req.query);
     const tickets = await agentService.listQueue(query);
     res.json({ tickets });
+  })
+);
+
+app.get(
+  "/api/v1/support/queue-counts",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const assignee = z.string().optional().parse(req.query.assignee);
+    const counts = await agentService.getQueueCounts(assignee);
+    res.json({ counts });
+  })
+);
+
+app.post(
+  "/api/v1/internal/support/ux-events",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    await supportUxService.trackEvent(req.body);
+    res.status(204).send();
+  })
+);
+
+app.get(
+  "/api/v1/internal/support/ux-metrics",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const metrics = await supportUxService.getMetricsSummary();
+    res.json({ metrics });
   })
 );
 
