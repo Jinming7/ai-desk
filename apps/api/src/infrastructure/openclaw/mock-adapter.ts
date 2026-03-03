@@ -30,12 +30,36 @@ const mockCorpus: Array<{ id: string; title: string; content: string; sourceUrl:
 
 export class MockOpenClawAdapter implements OpenClawAdapter {
   async analyzeTicket(input: OpenClawAnalyzeInput): Promise<OpenClawAnalyzeOutput> {
+    const combined = `${input.title} ${input.description}`;
+
     if (/simulate_openclaw_failure/i.test(`${input.title} ${input.description}`)) {
       throw new Error("Simulated OpenClaw failure");
     }
 
-    const needsEscalation = /error|failed|urgent|production/i.test(`${input.title} ${input.description}`);
-    const likelyFixable = /how to|cannot login|permission|billing|api key|setup/i.test(`${input.title} ${input.description}`);
+    if (/none_with_reply/i.test(combined)) {
+      return {
+        action: "none",
+        confidence: 0.73,
+        reply: "Please provide the exact issue details so we can continue troubleshooting.",
+        reasoning_summary: "Test fixture: none action with non-empty reply.",
+        evidence: ["fixture:none_with_reply"],
+        risk_flags: []
+      };
+    }
+
+    if (/none_noop/i.test(combined)) {
+      return {
+        action: "none",
+        confidence: 0.7,
+        reply: "",
+        reasoning_summary: "Test fixture: none action with empty reply.",
+        evidence: ["fixture:none_noop"],
+        risk_flags: []
+      };
+    }
+
+    const needsEscalation = /error|failed|urgent|production/i.test(combined);
+    const likelyFixable = /how to|cannot login|permission|billing|api key|setup/i.test(combined);
 
     return {
       action: needsEscalation ? "escalate" : likelyFixable ? "resolve" : "ask_user",

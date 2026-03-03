@@ -97,10 +97,11 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     await this.waitAgentRun(runId);
     const text = await this.fetchLatestAssistantText();
     const parsed = this.parseFirstJson(text) as Partial<OpenClawAnalyzeOutput>;
+    const reply = typeof parsed.reply === "string" ? parsed.reply : "";
     return {
-      action: this.normalizeAction(parsed.action),
+      action: this.normalizeAnalyzeAction(parsed.action, reply),
       confidence: this.normalizeConfidence(parsed.confidence),
-      reply: typeof parsed.reply === "string" ? parsed.reply : "",
+      reply,
       reasoning_summary: typeof parsed.reasoning_summary === "string" ? parsed.reasoning_summary : "OpenClaw agent response",
       evidence: Array.isArray(parsed.evidence) ? parsed.evidence.map((x) => String(x)) : [],
       risk_flags: Array.isArray(parsed.risk_flags) ? parsed.risk_flags.map((x) => String(x)) : []
@@ -215,6 +216,15 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     if (value === "auto_resolve") return "resolve";
     if (value === "ask_info") return "ask_user";
     return "ask_user";
+  }
+
+  private normalizeAnalyzeAction(rawAction: unknown, reply: string): OpenClawAnalyzeOutput["action"] {
+    const normalized = this.normalizeAction(rawAction);
+    // Guardrail: `none` is a true no-op only when there is no customer-facing reply.
+    if (normalized === "none" && reply.trim().length > 0) {
+      return "ask_user";
+    }
+    return normalized;
   }
 
   private normalizeConfidence(value: unknown): number {

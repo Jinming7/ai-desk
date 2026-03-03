@@ -203,3 +203,99 @@ test("internal-only endpoints reject requests without internal surface header", 
   });
   assert.equal(transitionRes.status, 403);
 });
+
+test("none action with non-empty reply persists message and transitions to WAITING_CUSTOMER", async () => {
+  const created = await fetch(`${baseUrl}/api/v1/tickets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: "none_with_reply fixture",
+      description: "none_with_reply verify lifecycle",
+      serviceCategory: "technical_support",
+      priority: "P3",
+      customer: { id: "customer_none_reply", name: "Fixture User" }
+    })
+  });
+  assert.equal(created.status, 201);
+
+  const payload = (await created.json()) as {
+    ticket: { id: string; status: string };
+    triage: { action: string; reply: string } | null;
+    triageError: string | null;
+  };
+  assert.equal(payload.triageError, null);
+  assert.equal(payload.ticket.status, "WAITING_CUSTOMER");
+  assert.equal(payload.triage?.reply.length ? true : false, true);
+
+  const detail = await fetch(`${baseUrl}/api/v1/tickets/${payload.ticket.id}`);
+  assert.equal(detail.status, 200);
+  const detailPayload = (await detail.json()) as {
+    messages: Array<{ author_type: string; is_ai_generated: boolean; body: string }>;
+  };
+  const aiMessage = detailPayload.messages.find((msg) => msg.is_ai_generated);
+  assert.equal(Boolean(aiMessage), true);
+  assert.equal(aiMessage?.author_type, "AGENT");
+});
+
+test("none action with empty reply stays no-op and records ai_triage_no_action audit", async () => {
+  const created = await fetch(`${baseUrl}/api/v1/tickets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: "none_noop fixture",
+      description: "none_noop verify no-op",
+      serviceCategory: "technical_support",
+      priority: "P3",
+      customer: { id: "customer_none_noop", name: "Fixture User" }
+    })
+  });
+  assert.equal(created.status, 201);
+
+  const payload = (await created.json()) as {
+    ticket: { id: string; status: string };
+    triage: { action: string; reply: string } | null;
+    triageError: string | null;
+  };
+  assert.equal(payload.triageError, null);
+  assert.equal(payload.ticket.status, "IN_PROGRESS");
+  assert.equal(payload.triage?.action, "none");
+  assert.equal(payload.triage?.reply, "");
+
+  const detail = await fetch(`${baseUrl}/api/v1/tickets/${payload.ticket.id}`);
+  assert.equal(detail.status, 200);
+  const detailPayload = (await detail.json()) as {
+    messages: Array<{ is_ai_generated: boolean }>;
+  };
+  const aiMessages = detailPayload.messages.filter((msg) => msg.is_ai_generated);
+  assert.equal(aiMessages.length, 0);
+
+  const audit = await pool.query<{ event_type: string }>(
+    "SELECT event_type FROM ticket_audit_logs WHERE ticket_id = $1 ORDER BY created_at DESC LIMIT 3",
+    [payload.ticket.id]
+  );
+  assert.equal(audit.rows.some((row) => row.event_type === "ai_triage_no_action"), true);
+});
+
+test("placeholder-content triage reply is English", async () => {
+  const created = await fetch(`${baseUrl}/api/v1/tickets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: "123",
+      description: "123456",
+      serviceCategory: "technical_support",
+      priority: "P3",
+      customer: { id: "customer_placeholder", name: "Fixture User" }
+    })
+  });
+  assert.equal(created.status, 201);
+
+  const payload = (await created.json()) as {
+    triage: { reply: string } | null;
+    triageError: string | null;
+  };
+  assert.equal(payload.triageError, null);
+  const reply = payload.triage?.reply ?? "";
+  assert.equal(reply.length > 0, true);
+  assert.equal(/[\u4e00-\u9fff]/.test(reply), false);
+});
