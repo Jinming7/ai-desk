@@ -1,10 +1,10 @@
 import type { AgentQueueTicket, AiEscalation, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
 
-const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:4000";
+const API = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 
 function asUserError(error: unknown): Error {
   if (error instanceof TypeError) {
-    return new Error("Cannot reach API server. Ensure backend is running on http://localhost:4000.");
+    return new Error("Cannot reach API server. Check deployment URL and API routing.");
   }
   return error instanceof Error ? error : new Error("Unexpected request error");
 }
