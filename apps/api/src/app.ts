@@ -16,6 +16,7 @@ import * as aiService from "./modules/ai/service.js";
 import * as aiRepo from "./modules/ai/repository.js";
 import * as escalationService from "./modules/escalation/service.js";
 import * as workflowService from "./modules/workflow/service.js";
+import * as settingsService from "./modules/settings/service.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
 import { env } from "./config/env.js";
@@ -126,8 +127,30 @@ app.post(
   asyncHandler(async (req, res) => {
     const id = z.string().parse(req.params.id);
     const input = ticketReplySchema.parse(req.body);
+    if (input.authorType === "AGENT" && req.header("x-portal-surface") !== "internal") {
+      res.status(403).json({ error: "Forbidden: internal portal access required for AGENT replies" });
+      return;
+    }
     await ticketService.addReply(id, input);
     res.status(204).send();
+  })
+);
+
+app.get(
+  "/api/v1/internal/settings/ai-agent",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const mode = await settingsService.getAiAgentMode();
+    res.json({ mode });
+  })
+);
+
+app.put(
+  "/api/v1/internal/settings/ai-agent",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const mode = await settingsService.setAiAgentMode(req.body);
+    res.json({ mode });
   })
 );
 

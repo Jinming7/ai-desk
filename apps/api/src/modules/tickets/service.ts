@@ -41,12 +41,22 @@ export async function addReply(id: string, input: TicketReplyInput) {
     aiConfidence: null
   });
 
-  if (ticket.status === "WAITING_CUSTOMER") {
+  if (input.authorType === "CUSTOMER" && ticket.status === "WAITING_CUSTOMER") {
     if (canTransition("WAITING_CUSTOMER", "IN_PROGRESS")) {
       await repo.transitionTicket(id, "WAITING_CUSTOMER", "IN_PROGRESS");
       await repo.addAuditLog(id, "workflow_stage_changed", "WAITING_CUSTOMER", "IN_PROGRESS", {
         reasonCode: "customer_reply",
         sla_effect: "resume_active_timer"
+      });
+    }
+  }
+
+  if (input.authorType === "AGENT" && (ticket.status === "IN_PROGRESS" || ticket.status === "ESCALATED_RND")) {
+    if (canTransition(ticket.status, "WAITING_CUSTOMER")) {
+      await repo.transitionTicket(id, ticket.status, "WAITING_CUSTOMER");
+      await repo.addAuditLog(id, "workflow_stage_changed", ticket.status, "WAITING_CUSTOMER", {
+        reasonCode: "manual_waiting_customer",
+        sla_effect: "pause_active_timer"
       });
     }
   }

@@ -172,7 +172,10 @@ async function processEscalation(escalationId: string, adapter: OpenClawAdapter)
       customer: {
         id: "ai_escalation_customer",
         name: "AI Escalation"
-      }
+      },
+      environment: "unknown",
+      reproducibility: "unknown",
+      impactSummary: "Generated from AI escalation flow"
     });
 
     await pool.query("UPDATE ai_search_escalations SET created_ticket_id = $2, updated_at = NOW() WHERE id = $1", [escalationId, ticket.id]);

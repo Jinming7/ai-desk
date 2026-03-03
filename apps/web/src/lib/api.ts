@@ -1,4 +1,4 @@
-import type { AgentQueueTicket, AiEscalation, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
+import type { AgentQueueTicket, AiAgentMode, AiEscalation, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
 
 const API = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 
@@ -34,17 +34,22 @@ export async function createTicket(payload: {
   title: string;
   description: string;
   serviceCategory: "technical_support" | "feature_consulting" | "account_issue";
+  customer?: { id: string; name: string; email?: string };
+  environment?: "production" | "staging" | "test" | "unknown";
+  reproducibility?: "always" | "sometimes" | "once" | "unknown";
+  impactSummary?: string;
 }) {
+  const customer = payload.customer ?? { id: "customer_demo", name: "Acme User" };
   const res = await fetch(`${API}/api/v1/tickets`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ...payload,
       priority: "P3",
-      customer: {
-        id: "customer_demo",
-        name: "Acme User"
-      }
+      customer,
+      environment: payload.environment ?? "unknown",
+      reproducibility: payload.reproducibility ?? "unknown",
+      impactSummary: payload.impactSummary ?? ""
     })
   }).catch((error) => {
     throw asUserError(error);
@@ -135,6 +140,22 @@ export async function replyTicket(id: string, body: string) {
   if (!res.ok) throw new Error("Failed to send reply");
 }
 
+export async function replyTicketAsAgent(id: string, body: string, authorName = "Support Team") {
+  const res = await fetch(`${API}/api/v1/tickets/${id}/replies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({
+      body,
+      authorType: "AGENT",
+      authorName,
+      attachments: []
+    })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to send agent reply");
+}
+
 export async function listAgentTickets(queue: "pending" | "mine" | "all", assignee?: string): Promise<AgentQueueTicket[]> {
   const params = new URLSearchParams();
   params.set("queue", queue);
@@ -186,4 +207,28 @@ export async function assignTicket(
     throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to assign ticket");
+}
+
+export async function getAiAgentMode(): Promise<AiAgentMode> {
+  const res = await fetch(`${API}/api/v1/internal/settings/ai-agent`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to get AI mode");
+  const data = await res.json();
+  return data.mode;
+}
+
+export async function setAiAgentMode(enabled: boolean, actor = "admin_operator"): Promise<AiAgentMode> {
+  const res = await fetch(`${API}/api/v1/internal/settings/ai-agent`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ enabled, actor })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to update AI mode");
+  const data = await res.json();
+  return data.mode;
 }

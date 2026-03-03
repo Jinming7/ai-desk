@@ -12,6 +12,10 @@ export interface TicketRecord {
   status: TicketStatus;
   customer_id: string;
   customer_name: string;
+  customer_email: string | null;
+  environment: string | null;
+  reproducibility: string | null;
+  impact_summary: string | null;
   assignee_type: string;
   assignee_name: string;
   ai_run_seq: number;
@@ -45,10 +49,25 @@ export async function createTicket(input: TicketCreateInput): Promise<TicketReco
 
   const result = await pool.query<TicketRecord>(
     `INSERT INTO tickets (
-      id, ticket_no, title, description, service_category, priority, status, customer_id, customer_name, assignee_type, assignee_name, sla_due_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,'OPEN',$7,$8,'SUPPORT_TEAM','Support Team',$9)
+      id, ticket_no, title, description, service_category, priority, status, customer_id, customer_name, customer_email,
+      environment, reproducibility, impact_summary, assignee_type, assignee_name, sla_due_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,'OPEN',$7,$8,$9,$10,$11,$12,'SUPPORT_TEAM','Support Team',$13)
     RETURNING *`,
-    [id, no, input.title, input.description, input.serviceCategory, input.priority, input.customer.id, input.customer.name, slaDue]
+    [
+      id,
+      no,
+      input.title,
+      input.description,
+      input.serviceCategory,
+      input.priority,
+      input.customer.id,
+      input.customer.name,
+      input.customer.email ?? null,
+      input.environment,
+      input.reproducibility,
+      input.impactSummary?.trim() || null,
+      slaDue
+    ]
   );
 
   await addMessage({

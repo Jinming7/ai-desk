@@ -7,6 +7,10 @@ export interface Ticket {
   status: TicketStatus;
   assignee_name: string;
   customer_name: string;
+  customer_email?: string | null;
+  environment?: "production" | "staging" | "test" | "unknown" | null;
+  reproducibility?: "always" | "sometimes" | "once" | "unknown" | null;
+  impact_summary?: string | null;
   updated_at: string;
   created_at: string;
   sla_due_at: string;
@@ -67,5 +71,11 @@ export interface AiEscalation {
   ticketId: string | null;
   resolution: { answer?: string; confidence?: number; references?: SearchReference[] } | null;
   createdAt: string;
+  updatedAt: string;
+}
+
+export interface AiAgentMode {
+  enabled: boolean;
+  updatedBy: string;
   updatedAt: string;
 }

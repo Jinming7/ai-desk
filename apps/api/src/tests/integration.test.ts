@@ -17,6 +17,10 @@ async function resetDb() {
   await pool.query("DELETE FROM ticket_audit_logs");
   await pool.query("DELETE FROM ticket_messages");
   await pool.query("DELETE FROM tickets");
+  await pool.query("DELETE FROM system_settings");
+  await pool.query(
+    "INSERT INTO system_settings(key, value_json, updated_by) VALUES ('ai_agent_enabled', '{\"enabled\":true}'::jsonb, 'test') ON CONFLICT (key) DO UPDATE SET value_json=EXCLUDED.value_json, updated_by=EXCLUDED.updated_by, updated_at=NOW()"
+  );
   await pool.query("DELETE FROM knowledge_documents");
 }
 
@@ -298,4 +302,103 @@ test("placeholder-content triage reply is English", async () => {
   const reply = payload.triage?.reply ?? "";
   assert.equal(reply.length > 0, true);
   assert.equal(/[\u4e00-\u9fff]/.test(reply), false);
+});
+
+test("AI mode OFF routes new ticket directly to R&D manual flow", async () => {
+  const switchMode = await fetch(`${baseUrl}/api/v1/internal/settings/ai-agent`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ enabled: false, actor: "integration_test" })
+  });
+  assert.equal(switchMode.status, 200);
+
+  const created = await fetch(`${baseUrl}/api/v1/tickets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: "manual route check",
+      description: "create in ai-off mode",
+      serviceCategory: "technical_support",
+      priority: "P2",
+      customer: { id: "customer_manual_1", name: "Manual User", email: "manual@example.com" },
+      environment: "production",
+      reproducibility: "always",
+      impactSummary: "Cannot use core function"
+    })
+  });
+  assert.equal(created.status, 201);
+  const payload = (await created.json()) as { ticket: { status: string; assignee_name: string }; triage: unknown };
+  assert.equal(payload.ticket.status, "IN_PROGRESS");
+  assert.equal(payload.ticket.assignee_name, "R&D Team");
+  assert.equal(payload.triage, null);
+});
+
+test("manual R&D closure loop supports handler waiting, customer resume, resolve and close", async () => {
+  const switchMode = await fetch(`${baseUrl}/api/v1/internal/settings/ai-agent`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ enabled: false, actor: "integration_test" })
+  });
+  assert.equal(switchMode.status, 200);
+
+  const created = await fetch(`${baseUrl}/api/v1/tickets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: "manual closure loop",
+      description: "Need manual R&D handling",
+      serviceCategory: "technical_support",
+      priority: "P3",
+      customer: { id: "customer_manual_2", name: "Manual User 2" }
+    })
+  });
+  const payload = (await created.json()) as { ticket: { id: string } };
+  const ticketId = payload.ticket.id;
+
+  const handlerReply = await fetch(`${baseUrl}/api/v1/tickets/${ticketId}/replies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({
+      body: "Please provide logs and exact timestamps.",
+      authorType: "AGENT",
+      authorName: "R&D Team",
+      attachments: []
+    })
+  });
+  assert.equal(handlerReply.status, 204);
+
+  const waitingDetail = await fetch(`${baseUrl}/api/v1/tickets/${ticketId}`);
+  const waitingPayload = (await waitingDetail.json()) as { ticket: { status: string } };
+  assert.equal(waitingPayload.ticket.status, "WAITING_CUSTOMER");
+
+  const customerReply = await fetch(`${baseUrl}/api/v1/tickets/${ticketId}/replies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      body: "Providing requested logs and screenshot.",
+      authorType: "CUSTOMER",
+      authorName: "Manual User 2",
+      attachments: []
+    })
+  });
+  assert.equal(customerReply.status, 204);
+
+  const detail = await fetch(`${baseUrl}/api/v1/tickets/${ticketId}`);
+  assert.equal(detail.status, 200);
+  const detailPayload = (await detail.json()) as { ticket: { status: string } };
+  assert.equal(detailPayload.ticket.status, "IN_PROGRESS");
+
+  const resolveRes = await fetch(`${baseUrl}/api/v1/tickets/${ticketId}/transition`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ to: "RESOLVED", reasonCode: "manual_resolution" })
+  });
+  assert.equal(resolveRes.status, 204);
+
+  const closeRes = await fetch(`${baseUrl}/api/v1/tickets/${ticketId}/close`, { method: "POST" });
+  assert.equal(closeRes.status, 204);
+
+  const closedDetail = await fetch(`${baseUrl}/api/v1/tickets/${ticketId}`);
+  const closedPayload = (await closedDetail.json()) as { ticket: { status: string } };
+  assert.equal(closedPayload.ticket.status, "CLOSED");
 });

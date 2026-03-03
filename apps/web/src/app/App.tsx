@@ -2,6 +2,7 @@ import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 import { AgentRouteGuard } from "../components/AgentRouteGuard";
 import { TopNav } from "../components/TopNav";
 import { AgentDashboardPage } from "../pages/AgentDashboardPage";
+import { AgentTicketDetailPage } from "../pages/AgentTicketDetailPage";
 import { PortalPage } from "../pages/PortalPage";
 import { RequestsPage } from "../pages/RequestsPage";
 import { TicketDetailPage } from "../pages/TicketDetailPage";
@@ -39,6 +40,7 @@ export function App() {
 
       <Route element={<InternalShell />}>
         <Route path={internalRoutePaths[0]} element={<AgentDashboardPage />} />
+        <Route path={internalRoutePaths[1]} element={<AgentTicketDetailPage />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />

@@ -18,8 +18,12 @@ export const ticketCreateSchema = z.object({
   priority: ticketPrioritySchema.default("P3"),
   customer: z.object({
     id: z.string().min(1),
-    name: z.string().min(1)
-  })
+    name: z.string().min(1),
+    email: z.string().email().optional()
+  }),
+  environment: z.enum(["production", "staging", "test", "unknown"]).default("unknown"),
+  reproducibility: z.enum(["always", "sometimes", "once", "unknown"]).default("unknown"),
+  impactSummary: z.string().max(500).default("")
 });
 
 export const ticketReplySchema = z.object({
