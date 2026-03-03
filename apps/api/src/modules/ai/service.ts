@@ -144,15 +144,8 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
       return result;
     }
 
-    if (result.action === "none") {
-      await tickets.addAuditLog(ticketId, "ai_triage_no_action", null, null, {
-        confidence: result.confidence,
-        evidence: result.evidence
-      });
-      return result;
-    }
-
-    if (result.reply.trim()) {
+    const shouldReplyToCustomer = result.reply.trim().length > 0;
+    if (shouldReplyToCustomer) {
       await tickets.addMessage({
         ticketId,
         authorType: "AGENT",
@@ -165,18 +158,26 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
     }
 
     const latest = await tickets.getTicketById(ticketId);
-    if (latest && canTransition(latest.status, "WAITING_CUSTOMER")) {
+    if (shouldReplyToCustomer && latest && canTransition(latest.status, "WAITING_CUSTOMER")) {
       await tickets.transitionTicket(ticketId, latest.status, "WAITING_CUSTOMER");
     }
 
-    await tickets.setTicketAssignee(ticketId, "SUPPORT_TEAM", "Support Team");
-    await tickets.addAuditLog(ticketId, "ai_triage_replied", null, "WAITING_CUSTOMER", {
-      action: result.action,
-      stage: "waiting_customer",
-      status: "WAITING_CUSTOMER",
-      assignee: "Support Team",
-      customer_message_policy: "reply_from_support_team",
-      sla_effect: "pause_active_timer",
+    if (shouldReplyToCustomer) {
+      await tickets.setTicketAssignee(ticketId, "SUPPORT_TEAM", "Support Team");
+      await tickets.addAuditLog(ticketId, "ai_triage_replied", null, "WAITING_CUSTOMER", {
+        action: result.action,
+        stage: "waiting_customer",
+        status: "WAITING_CUSTOMER",
+        assignee: "Support Team",
+        customer_message_policy: "reply_from_support_team",
+        sla_effect: "pause_active_timer",
+        confidence: result.confidence,
+        evidence: result.evidence
+      });
+      return result;
+    }
+
+    await tickets.addAuditLog(ticketId, "ai_triage_no_action", null, null, {
       confidence: result.confidence,
       evidence: result.evidence
     });
