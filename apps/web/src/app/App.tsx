@@ -48,6 +48,7 @@ export function App() {
         <Route path={internalRoutePaths[0]} element={<AgentDashboardPage />} />
         <Route path={internalRoutePaths[1]} element={<AgentTicketDetailPage />} />
         <Route path={internalRoutePaths[2]} element={<OnesSyncConfigPage />} />
+        <Route path="/support/admin/ones-sync" element={<Navigate to="/support/admin/configuration" replace />} />
         <Route path="/agent" element={<Navigate to="/support" replace />} />
         <Route path="/agent/tickets/:id" element={<LegacyAgentTicketRedirect />} />
       </Route>

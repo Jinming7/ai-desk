@@ -132,6 +132,18 @@ export interface OnesSyncConfig {
   listFieldsPathTemplate: string;
   timeoutMs: number;
   retries: number;
+  dataSourceMode: "ones_primary" | "local_mirror";
+  onesProjectKey?: string | null;
+  schemaHash?: string | null;
+  schemaSyncedAt?: string | null;
   updatedBy: string;
   updatedAt: string;
+}
+
+export interface OnesCatalogStatus {
+  ticketTypeCount: number;
+  schemaHash: string | null;
+  currentHash: string;
+  driftDetected: boolean;
+  schemaSyncedAt: string | null;
 }

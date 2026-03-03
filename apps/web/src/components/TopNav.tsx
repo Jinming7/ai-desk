@@ -13,7 +13,7 @@ export function TopNav({ mode }: { mode: "customer" | "internal" }) {
           { to: "/support", label: "Queues" },
           { to: "/support?menu=operations", label: "Operations" },
           { to: "/support?menu=insights", label: "Insights" },
-          { to: "/support/admin/ones-sync", label: "ONES Sync" }
+          { to: "/support/admin/configuration", label: "Configuration" }
         ];
 
   return (
@@ -30,7 +30,7 @@ export function TopNav({ mode }: { mode: "customer" | "internal" }) {
                   if (link.to === "/support") return location.pathname === "/support" && !menu;
                   if (link.to === "/support?menu=operations") return location.pathname === "/support" && menu === "operations";
                   if (link.to === "/support?menu=insights") return location.pathname === "/support" && menu === "insights";
-                  if (link.to === "/support/admin/ones-sync") return location.pathname === "/support/admin/ones-sync";
+                  if (link.to === "/support/admin/configuration") return location.pathname === "/support/admin/configuration";
                   return false;
                 })()
                   ? "text-brand-500"

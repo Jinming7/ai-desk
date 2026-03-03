@@ -12,14 +12,18 @@ export async function submitTicketWorkflow(input: TicketCreateInput, adapter: Op
   let triageError: string | null = null;
   let onesSyncError: string | null = null;
 
+  const dataSourceMode = await onesSyncService.getDataSourceMode();
+
   if (input.onesTicketTypeKey) {
     try {
+      const config = await onesSyncService.getConfig();
       const ones = await onesSyncService.createOnesTicket({
         ticketTypeKey: input.onesTicketTypeKey,
         context: {
           title: input.title,
           description: input.description,
           customer: input.customer,
+          projectKey: config?.onesProjectKey ?? null,
           fields: input.onesFields ?? {}
         }
       });
@@ -30,6 +34,9 @@ export async function submitTicketWorkflow(input: TicketCreateInput, adapter: Op
       await ticketsRepo.deleteTicket(ticket.id);
       throw new Error(`ONES sync failed: ${onesSyncError}`);
     }
+  } else if (dataSourceMode === "ones_primary") {
+    await ticketsRepo.deleteTicket(ticket.id);
+    throw new Error("ONES primary mode requires onesTicketTypeKey for ticket creation");
   } else {
     await ticketsRepo.setTicketOnesSyncResult(ticket.id, { status: "not_configured", key: null, error: null });
   }

@@ -1,4 +1,4 @@
-import type { AgentQueueTicket, AiAgentMode, AiEscalation, OnesSyncConfig, OnesTicketType, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
+import type { AgentQueueTicket, AiAgentMode, AiEscalation, OnesCatalogStatus, OnesSyncConfig, OnesTicketType, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
 
 const API = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 
@@ -346,7 +346,7 @@ export async function listOnesTicketTypesPublic(): Promise<OnesTicketType[]> {
 }
 
 export async function getOnesSyncConfig(): Promise<OnesSyncConfig | null> {
-  const res = await fetch(`${API}/api/v1/internal/ones-sync/config`, {
+  const res = await fetch(`${API}/api/v1/internal/configuration/config`, {
     headers: { "x-portal-surface": "internal" }
   }).catch((error) => {
     throw asUserError(error);
@@ -367,9 +367,11 @@ export async function updateOnesSyncConfig(input: {
   listFieldsPathTemplate: string;
   timeoutMs: number;
   retries: number;
+  dataSourceMode: "ones_primary" | "local_mirror";
+  onesProjectKey?: string;
   actor?: string;
 }): Promise<OnesSyncConfig> {
-  const res = await fetch(`${API}/api/v1/internal/ones-sync/config`, {
+  const res = await fetch(`${API}/api/v1/internal/configuration/config`, {
     method: "PUT",
     headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
     body: JSON.stringify(input)
@@ -382,7 +384,7 @@ export async function updateOnesSyncConfig(input: {
 }
 
 export async function discoverOnesTicketTypes(actor = "support_admin"): Promise<OnesTicketType[]> {
-  const res = await fetch(`${API}/api/v1/internal/ones-sync/discover`, {
+  const res = await fetch(`${API}/api/v1/internal/configuration/catalog/discover`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
     body: JSON.stringify({ actor })
@@ -394,7 +396,7 @@ export async function discoverOnesTicketTypes(actor = "support_admin"): Promise<
   return data.ticketTypes;
 }
 
-export async function listOnesMappings(ticketTypeKey: string, flow: "create" | "update") {
+export async function listOnesMappings(ticketTypeKey: string, flow: "create" | "update" | "transition" | "comment") {
   const params = new URLSearchParams({ ticketTypeKey, flow });
   const res = await fetch(`${API}/api/v1/internal/ones-sync/mappings?${params.toString()}`, {
     headers: { "x-portal-surface": "internal" }
@@ -407,7 +409,7 @@ export async function listOnesMappings(ticketTypeKey: string, flow: "create" | "
 
 export async function saveOnesMappingDraft(input: {
   ticketTypeKey: string;
-  flow: "create" | "update";
+  flow: "create" | "update" | "transition" | "comment";
   mappings: Array<{
     source: string;
     target: string;
@@ -430,7 +432,7 @@ export async function saveOnesMappingDraft(input: {
 
 export async function validateOnesMapping(input: {
   ticketTypeKey: string;
-  flow: "create" | "update";
+  flow: "create" | "update" | "transition" | "comment";
   mappings: Array<{
     source: string;
     target: string;
@@ -463,7 +465,7 @@ export async function publishOnesMapping(mappingId: string, actor = "support_adm
   return (await res.json()).mapping;
 }
 
-export async function rollbackOnesMapping(ticketTypeKey: string, flow: "create" | "update", actor = "support_admin") {
+export async function rollbackOnesMapping(ticketTypeKey: string, flow: "create" | "update" | "transition" | "comment", actor = "support_admin") {
   const res = await fetch(`${API}/api/v1/internal/ones-sync/mappings/rollback`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
@@ -473,4 +475,46 @@ export async function rollbackOnesMapping(ticketTypeKey: string, flow: "create" 
   });
   if (!res.ok) throw new Error("Failed to rollback ONES mapping");
   return (await res.json()).mapping;
+}
+
+export async function getOnesCatalogStatus(): Promise<OnesCatalogStatus> {
+  const res = await fetch(`${API}/api/v1/internal/configuration/catalog/status`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load ONES catalog status");
+  return (await res.json()).status;
+}
+
+export async function listFailedWebhookEvents() {
+  const res = await fetch(`${API}/api/v1/internal/configuration/webhook/failed`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load webhook failed events");
+  return (await res.json()).events as Array<{ id: string; event_type: string; ones_ticket_key: string | null; error: string | null; retries: number; received_at: string }>;
+}
+
+export async function replayWebhookEvent(eventId: string) {
+  const res = await fetch(`${API}/api/v1/internal/configuration/webhook/replay`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ eventId })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to replay webhook event");
+  return (await res.json()).result;
+}
+
+export async function getOnesSyncHealth() {
+  const res = await fetch(`${API}/api/v1/internal/configuration/operations/health`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load sync health");
+  return (await res.json()).health as { failedWebhookCount: number; topErrors: string[]; updatedAt: string };
 }

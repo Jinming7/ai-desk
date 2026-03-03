@@ -14,6 +14,12 @@ async function resetDb() {
   await pool.query("DELETE FROM ai_search_references");
   await pool.query("DELETE FROM ai_search_sessions");
   await pool.query("DELETE FROM ai_runs");
+  await pool.query("DELETE FROM ones_webhook_events");
+  await pool.query("DELETE FROM ones_sync_jobs");
+  await pool.query("DELETE FROM ones_field_mappings");
+  await pool.query("DELETE FROM ones_ticket_type_cache");
+  await pool.query("DELETE FROM ones_sync_config");
+  await pool.query("DELETE FROM ones_sync_audit_logs");
   await pool.query("DELETE FROM ticket_audit_logs");
   await pool.query("DELETE FROM ticket_messages");
   await pool.query("DELETE FROM tickets");
@@ -331,6 +337,70 @@ test("AI mode OFF routes new ticket directly to R&D manual flow", async () => {
   assert.equal(payload.ticket.status, "IN_PROGRESS");
   assert.equal(payload.ticket.assignee_name, "R&D Team");
   assert.equal(payload.triage, null);
+});
+
+test("ONES mapping dry-run rejects missing required fields from schema cache", async () => {
+  await pool.query(
+    `INSERT INTO ones_ticket_type_cache (id, type_key, type_name, fields_json, source_json)
+     VALUES ('11111111-1111-4111-8111-111111111111', 'incident', 'Incident', $1::jsonb, '{}'::jsonb)`,
+    [JSON.stringify([{ key: "title", required: true }, { key: "details", required: true }])]
+  );
+
+  const res = await fetch(`${baseUrl}/api/v1/internal/ones-sync/mappings/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({
+      ticketTypeKey: "incident",
+      flow: "create",
+      mappings: [{ source: "title", target: "title", transform: "none", transformConfig: {}, requiredPolicy: "hard_fail" }],
+      sampleContext: { title: "hello" }
+    })
+  });
+  assert.equal(res.status, 200);
+  const payload = (await res.json()) as { validation: { valid: boolean; errors: string[] } };
+  assert.equal(payload.validation.valid, false);
+  assert.equal(payload.validation.errors.some((e) => e.includes("Required ONES field is not mapped: details")), true);
+});
+
+test("ONES webhook ingestion is idempotent and updates local read model", async () => {
+  await pool.query(
+    `INSERT INTO tickets (
+      id, ticket_no, title, description, service_category, priority, status, customer_id, customer_name, assignee_type, assignee_name,
+      ones_ticket_key, ones_ticket_type_key
+    ) VALUES (
+      '22222222-2222-4222-8222-222222222222', 'T-TEST-ONES', 'x', 'y', 'technical_support', 'P3', 'OPEN', 'c1', 'C1', 'SUPPORT_TEAM', 'Support Team',
+      'ONES-123', 'incident'
+    )`
+  );
+
+  const body = {
+    eventId: "evt-1",
+    eventType: "issue.updated",
+    ticketKey: "ONES-123",
+    payload: { status: "IN_PROGRESS", assigneeName: "R&D Team", commentBody: "synced from webhook" }
+  };
+
+  const r1 = await fetch(`${baseUrl}/api/v1/internal/configuration/webhook/ingest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const r2 = await fetch(`${baseUrl}/api/v1/internal/configuration/webhook/ingest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  assert.equal(r1.status, 202);
+  assert.equal(r2.status, 202);
+
+  const ticket = await pool.query<{ status: string; assignee_name: string }>("SELECT status, assignee_name FROM tickets WHERE ones_ticket_key = 'ONES-123'");
+  assert.equal(ticket.rows[0].status, "IN_PROGRESS");
+  assert.equal(ticket.rows[0].assignee_name, "R&D Team");
+
+  const events = await pool.query<{ count: string }>(
+    "SELECT COUNT(*)::text AS count FROM ones_webhook_events WHERE external_event_id = 'evt-1' AND event_type = 'issue.updated' AND ones_ticket_key = 'ONES-123'"
+  );
+  assert.equal(events.rows[0].count, "1");
 });
 
 test("manual R&D closure loop supports handler waiting, customer resume, resolve and close", async () => {

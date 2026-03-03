@@ -1,7 +1,9 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { env } from "../../config/env.js";
 import { decryptSecret, encryptSecret, maskSecret } from "../../utils/crypto.js";
 import * as repo from "./repository.js";
+import * as ticketsRepo from "../tickets/repository.js";
 
 const configInputSchema = z.object({
   profileName: z.string().min(1).default("default"),
@@ -14,6 +16,8 @@ const configInputSchema = z.object({
   listFieldsPathTemplate: z.string().min(1),
   timeoutMs: z.coerce.number().int().positive().max(60000).default(12000),
   retries: z.coerce.number().int().min(0).max(3).default(1),
+  dataSourceMode: z.enum(["ones_primary", "local_mirror"]).default("ones_primary"),
+  onesProjectKey: z.string().optional(),
   actor: z.string().min(1).default("internal_operator")
 });
 
@@ -27,7 +31,7 @@ const mappingRowSchema = z.object({
 
 const saveMappingSchema = z.object({
   ticketTypeKey: z.string().min(1),
-  flow: z.enum(["create", "update"]),
+  flow: z.enum(["create", "update", "transition", "comment"]),
   mappings: z.array(mappingRowSchema).min(1),
   actor: z.string().min(1).default("internal_operator")
 });
@@ -39,8 +43,17 @@ const publishSchema = z.object({
 
 const rollbackSchema = z.object({
   ticketTypeKey: z.string().min(1),
-  flow: z.enum(["create", "update"]),
+  flow: z.enum(["create", "update", "transition", "comment"]),
   actor: z.string().min(1).default("internal_operator")
+});
+
+const webhookInputSchema = z.object({
+  eventId: z.string().min(1),
+  eventType: z.string().min(1),
+  ticketKey: z.string().optional(),
+  traceId: z.string().optional(),
+  payload: z.record(z.string(), z.any()),
+  signature: z.string().optional()
 });
 
 function withPath(baseUrl: string, path: string) {
@@ -76,12 +89,22 @@ async function onesFetch(config: repo.OnesSyncConfigRecord, path: string, init?:
       clearTimeout(timer);
       if (!response.ok) {
         const body = await response.text();
+        const retriable = response.status === 429 || response.status >= 500;
+        if (retriable && attempt < config.retries) {
+          const backoffMs = Math.min(2000, 200 * Math.pow(2, attempt));
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          continue;
+        }
         throw new Error(`ONES ${response.status}: ${body || "request failed"}`);
       }
       return response;
     } catch (error) {
       clearTimeout(timer);
       lastError = error as Error;
+      if (attempt < config.retries) {
+        const backoffMs = Math.min(2000, 200 * Math.pow(2, attempt));
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      }
     }
   }
   throw lastError ?? new Error("ONES request failed");
@@ -185,6 +208,10 @@ export async function getConfig() {
     listFieldsPathTemplate: config.list_fields_path_template,
     timeoutMs: config.timeout_ms,
     retries: config.retries,
+    dataSourceMode: config.data_source_mode,
+    onesProjectKey: config.ones_project_key,
+    schemaHash: config.schema_hash,
+    schemaSyncedAt: config.schema_synced_at,
     updatedBy: config.updated_by,
     updatedAt: config.updated_at
   };
@@ -203,6 +230,8 @@ export async function upsertConfig(input: unknown) {
     listFieldsPathTemplate: parsed.listFieldsPathTemplate,
     timeoutMs: parsed.timeoutMs,
     retries: parsed.retries,
+    dataSourceMode: parsed.dataSourceMode,
+    onesProjectKey: parsed.onesProjectKey,
     updatedBy: parsed.actor
   });
   await repo.addOnesSyncAudit({
@@ -223,6 +252,10 @@ export async function upsertConfig(input: unknown) {
     listFieldsPathTemplate: saved.list_fields_path_template,
     timeoutMs: saved.timeout_ms,
     retries: saved.retries,
+    dataSourceMode: saved.data_source_mode,
+    onesProjectKey: saved.ones_project_key,
+    schemaHash: saved.schema_hash,
+    schemaSyncedAt: saved.schema_synced_at,
     updatedBy: saved.updated_by,
     updatedAt: saved.updated_at
   };
@@ -248,7 +281,25 @@ export async function discoverTicketTypes(actor = "internal_operator") {
     }
     rows.push({ key: type.key, name: type.name, fields, source: type.source });
   }
+  const schemaHash = createHash("sha256").update(JSON.stringify(rows.map((r) => ({ key: r.key, fields: r.fields })))).digest("hex");
   await repo.upsertTicketTypeCache(rows);
+  await repo.upsertActiveConfig({
+    profileName: config.profile_name,
+    baseUrl: config.base_url,
+    authType: config.auth_type,
+    authHeader: config.auth_header,
+    authSecretEncrypted: config.auth_secret_encrypted,
+    createTicketPath: config.create_ticket_path,
+    listTicketTypesPath: config.list_ticket_types_path,
+    listFieldsPathTemplate: config.list_fields_path_template,
+    timeoutMs: config.timeout_ms,
+    retries: config.retries,
+    dataSourceMode: config.data_source_mode,
+    onesProjectKey: config.ones_project_key,
+    schemaHash,
+    schemaSyncedAt: new Date().toISOString(),
+    updatedBy: actor
+  });
   await repo.addOnesSyncAudit({
     actor,
     scope: "ticket_types",
@@ -287,7 +338,7 @@ export async function saveDraftMapping(input: unknown) {
   return saved;
 }
 
-export async function listMappings(ticketTypeKey: string, flow: "create" | "update") {
+export async function listMappings(ticketTypeKey: string, flow: "create" | "update" | "transition" | "comment") {
   return repo.listMappings(ticketTypeKey, flow);
 }
 
@@ -308,13 +359,38 @@ export function validateMappingRows(rows: Array<z.infer<typeof mappingRowSchema>
 
 export async function dryRunMapping(input: {
   ticketTypeKey: string;
-  flow: "create" | "update";
+  flow: "create" | "update" | "transition" | "comment";
   mappings: Array<z.infer<typeof mappingRowSchema>>;
   sampleContext: Record<string, unknown>;
 }) {
   const mappingValidation = validateMappingRows(input.mappings);
-  if (!mappingValidation.valid) {
-    return { valid: false, errors: mappingValidation.errors, payload: {} };
+  const errors = [...mappingValidation.errors];
+  const schema = await repo.getTicketTypeCacheByKey(input.ticketTypeKey);
+  if (schema) {
+    const fields = (schema.fields_json ?? []) as Array<Record<string, unknown>>;
+    const allowed = new Set(fields.map((f) => String(f.key ?? f.id ?? "")).filter(Boolean));
+    const required = new Set(
+      fields
+        .filter((f) => Boolean(f.required ?? false))
+        .map((f) => String(f.key ?? f.id ?? ""))
+        .filter(Boolean)
+    );
+
+    const mappedTargets = new Set(input.mappings.map((m) => m.target));
+    for (const target of mappedTargets) {
+      if (!allowed.has(target)) {
+        errors.push(`Target field not found in ONES schema: ${target}`);
+      }
+    }
+    for (const reqField of required) {
+      if (!mappedTargets.has(reqField)) {
+        errors.push(`Required ONES field is not mapped: ${reqField}`);
+      }
+    }
+  }
+
+  if (errors.length) {
+    return { valid: false, errors, payload: {} };
   }
   const built = buildPayloadFromMapping(input.mappings, input.sampleContext);
   return {
@@ -346,6 +422,20 @@ export async function rollbackMapping(input: unknown) {
     payload: { ticketTypeKey: parsed.ticketTypeKey, flow: parsed.flow, version: active.version }
   });
   return active;
+}
+
+export async function getCatalogStatus() {
+  const config = await repo.getActiveConfig();
+  const types = await repo.listTicketTypeCache();
+  const currentHash = createHash("sha256").update(JSON.stringify(types.map((r) => ({ key: r.type_key, fields: r.fields_json })))).digest("hex");
+  const savedHash = config?.schema_hash ?? null;
+  return {
+    ticketTypeCount: types.length,
+    schemaHash: savedHash,
+    currentHash,
+    driftDetected: Boolean(savedHash && savedHash !== currentHash),
+    schemaSyncedAt: config?.schema_synced_at ?? null
+  };
 }
 
 export async function createOnesTicket(input: {
@@ -384,6 +474,119 @@ export async function createOnesTicket(input: {
   return { key, raw };
 }
 
+export async function updateOnesTicketByFlow(input: {
+  flow: "transition" | "comment" | "update";
+  ticketTypeKey: string;
+  onesTicketKey: string;
+  context: Record<string, unknown>;
+}) {
+  const config = await repo.getActiveConfig();
+  if (!config) throw new Error("ONES sync config not set");
+
+  const activeMapping = await repo.getLatestMapping(input.ticketTypeKey, input.flow, "active");
+  const mappingRows = (activeMapping?.mapping_json ?? []) as Array<z.infer<typeof mappingRowSchema>>;
+  const built = buildPayloadFromMapping(mappingRows, input.context);
+  if (built.errors.length) throw new Error(`ONES mapping validation failed: ${built.errors.join("; ")}`);
+
+  const path = input.flow === "transition"
+    ? `${config.create_ticket_path}/${encodeURIComponent(input.onesTicketKey)}/transition`
+    : input.flow === "comment"
+    ? `${config.create_ticket_path}/${encodeURIComponent(input.onesTicketKey)}/comments`
+    : `${config.create_ticket_path}/${encodeURIComponent(input.onesTicketKey)}`;
+
+  const method = input.flow === "update" ? "PATCH" : "POST";
+  const raw = await onesFetch(config, path, { method, body: JSON.stringify(built.payload) }).then((res) => res.json()) as Record<string, unknown>;
+  return raw;
+}
+
+export async function getDataSourceMode(): Promise<"ones_primary" | "local_mirror"> {
+  const config = await repo.getActiveConfig();
+  return config?.data_source_mode ?? "ones_primary";
+}
+
+export async function ingestWebhook(input: unknown) {
+  const parsed = webhookInputSchema.parse(input);
+  const event = await repo.insertWebhookEvent({
+    externalEventId: parsed.eventId,
+    eventType: parsed.eventType,
+    onesTicketKey: parsed.ticketKey,
+    payload: parsed.payload,
+    signature: parsed.signature,
+    traceId: parsed.traceId
+  });
+  try {
+    const payload = parsed.payload;
+    await ticketsRepo.applyOnesWebhookEvent({
+      onesTicketKey: parsed.ticketKey ?? String(payload.ticketKey ?? payload.issueKey ?? ""),
+      status: typeof payload.status === "string" ? payload.status : undefined,
+      assigneeName: typeof payload.assigneeName === "string" ? payload.assigneeName : undefined,
+      commentBody: typeof payload.commentBody === "string" ? payload.commentBody : undefined
+    });
+    await repo.markWebhookProcessed(event.id);
+    return { id: event.id, status: "processed" as const };
+  } catch (error) {
+    await repo.markWebhookFailed(event.id, (error as Error).message);
+    throw error;
+  }
+}
+
+export async function replayFailedWebhook(eventId: string) {
+  const failed = await repo.listFailedWebhookEvents(200);
+  const event = failed.find((row) => row.id === eventId);
+  if (!event) throw new Error("Failed webhook event not found");
+  try {
+    await repo.markWebhookProcessed(event.id);
+    return { id: event.id, status: "processed" as const };
+  } catch (error) {
+    await repo.markWebhookFailed(event.id, (error as Error).message);
+    throw error;
+  }
+}
+
+export async function listFailedWebhooks() {
+  return repo.listFailedWebhookEvents(100);
+}
+
+export async function getSyncHealthSummary() {
+  const failed = await repo.listFailedWebhookEvents(100);
+  return {
+    failedWebhookCount: failed.length,
+    topErrors: failed.slice(0, 5).map((item) => item.error).filter(Boolean),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+export async function reconcileReadModel(limit = 50) {
+  const config = await repo.getActiveConfig();
+  if (!config) {
+    return { scanned: 0, updated: 0, skipped: 0, errors: ["ONES sync config not set"] };
+  }
+  const linked = await ticketsRepo.listOnesLinkedTickets(limit);
+  let updated = 0;
+  let skipped = 0;
+  const errors: string[] = [];
+
+  for (const ticket of linked) {
+    if (!ticket.ones_ticket_key) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      const raw = await onesFetch(config, `${config.create_ticket_path}/${encodeURIComponent(ticket.ones_ticket_key)}`).then((res) => res.json()) as Record<string, unknown>;
+      await ticketsRepo.applyOnesWebhookEvent({
+        onesTicketKey: ticket.ones_ticket_key,
+        status: typeof raw.status === "string" ? raw.status : undefined,
+        assigneeName: typeof raw.assigneeName === "string" ? raw.assigneeName : undefined
+      });
+      updated += 1;
+    } catch (error) {
+      errors.push(`${ticket.ones_ticket_key}: ${(error as Error).message}`);
+    }
+  }
+
+  return { scanned: linked.length, updated, skipped, errors };
+}
+
 export async function bootstrapDefaultConfigIfMissing() {
   const existing = await repo.getActiveConfig();
   if (existing) return;
@@ -398,6 +601,8 @@ export async function bootstrapDefaultConfigIfMissing() {
     listFieldsPathTemplate: env.ONES_SYNC_DEFAULT_FIELDS_PATH_TEMPLATE,
     timeoutMs: 12000,
     retries: 1,
+    dataSourceMode: "ones_primary",
+    onesProjectKey: null,
     updatedBy: "bootstrap"
   });
 }

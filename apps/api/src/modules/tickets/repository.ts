@@ -314,6 +314,47 @@ export async function deleteTicket(ticketId: string): Promise<void> {
   await pool.query("DELETE FROM tickets WHERE id = $1", [ticketId]);
 }
 
+export async function applyOnesWebhookEvent(input: {
+  onesTicketKey: string;
+  status?: string;
+  assigneeName?: string;
+  commentBody?: string;
+}) {
+  const ticket = await pool.query<TicketRecord>("SELECT * FROM tickets WHERE ones_ticket_key = $1 LIMIT 1", [input.onesTicketKey]);
+  if (!ticket.rowCount) return;
+  const row = ticket.rows[0];
+
+  if (input.status) {
+    const mapped = ["OPEN", "IN_PROGRESS", "WAITING_CUSTOMER", "ESCALATED_RND", "RESOLVED", "CLOSED"].includes(input.status) ? input.status : row.status;
+    await pool.query("UPDATE tickets SET status = $2, updated_at = NOW() WHERE id = $1", [row.id, mapped]);
+  }
+
+  if (input.assigneeName) {
+    await pool.query("UPDATE tickets SET assignee_name = $2, updated_at = NOW() WHERE id = $1", [row.id, input.assigneeName]);
+  }
+
+  if (input.commentBody) {
+    await pool.query(
+      `INSERT INTO ticket_messages (id, ticket_id, author_type, author_name, body, attachments, is_ai_generated, ai_confidence)
+       VALUES ($1,$2,'AGENT','ONES Sync',$3,'[]'::jsonb,false,NULL)`,
+      [uuidv4(), row.id, input.commentBody]
+    );
+    await pool.query("UPDATE tickets SET last_agent_reply_at = NOW(), updated_at = NOW() WHERE id = $1", [row.id]);
+  }
+}
+
+export async function listOnesLinkedTickets(limit = 100): Promise<Array<Pick<TicketRecord, "id" | "ones_ticket_key" | "ones_ticket_type_key" | "status" | "assignee_name">>> {
+  const result = await pool.query<Pick<TicketRecord, "id" | "ones_ticket_key" | "ones_ticket_type_key" | "status" | "assignee_name">>(
+    `SELECT id, ones_ticket_key, ones_ticket_type_key, status, assignee_name
+     FROM tickets
+     WHERE ones_ticket_key IS NOT NULL
+     ORDER BY updated_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return result.rows;
+}
+
 export async function addAuditLog(
   ticketId: string,
   eventType: string,

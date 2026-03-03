@@ -8,6 +8,7 @@ import type {
 } from "../../contracts/tickets.js";
 import { canTransition } from "../../domain/state-machine.js";
 import * as repo from "./repository.js";
+import * as onesSyncService from "../ones-sync/service.js";
 
 export async function createTicket(input: TicketCreateInput) {
   return repo.createTicket(input);
@@ -41,6 +42,20 @@ export async function addReply(id: string, input: TicketReplyInput) {
     isAiGenerated: false,
     aiConfidence: null
   });
+
+  const dataSourceMode = await onesSyncService.getDataSourceMode();
+  if (dataSourceMode === "ones_primary" && ticket.ones_ticket_key && ticket.ones_ticket_type_key) {
+    await onesSyncService.updateOnesTicketByFlow({
+      flow: "comment",
+      ticketTypeKey: ticket.ones_ticket_type_key,
+      onesTicketKey: ticket.ones_ticket_key,
+      context: {
+        body: input.body,
+        authorName: input.authorName,
+        authorType: input.authorType
+      }
+    });
+  }
 
   if (input.authorType === "CUSTOMER" && ticket.status === "WAITING_CUSTOMER") {
     if (canTransition("WAITING_CUSTOMER", "IN_PROGRESS")) {
@@ -97,6 +112,18 @@ export async function transitionInternal(id: string, input: TicketInternalTransi
     throw new Error(`Invalid transition ${ticket.status} -> ${input.to}`);
   }
   await repo.transitionTicket(id, ticket.status, input.to);
+  const dataSourceMode = await onesSyncService.getDataSourceMode();
+  if (dataSourceMode === "ones_primary" && ticket.ones_ticket_key && ticket.ones_ticket_type_key) {
+    await onesSyncService.updateOnesTicketByFlow({
+      flow: "transition",
+      ticketTypeKey: ticket.ones_ticket_type_key,
+      onesTicketKey: ticket.ones_ticket_key,
+      context: {
+        toStatus: input.to,
+        reasonCode: input.reasonCode
+      }
+    });
+  }
   await repo.addAuditLog(id, "internal_transition", ticket.status, input.to, {
     reasonCode: input.reasonCode,
     sla_effect: input.to === "WAITING_CUSTOMER" ? "pause_active_timer" : "none"

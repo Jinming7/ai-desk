@@ -31,6 +31,12 @@ app.use(express.json({ limit: "2mb" }));
 
 const aiAdapter = env.OPENCLAW_GATEWAY_TOKEN ? new WsOpenClawAdapter() : new MockOpenClawAdapter();
 
+if (env.NODE_ENV !== "test") {
+  setInterval(() => {
+    void onesSyncService.reconcileReadModel(20).catch(() => undefined);
+  }, 5 * 60 * 1000);
+}
+
 function requireInternalRequest(req: express.Request, res: express.Response, next: express.NextFunction) {
   const surface = req.header("x-portal-surface");
   if (surface !== "internal") {
@@ -281,6 +287,15 @@ app.get(
   })
 );
 
+app.get(
+  "/api/v1/internal/configuration/config",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const config = await onesSyncService.getConfig();
+    res.json({ config });
+  })
+);
+
 app.put(
   "/api/v1/internal/ones-sync/config",
   requireInternalRequest,
@@ -290,8 +305,27 @@ app.put(
   })
 );
 
+app.put(
+  "/api/v1/internal/configuration/config",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const config = await onesSyncService.upsertConfig(req.body);
+    res.json({ config });
+  })
+);
+
 app.post(
   "/api/v1/internal/ones-sync/discover",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const actor = z.string().default("internal_operator").parse(req.body?.actor);
+    const rows = await onesSyncService.discoverTicketTypes(actor);
+    res.json({ ticketTypes: rows });
+  })
+);
+
+app.post(
+  "/api/v1/internal/configuration/catalog/discover",
   requireInternalRequest,
   asyncHandler(async (req, res) => {
     const actor = z.string().default("internal_operator").parse(req.body?.actor);
@@ -310,11 +344,29 @@ app.get(
 );
 
 app.get(
+  "/api/v1/internal/configuration/catalog/ticket-types",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const ticketTypes = await onesSyncService.listTicketTypes();
+    res.json({ ticketTypes });
+  })
+);
+
+app.get(
+  "/api/v1/internal/configuration/catalog/status",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const status = await onesSyncService.getCatalogStatus();
+    res.json({ status });
+  })
+);
+
+app.get(
   "/api/v1/internal/ones-sync/mappings",
   requireInternalRequest,
   asyncHandler(async (req, res) => {
     const ticketTypeKey = z.string().min(1).parse(req.query.ticketTypeKey);
-    const flow = z.enum(["create", "update"]).parse(req.query.flow);
+    const flow = z.enum(["create", "update", "transition", "comment"]).parse(req.query.flow);
     const mappings = await onesSyncService.listMappings(ticketTypeKey, flow);
     res.json({ mappings });
   })
@@ -335,7 +387,7 @@ app.post(
   asyncHandler(async (req, res) => {
     const body = z.object({
       ticketTypeKey: z.string().min(1),
-      flow: z.enum(["create", "update"]),
+      flow: z.enum(["create", "update", "transition", "comment"]),
       mappings: z.array(
         z.object({
           source: z.string().min(1),
@@ -367,6 +419,52 @@ app.post(
   asyncHandler(async (req, res) => {
     const mapping = await onesSyncService.rollbackMapping(req.body);
     res.json({ mapping });
+  })
+);
+
+app.post(
+  "/api/v1/internal/configuration/webhook/ingest",
+  asyncHandler(async (req, res) => {
+    const result = await onesSyncService.ingestWebhook(req.body);
+    res.status(202).json({ result });
+  })
+);
+
+app.get(
+  "/api/v1/internal/configuration/webhook/failed",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const events = await onesSyncService.listFailedWebhooks();
+    res.json({ events });
+  })
+);
+
+app.post(
+  "/api/v1/internal/configuration/webhook/replay",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const eventId = z.string().uuid().parse(req.body?.eventId);
+    const result = await onesSyncService.replayFailedWebhook(eventId);
+    res.json({ result });
+  })
+);
+
+app.get(
+  "/api/v1/internal/configuration/operations/health",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const health = await onesSyncService.getSyncHealthSummary();
+    res.json({ health });
+  })
+);
+
+app.post(
+  "/api/v1/internal/configuration/operations/reconcile",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const limit = z.coerce.number().int().min(1).max(200).default(50).parse(req.body?.limit ?? 50);
+    const result = await onesSyncService.reconcileReadModel(limit);
+    res.json({ result });
   })
 );
 

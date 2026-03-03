@@ -44,6 +44,7 @@ export function PortalPage() {
   const [escalating, setEscalating] = useState(false);
   const [escalationError, setEscalationError] = useState<string | null>(null);
   const [onesTypes, setOnesTypes] = useState<OnesTicketType[]>([]);
+  const [selectedOnesTypeKey, setSelectedOnesTypeKey] = useState<string>("");
   const [onesFields, setOnesFields] = useState<Record<string, string>>({});
 
   const unresolved = useMemo(
@@ -69,7 +70,10 @@ export function PortalPage() {
 
   useEffect(() => {
     listOnesTicketTypesPublic()
-      .then((rows) => setOnesTypes(rows))
+      .then((rows) => {
+        setOnesTypes(rows);
+        if (rows[0]?.key) setSelectedOnesTypeKey((prev) => prev || rows[0].key);
+      })
       .catch(() => setOnesTypes([]));
   }, []);
 
@@ -83,7 +87,11 @@ export function PortalPage() {
       setSubmitError("Description must be at least 5 characters.");
       return;
     }
-    const selectedType = onesTypes.find((item) => item.key === service.key);
+    const selectedType = onesTypes.find((item) => item.key === selectedOnesTypeKey) ?? null;
+    if (!selectedType) {
+      setSubmitError("Please select a valid ONES ticket type.");
+      return;
+    }
     if (selectedType?.fields?.length) {
       for (const field of selectedType.fields) {
         const row = field as Record<string, unknown>;
@@ -102,13 +110,14 @@ export function PortalPage() {
         title: title.trim(),
         description: description.trim(),
         serviceCategory: service?.key,
-        onesTicketTypeKey: service?.key,
+        onesTicketTypeKey: selectedType?.key ?? undefined,
         onesFields
       });
       setSubmitSuccess(`Ticket ${created.ticket.ticket_no} submitted successfully.`);
       setOpen(false);
       setTitle("");
       setDescription("");
+      setSelectedOnesTypeKey("");
       setOnesFields({});
       navigate(`/tickets/${created.ticket.id}`);
     } catch (error) {
@@ -270,6 +279,7 @@ export function PortalPage() {
                   <button
                     onClick={() => {
                       setService(services[0]);
+                      if (!selectedOnesTypeKey && onesTypes[0]?.key) setSelectedOnesTypeKey(onesTypes[0].key);
                       setOpen(true);
                     }}
                     className="rounded-lg bg-brand-500 px-3 py-1.5 text-xs font-medium text-white"
@@ -289,11 +299,12 @@ export function PortalPage() {
                     key={type.key}
                     onClick={() => {
                       setService({
-                        key: type.key as "technical_support" | "feature_consulting" | "account_issue",
+                        key: "technical_support",
                         title: type.name,
                         description: `Create ${type.name} ticket in ONES.`,
                         icon: Wrench
                       });
+                      setSelectedOnesTypeKey(type.key);
                       setOpen(true);
                     }}
                     className="rounded-lg border border-slate-200 px-3 py-2 text-left text-sm hover:bg-slate-50"
@@ -326,6 +337,7 @@ export function PortalPage() {
                 transition={{ duration: 0.65, delay: 0.3 + index * 0.08, ease: "easeOut" }}
                 onClick={() => {
                   setService(item);
+                  if (!selectedOnesTypeKey && onesTypes[0]?.key) setSelectedOnesTypeKey(onesTypes[0].key);
                   setOpen(true);
                 }}
                 whileHover={{ y: -6, backgroundColor: "#F5F8FF" }}
@@ -368,12 +380,23 @@ export function PortalPage() {
                   className="w-full rounded-xl border border-line px-3 py-2"
                 />
               </div>
-              {service?.key && onesTypes.find((type) => type.key === service.key)?.fields?.length ? (
+              {onesTypes.length > 0 && (
                 <div className="space-y-3">
-                  <p className="text-sm font-medium text-[#1F2937]">ONES Fields</p>
-                  {onesTypes
-                    .find((type) => type.key === service.key)
-                    ?.fields.map((field, idx) => {
+                  <div>
+                    <label className="mb-1 block text-sm font-medium text-[#1F2937]">Ticket Type</label>
+                    <select
+                      className="h-10 w-full rounded-xl border border-line px-3 text-sm"
+                      value={selectedOnesTypeKey}
+                      onChange={(e) => setSelectedOnesTypeKey(e.target.value)}
+                    >
+                      {onesTypes.map((type) => (
+                        <option key={type.key} value={type.key}>
+                          {type.name} ({type.key})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {(onesTypes.find((type) => type.key === selectedOnesTypeKey)?.fields ?? []).map((field, idx) => {
                       const asRecord = field as Record<string, unknown>;
                       const key = String(asRecord.key ?? asRecord.id ?? `field_${idx}`);
                       const label = String(asRecord.label ?? asRecord.name ?? key);
@@ -392,7 +415,7 @@ export function PortalPage() {
                       );
                     })}
                 </div>
-              ) : null}
+              )}
               {!service && <p className="text-xs text-rose-600">Please select a service category before submitting.</p>}
               {submitError && <p className="text-xs text-rose-600">{submitError}</p>}
               <div className="rounded-xl border border-dashed border-[#D1D5DB] px-4 py-8 text-center text-sm text-[#6B7280]">
