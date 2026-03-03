@@ -1,4 +1,4 @@
 export default async function handler(req: any, res: any) {
-  const { app } = await import("../apps/api/src/app.ts");
+  const { app } = await import("../apps/api/src/app");
   return app(req, res);
 }
