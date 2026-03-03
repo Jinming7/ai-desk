@@ -1,4 +1,4 @@
-import type { AgentQueueTicket, AiAgentMode, AiEscalation, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
+import type { AgentQueueTicket, AiAgentMode, AiEscalation, OnesSyncConfig, OnesTicketType, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
 
 const API = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 
@@ -33,7 +33,9 @@ export async function getTicketDetail(id: string): Promise<{ ticket: Ticket; mes
 export async function createTicket(payload: {
   title: string;
   description: string;
-  serviceCategory: "technical_support" | "feature_consulting" | "account_issue";
+  serviceCategory?: "technical_support" | "feature_consulting" | "account_issue";
+  onesTicketTypeKey?: string;
+  onesFields?: Record<string, unknown>;
   customer?: { id: string; name: string; email?: string };
   environment?: "production" | "staging" | "test" | "unknown";
   reproducibility?: "always" | "sometimes" | "once" | "unknown";
@@ -46,6 +48,7 @@ export async function createTicket(payload: {
     body: JSON.stringify({
       ...payload,
       priority: "P3",
+      serviceCategory: payload.serviceCategory ?? "technical_support",
       customer,
       environment: payload.environment ?? "unknown",
       reproducibility: payload.reproducibility ?? "unknown",
@@ -59,7 +62,7 @@ export async function createTicket(payload: {
   return res.json() as Promise<{
     ticket: Ticket;
     triage: {
-      action: "resolve" | "ask_user" | "escalate" | "none";
+      action: "resolve" | "ask_user" | "escalate";
       confidence: number;
       reply: string;
       reasoning_summary: string;
@@ -157,18 +160,54 @@ export async function replyTicketAsAgent(id: string, body: string, authorName = 
 }
 
 export async function listAgentTickets(queue: "pending" | "mine" | "all", assignee?: string): Promise<AgentQueueTicket[]> {
-  const params = new URLSearchParams();
-  params.set("queue", queue);
-  if (assignee) params.set("assignee", assignee);
+  return listSupportTickets({ queue, assignee });
+}
 
-  const res = await fetch(`${API}/api/v1/agent/tickets?${params.toString()}`, {
+export async function listSupportTickets(input: {
+  queue: "pending" | "mine" | "all";
+  assignee?: string;
+  status?: TicketStatus;
+  priority?: "P1" | "P2" | "P3" | "P4";
+  slaRisk?: "healthy" | "at_risk" | "breached";
+  ticketType?: string;
+  sort?: "sla_risk" | "updated_desc" | "created_desc";
+}): Promise<AgentQueueTicket[]> {
+  const params = new URLSearchParams();
+  params.set("queue", input.queue);
+  if (input.assignee) params.set("assignee", input.assignee);
+  if (input.status) params.set("status", input.status);
+  if (input.priority) params.set("priority", input.priority);
+  if (input.slaRisk) params.set("slaRisk", input.slaRisk);
+  if (input.ticketType) params.set("ticketType", input.ticketType);
+  if (input.sort) params.set("sort", input.sort);
+
+  const res = await fetch(`${API}/api/v1/support/tickets?${params.toString()}`, {
     headers: { "x-portal-surface": "internal" }
   }).catch((error) => {
     throw asUserError(error);
   });
-  if (!res.ok) throw new Error("Failed to load agent queue");
+  if (!res.ok) throw new Error("Failed to load support queue");
   const data = await res.json();
   return data.tickets;
+}
+
+export async function runBulkTicketAction(input: {
+  ticketIds: string[];
+  action: "assign" | "priority" | "escalate";
+  assigneeType?: "SUPPORT_TEAM" | "RND_TEAM";
+  assigneeName?: string;
+  priority?: "P1" | "P2" | "P3" | "P4";
+  actor?: string;
+}) {
+  const res = await fetch(`${API}/api/v1/internal/tickets/bulk-actions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(input)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to run bulk action");
+  return res.json();
 }
 
 export async function transitionTicket(
@@ -220,15 +259,165 @@ export async function getAiAgentMode(): Promise<AiAgentMode> {
   return data.mode;
 }
 
-export async function setAiAgentMode(enabled: boolean, actor = "admin_operator"): Promise<AiAgentMode> {
+export async function setAiAgentMode(enabled: boolean, actor = "admin_operator", reason = "support_operation"): Promise<AiAgentMode> {
   const res = await fetch(`${API}/api/v1/internal/settings/ai-agent`, {
     method: "PUT",
     headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
-    body: JSON.stringify({ enabled, actor })
+    body: JSON.stringify({ enabled, actor, reason })
   }).catch((error) => {
     throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to update AI mode");
   const data = await res.json();
   return data.mode;
+}
+
+export async function listOnesTicketTypesInternal(): Promise<OnesTicketType[]> {
+  const res = await fetch(`${API}/api/v1/internal/ones-sync/ticket-types`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load ONES ticket types");
+  const data = await res.json();
+  return data.ticketTypes;
+}
+
+export async function listOnesTicketTypesPublic(): Promise<OnesTicketType[]> {
+  const res = await fetch(`${API}/api/v1/ones/ticket-types`).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load ONES ticket types");
+  const data = await res.json();
+  return data.ticketTypes;
+}
+
+export async function getOnesSyncConfig(): Promise<OnesSyncConfig | null> {
+  const res = await fetch(`${API}/api/v1/internal/ones-sync/config`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load ONES sync config");
+  const data = await res.json();
+  return data.config;
+}
+
+export async function updateOnesSyncConfig(input: {
+  profileName: string;
+  baseUrl: string;
+  authType: "bearer" | "header";
+  authHeader: string;
+  authSecret: string;
+  createTicketPath: string;
+  listTicketTypesPath: string;
+  listFieldsPathTemplate: string;
+  timeoutMs: number;
+  retries: number;
+  actor?: string;
+}): Promise<OnesSyncConfig> {
+  const res = await fetch(`${API}/api/v1/internal/ones-sync/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(input)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to update ONES sync config");
+  const data = await res.json();
+  return data.config;
+}
+
+export async function discoverOnesTicketTypes(actor = "support_admin"): Promise<OnesTicketType[]> {
+  const res = await fetch(`${API}/api/v1/internal/ones-sync/discover`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ actor })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to discover ONES ticket types");
+  const data = await res.json();
+  return data.ticketTypes;
+}
+
+export async function listOnesMappings(ticketTypeKey: string, flow: "create" | "update") {
+  const params = new URLSearchParams({ ticketTypeKey, flow });
+  const res = await fetch(`${API}/api/v1/internal/ones-sync/mappings?${params.toString()}`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load ONES mappings");
+  return (await res.json()).mappings;
+}
+
+export async function saveOnesMappingDraft(input: {
+  ticketTypeKey: string;
+  flow: "create" | "update";
+  mappings: Array<{
+    source: string;
+    target: string;
+    transform: "none" | "concat" | "enumMap" | "dateFormat" | "constant" | "fallback";
+    transformConfig: Record<string, unknown>;
+    requiredPolicy: "hard_fail" | "default_value";
+  }>;
+  actor?: string;
+}) {
+  const res = await fetch(`${API}/api/v1/internal/ones-sync/mappings/draft`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(input)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to save ONES mapping draft");
+  return (await res.json()).mapping;
+}
+
+export async function validateOnesMapping(input: {
+  ticketTypeKey: string;
+  flow: "create" | "update";
+  mappings: Array<{
+    source: string;
+    target: string;
+    transform: "none" | "concat" | "enumMap" | "dateFormat" | "constant" | "fallback";
+    transformConfig: Record<string, unknown>;
+    requiredPolicy: "hard_fail" | "default_value";
+  }>;
+  sampleContext: Record<string, unknown>;
+}) {
+  const res = await fetch(`${API}/api/v1/internal/ones-sync/mappings/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(input)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to validate ONES mapping");
+  return (await res.json()).validation;
+}
+
+export async function publishOnesMapping(mappingId: string, actor = "support_admin") {
+  const res = await fetch(`${API}/api/v1/internal/ones-sync/mappings/publish`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ mappingId, actor })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to publish ONES mapping");
+  return (await res.json()).mapping;
+}
+
+export async function rollbackOnesMapping(ticketTypeKey: string, flow: "create" | "update", actor = "support_admin") {
+  const res = await fetch(`${API}/api/v1/internal/ones-sync/mappings/rollback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ ticketTypeKey, flow, actor })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to rollback ONES mapping");
+  return (await res.json()).mapping;
 }

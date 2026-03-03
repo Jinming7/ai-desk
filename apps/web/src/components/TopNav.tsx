@@ -8,7 +8,12 @@ export function TopNav({ mode }: { mode: "customer" | "internal" }) {
   const links =
     mode === "customer"
       ? [{ to: "/requests", label: "My Requests" }]
-      : [{ to: "/agent", label: "Agent Queue" }];
+      : [
+          { to: "/support", label: "Queues" },
+          { to: "/support?menu=operations", label: "Operations" },
+          { to: "/support?menu=insights", label: "Insights" },
+          { to: "/support/admin/ones-sync", label: "ONES Sync" }
+        ];
 
   return (
     <header className="sticky top-0 z-30 border-b border-line bg-white">
@@ -19,7 +24,11 @@ export function TopNav({ mode }: { mode: "customer" | "internal" }) {
             <Link
               key={link.to}
               to={link.to}
-              className={`text-sm font-medium ${location.pathname === link.to ? "text-brand-500" : "text-muted hover:text-ink"}`}
+              className={`text-sm font-medium ${
+                location.pathname === link.to || (link.to.includes("?menu=") && location.pathname === "/support")
+                  ? "text-brand-500"
+                  : "text-muted hover:text-ink"
+              }`}
             >
               {link.label}
             </Link>
@@ -33,7 +42,7 @@ export function TopNav({ mode }: { mode: "customer" | "internal" }) {
           )}
           <button className="flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-sm text-muted hover:bg-slate-50">
             <CircleUserRound size={18} />
-            <span className="hidden md:inline">{mode === "customer" ? "Profile" : "Agent"}</span>
+            <span className="hidden md:inline">{mode === "customer" ? "Profile" : "Support"}</span>
             <ChevronDown size={16} />
           </button>
         </div>

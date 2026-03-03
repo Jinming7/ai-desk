@@ -38,7 +38,7 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
 
     if (/none_with_reply/i.test(combined)) {
       return {
-        action: "none",
+        action: "ask_user",
         confidence: 0.73,
         reply: "Please provide the exact issue details so we can continue troubleshooting.",
         reasoning_summary: "Test fixture: none action with non-empty reply.",
@@ -49,7 +49,7 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
 
     if (/none_noop/i.test(combined)) {
       return {
-        action: "none",
+        action: "ask_user",
         confidence: 0.7,
         reply: "",
         reasoning_summary: "Test fixture: none action with empty reply.",

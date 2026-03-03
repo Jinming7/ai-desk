@@ -14,8 +14,10 @@ export const ticketPrioritySchema = z.enum(["P1", "P2", "P3", "P4"]);
 export const ticketCreateSchema = z.object({
   title: z.string().min(3).max(200),
   description: z.string().min(5),
-  serviceCategory: z.enum(["technical_support", "feature_consulting", "account_issue"]),
+  serviceCategory: z.enum(["technical_support", "feature_consulting", "account_issue"]).optional(),
   priority: ticketPrioritySchema.default("P3"),
+  onesTicketTypeKey: z.string().min(1).optional(),
+  onesFields: z.record(z.string(), z.any()).optional(),
   customer: z.object({
     id: z.string().min(1),
     name: z.string().min(1),
@@ -41,7 +43,22 @@ export const ticketListQuerySchema = z.object({
 
 export const agentQueueQuerySchema = z.object({
   queue: z.enum(["pending", "mine", "all"]).default("pending"),
-  assignee: z.string().optional()
+  assignee: z.string().optional(),
+  status: ticketStatusSchema.optional(),
+  priority: ticketPrioritySchema.optional(),
+  slaRisk: z.enum(["healthy", "at_risk", "breached"]).optional(),
+  productArea: z.string().optional(),
+  ticketType: z.string().optional(),
+  sort: z.enum(["sla_risk", "updated_desc", "created_desc"]).default("sla_risk")
+});
+
+export const ticketBulkActionSchema = z.object({
+  ticketIds: z.array(z.string().uuid()).min(1).max(100),
+  action: z.enum(["assign", "priority", "escalate"]),
+  assigneeType: z.enum(["SUPPORT_TEAM", "RND_TEAM"]).optional(),
+  assigneeName: z.string().optional(),
+  priority: ticketPrioritySchema.optional(),
+  actor: z.string().default("support_operator")
 });
 
 export const ticketAssignSchema = z.object({
@@ -73,3 +90,4 @@ export type TicketCreateInput = z.infer<typeof ticketCreateSchema>;
 export type TicketReplyInput = z.infer<typeof ticketReplySchema>;
 export type TicketAssignInput = z.infer<typeof ticketAssignSchema>;
 export type TicketInternalTransitionInput = z.infer<typeof ticketInternalTransitionSchema>;
+export type TicketBulkActionInput = z.infer<typeof ticketBulkActionSchema>;

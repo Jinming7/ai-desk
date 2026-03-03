@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { useMemo, useState } from "react";
 
-const STORAGE_KEY = "nexusflow_agent_access_ok";
+const STORAGE_KEY = "nexusflow_support_access_ok";
 
 export function AgentRouteGuard({ children, requestedPath }: { children: ReactNode; requestedPath: string }) {
   const passcode = import.meta.env.VITE_AGENT_ACCESS_CODE;
@@ -28,8 +28,8 @@ export function AgentRouteGuard({ children, requestedPath }: { children: ReactNo
 
   return (
     <div className="mx-auto mt-20 max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-      <h1 className="text-xl font-semibold text-ink">Internal Portal Access</h1>
-      <p className="mt-2 text-sm text-slate-600">Enter the temporary access code to open Agent Portal.</p>
+      <h1 className="text-xl font-semibold text-ink">Support Portal Access</h1>
+      <p className="mt-2 text-sm text-slate-600">Enter the temporary access code to open Support Portal.</p>
       <input
         className="mt-4 h-10 w-full rounded-mdplus border border-slate-200 px-3"
         value={input}
@@ -48,7 +48,7 @@ export function AgentRouteGuard({ children, requestedPath }: { children: ReactNo
           setError("Invalid code");
         }}
       >
-        Enter Agent Portal
+        Enter Support Portal
       </button>
     </div>
   );

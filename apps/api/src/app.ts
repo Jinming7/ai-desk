@@ -3,6 +3,7 @@ import cors from "cors";
 import { z } from "zod";
 import {
   agentQueueQuerySchema,
+  ticketBulkActionSchema,
   ticketAssignSchema,
   ticketCreateSchema,
   ticketInternalTransitionSchema,
@@ -17,6 +18,7 @@ import * as aiRepo from "./modules/ai/repository.js";
 import * as escalationService from "./modules/escalation/service.js";
 import * as workflowService from "./modules/workflow/service.js";
 import * as settingsService from "./modules/settings/service.js";
+import * as onesSyncService from "./modules/ones-sync/service.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
 import { env } from "./config/env.js";
@@ -155,6 +157,16 @@ app.put(
 );
 
 app.post(
+  "/api/v1/internal/tickets/bulk-actions",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const input = ticketBulkActionSchema.parse(req.body);
+    const result = await ticketService.applyBulkAction(input);
+    res.json(result);
+  })
+);
+
+app.post(
   "/api/v1/tickets/:id/close",
   asyncHandler(async (req, res) => {
     const id = z.string().parse(req.params.id);
@@ -210,6 +222,122 @@ app.get(
     const query = agentQueueQuerySchema.parse(req.query);
     const tickets = await agentService.listQueue(query);
     res.json({ tickets });
+  })
+);
+
+app.get(
+  "/api/v1/support/tickets",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const query = agentQueueQuerySchema.parse(req.query);
+    const tickets = await agentService.listQueue(query);
+    res.json({ tickets });
+  })
+);
+
+app.get(
+  "/api/v1/ones/ticket-types",
+  asyncHandler(async (_req, res) => {
+    const rows = await onesSyncService.listTicketTypes();
+    res.json({ ticketTypes: rows });
+  })
+);
+
+app.get(
+  "/api/v1/internal/ones-sync/config",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const config = await onesSyncService.getConfig();
+    res.json({ config });
+  })
+);
+
+app.put(
+  "/api/v1/internal/ones-sync/config",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const config = await onesSyncService.upsertConfig(req.body);
+    res.json({ config });
+  })
+);
+
+app.post(
+  "/api/v1/internal/ones-sync/discover",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const actor = z.string().default("internal_operator").parse(req.body?.actor);
+    const rows = await onesSyncService.discoverTicketTypes(actor);
+    res.json({ ticketTypes: rows });
+  })
+);
+
+app.get(
+  "/api/v1/internal/ones-sync/ticket-types",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const ticketTypes = await onesSyncService.listTicketTypes();
+    res.json({ ticketTypes });
+  })
+);
+
+app.get(
+  "/api/v1/internal/ones-sync/mappings",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const ticketTypeKey = z.string().min(1).parse(req.query.ticketTypeKey);
+    const flow = z.enum(["create", "update"]).parse(req.query.flow);
+    const mappings = await onesSyncService.listMappings(ticketTypeKey, flow);
+    res.json({ mappings });
+  })
+);
+
+app.put(
+  "/api/v1/internal/ones-sync/mappings/draft",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const mapping = await onesSyncService.saveDraftMapping(req.body);
+    res.json({ mapping });
+  })
+);
+
+app.post(
+  "/api/v1/internal/ones-sync/mappings/validate",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const body = z.object({
+      ticketTypeKey: z.string().min(1),
+      flow: z.enum(["create", "update"]),
+      mappings: z.array(
+        z.object({
+          source: z.string().min(1),
+          target: z.string().min(1),
+          transform: z.enum(["none", "concat", "enumMap", "dateFormat", "constant", "fallback"]).default("none"),
+          transformConfig: z.record(z.string(), z.any()).default({}),
+          requiredPolicy: z.enum(["hard_fail", "default_value"]).default("hard_fail")
+        })
+      ),
+      sampleContext: z.record(z.string(), z.any()).default({})
+    }).parse(req.body);
+    const validation = await onesSyncService.dryRunMapping(body);
+    res.json({ validation });
+  })
+);
+
+app.post(
+  "/api/v1/internal/ones-sync/mappings/publish",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const mapping = await onesSyncService.publishMapping(req.body);
+    res.json({ mapping });
+  })
+);
+
+app.post(
+  "/api/v1/internal/ones-sync/mappings/rollback",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const mapping = await onesSyncService.rollbackMapping(req.body);
+    res.json({ mapping });
   })
 );
 

@@ -1,8 +1,9 @@
-import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
+import { Navigate, Outlet, Route, Routes, useLocation, useParams } from "react-router-dom";
 import { AgentRouteGuard } from "../components/AgentRouteGuard";
 import { TopNav } from "../components/TopNav";
 import { AgentDashboardPage } from "../pages/AgentDashboardPage";
 import { AgentTicketDetailPage } from "../pages/AgentTicketDetailPage";
+import { OnesSyncConfigPage } from "../pages/OnesSyncConfigPage";
 import { PortalPage } from "../pages/PortalPage";
 import { RequestsPage } from "../pages/RequestsPage";
 import { TicketDetailPage } from "../pages/TicketDetailPage";
@@ -29,6 +30,11 @@ function InternalShell() {
   );
 }
 
+function LegacyAgentTicketRedirect() {
+  const { id } = useParams();
+  return <Navigate to={id ? `/support/tickets/${id}` : "/support"} replace />;
+}
+
 export function App() {
   return (
     <Routes>
@@ -41,6 +47,9 @@ export function App() {
       <Route element={<InternalShell />}>
         <Route path={internalRoutePaths[0]} element={<AgentDashboardPage />} />
         <Route path={internalRoutePaths[1]} element={<AgentTicketDetailPage />} />
+        <Route path={internalRoutePaths[2]} element={<OnesSyncConfigPage />} />
+        <Route path="/agent" element={<Navigate to="/support" replace />} />
+        <Route path="/agent/tickets/:id" element={<LegacyAgentTicketRedirect />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />

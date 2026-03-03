@@ -3,8 +3,8 @@ import { motion } from "framer-motion";
 import { Loader2, Search, X, Wrench, Lightbulb, ShieldAlert } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { createQuickEscalation, createTicket, getEscalationStatus, searchKnowledge } from "../lib/api";
-import type { AiEscalation, SearchResult } from "../lib/types";
+import { createQuickEscalation, createTicket, getEscalationStatus, listOnesTicketTypesPublic, searchKnowledge } from "../lib/api";
+import type { AiEscalation, OnesTicketType, SearchResult } from "../lib/types";
 
 const services = [
   {
@@ -43,6 +43,8 @@ export function PortalPage() {
   const [escalation, setEscalation] = useState<AiEscalation | null>(null);
   const [escalating, setEscalating] = useState(false);
   const [escalationError, setEscalationError] = useState<string | null>(null);
+  const [onesTypes, setOnesTypes] = useState<OnesTicketType[]>([]);
+  const [onesFields, setOnesFields] = useState<Record<string, string>>({});
 
   const unresolved = useMemo(
     () => searchResult?.suggested_next_step === "submit_ticket" && Boolean(searchResult.unresolved_reason_code),
@@ -65,6 +67,12 @@ export function PortalPage() {
     return () => clearInterval(timer);
   }, [escalation]);
 
+  useEffect(() => {
+    listOnesTicketTypesPublic()
+      .then((rows) => setOnesTypes(rows))
+      .catch(() => setOnesTypes([]));
+  }, []);
+
   const submit = async () => {
     if (!service) return;
     if (title.trim().length < 3) {
@@ -75,14 +83,33 @@ export function PortalPage() {
       setSubmitError("Description must be at least 5 characters.");
       return;
     }
+    const selectedType = onesTypes.find((item) => item.key === service.key);
+    if (selectedType?.fields?.length) {
+      for (const field of selectedType.fields) {
+        const row = field as Record<string, unknown>;
+        const required = Boolean(row.required ?? false);
+        const key = String(row.key ?? row.id ?? "");
+        if (required && key && !(onesFields[key] ?? "").trim()) {
+          setSubmitError(`Field "${String(row.label ?? row.name ?? key)}" is required.`);
+          return;
+        }
+      }
+    }
     setSubmitError(null);
     setSubmitLoading(true);
     try {
-      const created = await createTicket({ title: title.trim(), description: description.trim(), serviceCategory: service.key });
+      const created = await createTicket({
+        title: title.trim(),
+        description: description.trim(),
+        serviceCategory: service?.key,
+        onesTicketTypeKey: service?.key,
+        onesFields
+      });
       setSubmitSuccess(`Ticket ${created.ticket.ticket_no} submitted successfully.`);
       setOpen(false);
       setTitle("");
       setDescription("");
+      setOnesFields({});
       navigate(`/tickets/${created.ticket.id}`);
     } catch (error) {
       setSubmitError((error as Error).message);
@@ -253,6 +280,30 @@ export function PortalPage() {
               )}
             </div>
           )}
+          {unresolved && onesTypes.length > 0 && (
+            <div className="mt-4 w-full rounded-2xl border border-slate-200 bg-white p-4 text-left md:w-[60%]">
+              <p className="text-xs font-semibold uppercase text-slate-500">ONES Ticket Types</p>
+              <div className="mt-2 grid gap-2">
+                {onesTypes.map((type) => (
+                  <button
+                    key={type.key}
+                    onClick={() => {
+                      setService({
+                        key: type.key as "technical_support" | "feature_consulting" | "account_issue",
+                        title: type.name,
+                        description: `Create ${type.name} ticket in ONES.`,
+                        icon: Wrench
+                      });
+                      setOpen(true);
+                    }}
+                    className="rounded-lg border border-slate-200 px-3 py-2 text-left text-sm hover:bg-slate-50"
+                  >
+                    {type.name} <span className="text-xs text-slate-500">({type.key})</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {!searching && query.trim().length >= 2 && !searchResult && !searchError && (
             <p className="mt-3 text-sm text-slate-500">No results yet. Press Search to query the knowledge base.</p>
           )}
@@ -317,6 +368,31 @@ export function PortalPage() {
                   className="w-full rounded-xl border border-line px-3 py-2"
                 />
               </div>
+              {service?.key && onesTypes.find((type) => type.key === service.key)?.fields?.length ? (
+                <div className="space-y-3">
+                  <p className="text-sm font-medium text-[#1F2937]">ONES Fields</p>
+                  {onesTypes
+                    .find((type) => type.key === service.key)
+                    ?.fields.map((field, idx) => {
+                      const asRecord = field as Record<string, unknown>;
+                      const key = String(asRecord.key ?? asRecord.id ?? `field_${idx}`);
+                      const label = String(asRecord.label ?? asRecord.name ?? key);
+                      const required = Boolean(asRecord.required ?? false);
+                      return (
+                        <div key={key}>
+                          <label className="mb-1 block text-xs font-medium text-slate-600">
+                            {label} {required ? "*" : ""}
+                          </label>
+                          <input
+                            className="h-10 w-full rounded-xl border border-line px-3 text-sm"
+                            value={onesFields[key] ?? ""}
+                            onChange={(e) => setOnesFields((prev) => ({ ...prev, [key]: e.target.value }))}
+                          />
+                        </div>
+                      );
+                    })}
+                </div>
+              ) : null}
               {!service && <p className="text-xs text-rose-600">Please select a service category before submitting.</p>}
               {submitError && <p className="text-xs text-rose-600">{submitError}</p>}
               <div className="rounded-xl border border-dashed border-[#D1D5DB] px-4 py-8 text-center text-sm text-[#6B7280]">

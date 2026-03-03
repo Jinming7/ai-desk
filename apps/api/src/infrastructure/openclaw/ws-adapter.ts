@@ -80,10 +80,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const prompt = [
       "You are first-line ticket triage.",
       "Return ONLY valid JSON with keys:",
-      "action(resolve|ask_user|escalate|none), confidence(0..1), reply, reasoning_summary, evidence(string[]), risk_flags(string[])",
+      "action(resolve|ask_user|escalate), confidence(0..1), reply, reasoning_summary, evidence(string[]), risk_flags(string[])",
       "All output text must be English.",
-      "If you need more user information, action must be ask_user (not none).",
-      "Use action none only when absolutely no customer-facing reply is needed.",
+      "If you need more user information, action must be ask_user.",
       "Do not include markdown.",
       `ticket_id: ${input.ticket_id}`,
       `title: ${input.title}`,
@@ -99,7 +98,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const parsed = this.parseFirstJson(text) as Partial<OpenClawAnalyzeOutput>;
     const reply = typeof parsed.reply === "string" ? parsed.reply : "";
     return {
-      action: this.normalizeAnalyzeAction(parsed.action, reply),
+      action: this.normalizeAction(parsed.action),
       confidence: this.normalizeConfidence(parsed.confidence),
       reply,
       reasoning_summary: typeof parsed.reasoning_summary === "string" ? parsed.reasoning_summary : "OpenClaw agent response",
@@ -212,19 +211,10 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   }
 
   private normalizeAction(value: unknown): OpenClawAnalyzeOutput["action"] {
-    if (value === "resolve" || value === "ask_user" || value === "escalate" || value === "none") return value;
+    if (value === "resolve" || value === "ask_user" || value === "escalate") return value;
     if (value === "auto_resolve") return "resolve";
     if (value === "ask_info") return "ask_user";
     return "ask_user";
-  }
-
-  private normalizeAnalyzeAction(rawAction: unknown, reply: string): OpenClawAnalyzeOutput["action"] {
-    const normalized = this.normalizeAction(rawAction);
-    // Guardrail: `none` is a true no-op only when there is no customer-facing reply.
-    if (normalized === "none" && reply.trim().length > 0) {
-      return "ask_user";
-    }
-    return normalized;
   }
 
   private normalizeConfidence(value: unknown): number {

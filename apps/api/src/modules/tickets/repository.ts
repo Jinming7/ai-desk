@@ -20,6 +20,22 @@ export interface TicketRecord {
   assignee_name: string;
   ai_run_seq: number;
   sla_due_at: string | null;
+  first_response_due_at: string | null;
+  first_response_at: string | null;
+  resolution_due_at: string | null;
+  sla_paused_at: string | null;
+  sla_pause_reason: string | null;
+  sla_paused_total_seconds: number;
+  ones_ticket_type_key: string | null;
+  ones_ticket_key: string | null;
+  ones_sync_status: string | null;
+  ones_sync_error: string | null;
+  ai_mode_snapshot: string | null;
+  ai_last_trace_id: string | null;
+  ai_last_action: string | null;
+  ai_last_confidence: number | null;
+  ai_last_model: string | null;
+  ai_last_fallback_applied: boolean;
   resolved_at: string | null;
   closed_at: string | null;
   created_at: string;
@@ -45,20 +61,22 @@ function ticketNumber(): string {
 export async function createTicket(input: TicketCreateInput): Promise<TicketRecord> {
   const id = uuidv4();
   const no = ticketNumber();
-  const slaDue = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const firstResponseDue = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const resolutionDue = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
   const result = await pool.query<TicketRecord>(
     `INSERT INTO tickets (
       id, ticket_no, title, description, service_category, priority, status, customer_id, customer_name, customer_email,
-      environment, reproducibility, impact_summary, assignee_type, assignee_name, sla_due_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,'OPEN',$7,$8,$9,$10,$11,$12,'SUPPORT_TEAM','Support Team',$13)
+      environment, reproducibility, impact_summary, assignee_type, assignee_name, sla_due_at,
+      first_response_due_at, resolution_due_at, ones_ticket_type_key, ai_mode_snapshot
+    ) VALUES ($1,$2,$3,$4,$5,$6,'OPEN',$7,$8,$9,$10,$11,$12,'SUPPORT_TEAM','Support Team',$13,$14,$15,$16,$17)
     RETURNING *`,
     [
       id,
       no,
       input.title,
       input.description,
-      input.serviceCategory,
+      input.serviceCategory ?? "technical_support",
       input.priority,
       input.customer.id,
       input.customer.name,
@@ -66,7 +84,11 @@ export async function createTicket(input: TicketCreateInput): Promise<TicketReco
       input.environment,
       input.reproducibility,
       input.impactSummary?.trim() || null,
-      slaDue
+      resolutionDue,
+      firstResponseDue,
+      resolutionDue,
+      input.onesTicketTypeKey ?? null,
+      "AI_ON"
     ]
   );
 
@@ -132,6 +154,7 @@ export async function addMessage(input: {
   isAiGenerated: boolean;
   aiConfidence: number | null;
 }): Promise<void> {
+  const ticket = await getTicketById(input.ticketId);
   await pool.query(
     `INSERT INTO ticket_messages (id, ticket_id, author_type, author_name, body, attachments, is_ai_generated, ai_confidence)
      VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`,
@@ -139,19 +162,37 @@ export async function addMessage(input: {
   );
 
   await pool.query("UPDATE tickets SET updated_at = NOW() WHERE id = $1", [input.ticketId]);
+
+  if (ticket && !ticket.first_response_at && (input.authorType === "AGENT" || input.isAiGenerated)) {
+    await pool.query("UPDATE tickets SET first_response_at = NOW() WHERE id = $1 AND first_response_at IS NULL", [input.ticketId]);
+  }
 }
 
 export async function transitionTicket(id: string, from: TicketStatus, to: TicketStatus): Promise<void> {
+  const now = new Date();
+  const previous = await getTicketById(id);
+  if (!previous) {
+    throw new Error("Ticket not found");
+  }
+  let pausedSeconds = previous.sla_paused_total_seconds ?? 0;
+  if (from === "WAITING_CUSTOMER" && previous.sla_paused_at) {
+    pausedSeconds += Math.max(0, Math.floor((now.getTime() - new Date(previous.sla_paused_at).getTime()) / 1000));
+  }
+
   const updateFields =
     to === "RESOLVED"
-      ? ", resolved_at = NOW()"
+      ? ", resolved_at = NOW(), sla_paused_at = NULL, sla_pause_reason = NULL"
       : to === "CLOSED"
       ? ", closed_at = NOW()"
-      : "";
+      : to === "WAITING_CUSTOMER"
+      ? ", sla_paused_at = NOW(), sla_pause_reason = 'waiting_customer'"
+      : ", sla_paused_at = NULL, sla_pause_reason = NULL";
 
   const result = await pool.query(
-    `UPDATE tickets SET status = $2, updated_at = NOW() ${updateFields} WHERE id = $1 AND status = $3`,
-    [id, to, from]
+    `UPDATE tickets
+     SET status = $2, updated_at = NOW(), sla_paused_total_seconds = $4 ${updateFields}
+     WHERE id = $1 AND status = $3`,
+    [id, to, from, pausedSeconds]
   );
 
   if (!result.rowCount) {
@@ -159,6 +200,10 @@ export async function transitionTicket(id: string, from: TicketStatus, to: Ticke
   }
 
   await addAuditLog(id, "status_changed", from, to, {});
+}
+
+export async function setTicketPriority(id: string, priority: "P1" | "P2" | "P3" | "P4"): Promise<void> {
+  await pool.query("UPDATE tickets SET priority = $2, updated_at = NOW() WHERE id = $1", [id, priority]);
 }
 
 export async function setTicketAssignee(id: string, type: "SUPPORT_TEAM" | "RND_TEAM", name: string): Promise<void> {
@@ -192,6 +237,65 @@ export async function completeAiRun(id: string, response: Record<string, unknown
 
 export async function failAiRun(id: string, error: string): Promise<void> {
   await pool.query("UPDATE ai_runs SET status = 'failed', error = $2 WHERE id = $1", [id, error]);
+}
+
+export async function finalizeAiRun(id: string, input: {
+  response: Record<string, unknown>;
+  traceId: string;
+  action: string;
+  model: string;
+  confidence: number;
+  evidence: string[];
+  fallbackApplied: boolean;
+  promptHash: string;
+}): Promise<void> {
+  await pool.query(
+    `UPDATE ai_runs
+     SET status = 'completed',
+         response_json = $2::jsonb,
+         trace_id = $3,
+         decision_action = $4,
+         model_name = $5,
+         confidence = $6,
+         evidence_json = $7::jsonb,
+         fallback_applied = $8,
+         prompt_hash = $9
+     WHERE id = $1`,
+    [id, JSON.stringify(input.response), input.traceId, input.action, input.model, input.confidence, JSON.stringify(input.evidence), input.fallbackApplied, input.promptHash]
+  );
+}
+
+export async function setTicketAiSnapshot(ticketId: string, input: {
+  traceId: string;
+  action: string;
+  confidence: number;
+  model: string;
+  fallbackApplied: boolean;
+  aiModeSnapshot: string;
+}) {
+  await pool.query(
+    `UPDATE tickets
+     SET ai_last_trace_id = $2,
+         ai_last_action = $3,
+         ai_last_confidence = $4,
+         ai_last_model = $5,
+         ai_last_fallback_applied = $6,
+         ai_mode_snapshot = $7,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [ticketId, input.traceId, input.action, input.confidence, input.model, input.fallbackApplied, input.aiModeSnapshot]
+  );
+}
+
+export async function setTicketOnesSyncResult(ticketId: string, input: { status: "synced" | "failed" | "not_configured"; key?: string | null; error?: string | null }) {
+  await pool.query(
+    "UPDATE tickets SET ones_sync_status = $2, ones_ticket_key = $3, ones_sync_error = $4, updated_at = NOW() WHERE id = $1",
+    [ticketId, input.status, input.key ?? null, input.error ?? null]
+  );
+}
+
+export async function deleteTicket(ticketId: string): Promise<void> {
+  await pool.query("DELETE FROM tickets WHERE id = $1", [ticketId]);
 }
 
 export async function addAuditLog(

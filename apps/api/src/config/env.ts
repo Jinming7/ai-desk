@@ -39,7 +39,12 @@ const envSchema = z.object({
   DISABLE_AI_TRIAGE_FALLBACK: z.coerce.boolean().default(true),
   FEATURE_KB_GROUNDED_SEARCH: z.coerce.boolean().default(true),
   FEATURE_QUICK_TICKET: z.coerce.boolean().default(true),
-  FEATURE_DEEP_RETRIEVAL: z.coerce.boolean().default(true)
+  FEATURE_DEEP_RETRIEVAL: z.coerce.boolean().default(true),
+  ONES_SYNC_ENCRYPTION_KEY: z.string().default("dev-only-change-me-32-char-key"),
+  ONES_SYNC_DEFAULT_BASE_URL: z.string().default("https://ones.com"),
+  ONES_SYNC_DEFAULT_TICKET_TYPES_PATH: z.string().default("/api/v1/ticket-types"),
+  ONES_SYNC_DEFAULT_FIELDS_PATH_TEMPLATE: z.string().default("/api/v1/ticket-types/{ticketTypeKey}/fields"),
+  ONES_SYNC_DEFAULT_CREATE_TICKET_PATH: z.string().default("/api/v1/tickets")
 });
 
 export const env = envSchema.parse(process.env);

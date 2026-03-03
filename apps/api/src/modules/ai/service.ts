@@ -1,22 +1,54 @@
 import { canTransition } from "../../domain/state-machine.js";
 import type { OpenClawAdapter, OpenClawAnalyzeOutput, OpenClawDecisionAction } from "../../infrastructure/openclaw/types.js";
 import { env } from "../../config/env.js";
+import crypto from "node:crypto";
 import * as aiRepo from "./repository.js";
 import { SearchOrchestrator } from "./search-orchestrator.js";
 import type { SearchModeResult } from "./types.js";
 import * as tickets from "../tickets/repository.js";
+import * as settings from "../settings/repository.js";
 
 function normalizeAction(action: string): OpenClawDecisionAction {
   if (action === "ask_info") return "ask_user";
   if (action === "auto_resolve") return "resolve";
-  if (action === "escalate" || action === "ask_user" || action === "resolve" || action === "none") return action;
+  if (action === "escalate" || action === "ask_user" || action === "resolve") return action;
   return "ask_user";
 }
 
-function normalizeAnalyzeOutput(raw: OpenClawAnalyzeOutput): OpenClawAnalyzeOutput {
+function containsCjk(text: string): boolean {
+  return /[\u3400-\u9FBF]/.test(text);
+}
+
+function normalizeReplyToEnglish(action: OpenClawDecisionAction, text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return action === "resolve"
+      ? "Thanks for your report. We have applied a fix and marked this ticket as resolved. Please verify and let us know if you still see the issue."
+      : action === "escalate"
+      ? "Thanks for your report. This issue requires deeper investigation, so I have escalated it to our R&D team."
+      : "Thanks for contacting support. I need a bit more detail to proceed. Please share expected behavior, actual behavior, exact steps, and any error logs or screenshots.";
+  }
+  if (containsCjk(trimmed)) {
+    if (action === "resolve") {
+      return "Thanks for your report. We have completed the fix and set this ticket to resolved. Please confirm whether the issue is solved.";
+    }
+    if (action === "escalate") {
+      return "Thanks for your report. We need deeper technical analysis, so this ticket has been escalated to our R&D team.";
+    }
+    return "Thanks for contacting support. Your ticket currently lacks actionable details. Please provide the exact issue, expected result, actual result, and reproduction steps.";
+  }
+  return trimmed;
+}
+
+function normalizeAnalyzeOutput(raw: OpenClawAnalyzeOutput): OpenClawAnalyzeOutput & { fallback_applied: boolean } {
+  const normalizedAction = normalizeAction(raw.action);
+  const fallbackApplied = raw.action !== normalizedAction || raw.action === undefined || raw.action === null;
+  const reply = normalizeReplyToEnglish(normalizedAction, raw.reply);
   return {
     ...raw,
-    action: normalizeAction(raw.action)
+    action: normalizedAction,
+    reply,
+    fallback_applied: fallbackApplied
   };
 }
 
@@ -121,8 +153,32 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
   try {
     const rawResult = await adapter.analyzeTicket(input, idempotencyKey);
     const result = normalizeAnalyzeOutput(rawResult);
+    const traceId = `${ticketId}:${idempotencyKey}:${Date.now()}`;
+    const promptHash = crypto
+      .createHash("sha256")
+      .update(JSON.stringify(input))
+      .digest("hex");
+    const aiMode = await settings.getAiAgentMode();
+    const modelName = process.env.OPENCLAW_AGENT_ID || "openclaw-agent";
 
-    await tickets.completeAiRun(runId, result as unknown as Record<string, unknown>);
+    await tickets.finalizeAiRun(runId, {
+      response: result as unknown as Record<string, unknown>,
+      traceId,
+      action: result.action,
+      model: modelName,
+      confidence: result.confidence,
+      evidence: result.evidence,
+      fallbackApplied: result.fallback_applied,
+      promptHash
+    });
+    await tickets.setTicketAiSnapshot(ticketId, {
+      traceId,
+      action: result.action,
+      confidence: result.confidence,
+      model: modelName,
+      fallbackApplied: result.fallback_applied,
+      aiModeSnapshot: aiMode.enabled ? "AI_ON" : "AI_OFF"
+    });
 
     if (result.action === "escalate") {
       const latest = await tickets.getTicketById(ticketId);
@@ -133,6 +189,7 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
       await tickets.addAuditLog(ticketId, "ai_triage_escalated", null, null, {
         reason: "model_escalation",
         reasonCode: "ai_model_escalation",
+        traceId,
         stage: "escalated_rnd",
         status: "ESCALATED_RND",
         assignee: "R&D Team",
@@ -166,6 +223,7 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
       await tickets.setTicketAssignee(ticketId, "SUPPORT_TEAM", "Support Team");
       await tickets.addAuditLog(ticketId, "ai_triage_replied", null, "WAITING_CUSTOMER", {
         action: result.action,
+        traceId,
         stage: "waiting_customer",
         status: "WAITING_CUSTOMER",
         assignee: "Support Team",
@@ -176,11 +234,6 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
       });
       return result;
     }
-
-    await tickets.addAuditLog(ticketId, "ai_triage_no_action", null, null, {
-      confidence: result.confidence,
-      evidence: result.evidence
-    });
 
     return result;
   } catch (error) {

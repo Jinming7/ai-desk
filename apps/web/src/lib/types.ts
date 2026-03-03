@@ -14,6 +14,21 @@ export interface Ticket {
   updated_at: string;
   created_at: string;
   sla_due_at: string;
+  first_response_due_at?: string | null;
+  first_response_at?: string | null;
+  resolution_due_at?: string | null;
+  sla_paused_at?: string | null;
+  sla_pause_reason?: string | null;
+  ones_ticket_type_key?: string | null;
+  ones_ticket_key?: string | null;
+  ones_sync_status?: string | null;
+  ones_sync_error?: string | null;
+  ai_mode_snapshot?: string | null;
+  ai_last_trace_id?: string | null;
+  ai_last_action?: "resolve" | "ask_user" | "escalate" | null;
+  ai_last_confidence?: number | null;
+  ai_last_model?: string | null;
+  ai_last_fallback_applied?: boolean;
 }
 
 export interface TicketMessage {
@@ -39,6 +54,18 @@ export interface AgentQueueTicket {
   triage_evidence: string[] | null;
   triage_confidence: number | null;
   handoff_reason_code: string | null;
+  priority?: "P1" | "P2" | "P3" | "P4";
+  resolution_due_at?: string | null;
+  first_response_due_at?: string | null;
+  first_response_at?: string | null;
+  sla_paused_at?: string | null;
+  sla_pause_reason?: string | null;
+  ones_ticket_type_key?: string | null;
+  ones_ticket_key?: string | null;
+  ones_sync_status?: string | null;
+  ai_mode_snapshot?: string | null;
+  ai_last_trace_id?: string | null;
+  sla_risk?: "healthy" | "at_risk" | "breached";
 }
 
 export interface SearchReference {
@@ -76,6 +103,29 @@ export interface AiEscalation {
 
 export interface AiAgentMode {
   enabled: boolean;
+  updatedBy: string;
+  updatedAt: string;
+}
+
+export interface OnesTicketType {
+  key: string;
+  name: string;
+  fields: Array<Record<string, unknown>>;
+  syncedAt?: string;
+}
+
+export interface OnesSyncConfig {
+  id: string;
+  profileName: string;
+  baseUrl: string;
+  authType: "bearer" | "header";
+  authHeader: string;
+  authSecretMasked: string;
+  createTicketPath: string;
+  listTicketTypesPath: string;
+  listFieldsPathTemplate: string;
+  timeoutMs: number;
+  retries: number;
   updatedBy: string;
   updatedAt: string;
 }

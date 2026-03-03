@@ -4,11 +4,35 @@ import * as aiService from "../ai/service.js";
 import * as ticketsService from "../tickets/service.js";
 import * as ticketsRepo from "../tickets/repository.js";
 import * as settingsRepo from "../settings/repository.js";
+import * as onesSyncService from "../ones-sync/service.js";
 
 export async function submitTicketWorkflow(input: TicketCreateInput, adapter: OpenClawAdapter) {
   const ticket = await ticketsService.createTicket(input);
   let triage: unknown = null;
   let triageError: string | null = null;
+  let onesSyncError: string | null = null;
+
+  if (input.onesTicketTypeKey) {
+    try {
+      const ones = await onesSyncService.createOnesTicket({
+        ticketTypeKey: input.onesTicketTypeKey,
+        context: {
+          title: input.title,
+          description: input.description,
+          customer: input.customer,
+          fields: input.onesFields ?? {}
+        }
+      });
+      await ticketsRepo.setTicketOnesSyncResult(ticket.id, { status: "synced", key: ones.key, error: null });
+    } catch (error) {
+      onesSyncError = (error as Error).message;
+      await ticketsRepo.setTicketOnesSyncResult(ticket.id, { status: "failed", key: null, error: onesSyncError });
+      await ticketsRepo.deleteTicket(ticket.id);
+      throw new Error(`ONES sync failed: ${onesSyncError}`);
+    }
+  } else {
+    await ticketsRepo.setTicketOnesSyncResult(ticket.id, { status: "not_configured", key: null, error: null });
+  }
 
   const aiMode = await settingsRepo.getAiAgentMode();
   if (!aiMode.enabled) {
@@ -26,6 +50,7 @@ export async function submitTicketWorkflow(input: TicketCreateInput, adapter: Op
       ticket: detail.ticket,
       triage,
       triageError,
+      onesSyncError,
       lifecycle: {
         status: detail.ticket.status,
         assignee: detail.ticket.assignee_name
@@ -44,6 +69,7 @@ export async function submitTicketWorkflow(input: TicketCreateInput, adapter: Op
     ticket: detail.ticket,
     triage,
     triageError,
+    onesSyncError,
     lifecycle: {
       status: detail.ticket.status,
       assignee: detail.ticket.assignee_name

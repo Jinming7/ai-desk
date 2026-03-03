@@ -1,4 +1,5 @@
 import { pool } from "../../db/client.js";
+import { v4 as uuidv4 } from "uuid";
 
 export interface AiAgentModeSetting {
   enabled: boolean;
@@ -46,4 +47,11 @@ export async function setAiAgentMode(enabled: boolean, updatedBy: string): Promi
     updatedBy: result.rows[0].updated_by,
     updatedAt: result.rows[0].updated_at
   };
+}
+
+export async function addAiModeAudit(input: { actor: string; previous: boolean; next: boolean; reason: string }) {
+  await pool.query(
+    "INSERT INTO ones_sync_audit_logs (id, actor, scope, event_type, payload) VALUES ($1,$2,'ai_mode','ai_mode_switched',$3::jsonb)",
+    [uuidv4(), input.actor, JSON.stringify({ previous: input.previous, next: input.next, reason: input.reason })]
+  );
 }

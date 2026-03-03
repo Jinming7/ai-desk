@@ -1,4 +1,5 @@
 import type {
+  TicketBulkActionInput,
   TicketAssignInput,
   TicketCreateInput,
   TicketInternalTransitionInput,
@@ -112,4 +113,48 @@ export async function assign(id: string, input: TicketAssignInput) {
     assigneeName: input.assigneeName,
     reasonCode: input.reasonCode
   });
+}
+
+export async function applyBulkAction(input: TicketBulkActionInput) {
+  const results: Array<{ id: string; ok: boolean; error?: string }> = [];
+  for (const ticketId of input.ticketIds) {
+    try {
+      if (input.action === "assign") {
+        if (!input.assigneeType || !input.assigneeName) {
+          throw new Error("assigneeType and assigneeName are required for assign");
+        }
+        await assign(ticketId, {
+          assigneeType: input.assigneeType,
+          assigneeName: input.assigneeName,
+          reasonCode: "manual_claim"
+        });
+      } else if (input.action === "priority") {
+        if (!input.priority) {
+          throw new Error("priority is required for priority action");
+        }
+        await repo.setTicketPriority(ticketId, input.priority);
+        await repo.addAuditLog(ticketId, "priority_changed", null, null, {
+          priority: input.priority,
+          actor: input.actor
+        });
+      } else if (input.action === "escalate") {
+        const ticket = await repo.getTicketById(ticketId);
+        if (!ticket) throw new Error("Ticket not found");
+        if (canTransition(ticket.status, "ESCALATED_RND")) {
+          await repo.transitionTicket(ticketId, ticket.status, "ESCALATED_RND");
+        }
+        await repo.setTicketAssignee(ticketId, "RND_TEAM", "R&D Team");
+        await repo.addAuditLog(ticketId, "bulk_escalated_rnd", ticket.status, "ESCALATED_RND", { actor: input.actor });
+      }
+      results.push({ id: ticketId, ok: true });
+    } catch (error) {
+      results.push({ id: ticketId, ok: false, error: (error as Error).message });
+    }
+  }
+  return {
+    total: input.ticketIds.length,
+    success: results.filter((r) => r.ok).length,
+    failed: results.filter((r) => !r.ok).length,
+    results
+  };
 }
