@@ -7,6 +7,7 @@ The team needs ONES OpenAPI knowledge to persist across threads and contributors
 - Add a durable ONES OpenAPI knowledge map artifact in OpenSpec with domain-based API indexing.
 - Define normative guidance for how future ONES integration tasks should reference endpoints, scopes, request contracts, and known document inconsistencies.
 - Record high-risk contract ambiguities (for example, schema required/property mismatches) and required validation steps before implementation.
+- Include ONES Webhook capability knowledge, including event message schema, heartbeat handling, acknowledgment protocol, and retry/disable behavior.
 - Establish a maintenance workflow so the knowledge map can be updated when ONES OpenAPI changes.
 
 ## Capabilities

@@ -33,7 +33,7 @@ Stakeholders:
 - Why not: AGENTS.md is instruction-oriented and becomes noisy/fragile when overloaded with large API domain references.
 
 ### Decision 2: Organize knowledge by integration domains rather than raw path order
-- Rationale: Future requirements are usually domain-driven (issue lifecycle, worklog, wiki, user sync), not file-order-driven.
+- Rationale: Future requirements are usually domain-driven (issue lifecycle, worklog, wiki, user sync, webhook event consumption), not file-order-driven.
 - Alternative considered: Single flat endpoint list.
 - Why not: Harder to navigate and reason about end-to-end flows.
 
@@ -53,6 +53,7 @@ Stakeholders:
 - [Risk] Knowledge map goes stale after ONES upgrades → Mitigation: require refresh task in any change that depends on newly changed ONES endpoints/scopes.
 - [Risk] Overly detailed docs increase maintenance burden → Mitigation: capture stable integration-critical fields, avoid duplicating every low-value example.
 - [Risk] Teams misuse guidance as absolute truth → Mitigation: explicitly separate “spec-derived facts” from “inferred guidance” and “known ambiguities”.
+- [Risk] Webhook delivery semantics can cause duplicate processing or silent pause if acknowledgments are wrong → Mitigation: document idempotent consumer requirements and exact acknowledgment contract (`response body` returns received message `id`).
 
 ## Migration Plan
 

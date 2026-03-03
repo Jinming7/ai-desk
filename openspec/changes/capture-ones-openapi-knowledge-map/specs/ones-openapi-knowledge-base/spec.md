@@ -8,11 +8,22 @@ The project SHALL maintain a version-controlled ONES OpenAPI knowledge base unde
 - **THEN** the contributor SHALL be able to locate ONES API guidance in OpenSpec artifacts without relying on prior chat context
 
 ### Requirement: Domain-Oriented API Indexing
-The knowledge base SHALL organize ONES APIs by functional domain (for example OAuth, Issue, Worklog, Wiki, User, Project, Resource) and SHALL provide endpoint method/path mappings for each domain.
+The knowledge base SHALL organize ONES APIs by functional domain (for example OAuth, Issue, Worklog, Wiki, User, Project, Resource, Webhook) and SHALL provide endpoint method/path mappings for each domain.
 
 #### Scenario: Engineer needs issue lifecycle endpoints
 - **WHEN** an engineer needs to design issue create/update/workflow/comment flows
 - **THEN** the knowledge base SHALL provide a domain section listing the required ONES endpoints and their required scopes
+
+### Requirement: Webhook Delivery and Acknowledgment Contract
+The knowledge base SHALL describe ONES Webhook delivery semantics, including notification and heartbeat message types, acknowledgment protocol, retry policy, and disable/re-enable behavior.
+
+#### Scenario: Service receives webhook notification
+- **WHEN** an integration service receives an ONES webhook payload
+- **THEN** the service contract guidance SHALL require returning the payload `id` as plain response body acknowledgment
+
+#### Scenario: Delivery failure handling
+- **WHEN** acknowledgments are not received by ONES within the documented retry window
+- **THEN** the knowledge base SHALL specify that ONES retries (5-second timeout, up to 3 retries) and may disable delivery after prolonged acknowledgment failure, requiring manual re-enable
 
 ### Requirement: Normative Call Contract Guidance
 For integration-critical endpoints, the knowledge base SHALL document required request location and shapes, including path/query parameters, request body media type, and expected response envelope conventions.
