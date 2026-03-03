@@ -78,6 +78,7 @@ export function AgentDashboardPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [countsError, setCountsError] = useState<string | null>(null);
   const [replyBody, setReplyBody] = useState("");
   const [internalNote, setInternalNote] = useState("");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -88,19 +89,22 @@ export function AgentDashboardPage() {
   const loadQueue = async () => {
     setLoading(true);
     setError(null);
+    setCountsError(null);
     try {
-      const [list, queueCounts] = await Promise.all([
-        listSupportTickets({
-          queue,
-          assignee: queue === "my_all" || queue === "waiting_my_reply" ? assignee : undefined,
-          status: statusFilter === "ALL" ? undefined : statusFilter,
-          priority: priorityFilter === "ALL" ? undefined : priorityFilter,
-          sort: "sla_risk"
-        }),
-        getSupportQueueCounts(assignee)
-      ]);
+      const list = await listSupportTickets({
+        queue,
+        assignee: queue === "my_all" || queue === "waiting_my_reply" ? assignee : undefined,
+        status: statusFilter === "ALL" ? undefined : statusFilter,
+        priority: priorityFilter === "ALL" ? undefined : priorityFilter,
+        sort: "sla_risk"
+      });
       setRows(list);
-      setCounts(queueCounts);
+      try {
+        const queueCounts = await getSupportQueueCounts(assignee);
+        setCounts(queueCounts);
+      } catch (countErr) {
+        setCountsError((countErr as Error).message);
+      }
       if (!selectedTicketId && list.length > 0) {
         setSelectedTicketId(list[0].id);
       }
@@ -272,12 +276,16 @@ export function AgentDashboardPage() {
 
   const toggleAiMode = async () => {
     if (!aiMode || aiModeLoading) return;
-    const reason = window.prompt("Reason for AI mode switch:", "support_operation") || "support_operation";
+    const nextEnabled = !aiMode.enabled;
+    setAiMode({ ...aiMode, enabled: nextEnabled });
     setSaving(true);
     try {
-      const mode = await setAiAgentMode(!aiMode.enabled, "support_admin", reason);
+      const mode = await setAiAgentMode(nextEnabled, "support_admin", "support_operation");
       setAiMode(mode);
       await loadQueue();
+    } catch (err) {
+      setAiMode(aiMode);
+      setError((err as Error).message);
     } finally {
       setSaving(false);
     }
@@ -360,6 +368,7 @@ export function AgentDashboardPage() {
               <p>SLA Queue Opens: {uxMetrics.slaAtRiskQueueSelections}</p>
             </div>
           )}
+          {countsError && <p className="mt-2 text-xs text-amber-700">Queue counts unavailable. List still loaded.</p>}
         </aside>
 
         <section className="rounded-mdplus border border-[#EBECF0] bg-[#FAFAFB] p-3">

@@ -22,6 +22,20 @@ interface QueueParams {
   sort: "sla_risk" | "updated_desc" | "created_desc";
 }
 
+let cachedTicketColumns: Set<string> | null = null;
+let cachedTicketColumnsAt = 0;
+
+async function getTicketColumns(): Promise<Set<string>> {
+  const now = Date.now();
+  if (cachedTicketColumns && now - cachedTicketColumnsAt < 60_000) return cachedTicketColumns;
+  const columns = await pool.query<{ column_name: string }>(
+    "SELECT column_name FROM information_schema.columns WHERE table_name = 'tickets'"
+  );
+  cachedTicketColumns = new Set(columns.rows.map((r) => r.column_name));
+  cachedTicketColumnsAt = now;
+  return cachedTicketColumns;
+}
+
 function computeSlaRisk(due: string | null): "healthy" | "at_risk" | "breached" {
   if (!due) return "healthy";
   const diff = new Date(due).getTime() - Date.now();
@@ -68,10 +82,7 @@ function matchesQueue(row: Record<string, unknown>, queue: QueueKey, assignee?: 
 }
 
 export async function listQueue(params: QueueParams) {
-  const columns = await pool.query<{ column_name: string }>(
-    "SELECT column_name FROM information_schema.columns WHERE table_name = 'tickets'"
-  );
-  const supported = new Set(columns.rows.map((r) => r.column_name));
+  const supported = await getTicketColumns();
 
   const has = (name: string) => supported.has(name);
   const resolutionDueExpr = has("resolution_due_at") ? "t.resolution_due_at" : "t.sla_due_at";
@@ -159,11 +170,7 @@ export async function listQueue(params: QueueParams) {
 
 export async function getQueueCounts(assignee?: string) {
   const keys: QueueKey[] = ["sla_at_risk", "ai_suggested", "new_assigned", "waiting_my_reply", "my_all", "resolved"];
-  const entries = await Promise.all(
-    keys.map(async (key) => {
-      const rows = await listQueue({ queue: key, assignee, sort: "sla_risk" });
-      return [key, rows.length] as const;
-    })
-  );
+  const allRows = await listQueue({ queue: "all", assignee, sort: "sla_risk" });
+  const entries = keys.map((key) => [key, allRows.filter((row) => matchesQueue(row as Record<string, unknown>, key, assignee)).length] as const);
   return Object.fromEntries(entries);
 }

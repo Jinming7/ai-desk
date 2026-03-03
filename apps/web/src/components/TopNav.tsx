@@ -4,6 +4,7 @@ import { BrandLogoUsage } from "./BrandLogoUsage";
 
 export function TopNav({ mode }: { mode: "customer" | "internal" }) {
   const location = useLocation();
+  const menu = new URLSearchParams(location.search).get("menu");
 
   const links =
     mode === "customer"
@@ -25,7 +26,13 @@ export function TopNav({ mode }: { mode: "customer" | "internal" }) {
               key={link.to}
               to={link.to}
               className={`text-sm font-medium ${
-                location.pathname === link.to || (link.to.includes("?menu=") && location.pathname === "/support")
+                (() => {
+                  if (link.to === "/support") return location.pathname === "/support" && !menu;
+                  if (link.to === "/support?menu=operations") return location.pathname === "/support" && menu === "operations";
+                  if (link.to === "/support?menu=insights") return location.pathname === "/support" && menu === "insights";
+                  if (link.to === "/support/admin/ones-sync") return location.pathname === "/support/admin/ones-sync";
+                  return false;
+                })()
                   ? "text-brand-500"
                   : "text-muted hover:text-ink"
               }`}
