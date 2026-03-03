@@ -66,6 +66,7 @@ export function AgentDashboardPage() {
   const [internalNote, setInternalNote] = useState("");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [aiMode, setAiMode] = useState<{ enabled: boolean; updatedAt: string; updatedBy: string } | null>(null);
+  const [aiModeLoading, setAiModeLoading] = useState(true);
   const [uxMetrics, setUxMetrics] = useState<{ firstActionLatencySecondsAvg: number; aiSuggestionAdoptionRate: number; slaAtRiskQueueSelections: number; actionsExecuted: number } | null>(null);
 
   const loadQueue = async () => {
@@ -128,8 +129,23 @@ export function AgentDashboardPage() {
   }, [selectedTicketId]);
 
   useEffect(() => {
-    getAiAgentMode().then(setAiMode).catch(() => setAiMode(null));
+    let cancelled = false;
+    const loadAiMode = async () => {
+      setAiModeLoading(true);
+      try {
+        const mode = await getAiAgentMode();
+        if (!cancelled) setAiMode(mode);
+      } catch {
+        if (!cancelled) setAiMode(null);
+      } finally {
+        if (!cancelled) setAiModeLoading(false);
+      }
+    };
+    void loadAiMode();
     getSupportUxMetrics().then(setUxMetrics).catch(() => setUxMetrics(null));
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const selectedRow = useMemo(() => rows.find((r) => r.id === selectedTicketId) ?? null, [rows, selectedTicketId]);
@@ -239,11 +255,16 @@ export function AgentDashboardPage() {
   };
 
   const toggleAiMode = async () => {
-    if (!aiMode) return;
+    if (!aiMode || aiModeLoading) return;
     const reason = window.prompt("Reason for AI mode switch:", "support_operation") || "support_operation";
-    const mode = await setAiAgentMode(!aiMode.enabled, "support_admin", reason);
-    setAiMode(mode);
-    await loadQueue();
+    setSaving(true);
+    try {
+      const mode = await setAiAgentMode(!aiMode.enabled, "support_admin", reason);
+      setAiMode(mode);
+      await loadQueue();
+    } finally {
+      setSaving(false);
+    }
   };
 
   if (!featureV2) {
@@ -256,26 +277,34 @@ export function AgentDashboardPage() {
   }
 
   return (
-    <div className="mx-auto max-w-[1440px] px-4 py-6 md:px-6">
-      <div className="mb-4 flex items-center justify-between gap-3 rounded-mdplus border border-slate-200 bg-white p-3">
+    <div className="mx-auto max-w-[1680px] px-4 py-6 md:px-6">
+      <div className="mb-4 flex items-center justify-between gap-3 rounded-mdplus border border-slate-200 bg-white p-4">
         <div>
-          <h1 className="text-xl font-semibold text-[#16171A]">Support Agent Workbench</h1>
-          <p className="text-xs text-slate-500">Guidance-first console: priority to context to action</p>
+          <h1 className="text-2xl font-semibold text-[#16171A]">Support Agent Workbench</h1>
+          <p className="text-sm text-slate-500">Guidance-first console: priority to context to action</p>
         </div>
         <div className="flex items-center gap-2">
-          <span className={`rounded-full px-2 py-1 text-xs ${aiMode?.enabled ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>
-            {aiMode?.enabled ? "AI ON" : "AI OFF"}
+          <span
+            className={`rounded-full px-2 py-1 text-xs ${
+              aiModeLoading ? "bg-slate-100 text-slate-600" : aiMode?.enabled ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"
+            }`}
+          >
+            {aiModeLoading ? "AI Mode Syncing" : aiMode?.enabled ? "AI ON: First-line automation" : "AI OFF: Manual support"}
           </span>
-          <button className="rounded border border-slate-200 px-3 py-1 text-xs" onClick={() => void toggleAiMode()}>
-            {aiMode?.enabled ? "Switch OFF" : "Switch ON"}
+          <button
+            className="rounded border border-slate-200 px-3 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-60"
+            onClick={() => void toggleAiMode()}
+            disabled={aiModeLoading || saving || !aiMode}
+          >
+            {aiModeLoading ? "Loading..." : aiMode?.enabled ? "Switch OFF" : "Switch ON"}
           </button>
         </div>
       </div>
 
-      <div className="grid gap-3 xl:grid-cols-[260px_1fr_520px]">
+      <div className="grid min-h-[calc(100vh-180px)] gap-3 xl:grid-cols-[minmax(220px,280px)_minmax(360px,35fr)_minmax(560px,65fr)]">
         <aside className="rounded-mdplus border border-slate-200 bg-white p-3">
           <p className="mb-2 text-xs font-semibold uppercase text-slate-500">Smart Queues</p>
-          <div className="space-y-1">
+          <div className="space-y-1.5">
             {queues.map((item) => {
               const Icon = item.icon;
               const active = queue === item.key;
@@ -333,13 +362,13 @@ export function AgentDashboardPage() {
             <button className="rounded border border-slate-200 px-2 py-1 text-xs" onClick={() => void bulkAction("priority")}>Bulk Priority P2</button>
             <button className="rounded border border-rose-200 px-2 py-1 text-xs text-rose-700" onClick={() => void bulkAction("escalate")}>Bulk Escalate</button>
           </div>
-          <div className="space-y-2 overflow-auto">
+          <div className="space-y-3 overflow-auto">
             {loading && <p className="text-sm text-slate-500">Loading queue...</p>}
             {rows.map((row) => (
               <button
                 key={row.id}
                 onClick={() => setSelectedTicketId(row.id)}
-                className={`w-full rounded-mdplus border p-3 text-left ${selectedTicketId === row.id ? "border-brand-300 bg-brand-50/40" : "border-slate-200 bg-white hover:bg-slate-50"}`}
+                className={`w-full rounded-mdplus border p-4 text-left transition ${selectedTicketId === row.id ? "border-slate-300 border-l-4 border-l-brand-500 bg-[#F3F4F6]" : "border-slate-200 bg-white hover:bg-slate-50"}`}
               >
                 <div className="mb-1 flex items-center justify-between gap-2">
                   <span className="font-semibold text-[#16171A]">{row.customer_name} - {row.title}</span>
@@ -352,10 +381,11 @@ export function AgentDashboardPage() {
                     }}
                   />
                 </div>
-                <p className="text-xs text-slate-600">
-                  AI Summary: {row.triage_reasoning_summary || "AI has not produced a summary yet. Open detail and triage manually."}
+                <p className="mt-2 flex items-start gap-1.5 text-sm leading-6 text-[#4B5563]">
+                  <Sparkles size={14} className="mt-1 shrink-0 text-brand-600" />
+                  <span>{row.triage_reasoning_summary || "AI summary is not available yet. Open detail to process manually."}</span>
                 </p>
-                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
                   <span>{row.ticket_no}</span>
                   <span className="text-slate-400">|</span>
                   <span>{row.assignee_name}</span>
@@ -368,14 +398,14 @@ export function AgentDashboardPage() {
           </div>
         </section>
 
-        <section className="rounded-mdplus border border-slate-200 bg-white p-3">
+        <section className="rounded-mdplus border border-slate-200 bg-white p-4">
           {detailLoading && <div className="flex items-center gap-2 text-sm text-slate-500"><Loader2 size={14} className="animate-spin" />Loading detail...</div>}
           {!ticketDetail && !detailLoading && <p className="text-sm text-slate-500">Select a ticket to view detail and actions.</p>}
           {ticketDetail && (
             <div className="space-y-3">
-              <header className="rounded border border-slate-200 bg-slate-50 p-3">
+              <header className="rounded border border-slate-200 bg-slate-50 p-4">
                 <p className="text-xs text-slate-500">{ticketDetail.ticket_no}</p>
-                <h2 className="text-lg font-semibold text-[#16171A]">{ticketDetail.title}</h2>
+                <h2 className="text-2xl font-semibold text-[#16171A]">{ticketDetail.title}</h2>
                 <div className="mt-2 flex items-center gap-2">
                   <StatusBadge status={ticketDetail.status} />
                   <span className={`rounded-full px-2 py-1 text-xs ${toneByRisk(selectedRow?.sla_risk)}`}>
@@ -384,9 +414,9 @@ export function AgentDashboardPage() {
                 </div>
               </header>
 
-              <div className="rounded border border-brand-100 bg-brand-50 p-3">
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 shadow-sm">
                 <p className="mb-1 text-xs font-semibold uppercase text-brand-700">AI Insight & Suggestion</p>
-                <p className="text-sm text-slate-700">{selectedRow?.triage_reasoning_summary || "No AI summary available."}</p>
+                <p className="text-sm leading-6 text-slate-700">{selectedRow?.triage_reasoning_summary || "No AI summary available."}</p>
                 <p className="mt-1 text-xs text-slate-600">Confidence: {ticketDetail.ai_last_confidence ?? selectedRow?.triage_confidence ?? "-"} | Trace: {ticketDetail.ai_last_trace_id ?? "-"}</p>
                 <div className="mt-2 flex gap-2">
                   <button className="rounded border border-brand-300 bg-white px-2 py-1 text-xs" onClick={() => void applyAiSuggestion()}>
