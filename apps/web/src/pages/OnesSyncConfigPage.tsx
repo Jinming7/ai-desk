@@ -75,6 +75,7 @@ export function OnesSyncConfigPage() {
     retries: number;
     dataSourceMode: "ones_primary" | "local_mirror";
     onesProjectKey: string;
+    onesTeamId: string;
     updatedBy: string;
     updatedAt: string;
   }>({
@@ -91,13 +92,14 @@ export function OnesSyncConfigPage() {
     retries: 1,
     dataSourceMode: "ones_primary",
     onesProjectKey: "",
+    onesTeamId: "",
     updatedBy: "-",
     updatedAt: "-"
   });
 
   const selectedTypeDetail = useMemo(() => ticketTypes.find((t) => t.key === selectedType) ?? null, [selectedType, ticketTypes]);
 
-  const load = async () => {
+  const load = async (options?: { keepAuthSecret?: boolean }) => {
     setLoading(true);
     setError(null);
     try {
@@ -109,12 +111,12 @@ export function OnesSyncConfigPage() {
         getOnesSyncHealth().catch(() => null)
       ]);
       if (config) {
-        setForm({
+        setForm((prev) => ({
           profileName: config.profileName,
           baseUrl: config.baseUrl,
           authType: config.authType,
           authHeader: config.authHeader,
-          authSecret: "",
+          authSecret: options?.keepAuthSecret ? prev.authSecret : "",
           createTicketPath: config.createTicketPath,
           listProjectsPath: config.listProjectsPath,
           listTicketTypesPath: config.listTicketTypesPath,
@@ -123,9 +125,10 @@ export function OnesSyncConfigPage() {
           retries: config.retries,
           dataSourceMode: config.dataSourceMode,
           onesProjectKey: config.onesProjectKey ?? "",
+          onesTeamId: config.onesTeamId ?? "",
           updatedBy: config.updatedBy,
           updatedAt: config.updatedAt
-        });
+        }));
       }
       setCatalogStatus(status);
       setTicketTypes(types);
@@ -183,10 +186,11 @@ export function OnesSyncConfigPage() {
         retries: form.retries,
         dataSourceMode: form.dataSourceMode,
         onesProjectKey: form.onesProjectKey,
+        onesTeamId: form.onesTeamId,
         actor: "support_admin"
       });
       setSuccess("Configuration updated.");
-      await load();
+      await load({ keepAuthSecret: true });
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -260,6 +264,7 @@ export function OnesSyncConfigPage() {
           <h2 className="text-sm font-semibold text-[#16171A]">Connection</h2>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Profile Name" value={form.profileName} onChange={(e) => setForm((p) => ({ ...p, profileName: e.target.value }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="ONES Team ID (required for project discovery)" value={form.onesTeamId} onChange={(e) => setForm((p) => ({ ...p, onesTeamId: e.target.value }))} />
             {projects.length > 0 ? (
               <select className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))}>
                 <option value="">Select ONES Project</option>
@@ -289,11 +294,12 @@ export function OnesSyncConfigPage() {
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Fields Path Template" value={form.listFieldsPathTemplate} onChange={(e) => setForm((p) => ({ ...p, listFieldsPathTemplate: e.target.value }))} />
           </div>
           <div className="mt-3 flex gap-2">
-            <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || !form.authSecret} onClick={() => void discoverOnesProjects({
+            <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || !form.authSecret || !form.onesTeamId} onClick={() => void discoverOnesProjects({
               baseUrl: form.baseUrl,
               authType: form.authType,
               authHeader: form.authHeader,
               authSecret: form.authSecret,
+              teamId: form.onesTeamId,
               listProjectsPath: form.listProjectsPath,
               timeoutMs: form.timeoutMs
             }).then((rows) => {

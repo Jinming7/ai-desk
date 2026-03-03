@@ -135,6 +135,7 @@ export interface OnesSyncConfig {
   retries: number;
   dataSourceMode: "ones_primary" | "local_mirror";
   onesProjectKey?: string | null;
+  onesTeamId?: string | null;
   schemaHash?: string | null;
   schemaSyncedAt?: string | null;
   updatedBy: string;

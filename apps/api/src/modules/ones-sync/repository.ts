@@ -16,6 +16,7 @@ export interface OnesSyncConfigRecord {
   retries: number;
   data_source_mode: "ones_primary" | "local_mirror";
   ones_project_key: string | null;
+  ones_team_id: string | null;
   schema_hash: string | null;
   schema_synced_at: string | null;
   is_active: boolean;
@@ -68,6 +69,7 @@ export async function upsertActiveConfig(input: {
   retries: number;
   dataSourceMode: "ones_primary" | "local_mirror";
   onesProjectKey?: string | null;
+  onesTeamId?: string | null;
   schemaHash?: string | null;
   schemaSyncedAt?: string | null;
   updatedBy: string;
@@ -78,8 +80,8 @@ export async function upsertActiveConfig(input: {
     `INSERT INTO ones_sync_config (
       id, profile_name, base_url, auth_type, auth_header, auth_secret_encrypted,
       create_ticket_path, list_projects_path, list_ticket_types_path, list_fields_path_template,
-      timeout_ms, retries, data_source_mode, ones_project_key, schema_hash, schema_synced_at, is_active, updated_by
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,true,$17)
+      timeout_ms, retries, data_source_mode, ones_project_key, ones_team_id, schema_hash, schema_synced_at, is_active, updated_by
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,true,$18)
     RETURNING *`,
     [
       id,
@@ -96,6 +98,7 @@ export async function upsertActiveConfig(input: {
       input.retries,
       input.dataSourceMode,
       input.onesProjectKey ?? null,
+      input.onesTeamId ?? null,
       input.schemaHash ?? null,
       input.schemaSyncedAt ?? null,
       input.updatedBy

@@ -370,6 +370,7 @@ export async function updateOnesSyncConfig(input: {
   retries: number;
   dataSourceMode: "ones_primary" | "local_mirror";
   onesProjectKey?: string;
+  onesTeamId?: string;
   actor?: string;
 }): Promise<OnesSyncConfig> {
   const res = await fetch(`${API}/api/v1/internal/configuration/config`, {
@@ -493,6 +494,7 @@ export async function discoverOnesProjects(input: {
   authType: "bearer" | "header";
   authHeader: string;
   authSecret: string;
+  teamId: string;
   listProjectsPath: string;
   timeoutMs: number;
 }) {

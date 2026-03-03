@@ -19,6 +19,7 @@ const configInputSchema = z.object({
   retries: z.coerce.number().int().min(0).max(3).default(1),
   dataSourceMode: z.enum(["ones_primary", "local_mirror"]).default("ones_primary"),
   onesProjectKey: z.string().optional(),
+  onesTeamId: z.string().optional(),
   actor: z.string().min(1).default("internal_operator")
 });
 
@@ -235,6 +236,7 @@ export async function getConfig() {
     retries: config.retries,
     dataSourceMode: config.data_source_mode,
     onesProjectKey: config.ones_project_key,
+    onesTeamId: config.ones_team_id,
     schemaHash: config.schema_hash,
     schemaSyncedAt: config.schema_synced_at,
     updatedBy: config.updated_by,
@@ -258,6 +260,7 @@ export async function upsertConfig(input: unknown) {
     retries: parsed.retries,
     dataSourceMode: parsed.dataSourceMode,
     onesProjectKey: parsed.onesProjectKey,
+    onesTeamId: parsed.onesTeamId,
     updatedBy: parsed.actor
   });
   await repo.addOnesSyncAudit({
@@ -281,6 +284,7 @@ export async function upsertConfig(input: unknown) {
     retries: saved.retries,
     dataSourceMode: saved.data_source_mode,
     onesProjectKey: saved.ones_project_key,
+    onesTeamId: saved.ones_team_id,
     schemaHash: saved.schema_hash,
     schemaSyncedAt: saved.schema_synced_at,
     updatedBy: saved.updated_by,
@@ -324,6 +328,7 @@ export async function discoverTicketTypes(actor = "internal_operator") {
     retries: config.retries,
     dataSourceMode: config.data_source_mode,
     onesProjectKey: config.ones_project_key,
+    onesTeamId: config.ones_team_id,
     schemaHash,
     schemaSyncedAt: new Date().toISOString(),
     updatedBy: actor
@@ -353,6 +358,7 @@ export async function discoverProjects(input: unknown) {
     authType: z.enum(["bearer", "header"]),
     authHeader: z.string().min(1),
     authSecret: z.string().min(1),
+    teamId: z.string().min(1),
     listProjectsPath: z.string().min(1).default("/api/v1/projects"),
     timeoutMs: z.coerce.number().int().positive().max(60000).default(12000)
   }).parse(input);
@@ -364,12 +370,22 @@ export async function discoverProjects(input: unknown) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), parsed.timeoutMs);
   try {
-    const res = await fetch(withPath(parsed.baseUrl, parsed.listProjectsPath), { headers, signal: controller.signal });
+    const pathWithTeam = parsed.listProjectsPath.includes("{team_id}")
+      ? parsed.listProjectsPath.replaceAll("{team_id}", encodeURIComponent(parsed.teamId))
+      : parsed.listProjectsPath;
+    const requestUrl = new URL(withPath(parsed.baseUrl, pathWithTeam));
+    if (!parsed.listProjectsPath.includes("{team_id}") && !requestUrl.searchParams.has("team_id")) {
+      requestUrl.searchParams.set("team_id", parsed.teamId);
+    }
+    const res = await fetch(requestUrl.toString(), { headers, signal: controller.signal });
     if (!res.ok) {
       throw new Error(`ONES ${res.status}: ${await res.text()}`);
     }
     const raw = await res.json();
     return parseProjects(raw);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "request failed";
+    throw new Error(`Project discovery failed: ${message}`);
   } finally {
     clearTimeout(timer);
   }
