@@ -128,6 +128,7 @@ export interface OnesSyncConfig {
   authHeader: string;
   authSecretMasked: string;
   createTicketPath: string;
+  listProjectsPath: string;
   listTicketTypesPath: string;
   listFieldsPathTemplate: string;
   timeoutMs: number;

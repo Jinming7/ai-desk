@@ -334,6 +334,15 @@ app.post(
   })
 );
 
+app.post(
+  "/api/v1/internal/configuration/projects/discover",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const projects = await onesSyncService.discoverProjects(req.body);
+    res.json({ projects });
+  })
+);
+
 app.get(
   "/api/v1/internal/ones-sync/ticket-types",
   requireInternalRequest,

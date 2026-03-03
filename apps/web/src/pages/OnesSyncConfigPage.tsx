@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  discoverOnesProjects,
   discoverOnesTicketTypes,
   getOnesCatalogStatus,
   getOnesSyncConfig,
@@ -56,6 +57,7 @@ export function OnesSyncConfigPage() {
   const [draftId, setDraftId] = useState<string | null>(null);
   const [validation, setValidation] = useState<{ valid: boolean; errors: string[]; payload: Record<string, unknown> } | null>(null);
   const [catalogStatus, setCatalogStatus] = useState<OnesCatalogStatus | null>(null);
+  const [projects, setProjects] = useState<Array<{ key: string; name: string }>>([]);
   const [failedWebhookEvents, setFailedWebhookEvents] = useState<Array<{ id: string; event_type: string; ones_ticket_key: string | null; error: string | null; retries: number; received_at: string }>>([]);
   const [health, setHealth] = useState<{ failedWebhookCount: number; topErrors: string[]; updatedAt: string } | null>(null);
 
@@ -66,6 +68,7 @@ export function OnesSyncConfigPage() {
     authHeader: string;
     authSecret: string;
     createTicketPath: string;
+    listProjectsPath: string;
     listTicketTypesPath: string;
     listFieldsPathTemplate: string;
     timeoutMs: number;
@@ -81,6 +84,7 @@ export function OnesSyncConfigPage() {
     authHeader: "Authorization",
     authSecret: "",
     createTicketPath: "/api/v1/tickets",
+    listProjectsPath: "/api/v1/projects",
     listTicketTypesPath: "/api/v1/ticket-types",
     listFieldsPathTemplate: "/api/v1/ticket-types/{ticketTypeKey}/fields",
     timeoutMs: 12000,
@@ -112,6 +116,7 @@ export function OnesSyncConfigPage() {
           authHeader: config.authHeader,
           authSecret: "",
           createTicketPath: config.createTicketPath,
+          listProjectsPath: config.listProjectsPath,
           listTicketTypesPath: config.listTicketTypesPath,
           listFieldsPathTemplate: config.listFieldsPathTemplate,
           timeoutMs: config.timeoutMs,
@@ -171,6 +176,7 @@ export function OnesSyncConfigPage() {
         authHeader: form.authHeader,
         authSecret: form.authSecret,
         createTicketPath: form.createTicketPath,
+        listProjectsPath: form.listProjectsPath,
         listTicketTypesPath: form.listTicketTypesPath,
         listFieldsPathTemplate: form.listFieldsPathTemplate,
         timeoutMs: form.timeoutMs,
@@ -254,7 +260,18 @@ export function OnesSyncConfigPage() {
           <h2 className="text-sm font-semibold text-[#16171A]">Connection</h2>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Profile Name" value={form.profileName} onChange={(e) => setForm((p) => ({ ...p, profileName: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="ONES Project Key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
+            {projects.length > 0 ? (
+              <select className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))}>
+                <option value="">Select ONES Project</option>
+                {projects.map((project) => (
+                  <option key={project.key} value={project.key}>
+                    {project.name} ({project.key})
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="ONES Project Key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
+            )}
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Base URL" value={form.baseUrl} onChange={(e) => setForm((p) => ({ ...p, baseUrl: e.target.value }))} />
             <select className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.dataSourceMode} onChange={(e) => setForm((p) => ({ ...p, dataSourceMode: e.target.value as "ones_primary" | "local_mirror" }))}>
               <option value="ones_primary">ones_primary</option>
@@ -265,14 +282,31 @@ export function OnesSyncConfigPage() {
               <option value="header">Custom Header Token</option>
             </select>
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Auth Header" value={form.authHeader} onChange={(e) => setForm((p) => ({ ...p, authHeader: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Auth Secret (required to update)" value={form.authSecret} onChange={(e) => setForm((p) => ({ ...p, authSecret: e.target.value }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="password" placeholder="OpenAPI Access Token (required to update)" value={form.authSecret} onChange={(e) => setForm((p) => ({ ...p, authSecret: e.target.value }))} />
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Create Ticket Path" value={form.createTicketPath} onChange={(e) => setForm((p) => ({ ...p, createTicketPath: e.target.value }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Projects Path" value={form.listProjectsPath} onChange={(e) => setForm((p) => ({ ...p, listProjectsPath: e.target.value }))} />
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Ticket Types Path" value={form.listTicketTypesPath} onChange={(e) => setForm((p) => ({ ...p, listTicketTypesPath: e.target.value }))} />
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Fields Path Template" value={form.listFieldsPathTemplate} onChange={(e) => setForm((p) => ({ ...p, listFieldsPathTemplate: e.target.value }))} />
           </div>
-          <button className="mt-3 rounded-mdplus bg-brand-500 px-3 py-2 text-sm text-white disabled:opacity-70" disabled={saving} onClick={() => void saveConfig()}>
-            Save Configuration
-          </button>
+          <div className="mt-3 flex gap-2">
+            <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || !form.authSecret} onClick={() => void discoverOnesProjects({
+              baseUrl: form.baseUrl,
+              authType: form.authType,
+              authHeader: form.authHeader,
+              authSecret: form.authSecret,
+              listProjectsPath: form.listProjectsPath,
+              timeoutMs: form.timeoutMs
+            }).then((rows) => {
+              setProjects(rows);
+              if (rows[0]?.key) setForm((p) => ({ ...p, onesProjectKey: p.onesProjectKey || rows[0].key }));
+              setSuccess(`Fetched ${rows.length} projects.`);
+            }).catch((err) => setError((err as Error).message))}>
+              Discover Projects
+            </button>
+            <button className="rounded-mdplus bg-brand-500 px-3 py-2 text-sm text-white disabled:opacity-70" disabled={saving} onClick={() => void saveConfig()}>
+              Save Configuration
+            </button>
+          </div>
         </section>
       )}
 

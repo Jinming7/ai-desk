@@ -9,6 +9,7 @@ export interface OnesSyncConfigRecord {
   auth_header: string;
   auth_secret_encrypted: string;
   create_ticket_path: string;
+  list_projects_path: string;
   list_ticket_types_path: string;
   list_fields_path_template: string;
   timeout_ms: number;
@@ -60,6 +61,7 @@ export async function upsertActiveConfig(input: {
   authHeader: string;
   authSecretEncrypted: string;
   createTicketPath: string;
+  listProjectsPath: string;
   listTicketTypesPath: string;
   listFieldsPathTemplate: string;
   timeoutMs: number;
@@ -75,9 +77,9 @@ export async function upsertActiveConfig(input: {
   const result = await pool.query<OnesSyncConfigRecord>(
     `INSERT INTO ones_sync_config (
       id, profile_name, base_url, auth_type, auth_header, auth_secret_encrypted,
-      create_ticket_path, list_ticket_types_path, list_fields_path_template,
+      create_ticket_path, list_projects_path, list_ticket_types_path, list_fields_path_template,
       timeout_ms, retries, data_source_mode, ones_project_key, schema_hash, schema_synced_at, is_active, updated_by
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,true,$16)
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,true,$17)
     RETURNING *`,
     [
       id,
@@ -87,6 +89,7 @@ export async function upsertActiveConfig(input: {
       input.authHeader,
       input.authSecretEncrypted,
       input.createTicketPath,
+      input.listProjectsPath,
       input.listTicketTypesPath,
       input.listFieldsPathTemplate,
       input.timeoutMs,

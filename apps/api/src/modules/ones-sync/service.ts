@@ -12,6 +12,7 @@ const configInputSchema = z.object({
   authHeader: z.string().min(1).default("Authorization"),
   authSecret: z.string().min(1),
   createTicketPath: z.string().min(1),
+  listProjectsPath: z.string().min(1).default("/api/v1/projects"),
   listTicketTypesPath: z.string().min(1),
   listFieldsPathTemplate: z.string().min(1),
   timeoutMs: z.coerce.number().int().positive().max(60000).default(12000),
@@ -69,6 +70,15 @@ function buildAuthHeaders(config: repo.OnesSyncConfigRecord, token: string): Rec
     };
   }
   return { [config.auth_header]: token };
+}
+
+function buildAuthHeadersFromInput(input: { authType: "bearer" | "header"; authHeader: string; authSecret: string }) {
+  if (input.authType === "bearer") {
+    return {
+      [input.authHeader]: input.authSecret.startsWith("Bearer ") ? input.authSecret : `Bearer ${input.authSecret}`
+    };
+  }
+  return { [input.authHeader]: input.authSecret };
 }
 
 async function onesFetch(config: repo.OnesSyncConfigRecord, path: string, init?: RequestInit) {
@@ -131,6 +141,20 @@ function parseFields(raw: unknown): unknown[] {
   const envelope = raw as Record<string, unknown>;
   const list = envelope.fields ?? envelope.data ?? [];
   return Array.isArray(list) ? list : [];
+}
+
+function parseProjects(raw: unknown): Array<{ key: string; name: string }> {
+  if (Array.isArray(raw)) {
+    return raw
+      .map((row) => row as Record<string, unknown>)
+      .map((row) => ({
+        key: String(row.key ?? row.uuid ?? row.id ?? ""),
+        name: String(row.name ?? row.title ?? row.key ?? row.id ?? "")
+      }))
+      .filter((row) => row.key);
+  }
+  const envelope = raw as Record<string, unknown>;
+  return parseProjects(envelope.projects ?? envelope.data ?? envelope.items ?? []);
 }
 
 function resolveSource(path: string, context: Record<string, unknown>): unknown {
@@ -204,6 +228,7 @@ export async function getConfig() {
     authHeader: config.auth_header,
     authSecretMasked: maskSecret(decryptSecret(config.auth_secret_encrypted)),
     createTicketPath: config.create_ticket_path,
+    listProjectsPath: config.list_projects_path,
     listTicketTypesPath: config.list_ticket_types_path,
     listFieldsPathTemplate: config.list_fields_path_template,
     timeoutMs: config.timeout_ms,
@@ -226,6 +251,7 @@ export async function upsertConfig(input: unknown) {
     authHeader: parsed.authHeader,
     authSecretEncrypted: encryptSecret(parsed.authSecret),
     createTicketPath: parsed.createTicketPath,
+    listProjectsPath: parsed.listProjectsPath,
     listTicketTypesPath: parsed.listTicketTypesPath,
     listFieldsPathTemplate: parsed.listFieldsPathTemplate,
     timeoutMs: parsed.timeoutMs,
@@ -248,6 +274,7 @@ export async function upsertConfig(input: unknown) {
     authHeader: saved.auth_header,
     authSecretMasked: maskSecret(parsed.authSecret),
     createTicketPath: saved.create_ticket_path,
+    listProjectsPath: saved.list_projects_path,
     listTicketTypesPath: saved.list_ticket_types_path,
     listFieldsPathTemplate: saved.list_fields_path_template,
     timeoutMs: saved.timeout_ms,
@@ -290,6 +317,7 @@ export async function discoverTicketTypes(actor = "internal_operator") {
     authHeader: config.auth_header,
     authSecretEncrypted: config.auth_secret_encrypted,
     createTicketPath: config.create_ticket_path,
+    listProjectsPath: config.list_projects_path,
     listTicketTypesPath: config.list_ticket_types_path,
     listFieldsPathTemplate: config.list_fields_path_template,
     timeoutMs: config.timeout_ms,
@@ -317,6 +345,34 @@ export async function listTicketTypes() {
     fields: row.fields_json,
     syncedAt: row.synced_at
   }));
+}
+
+export async function discoverProjects(input: unknown) {
+  const parsed = z.object({
+    baseUrl: z.string().url(),
+    authType: z.enum(["bearer", "header"]),
+    authHeader: z.string().min(1),
+    authSecret: z.string().min(1),
+    listProjectsPath: z.string().min(1).default("/api/v1/projects"),
+    timeoutMs: z.coerce.number().int().positive().max(60000).default(12000)
+  }).parse(input);
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...buildAuthHeadersFromInput(parsed)
+  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), parsed.timeoutMs);
+  try {
+    const res = await fetch(withPath(parsed.baseUrl, parsed.listProjectsPath), { headers, signal: controller.signal });
+    if (!res.ok) {
+      throw new Error(`ONES ${res.status}: ${await res.text()}`);
+    }
+    const raw = await res.json();
+    return parseProjects(raw);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function saveDraftMapping(input: unknown) {
@@ -597,6 +653,7 @@ export async function bootstrapDefaultConfigIfMissing() {
     authHeader: "Authorization",
     authSecretEncrypted: encryptSecret(""),
     createTicketPath: env.ONES_SYNC_DEFAULT_CREATE_TICKET_PATH,
+    listProjectsPath: env.ONES_SYNC_DEFAULT_PROJECTS_PATH,
     listTicketTypesPath: env.ONES_SYNC_DEFAULT_TICKET_TYPES_PATH,
     listFieldsPathTemplate: env.ONES_SYNC_DEFAULT_FIELDS_PATH_TEMPLATE,
     timeoutMs: 12000,

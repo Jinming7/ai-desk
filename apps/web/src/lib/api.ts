@@ -363,6 +363,7 @@ export async function updateOnesSyncConfig(input: {
   authHeader: string;
   authSecret: string;
   createTicketPath: string;
+  listProjectsPath: string;
   listTicketTypesPath: string;
   listFieldsPathTemplate: string;
   timeoutMs: number;
@@ -485,6 +486,25 @@ export async function getOnesCatalogStatus(): Promise<OnesCatalogStatus> {
   });
   if (!res.ok) throw new Error("Failed to load ONES catalog status");
   return (await res.json()).status;
+}
+
+export async function discoverOnesProjects(input: {
+  baseUrl: string;
+  authType: "bearer" | "header";
+  authHeader: string;
+  authSecret: string;
+  listProjectsPath: string;
+  timeoutMs: number;
+}) {
+  const res = await fetch(`${API}/api/v1/internal/configuration/projects/discover`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(input)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to discover ONES projects");
+  return (await res.json()).projects as Array<{ key: string; name: string }>;
 }
 
 export async function listFailedWebhookEvents() {
