@@ -41,10 +41,26 @@ function formatRemaining(due: string | null | undefined) {
   return `${hours}h ${mins}m`;
 }
 
-function toneByRisk(risk: AgentQueueTicket["sla_risk"]) {
-  if (risk === "breached") return "bg-rose-50 text-rose-700";
-  if (risk === "at_risk") return "bg-amber-50 text-amber-700";
-  return "bg-emerald-50 text-emerald-700";
+function slaMsRemaining(due: string | null | undefined) {
+  if (!due) return null;
+  return new Date(due).getTime() - Date.now();
+}
+
+function getSlaPill(due: string | null | undefined) {
+  const remaining = slaMsRemaining(due);
+  if (remaining === null) {
+    return { text: "No SLA", textClass: "text-slate-600", dotClass: "bg-slate-500", dotDuration: "2.5s" };
+  }
+  if (remaining <= 0) {
+    return { text: "Overdue", textClass: "text-rose-700", dotClass: "bg-rose-500", dotDuration: "0.8s" };
+  }
+  if (remaining <= 60 * 60 * 1000) {
+    return { text: formatRemaining(due), textClass: "text-rose-700", dotClass: "bg-rose-500", dotDuration: "0.8s" };
+  }
+  if (remaining <= 4 * 60 * 60 * 1000) {
+    return { text: formatRemaining(due), textClass: "text-amber-700", dotClass: "bg-amber-500", dotDuration: "1.8s" };
+  }
+  return { text: formatRemaining(due), textClass: "text-slate-700", dotClass: "bg-slate-500", dotDuration: "2.5s" };
 }
 
 export function AgentDashboardPage() {
@@ -277,8 +293,8 @@ export function AgentDashboardPage() {
   }
 
   return (
-    <div className="mx-auto max-w-[1680px] px-4 py-6 md:px-6">
-      <div className="mb-4 flex items-center justify-between gap-3 rounded-mdplus border border-slate-200 bg-white p-4">
+    <div className="mx-auto max-w-[1720px] px-4 py-5 md:px-6">
+      <div className="mb-3 flex items-center justify-between gap-3 rounded-mdplus border border-[#EBECF0] bg-white p-4">
         <div>
           <h1 className="text-2xl font-semibold text-[#16171A]">Support Agent Workbench</h1>
           <p className="text-sm text-slate-500">Guidance-first console: priority to context to action</p>
@@ -292,17 +308,27 @@ export function AgentDashboardPage() {
             {aiModeLoading ? "AI Mode Syncing" : aiMode?.enabled ? "AI ON: First-line automation" : "AI OFF: Manual support"}
           </span>
           <button
-            className="rounded border border-slate-200 px-3 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-60"
+            type="button"
+            role="switch"
+            aria-checked={Boolean(aiMode?.enabled)}
+            aria-label="Toggle AI mode"
+            className={`relative inline-flex h-7 w-12 items-center rounded-full transition disabled:cursor-not-allowed disabled:opacity-60 ${
+              aiMode?.enabled ? "bg-[#0064FF]" : "bg-slate-300"
+            }`}
             onClick={() => void toggleAiMode()}
             disabled={aiModeLoading || saving || !aiMode}
           >
-            {aiModeLoading ? "Loading..." : aiMode?.enabled ? "Switch OFF" : "Switch ON"}
+            <span
+              className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition ${
+                aiMode?.enabled ? "translate-x-6" : "translate-x-1"
+              }`}
+            />
           </button>
         </div>
       </div>
 
       <div className="grid min-h-[calc(100vh-180px)] gap-3 xl:grid-cols-[minmax(220px,280px)_minmax(360px,35fr)_minmax(560px,65fr)]">
-        <aside className="rounded-mdplus border border-slate-200 bg-white p-3">
+        <aside className="rounded-mdplus border border-[#EBECF0] bg-[#F7F8FA] p-3">
           <p className="mb-2 text-xs font-semibold uppercase text-slate-500">Smart Queues</p>
           <div className="space-y-1.5">
             {queues.map((item) => {
@@ -312,15 +338,17 @@ export function AgentDashboardPage() {
                 <button
                   key={item.key}
                   onClick={() => void changeQueue(item.key)}
-                  className={`flex w-full items-center justify-between rounded px-2 py-2 text-left text-sm ${active ? "bg-brand-50 text-brand-700" : "hover:bg-slate-50"}`}
+                  className={`flex w-full items-center justify-between rounded-md px-2.5 py-2.5 text-left text-sm transition ${
+                    active ? "bg-[#3B82F6] text-white shadow-sm" : "text-slate-700 hover:bg-white"
+                  }`}
                 >
                   <span className="flex items-center gap-2">
-                    <span className={`rounded p-1 ${item.tone}`}>
-                      <Icon size={14} />
+                    <span className={`rounded p-1 ${active ? "bg-white/20 text-white" : item.tone}`}>
+                      <Icon size={20} />
                     </span>
                     {item.label}
                   </span>
-                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs">{counts[item.key] ?? 0}</span>
+                  <span className={`rounded-full px-2 py-0.5 text-xs ${active ? "bg-white/25 text-white" : "bg-slate-200 text-slate-700"}`}>{counts[item.key] ?? 0}</span>
                 </button>
               );
             })}
@@ -334,7 +362,16 @@ export function AgentDashboardPage() {
           )}
         </aside>
 
-        <section className="rounded-mdplus border border-slate-200 bg-white p-3">
+        <section className="rounded-mdplus border border-[#EBECF0] bg-[#FAFAFB] p-3">
+          <div className="mb-3 flex items-center justify-between rounded border border-[#EBECF0] bg-white px-3 py-2">
+            <p className="text-sm font-semibold text-[#16171A]">Ticket List</p>
+            <div className="flex items-center gap-2 text-xs text-slate-500">
+              <span>Sort: SLA risk</span>
+              <span className="text-[#EBECF0]">|</span>
+              <span>{rows.length} tickets</span>
+            </div>
+          </div>
+
           <div className="mb-3 grid gap-2 md:grid-cols-4">
             <input className="h-9 rounded border border-slate-200 px-2 text-sm" value={assignee} onChange={(e) => setAssignee(e.target.value)} placeholder="Assignee" />
             <select className="h-9 rounded border border-slate-200 px-2 text-sm" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as typeof statusFilter)}>
@@ -365,11 +402,7 @@ export function AgentDashboardPage() {
           <div className="space-y-3 overflow-auto">
             {loading && <p className="text-sm text-slate-500">Loading queue...</p>}
             {rows.map((row) => (
-              <button
-                key={row.id}
-                onClick={() => setSelectedTicketId(row.id)}
-                className={`w-full rounded-mdplus border p-4 text-left transition ${selectedTicketId === row.id ? "border-slate-300 border-l-4 border-l-brand-500 bg-[#F3F4F6]" : "border-slate-200 bg-white hover:bg-slate-50"}`}
-              >
+              <button key={row.id} onClick={() => setSelectedTicketId(row.id)} className={`w-full rounded-mdplus border p-4 text-left transition ${selectedTicketId === row.id ? "border-[#BFDBFE] border-l-2 border-l-[#0064FF] bg-[#EBF4FF]" : "border-[#EBECF0] bg-white hover:bg-slate-50"}`}>
                 <div className="mb-1 flex items-center justify-between gap-2">
                   <span className="font-semibold text-[#16171A]">{row.customer_name} - {row.title}</span>
                   <input
@@ -389,7 +422,15 @@ export function AgentDashboardPage() {
                   <span>{row.ticket_no}</span>
                   <span className="text-slate-400">|</span>
                   <span>{row.assignee_name}</span>
-                  <span className={`rounded-full px-2 py-0.5 ${toneByRisk(row.sla_risk)}`}>{formatRemaining(row.resolution_due_at ?? row.sla_due_at)}</span>
+                  {(() => {
+                    const pill = getSlaPill(row.resolution_due_at ?? row.sla_due_at);
+                    return (
+                      <span className={`inline-flex items-center gap-1.5 rounded-full bg-white px-2.5 py-1 ${pill.textClass}`}>
+                        <span className={`h-1.5 w-1.5 rounded-full ${pill.dotClass} animate-pulse`} style={{ animationDuration: pill.dotDuration }} />
+                        {pill.text}
+                      </span>
+                    );
+                  })()}
                   <StatusBadge status={row.status} />
                 </div>
               </button>
@@ -398,7 +439,11 @@ export function AgentDashboardPage() {
           </div>
         </section>
 
-        <section className="rounded-mdplus border border-slate-200 bg-white p-4">
+        <section className="rounded-mdplus border border-[#EBECF0] bg-white p-4">
+          <div className="mb-3 flex items-center justify-between rounded border border-[#EBECF0] bg-[#FAFAFB] px-3 py-2">
+            <p className="text-sm font-semibold text-[#16171A]">Ticket Detail & Actions</p>
+            {selectedRow ? <p className="text-xs text-slate-500">{selectedRow.ticket_no}</p> : <p className="text-xs text-slate-500">No ticket selected</p>}
+          </div>
           {detailLoading && <div className="flex items-center gap-2 text-sm text-slate-500"><Loader2 size={14} className="animate-spin" />Loading detail...</div>}
           {!ticketDetail && !detailLoading && <p className="text-sm text-slate-500">Select a ticket to view detail and actions.</p>}
           {ticketDetail && (
@@ -408,19 +453,28 @@ export function AgentDashboardPage() {
                 <h2 className="text-2xl font-semibold text-[#16171A]">{ticketDetail.title}</h2>
                 <div className="mt-2 flex items-center gap-2">
                   <StatusBadge status={ticketDetail.status} />
-                  <span className={`rounded-full px-2 py-1 text-xs ${toneByRisk(selectedRow?.sla_risk)}`}>
-                    SLA {selectedRow?.sla_risk ?? "healthy"} - {formatRemaining(ticketDetail.resolution_due_at ?? ticketDetail.sla_due_at)}
-                  </span>
+                  {(() => {
+                    const pill = getSlaPill(ticketDetail.resolution_due_at ?? ticketDetail.sla_due_at);
+                    return (
+                      <span className={`inline-flex items-center gap-1.5 rounded-full bg-white px-2.5 py-1 text-xs ${pill.textClass}`}>
+                        <span className={`h-1.5 w-1.5 rounded-full ${pill.dotClass} animate-pulse`} style={{ animationDuration: pill.dotDuration }} />
+                        SLA {pill.text}
+                      </span>
+                    );
+                  })()}
                 </div>
               </header>
 
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 shadow-sm">
-                <p className="mb-1 text-xs font-semibold uppercase text-brand-700">AI Insight & Suggestion</p>
+              <div className="rounded-lg border border-[#BFDBFE] bg-[#EFF6FF] p-4 shadow-sm">
+                <p className="mb-1 flex items-center gap-2 text-xs font-semibold uppercase text-brand-700">
+                  <Bot size={16} />
+                  AI Insight & Suggestion
+                </p>
                 <p className="text-sm leading-6 text-slate-700">{selectedRow?.triage_reasoning_summary || "No AI summary available."}</p>
                 <p className="mt-1 text-xs text-slate-600">Confidence: {ticketDetail.ai_last_confidence ?? selectedRow?.triage_confidence ?? "-"} | Trace: {ticketDetail.ai_last_trace_id ?? "-"}</p>
                 <div className="mt-2 flex gap-2">
-                  <button className="rounded border border-brand-300 bg-white px-2 py-1 text-xs" onClick={() => void applyAiSuggestion()}>
-                    One-click Apply
+                  <button className="rounded border border-[#93C5FD] bg-white px-2 py-1 text-xs text-[#1D4ED8]" onClick={() => void applyAiSuggestion()}>
+                    ✨ One-click Apply
                   </button>
                   <button className="rounded border border-slate-300 bg-white px-2 py-1 text-xs" onClick={() => void overrideAiSuggestion()}>
                     Manual Override
