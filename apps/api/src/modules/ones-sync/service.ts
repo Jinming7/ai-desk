@@ -458,16 +458,18 @@ export async function discoverProjects(input: unknown) {
   };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), parsed.timeoutMs);
+  let requestUrl = "";
   try {
     const pathWithTeam = resolvePathTemplate(parsed.listProjectsPath, { teamId: parsed.teamId });
-    const requestUrl = new URL(withPath(parsed.baseUrl, pathWithTeam));
+    const url = new URL(withPath(parsed.baseUrl, pathWithTeam));
     const hasTeamPlaceholder = parsed.listProjectsPath.includes("{team_id}") || parsed.listProjectsPath.includes("{teamID}");
-    if (!hasTeamPlaceholder && !requestUrl.searchParams.has("team_id") && !requestUrl.searchParams.has("teamID")) {
-      requestUrl.searchParams.set("teamID", parsed.teamId);
+    if (!hasTeamPlaceholder && !url.searchParams.has("team_id") && !url.searchParams.has("teamID")) {
+      url.searchParams.set("teamID", parsed.teamId);
     }
-    requestUrl.searchParams.set("limit", String(parsed.limit));
-    if (parsed.cursor) requestUrl.searchParams.set("cursor", parsed.cursor);
-    const res = await fetch(requestUrl.toString(), { headers, signal: controller.signal });
+    url.searchParams.set("limit", String(parsed.limit));
+    if (parsed.cursor) url.searchParams.set("cursor", parsed.cursor);
+    requestUrl = url.toString();
+    const res = await fetch(requestUrl, { headers, signal: controller.signal });
     if (!res.ok) {
       throw new Error(`ONES ${res.status}: ${await res.text()}`);
     }
@@ -475,7 +477,17 @@ export async function discoverProjects(input: unknown) {
     return parseProjectDiscoveryPage(raw);
   } catch (error) {
     const message = error instanceof Error ? error.message : "request failed";
-    throw new Error(`Project discovery failed: ${message}`);
+    const cause = error && typeof error === "object" && "cause" in error ? String((error as { cause: unknown }).cause) : "";
+    console.error("[ones-sync][discover-projects] failed", {
+      requestUrl,
+      teamId: parsed.teamId,
+      authType: parsed.authType,
+      authHeader: parsed.authHeader,
+      timeoutMs: parsed.timeoutMs,
+      message,
+      cause
+    });
+    throw new Error(`Project discovery failed: ${message}${cause ? ` | cause: ${cause}` : ""}${requestUrl ? ` | url: ${requestUrl}` : ""}`);
   } finally {
     clearTimeout(timer);
   }

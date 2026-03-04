@@ -58,9 +58,8 @@ export function OnesSyncConfigPage() {
   const [validation, setValidation] = useState<{ valid: boolean; errors: string[]; payload: Record<string, unknown> } | null>(null);
   const [catalogStatus, setCatalogStatus] = useState<OnesCatalogStatus | null>(null);
   const [projects, setProjects] = useState<Array<{ key: string; name: string }>>([]);
-  const [projectCursor, setProjectCursor] = useState("");
+  const [projectCursor, setProjectCursor] = useState<string | null>(null);
   const [projectNextCursor, setProjectNextCursor] = useState<string | null>(null);
-  const [projectLimit, setProjectLimit] = useState(50);
   const [failedWebhookEvents, setFailedWebhookEvents] = useState<Array<{ id: string; event_type: string; ones_ticket_key: string | null; error: string | null; retries: number; received_at: string }>>([]);
   const [health, setHealth] = useState<{ failedWebhookCount: number; topErrors: string[]; updatedAt: string } | null>(null);
   const [authSecretMasked, setAuthSecretMasked] = useState("");
@@ -134,7 +133,7 @@ export function OnesSyncConfigPage() {
     };
   }, [form.onesTeamId, form.onesProjectKey, form.listProjectsPath, form.listTicketTypesPath, form.listFieldsPathTemplate, selectedType]);
 
-  const canDiscoverProjects = Boolean((authSecretDirty ? form.authSecret.trim().length > 0 : authSecretMasked.length > 0) && form.onesTeamId && form.baseUrl && projectLimit > 0 && projectLimit <= 100);
+  const canDiscoverProjects = Boolean((authSecretDirty ? form.authSecret.trim().length > 0 : authSecretMasked.length > 0) && form.onesTeamId && form.baseUrl);
   const canRefreshCatalog = Boolean(form.onesTeamId && form.onesProjectKey);
 
   const load = async (options?: { keepAuthSecret?: boolean }) => {
@@ -272,7 +271,7 @@ export function OnesSyncConfigPage() {
     }
   };
 
-  const fetchProjects = async (cursor = "") => {
+  const fetchProjects = async (cursor: string | null = null) => {
     setSaving(true);
     setError(null);
     try {
@@ -283,12 +282,12 @@ export function OnesSyncConfigPage() {
         authSecret: authSecretDirty ? form.authSecret : undefined,
         keepExistingSecret: !authSecretDirty,
         teamId: form.onesTeamId,
-        limit: projectLimit,
-        cursor: cursor || undefined,
+        limit: 50,
+        cursor: cursor ?? undefined,
         listProjectsPath: form.listProjectsPath,
         timeoutMs: form.timeoutMs
       });
-      setProjects(result.projects);
+      setProjects((prev) => (cursor ? [...prev, ...result.projects] : result.projects));
       setProjectCursor(cursor);
       setProjectNextCursor(result.nextCursor);
       if (result.projects[0]?.key) {
@@ -344,11 +343,7 @@ export function OnesSyncConfigPage() {
               <p className="mt-1 text-xs text-slate-500">Used by ONES APIs. Supports template placeholders: {"{team_id}"} / {"{teamID}"}.</p>
               <input className="mt-3 w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="ONES project_key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
               <p className="mt-1 text-xs text-slate-500">Used for issue type/field APIs. Supports {"{project_key}"} / {"{projectID}"}.</p>
-              <div className="mt-3 grid gap-2 md:grid-cols-2">
-                <input className="w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" type="number" min={1} max={100} placeholder="limit (<=100)" value={projectLimit} onChange={(e) => setProjectLimit(Math.max(1, Math.min(100, Number(e.target.value) || 50)))} />
-                <input className="w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="cursor (optional)" value={projectCursor} onChange={(e) => setProjectCursor(e.target.value)} />
-              </div>
-              <p className="mt-1 text-xs text-slate-500">Project list API uses query params: <code>teamID</code>, <code>limit</code>, <code>cursor</code>.</p>
+              <p className="mt-3 text-xs text-slate-500">Project list API uses query params: <code>teamID</code>, <code>limit</code>, <code>cursor</code>. Cursor and limit are handled automatically by system UI.</p>
             </div>
             <div>
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Auth</p>
@@ -445,13 +440,13 @@ export function OnesSyncConfigPage() {
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={0} max={3} placeholder="Retries" value={form.retries} onChange={(e) => setForm((p) => ({ ...p, retries: Number(e.target.value) || 0 }))} />
           </div>
           <div className="mt-3 flex gap-2">
-            <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || !canDiscoverProjects} onClick={() => void fetchProjects(projectCursor)}>
+            <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || !canDiscoverProjects} onClick={() => void fetchProjects(null)}>
               Fetch Projects
             </button>
             <button
               className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm disabled:opacity-60"
               disabled={saving || !projectNextCursor || !canDiscoverProjects}
-              onClick={() => void fetchProjects(projectNextCursor ?? "")}
+              onClick={() => void fetchProjects(projectNextCursor)}
             >
               Load Next Page
             </button>
