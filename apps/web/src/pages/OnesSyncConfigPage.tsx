@@ -62,6 +62,7 @@ export function OnesSyncConfigPage() {
   const [health, setHealth] = useState<{ failedWebhookCount: number; topErrors: string[]; updatedAt: string } | null>(null);
   const [authSecretMasked, setAuthSecretMasked] = useState("");
   const [authSecretDirty, setAuthSecretDirty] = useState(false);
+  const [editingAuthSecret, setEditingAuthSecret] = useState(false);
 
   const [form, setForm] = useState<{
     profileName: string;
@@ -101,6 +102,33 @@ export function OnesSyncConfigPage() {
 
   const selectedTypeDetail = useMemo(() => ticketTypes.find((t) => t.key === selectedType) ?? null, [selectedType, ticketTypes]);
 
+  const resolveTemplatePreview = (template: string, vars: Record<string, string>) => {
+    const placeholders = Array.from(template.matchAll(/\{([a-zA-Z0-9_]+)\}/g)).map((x) => x[1]);
+    const missing = placeholders.filter((name) => !vars[name]);
+    let resolved = template;
+    for (const [key, value] of Object.entries(vars)) {
+      resolved = resolved.replaceAll(`{${key}}`, encodeURIComponent(value));
+    }
+    return {
+      resolved,
+      placeholders,
+      missing
+    };
+  };
+
+  const endpointPreview = useMemo(() => {
+    const vars = {
+      team_id: form.onesTeamId,
+      project_key: form.onesProjectKey,
+      ticketTypeKey: selectedType || "sample_type_key"
+    };
+    return {
+      projects: resolveTemplatePreview(form.listProjectsPath, vars),
+      ticketTypes: resolveTemplatePreview(form.listTicketTypesPath, vars),
+      fields: resolveTemplatePreview(form.listFieldsPathTemplate, vars)
+    };
+  }, [form.onesTeamId, form.onesProjectKey, form.listProjectsPath, form.listTicketTypesPath, form.listFieldsPathTemplate, selectedType]);
+
   const load = async (options?: { keepAuthSecret?: boolean }) => {
     setLoading(true);
     setError(null);
@@ -132,6 +160,7 @@ export function OnesSyncConfigPage() {
           updatedAt: config.updatedAt
         }));
         setAuthSecretMasked(config.authSecretMasked ?? "");
+        setEditingAuthSecret(false);
         if (!options?.keepAuthSecret) setAuthSecretDirty(false);
       }
       setCatalogStatus(status);
@@ -268,7 +297,95 @@ export function OnesSyncConfigPage() {
           <h2 className="text-sm font-semibold text-[#16171A]">Connection</h2>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Profile Name" value={form.profileName} onChange={(e) => setForm((p) => ({ ...p, profileName: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="ONES Team ID (required for project discovery)" value={form.onesTeamId} onChange={(e) => setForm((p) => ({ ...p, onesTeamId: e.target.value }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Base URL (e.g. https://xxx.myones.net)" value={form.baseUrl} onChange={(e) => setForm((p) => ({ ...p, baseUrl: e.target.value }))} />
+          </div>
+          <div className="mt-4 grid gap-3 rounded-mdplus border border-slate-200 bg-slate-50 p-3 md:grid-cols-2">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Required Parameters</p>
+              <input className="mt-2 w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="ONES team_id" value={form.onesTeamId} onChange={(e) => setForm((p) => ({ ...p, onesTeamId: e.target.value }))} />
+              <p className="mt-1 text-xs text-slate-500">Used by project and ticket type discovery endpoints.</p>
+              <input className="mt-3 w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="ONES project_key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
+              <p className="mt-1 text-xs text-slate-500">Used for issue type/field catalog and lifecycle sync.</p>
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Auth</p>
+              <div className="mt-2 grid gap-2">
+                <select className="rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" value={form.authType} onChange={(e) => setForm((p) => ({ ...p, authType: e.target.value as "bearer" | "header" }))}>
+                  <option value="bearer">Bearer Token</option>
+                  <option value="header">Custom Header Token</option>
+                </select>
+                <input className="rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="Auth Header" value={form.authHeader} onChange={(e) => setForm((p) => ({ ...p, authHeader: e.target.value }))} />
+                {!editingAuthSecret ? (
+                  <div className="flex gap-2">
+                    <input className="min-w-0 flex-1 rounded-mdplus border border-slate-200 bg-slate-100 px-3 py-2 text-sm" type="password" value={authSecretMasked || "********"} readOnly />
+                    <button
+                      className="rounded-mdplus border border-slate-300 bg-white px-3 py-2 text-sm"
+                      onClick={() => {
+                        setEditingAuthSecret(true);
+                        setAuthSecretDirty(true);
+                        setForm((p) => ({ ...p, authSecret: "" }));
+                      }}
+                    >
+                      Replace Token
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex gap-2">
+                    <input
+                      className="min-w-0 flex-1 rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm"
+                      type="password"
+                      placeholder="Enter new OpenAPI token"
+                      value={form.authSecret}
+                      onChange={(e) => setForm((p) => ({ ...p, authSecret: e.target.value }))}
+                    />
+                    <button
+                      className="rounded-mdplus border border-slate-300 bg-white px-3 py-2 text-sm"
+                      onClick={() => {
+                        setEditingAuthSecret(false);
+                        setAuthSecretDirty(false);
+                        setForm((p) => ({ ...p, authSecret: "" }));
+                      }}
+                    >
+                      Keep Stored
+                    </button>
+                  </div>
+                )}
+                <p className="text-xs text-slate-500">Token is encrypted server-side. UI only shows masked value.</p>
+              </div>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-3 rounded-mdplus border border-slate-200 bg-white p-3 md:grid-cols-2">
+            <div className="md:col-span-2">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Endpoint Templates (ONES OpenAPI)</p>
+              <p className="mt-1 text-xs text-slate-500">Supports placeholders: <code>{"{team_id}"}</code> <code>{"{project_key}"}</code> <code>{"{ticketTypeKey}"}</code>.</p>
+            </div>
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Create Ticket Path" value={form.createTicketPath} onChange={(e) => setForm((p) => ({ ...p, createTicketPath: e.target.value }))} />
+            <select className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.dataSourceMode} onChange={(e) => setForm((p) => ({ ...p, dataSourceMode: e.target.value as "ones_primary" | "local_mirror" }))}>
+              <option value="ones_primary">ones_primary</option>
+              <option value="local_mirror">local_mirror</option>
+            </select>
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Projects Path (supports {team_id})" value={form.listProjectsPath} onChange={(e) => setForm((p) => ({ ...p, listProjectsPath: e.target.value }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Ticket Types Path (supports {team_id},{project_key})" value={form.listTicketTypesPath} onChange={(e) => setForm((p) => ({ ...p, listTicketTypesPath: e.target.value }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm md:col-span-2" placeholder="List Fields Path Template (supports {team_id},{project_key},{ticketTypeKey})" value={form.listFieldsPathTemplate} onChange={(e) => setForm((p) => ({ ...p, listFieldsPathTemplate: e.target.value }))} />
+          </div>
+          <div className="mt-4 grid gap-3 rounded-mdplus border border-slate-200 bg-slate-50 p-3 md:grid-cols-3">
+            <article className="rounded-md border border-slate-200 bg-white p-2 text-xs">
+              <p className="font-semibold text-[#16171A]">Projects API Preview</p>
+              <p className="mt-1 break-all text-slate-600">{form.baseUrl.replace(/\/$/, "")}{endpointPreview.projects.resolved}</p>
+              {endpointPreview.projects.missing.length > 0 && <p className="mt-1 text-rose-600">Missing: {endpointPreview.projects.missing.join(", ")}</p>}
+            </article>
+            <article className="rounded-md border border-slate-200 bg-white p-2 text-xs">
+              <p className="font-semibold text-[#16171A]">Ticket Types API Preview</p>
+              <p className="mt-1 break-all text-slate-600">{form.baseUrl.replace(/\/$/, "")}{endpointPreview.ticketTypes.resolved}</p>
+              {endpointPreview.ticketTypes.missing.length > 0 && <p className="mt-1 text-rose-600">Missing: {endpointPreview.ticketTypes.missing.join(", ")}</p>}
+            </article>
+            <article className="rounded-md border border-slate-200 bg-white p-2 text-xs">
+              <p className="font-semibold text-[#16171A]">Fields API Preview</p>
+              <p className="mt-1 break-all text-slate-600">{form.baseUrl.replace(/\/$/, "")}{endpointPreview.fields.resolved}</p>
+              {endpointPreview.fields.missing.length > 0 && <p className="mt-1 text-rose-600">Missing: {endpointPreview.fields.missing.join(", ")}</p>}
+            </article>
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
             {projects.length > 0 ? (
               <select className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))}>
                 <option value="">Select ONES Project</option>
@@ -281,36 +398,8 @@ export function OnesSyncConfigPage() {
             ) : (
               <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="ONES Project Key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
             )}
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Base URL" value={form.baseUrl} onChange={(e) => setForm((p) => ({ ...p, baseUrl: e.target.value }))} />
-            <select className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.dataSourceMode} onChange={(e) => setForm((p) => ({ ...p, dataSourceMode: e.target.value as "ones_primary" | "local_mirror" }))}>
-              <option value="ones_primary">ones_primary</option>
-              <option value="local_mirror">local_mirror</option>
-            </select>
-            <select className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.authType} onChange={(e) => setForm((p) => ({ ...p, authType: e.target.value as "bearer" | "header" }))}>
-              <option value="bearer">Bearer Token</option>
-              <option value="header">Custom Header Token</option>
-            </select>
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Auth Header" value={form.authHeader} onChange={(e) => setForm((p) => ({ ...p, authHeader: e.target.value }))} />
-            <input
-              className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm"
-              type="password"
-              placeholder="OpenAPI Access Token"
-              value={authSecretDirty ? form.authSecret : authSecretMasked}
-              onFocus={() => {
-                if (!authSecretDirty) {
-                  setForm((p) => ({ ...p, authSecret: "" }));
-                  setAuthSecretDirty(true);
-                }
-              }}
-              onChange={(e) => {
-                if (!authSecretDirty) setAuthSecretDirty(true);
-                setForm((p) => ({ ...p, authSecret: e.target.value }));
-              }}
-            />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Create Ticket Path" value={form.createTicketPath} onChange={(e) => setForm((p) => ({ ...p, createTicketPath: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Projects Path (supports {team_id})" value={form.listProjectsPath} onChange={(e) => setForm((p) => ({ ...p, listProjectsPath: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Ticket Types Path (supports {team_id},{project_key})" value={form.listTicketTypesPath} onChange={(e) => setForm((p) => ({ ...p, listTicketTypesPath: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Fields Path Template" value={form.listFieldsPathTemplate} onChange={(e) => setForm((p) => ({ ...p, listFieldsPathTemplate: e.target.value }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={3000} max={60000} placeholder="Timeout (ms)" value={form.timeoutMs} onChange={(e) => setForm((p) => ({ ...p, timeoutMs: Number(e.target.value) || 12000 }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={0} max={3} placeholder="Retries" value={form.retries} onChange={(e) => setForm((p) => ({ ...p, retries: Number(e.target.value) || 0 }))} />
           </div>
           <div className="mt-3 flex gap-2">
             <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || (!authSecretDirty && !authSecretMasked) || !form.onesTeamId} onClick={() => void discoverOnesProjects({
