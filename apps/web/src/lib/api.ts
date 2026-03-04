@@ -361,7 +361,8 @@ export async function updateOnesSyncConfig(input: {
   baseUrl: string;
   authType: "bearer" | "header";
   authHeader: string;
-  authSecret: string;
+  authSecret?: string;
+  keepExistingSecret?: boolean;
   createTicketPath: string;
   listProjectsPath: string;
   listTicketTypesPath: string;
@@ -493,7 +494,8 @@ export async function discoverOnesProjects(input: {
   baseUrl: string;
   authType: "bearer" | "header";
   authHeader: string;
-  authSecret: string;
+  authSecret?: string;
+  keepExistingSecret?: boolean;
   teamId: string;
   listProjectsPath: string;
   timeoutMs: number;

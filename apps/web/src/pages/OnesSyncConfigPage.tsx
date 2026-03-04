@@ -60,6 +60,8 @@ export function OnesSyncConfigPage() {
   const [projects, setProjects] = useState<Array<{ key: string; name: string }>>([]);
   const [failedWebhookEvents, setFailedWebhookEvents] = useState<Array<{ id: string; event_type: string; ones_ticket_key: string | null; error: string | null; retries: number; received_at: string }>>([]);
   const [health, setHealth] = useState<{ failedWebhookCount: number; topErrors: string[]; updatedAt: string } | null>(null);
+  const [authSecretMasked, setAuthSecretMasked] = useState("");
+  const [authSecretDirty, setAuthSecretDirty] = useState(false);
 
   const [form, setForm] = useState<{
     profileName: string;
@@ -129,6 +131,8 @@ export function OnesSyncConfigPage() {
           updatedBy: config.updatedBy,
           updatedAt: config.updatedAt
         }));
+        setAuthSecretMasked(config.authSecretMasked ?? "");
+        if (!options?.keepAuthSecret) setAuthSecretDirty(false);
       }
       setCatalogStatus(status);
       setTicketTypes(types);
@@ -167,7 +171,6 @@ export function OnesSyncConfigPage() {
 
   const saveConfig = async () => {
     if (!form.baseUrl) return setError("Base URL is required.");
-    if (!form.authSecret) return setError("Auth Secret is required when updating config.");
     setSaving(true);
     setError(null);
     setSuccess(null);
@@ -177,7 +180,8 @@ export function OnesSyncConfigPage() {
         baseUrl: form.baseUrl,
         authType: form.authType,
         authHeader: form.authHeader,
-        authSecret: form.authSecret,
+        authSecret: authSecretDirty ? form.authSecret : undefined,
+        keepExistingSecret: !authSecretDirty,
         createTicketPath: form.createTicketPath,
         listProjectsPath: form.listProjectsPath,
         listTicketTypesPath: form.listTicketTypesPath,
@@ -190,7 +194,7 @@ export function OnesSyncConfigPage() {
         actor: "support_admin"
       });
       setSuccess("Configuration updated.");
-      await load({ keepAuthSecret: true });
+      await load({ keepAuthSecret: false });
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -287,18 +291,34 @@ export function OnesSyncConfigPage() {
               <option value="header">Custom Header Token</option>
             </select>
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Auth Header" value={form.authHeader} onChange={(e) => setForm((p) => ({ ...p, authHeader: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="password" placeholder="OpenAPI Access Token (required to update)" value={form.authSecret} onChange={(e) => setForm((p) => ({ ...p, authSecret: e.target.value }))} />
+            <input
+              className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm"
+              type="password"
+              placeholder="OpenAPI Access Token"
+              value={authSecretDirty ? form.authSecret : authSecretMasked}
+              onFocus={() => {
+                if (!authSecretDirty) {
+                  setForm((p) => ({ ...p, authSecret: "" }));
+                  setAuthSecretDirty(true);
+                }
+              }}
+              onChange={(e) => {
+                if (!authSecretDirty) setAuthSecretDirty(true);
+                setForm((p) => ({ ...p, authSecret: e.target.value }));
+              }}
+            />
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Create Ticket Path" value={form.createTicketPath} onChange={(e) => setForm((p) => ({ ...p, createTicketPath: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Projects Path" value={form.listProjectsPath} onChange={(e) => setForm((p) => ({ ...p, listProjectsPath: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Ticket Types Path" value={form.listTicketTypesPath} onChange={(e) => setForm((p) => ({ ...p, listTicketTypesPath: e.target.value }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Projects Path (supports {team_id})" value={form.listProjectsPath} onChange={(e) => setForm((p) => ({ ...p, listProjectsPath: e.target.value }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Ticket Types Path (supports {team_id},{project_key})" value={form.listTicketTypesPath} onChange={(e) => setForm((p) => ({ ...p, listTicketTypesPath: e.target.value }))} />
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Fields Path Template" value={form.listFieldsPathTemplate} onChange={(e) => setForm((p) => ({ ...p, listFieldsPathTemplate: e.target.value }))} />
           </div>
           <div className="mt-3 flex gap-2">
-            <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || !form.authSecret || !form.onesTeamId} onClick={() => void discoverOnesProjects({
+            <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || (!authSecretDirty && !authSecretMasked) || !form.onesTeamId} onClick={() => void discoverOnesProjects({
               baseUrl: form.baseUrl,
               authType: form.authType,
               authHeader: form.authHeader,
-              authSecret: form.authSecret,
+              authSecret: authSecretDirty ? form.authSecret : undefined,
+              keepExistingSecret: !authSecretDirty,
               teamId: form.onesTeamId,
               listProjectsPath: form.listProjectsPath,
               timeoutMs: form.timeoutMs

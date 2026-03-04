@@ -10,7 +10,8 @@ const configInputSchema = z.object({
   baseUrl: z.string().url(),
   authType: z.enum(["bearer", "header"]).default("bearer"),
   authHeader: z.string().min(1).default("Authorization"),
-  authSecret: z.string().min(1),
+  authSecret: z.string().min(1).optional(),
+  keepExistingSecret: z.coerce.boolean().default(false),
   createTicketPath: z.string().min(1),
   listProjectsPath: z.string().min(1).default("/api/v1/projects"),
   listTicketTypesPath: z.string().min(1),
@@ -144,6 +145,26 @@ function parseFields(raw: unknown): unknown[] {
   return Array.isArray(list) ? list : [];
 }
 
+function resolvePathTemplate(
+  rawPath: string,
+  ctx: { teamId?: string | null; projectKey?: string | null; ticketTypeKey?: string | null }
+) {
+  let path = rawPath;
+  if (path.includes("{team_id}")) {
+    if (!ctx.teamId) throw new Error("Missing required onesTeamId for path template {team_id}");
+    path = path.replaceAll("{team_id}", encodeURIComponent(ctx.teamId));
+  }
+  if (path.includes("{project_key}")) {
+    if (!ctx.projectKey) throw new Error("Missing required onesProjectKey for path template {project_key}");
+    path = path.replaceAll("{project_key}", encodeURIComponent(ctx.projectKey));
+  }
+  if (path.includes("{ticketTypeKey}")) {
+    if (!ctx.ticketTypeKey) throw new Error("Missing required ticketTypeKey for path template {ticketTypeKey}");
+    path = path.replaceAll("{ticketTypeKey}", encodeURIComponent(ctx.ticketTypeKey));
+  }
+  return path;
+}
+
 function parseProjects(raw: unknown): Array<{ key: string; name: string }> {
   if (Array.isArray(raw)) {
     return raw
@@ -246,12 +267,20 @@ export async function getConfig() {
 
 export async function upsertConfig(input: unknown) {
   const parsed = configInputSchema.parse(input);
+  const existing = await repo.getActiveConfig();
+  const resolvedSecret =
+    parsed.keepExistingSecret && existing
+      ? decryptSecret(existing.auth_secret_encrypted)
+      : (parsed.authSecret ?? "");
+  if (!resolvedSecret) {
+    throw new Error("Auth Secret is required when no existing token is available.");
+  }
   const saved = await repo.upsertActiveConfig({
     profileName: parsed.profileName,
     baseUrl: parsed.baseUrl,
     authType: parsed.authType,
     authHeader: parsed.authHeader,
-    authSecretEncrypted: encryptSecret(parsed.authSecret),
+    authSecretEncrypted: encryptSecret(resolvedSecret),
     createTicketPath: parsed.createTicketPath,
     listProjectsPath: parsed.listProjectsPath,
     listTicketTypesPath: parsed.listTicketTypesPath,
@@ -267,7 +296,7 @@ export async function upsertConfig(input: unknown) {
     actor: parsed.actor,
     scope: "config",
     eventType: "config_updated",
-    payload: { profileName: parsed.profileName, baseUrl: parsed.baseUrl }
+    payload: { profileName: parsed.profileName, baseUrl: parsed.baseUrl, keepExistingSecret: parsed.keepExistingSecret }
   });
   return {
     id: saved.id,
@@ -275,7 +304,7 @@ export async function upsertConfig(input: unknown) {
     baseUrl: saved.base_url,
     authType: saved.auth_type,
     authHeader: saved.auth_header,
-    authSecretMasked: maskSecret(parsed.authSecret),
+    authSecretMasked: maskSecret(resolvedSecret),
     createTicketPath: saved.create_ticket_path,
     listProjectsPath: saved.list_projects_path,
     listTicketTypesPath: saved.list_ticket_types_path,
@@ -297,12 +326,20 @@ export async function discoverTicketTypes(actor = "internal_operator") {
   if (!config) {
     throw new Error("ONES sync config not set");
   }
-  const typesRaw = await onesFetch(config, config.list_ticket_types_path).then((res) => res.json());
+  const typesPath = resolvePathTemplate(config.list_ticket_types_path, {
+    teamId: config.ones_team_id,
+    projectKey: config.ones_project_key
+  });
+  const typesRaw = await onesFetch(config, typesPath).then((res) => res.json());
   const ticketTypes = parseTicketTypes(typesRaw);
   const rows: Array<{ key: string; name: string; fields: unknown[]; source: Record<string, unknown> }> = [];
 
   for (const type of ticketTypes) {
-    const fieldsPath = config.list_fields_path_template.replace("{ticketTypeKey}", encodeURIComponent(type.key));
+    const fieldsPath = resolvePathTemplate(config.list_fields_path_template, {
+      teamId: config.ones_team_id,
+      projectKey: config.ones_project_key,
+      ticketTypeKey: type.key
+    });
     let fields: unknown[] = [];
     try {
       const fieldsRaw = await onesFetch(config, fieldsPath).then((res) => res.json());
@@ -357,15 +394,24 @@ export async function discoverProjects(input: unknown) {
     baseUrl: z.string().url(),
     authType: z.enum(["bearer", "header"]),
     authHeader: z.string().min(1),
-    authSecret: z.string().min(1),
+    authSecret: z.string().min(1).optional(),
+    keepExistingSecret: z.coerce.boolean().default(false),
     teamId: z.string().min(1),
     listProjectsPath: z.string().min(1).default("/api/v1/projects"),
     timeoutMs: z.coerce.number().int().positive().max(60000).default(12000)
   }).parse(input);
+  const existing = await repo.getActiveConfig();
+  const resolvedSecret =
+    parsed.keepExistingSecret && existing
+      ? decryptSecret(existing.auth_secret_encrypted)
+      : (parsed.authSecret ?? "");
+  if (!resolvedSecret) {
+    throw new Error("Auth Secret is required for project discovery.");
+  }
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    ...buildAuthHeadersFromInput(parsed)
+    ...buildAuthHeadersFromInput({ ...parsed, authSecret: resolvedSecret })
   };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), parsed.timeoutMs);
