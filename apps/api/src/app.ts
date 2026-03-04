@@ -338,8 +338,8 @@ app.post(
   "/api/v1/internal/configuration/projects/discover",
   requireInternalRequest,
   asyncHandler(async (req, res) => {
-    const projects = await onesSyncService.discoverProjects(req.body);
-    res.json({ projects });
+    const result = await onesSyncService.discoverProjects(req.body);
+    res.json(result);
   })
 );
 

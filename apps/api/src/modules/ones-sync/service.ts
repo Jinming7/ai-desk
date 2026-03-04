@@ -195,6 +195,31 @@ function parseProjects(raw: unknown): Array<{ key: string; name: string }> {
   return parseProjects(envelope.projects ?? envelope.data ?? envelope.items ?? []);
 }
 
+function parseProjectDiscoveryPage(raw: unknown): { projects: Array<{ key: string; name: string }>; nextCursor: string | null } {
+  const envelope = raw as Record<string, unknown>;
+  const data = (envelope.data ?? envelope.result ?? envelope) as Record<string, unknown>;
+  const projects = parseProjects(
+    data.projects ??
+      data.items ??
+      data.list ??
+      envelope.projects ??
+      envelope.items ??
+      envelope.list ??
+      data
+  );
+  const cursorCandidate =
+    data.nextCursor ??
+    data.next_cursor ??
+    data.cursor ??
+    envelope.nextCursor ??
+    envelope.next_cursor ??
+    envelope.cursor;
+  return {
+    projects,
+    nextCursor: typeof cursorCandidate === "string" && cursorCandidate.length > 0 ? cursorCandidate : null
+  };
+}
+
 function resolveSource(path: string, context: Record<string, unknown>): unknown {
   const normalized = path.replace(/^ticket\./, "").replace(/^customer\./, "customer.");
   const keys = normalized.split(".");
@@ -413,7 +438,9 @@ export async function discoverProjects(input: unknown) {
     authSecret: z.string().min(1).optional(),
     keepExistingSecret: z.coerce.boolean().default(false),
     teamId: z.string().min(1),
-    listProjectsPath: z.string().min(1).default("/api/v1/projects"),
+    limit: z.coerce.number().int().positive().max(100).default(50),
+    cursor: z.string().optional(),
+    listProjectsPath: z.string().min(1).default("/openapi/v2/project/projects"),
     timeoutMs: z.coerce.number().int().positive().max(60000).default(12000)
   }).parse(input);
   const existing = await repo.getActiveConfig();
@@ -432,20 +459,20 @@ export async function discoverProjects(input: unknown) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), parsed.timeoutMs);
   try {
-    const pathWithTeam = parsed.listProjectsPath.includes("{team_id}")
-      ? parsed.listProjectsPath.replaceAll("{team_id}", encodeURIComponent(parsed.teamId))
-      : parsed.listProjectsPath;
+    const pathWithTeam = resolvePathTemplate(parsed.listProjectsPath, { teamId: parsed.teamId });
     const requestUrl = new URL(withPath(parsed.baseUrl, pathWithTeam));
     const hasTeamPlaceholder = parsed.listProjectsPath.includes("{team_id}") || parsed.listProjectsPath.includes("{teamID}");
     if (!hasTeamPlaceholder && !requestUrl.searchParams.has("team_id") && !requestUrl.searchParams.has("teamID")) {
       requestUrl.searchParams.set("teamID", parsed.teamId);
     }
+    requestUrl.searchParams.set("limit", String(parsed.limit));
+    if (parsed.cursor) requestUrl.searchParams.set("cursor", parsed.cursor);
     const res = await fetch(requestUrl.toString(), { headers, signal: controller.signal });
     if (!res.ok) {
       throw new Error(`ONES ${res.status}: ${await res.text()}`);
     }
     const raw = await res.json();
-    return parseProjects(raw);
+    return parseProjectDiscoveryPage(raw);
   } catch (error) {
     const message = error instanceof Error ? error.message : "request failed";
     throw new Error(`Project discovery failed: ${message}`);

@@ -497,6 +497,8 @@ export async function discoverOnesProjects(input: {
   authSecret?: string;
   keepExistingSecret?: boolean;
   teamId: string;
+  limit?: number;
+  cursor?: string;
   listProjectsPath: string;
   timeoutMs: number;
 }) {
@@ -508,7 +510,7 @@ export async function discoverOnesProjects(input: {
     throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to discover ONES projects");
-  return (await res.json()).projects as Array<{ key: string; name: string }>;
+  return (await res.json()) as { projects: Array<{ key: string; name: string }>; nextCursor: string | null };
 }
 
 export async function listFailedWebhookEvents() {
