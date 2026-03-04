@@ -150,17 +150,33 @@ function resolvePathTemplate(
   ctx: { teamId?: string | null; projectKey?: string | null; ticketTypeKey?: string | null }
 ) {
   let path = rawPath;
+  const hasTeamPlaceholder = path.includes("{team_id}") || path.includes("{teamID}");
+  const hasProjectPlaceholder = path.includes("{project_key}") || path.includes("{projectID}");
   if (path.includes("{team_id}")) {
     if (!ctx.teamId) throw new Error("Missing required onesTeamId for path template {team_id}");
     path = path.replaceAll("{team_id}", encodeURIComponent(ctx.teamId));
+  }
+  if (path.includes("{teamID}")) {
+    if (!ctx.teamId) throw new Error("Missing required onesTeamId for path template {teamID}");
+    path = path.replaceAll("{teamID}", encodeURIComponent(ctx.teamId));
   }
   if (path.includes("{project_key}")) {
     if (!ctx.projectKey) throw new Error("Missing required onesProjectKey for path template {project_key}");
     path = path.replaceAll("{project_key}", encodeURIComponent(ctx.projectKey));
   }
+  if (path.includes("{projectID}")) {
+    if (!ctx.projectKey) throw new Error("Missing required onesProjectKey for path template {projectID}");
+    path = path.replaceAll("{projectID}", encodeURIComponent(ctx.projectKey));
+  }
   if (path.includes("{ticketTypeKey}")) {
     if (!ctx.ticketTypeKey) throw new Error("Missing required ticketTypeKey for path template {ticketTypeKey}");
     path = path.replaceAll("{ticketTypeKey}", encodeURIComponent(ctx.ticketTypeKey));
+  }
+  if (hasTeamPlaceholder && !ctx.teamId) {
+    throw new Error("Missing required onesTeamId for team placeholder");
+  }
+  if (hasProjectPlaceholder && !ctx.projectKey) {
+    throw new Error("Missing required onesProjectKey for project placeholder");
   }
   return path;
 }
@@ -420,8 +436,9 @@ export async function discoverProjects(input: unknown) {
       ? parsed.listProjectsPath.replaceAll("{team_id}", encodeURIComponent(parsed.teamId))
       : parsed.listProjectsPath;
     const requestUrl = new URL(withPath(parsed.baseUrl, pathWithTeam));
-    if (!parsed.listProjectsPath.includes("{team_id}") && !requestUrl.searchParams.has("team_id")) {
-      requestUrl.searchParams.set("team_id", parsed.teamId);
+    const hasTeamPlaceholder = parsed.listProjectsPath.includes("{team_id}") || parsed.listProjectsPath.includes("{teamID}");
+    if (!hasTeamPlaceholder && !requestUrl.searchParams.has("team_id") && !requestUrl.searchParams.has("teamID")) {
+      requestUrl.searchParams.set("teamID", parsed.teamId);
     }
     const res = await fetch(requestUrl.toString(), { headers, signal: controller.signal });
     if (!res.ok) {

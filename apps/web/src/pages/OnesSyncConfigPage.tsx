@@ -119,7 +119,9 @@ export function OnesSyncConfigPage() {
   const endpointPreview = useMemo(() => {
     const vars = {
       team_id: form.onesTeamId,
+      teamID: form.onesTeamId,
       project_key: form.onesProjectKey,
+      projectID: form.onesProjectKey,
       ticketTypeKey: selectedType || "sample_type_key"
     };
     return {
@@ -128,6 +130,9 @@ export function OnesSyncConfigPage() {
       fields: resolveTemplatePreview(form.listFieldsPathTemplate, vars)
     };
   }, [form.onesTeamId, form.onesProjectKey, form.listProjectsPath, form.listTicketTypesPath, form.listFieldsPathTemplate, selectedType]);
+
+  const canDiscoverProjects = Boolean((authSecretDirty ? form.authSecret.trim().length > 0 : authSecretMasked.length > 0) && form.onesTeamId);
+  const canRefreshCatalog = Boolean(form.onesTeamId && form.onesProjectKey);
 
   const load = async (options?: { keepAuthSecret?: boolean }) => {
     setLoading(true);
@@ -303,9 +308,9 @@ export function OnesSyncConfigPage() {
             <div>
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Required Parameters</p>
               <input className="mt-2 w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="ONES team_id" value={form.onesTeamId} onChange={(e) => setForm((p) => ({ ...p, onesTeamId: e.target.value }))} />
-              <p className="mt-1 text-xs text-slate-500">Used by project and ticket type discovery endpoints.</p>
+              <p className="mt-1 text-xs text-slate-500">Used by ONES APIs. Supports template placeholders: {"{team_id}"} / {"{teamID}"}.</p>
               <input className="mt-3 w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="ONES project_key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
-              <p className="mt-1 text-xs text-slate-500">Used for issue type/field catalog and lifecycle sync.</p>
+              <p className="mt-1 text-xs text-slate-500">Used for issue type/field APIs. Supports {"{project_key}"} / {"{projectID}"}.</p>
             </div>
             <div>
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Auth</p>
@@ -357,7 +362,7 @@ export function OnesSyncConfigPage() {
           <div className="mt-4 grid gap-3 rounded-mdplus border border-slate-200 bg-white p-3 md:grid-cols-2">
             <div className="md:col-span-2">
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Endpoint Templates (ONES OpenAPI)</p>
-              <p className="mt-1 text-xs text-slate-500">Supports placeholders: <code>{"{team_id}"}</code> <code>{"{project_key}"}</code> <code>{"{ticketTypeKey}"}</code>.</p>
+              <p className="mt-1 text-xs text-slate-500">Supports placeholders: <code>{"{team_id}"}</code> <code>{"{teamID}"}</code> <code>{"{project_key}"}</code> <code>{"{projectID}"}</code> <code>{"{ticketTypeKey}"}</code>.</p>
             </div>
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Create Ticket Path" value={form.createTicketPath} onChange={(e) => setForm((p) => ({ ...p, createTicketPath: e.target.value }))} />
             <select className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.dataSourceMode} onChange={(e) => setForm((p) => ({ ...p, dataSourceMode: e.target.value as "ones_primary" | "local_mirror" }))}>
@@ -402,7 +407,7 @@ export function OnesSyncConfigPage() {
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={0} max={3} placeholder="Retries" value={form.retries} onChange={(e) => setForm((p) => ({ ...p, retries: Number(e.target.value) || 0 }))} />
           </div>
           <div className="mt-3 flex gap-2">
-            <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || (!authSecretDirty && !authSecretMasked) || !form.onesTeamId} onClick={() => void discoverOnesProjects({
+            <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || !canDiscoverProjects} onClick={() => void discoverOnesProjects({
               baseUrl: form.baseUrl,
               authType: form.authType,
               authHeader: form.authHeader,
@@ -430,7 +435,12 @@ export function OnesSyncConfigPage() {
           <div className="mb-3 flex items-center justify-between">
             <h2 className="text-sm font-semibold text-[#16171A]">Catalog</h2>
             <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={discovering} onClick={() => {
+              if (!canRefreshCatalog) {
+                setError("Catalog discovery requires both ONES Team ID and ONES Project Key in Connection.");
+                return;
+              }
               setDiscovering(true);
+              setError(null);
               discoverOnesTicketTypes("support_admin").then((rows) => {
                 setTicketTypes(rows);
                 setSelectedType(rows[0]?.key ?? "");
@@ -438,6 +448,31 @@ export function OnesSyncConfigPage() {
               }).finally(() => setDiscovering(false));
             }}>{discovering ? "Refreshing..." : "Refresh from ONES"}</button>
           </div>
+          <div className="mb-3 grid gap-2 rounded-mdplus border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700 md:grid-cols-3">
+            <article className="rounded border border-slate-200 bg-white p-2">
+              <p className="font-semibold text-[#16171A]">Projects API</p>
+              <p className="mt-1 text-slate-500">Method: GET | Auth: header/bearer</p>
+              <p className="mt-1">Params: <span className="font-medium">team_id / teamID</span> (query or path)</p>
+              <p className="mt-1 break-all text-slate-600">{form.baseUrl.replace(/\/$/, "")}{endpointPreview.projects.resolved}</p>
+            </article>
+            <article className="rounded border border-slate-200 bg-white p-2">
+              <p className="font-semibold text-[#16171A]">Ticket Types API</p>
+              <p className="mt-1 text-slate-500">Method: GET | Auth: header/bearer</p>
+              <p className="mt-1">Params: <span className="font-medium">team_id/teamID + project_key/projectID</span></p>
+              <p className="mt-1 break-all text-slate-600">{form.baseUrl.replace(/\/$/, "")}{endpointPreview.ticketTypes.resolved}</p>
+            </article>
+            <article className="rounded border border-slate-200 bg-white p-2">
+              <p className="font-semibold text-[#16171A]">Fields API</p>
+              <p className="mt-1 text-slate-500">Method: GET | Auth: header/bearer</p>
+              <p className="mt-1">Params: <span className="font-medium">team/project + ticketTypeKey</span></p>
+              <p className="mt-1 break-all text-slate-600">{form.baseUrl.replace(/\/$/, "")}{endpointPreview.fields.resolved}</p>
+            </article>
+          </div>
+          {!canRefreshCatalog && (
+            <p className="mb-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+              Configure both ONES Team ID and ONES Project Key in Connection before refreshing catalog.
+            </p>
+          )}
           {catalogStatus && (
             <div className="mb-3 rounded border border-slate-200 bg-slate-50 p-2 text-xs text-slate-600">
               <p>Ticket types: {catalogStatus.ticketTypeCount}</p>
