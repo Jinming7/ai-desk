@@ -446,7 +446,7 @@ export async function discoverProjects(input: unknown) {
     limit: z.coerce.number().int().positive().max(100).default(50),
     cursor: z.string().optional(),
     listProjectsPath: z.string().min(1).default("/openapi/v2/project/projects"),
-    timeoutMs: z.coerce.number().int().positive().max(60000).default(6000)
+    timeoutMs: z.coerce.number().int().positive().max(60000).default(15000)
   }).parse(input);
   const existing = await repo.getActiveConfig();
   const resolvedSecret =
@@ -475,8 +475,9 @@ export async function discoverProjects(input: unknown) {
     requestUrl = url.toString();
     let lastError: Error | null = null;
     for (let attempt = 0; attempt <= 1; attempt += 1) {
+      const attemptTimeout = attempt === 0 ? parsed.timeoutMs : Math.min(30000, parsed.timeoutMs * 2);
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), parsed.timeoutMs);
+      const timer = setTimeout(() => controller.abort(), attemptTimeout);
       try {
         const res = await fetch(requestUrl, { headers, signal: controller.signal });
         clearTimeout(timer);

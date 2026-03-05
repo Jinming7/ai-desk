@@ -93,7 +93,7 @@ export function OnesSyncConfigPage() {
     listProjectsPath: "/openapi/v2/project/projects",
     listTicketTypesPath: "/api/v1/ticket-types",
     listFieldsPathTemplate: "/api/v1/ticket-types/{ticketTypeKey}/fields",
-    timeoutMs: 6000,
+    timeoutMs: 15000,
     retries: 1,
     dataSourceMode: "ones_primary",
     onesProjectKey: "",
@@ -436,7 +436,7 @@ export function OnesSyncConfigPage() {
             ) : (
               <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="ONES Project Key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
             )}
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={1000} max={60000} placeholder="Timeout (ms)" value={form.timeoutMs} onChange={(e) => setForm((p) => ({ ...p, timeoutMs: Number(e.target.value) || 6000 }))} />
+            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={5000} max={60000} placeholder="Timeout (ms)" value={form.timeoutMs} onChange={(e) => setForm((p) => ({ ...p, timeoutMs: Number(e.target.value) || 15000 }))} />
             <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={0} max={3} placeholder="Retries" value={form.retries} onChange={(e) => setForm((p) => ({ ...p, retries: Number(e.target.value) || 0 }))} />
           </div>
           <div className="mt-3 flex gap-2">
