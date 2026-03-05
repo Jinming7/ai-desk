@@ -333,26 +333,44 @@ export function OnesSyncConfigPage() {
         <section className="rounded-mdplus border border-slate-200 bg-white p-4">
           <h2 className="text-sm font-semibold text-[#16171A]">Connection</h2>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Profile Name" value={form.profileName} onChange={(e) => setForm((p) => ({ ...p, profileName: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Base URL (e.g. https://xxx.myones.net)" value={form.baseUrl} onChange={(e) => setForm((p) => ({ ...p, baseUrl: e.target.value }))} />
+            <label className="space-y-1">
+              <span className="text-xs font-medium text-slate-600">Profile Name</span>
+              <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="default" value={form.profileName} onChange={(e) => setForm((p) => ({ ...p, profileName: e.target.value }))} />
+            </label>
+            <label className="space-y-1">
+              <span className="text-xs font-medium text-slate-600">Base URL</span>
+              <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="https://demo688.ones.pro/" value={form.baseUrl} onChange={(e) => setForm((p) => ({ ...p, baseUrl: e.target.value }))} />
+            </label>
           </div>
           <div className="mt-4 grid gap-3 rounded-mdplus border border-slate-200 bg-slate-50 p-3 md:grid-cols-2">
             <div>
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Required Parameters</p>
-              <input className="mt-2 w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="ONES team_id" value={form.onesTeamId} onChange={(e) => setForm((p) => ({ ...p, onesTeamId: e.target.value }))} />
+              <label className="mt-2 block space-y-1">
+                <span className="text-xs font-medium text-slate-600">Team ID</span>
+                <input className="w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="3xy3ePkc" value={form.onesTeamId} onChange={(e) => setForm((p) => ({ ...p, onesTeamId: e.target.value }))} />
+              </label>
               <p className="mt-1 text-xs text-slate-500">Used by ONES APIs. Supports template placeholders: {"{team_id}"} / {"{teamID}"}.</p>
-              <input className="mt-3 w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="ONES project_key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
+              <label className="mt-3 block space-y-1">
+                <span className="text-xs font-medium text-slate-600">Project Key</span>
+                <input className="w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="optional when selecting from project list" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
+              </label>
               <p className="mt-1 text-xs text-slate-500">Used for issue type/field APIs. Supports {"{project_key}"} / {"{projectID}"}.</p>
               <p className="mt-3 text-xs text-slate-500">Project list API uses query params: <code>teamID</code>, <code>limit</code>, <code>cursor</code>. Cursor and limit are handled automatically by system UI.</p>
             </div>
             <div>
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Auth</p>
               <div className="mt-2 grid gap-2">
-                <select className="rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" value={form.authType} onChange={(e) => setForm((p) => ({ ...p, authType: e.target.value as "bearer" | "header" }))}>
-                  <option value="bearer">Bearer Token</option>
-                  <option value="header">Custom Header Token</option>
-                </select>
-                <input className="rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="Auth Header" value={form.authHeader} onChange={(e) => setForm((p) => ({ ...p, authHeader: e.target.value }))} />
+                <label className="space-y-1">
+                  <span className="text-xs font-medium text-slate-600">Auth Type</span>
+                  <select className="w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" value={form.authType} onChange={(e) => setForm((p) => ({ ...p, authType: e.target.value as "bearer" | "header" }))}>
+                    <option value="bearer">Bearer Token</option>
+                    <option value="header">Custom Header Token</option>
+                  </select>
+                </label>
+                <label className="space-y-1">
+                  <span className="text-xs font-medium text-slate-600">Auth Header</span>
+                  <input className="w-full rounded-mdplus border border-slate-200 bg-white px-3 py-2 text-sm" placeholder="Authorization" value={form.authHeader} onChange={(e) => setForm((p) => ({ ...p, authHeader: e.target.value }))} />
+                </label>
                 {!editingAuthSecret ? (
                   <div className="flex gap-2">
                     <input className="min-w-0 flex-1 rounded-mdplus border border-slate-200 bg-slate-100 px-3 py-2 text-sm" type="password" value={authSecretMasked || "********"} readOnly />
@@ -397,14 +415,29 @@ export function OnesSyncConfigPage() {
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Endpoint Templates (ONES OpenAPI)</p>
               <p className="mt-1 text-xs text-slate-500">Supports placeholders: <code>{"{team_id}"}</code> <code>{"{teamID}"}</code> <code>{"{project_key}"}</code> <code>{"{projectID}"}</code> <code>{"{ticketTypeKey}"}</code>.</p>
             </div>
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="Create Ticket Path" value={form.createTicketPath} onChange={(e) => setForm((p) => ({ ...p, createTicketPath: e.target.value }))} />
-            <select className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.dataSourceMode} onChange={(e) => setForm((p) => ({ ...p, dataSourceMode: e.target.value as "ones_primary" | "local_mirror" }))}>
-              <option value="ones_primary">ones_primary</option>
-              <option value="local_mirror">local_mirror</option>
-            </select>
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Projects Path (supports {team_id})" value={form.listProjectsPath} onChange={(e) => setForm((p) => ({ ...p, listProjectsPath: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="List Ticket Types Path (supports {team_id},{project_key})" value={form.listTicketTypesPath} onChange={(e) => setForm((p) => ({ ...p, listTicketTypesPath: e.target.value }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm md:col-span-2" placeholder="List Fields Path Template (supports {team_id},{project_key},{ticketTypeKey})" value={form.listFieldsPathTemplate} onChange={(e) => setForm((p) => ({ ...p, listFieldsPathTemplate: e.target.value }))} />
+            <label className="space-y-1">
+              <span className="text-xs font-medium text-slate-600">Create Ticket Path</span>
+              <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="/api/v1/tickets" value={form.createTicketPath} onChange={(e) => setForm((p) => ({ ...p, createTicketPath: e.target.value }))} />
+            </label>
+            <label className="space-y-1">
+              <span className="text-xs font-medium text-slate-600">Data Source Mode</span>
+              <select className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.dataSourceMode} onChange={(e) => setForm((p) => ({ ...p, dataSourceMode: e.target.value as "ones_primary" | "local_mirror" }))}>
+                <option value="ones_primary">ones_primary</option>
+                <option value="local_mirror">local_mirror</option>
+              </select>
+            </label>
+            <label className="space-y-1">
+              <span className="text-xs font-medium text-slate-600">List Projects Path</span>
+              <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="/openapi/v2/project/projects" value={form.listProjectsPath} onChange={(e) => setForm((p) => ({ ...p, listProjectsPath: e.target.value }))} />
+            </label>
+            <label className="space-y-1">
+              <span className="text-xs font-medium text-slate-600">List Ticket Types Path</span>
+              <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="/api/v1/ticket-types" value={form.listTicketTypesPath} onChange={(e) => setForm((p) => ({ ...p, listTicketTypesPath: e.target.value }))} />
+            </label>
+            <label className="space-y-1 md:col-span-2">
+              <span className="text-xs font-medium text-slate-600">List Fields Path Template</span>
+              <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="/api/v1/ticket-types/{ticketTypeKey}/fields" value={form.listFieldsPathTemplate} onChange={(e) => setForm((p) => ({ ...p, listFieldsPathTemplate: e.target.value }))} />
+            </label>
           </div>
           <div className="mt-4 grid gap-3 rounded-mdplus border border-slate-200 bg-slate-50 p-3 md:grid-cols-3">
             <article className="rounded-md border border-slate-200 bg-white p-2 text-xs">
@@ -425,19 +458,31 @@ export function OnesSyncConfigPage() {
           </div>
           <div className="mt-4 grid gap-3 md:grid-cols-2">
             {projects.length > 0 ? (
-              <select className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))}>
-                <option value="">Select ONES Project</option>
-                {projects.map((project) => (
-                  <option key={project.key} value={project.key}>
-                    {project.name} ({project.key})
-                  </option>
-                ))}
-              </select>
+              <label className="space-y-1">
+                <span className="text-xs font-medium text-slate-600">Selected Project</span>
+                <select className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))}>
+                  <option value="">Select ONES Project</option>
+                  {projects.map((project) => (
+                    <option key={project.key} value={project.key}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
             ) : (
-              <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="ONES Project Key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
+              <label className="space-y-1">
+                <span className="text-xs font-medium text-slate-600">Selected Project</span>
+                <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="ONES Project Key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
+              </label>
             )}
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={5000} max={60000} placeholder="Timeout (ms)" value={form.timeoutMs} onChange={(e) => setForm((p) => ({ ...p, timeoutMs: Number(e.target.value) || 15000 }))} />
-            <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={0} max={3} placeholder="Retries" value={form.retries} onChange={(e) => setForm((p) => ({ ...p, retries: Number(e.target.value) || 0 }))} />
+            <label className="space-y-1">
+              <span className="text-xs font-medium text-slate-600">Timeout (ms)</span>
+              <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={5000} max={60000} placeholder="15000" value={form.timeoutMs} onChange={(e) => setForm((p) => ({ ...p, timeoutMs: Number(e.target.value) || 15000 }))} />
+            </label>
+            <label className="space-y-1">
+              <span className="text-xs font-medium text-slate-600">Retries</span>
+              <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={0} max={3} placeholder="1" value={form.retries} onChange={(e) => setForm((p) => ({ ...p, retries: Number(e.target.value) || 0 }))} />
+            </label>
           </div>
           <div className="mt-3 flex gap-2">
             <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || !canDiscoverProjects} onClick={() => void fetchProjects(null)}>
