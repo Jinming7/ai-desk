@@ -514,6 +514,67 @@ export async function discoverProjects(input: unknown) {
   }
 }
 
+export async function testEndpoint(input: unknown) {
+  const parsed = z.object({
+    baseUrl: z.string().url(),
+    authType: z.enum(["bearer", "header"]),
+    authHeader: z.string().min(1),
+    authSecret: z.string().min(1).optional(),
+    keepExistingSecret: z.coerce.boolean().default(false),
+    method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
+    path: z.string().min(1),
+    body: z.unknown().optional(),
+    customHeaders: z.record(z.string(), z.string()).optional(),
+    timeoutMs: z.coerce.number().int().positive().max(60000).default(15000)
+  }).parse(input);
+
+  const existing = await repo.getActiveConfig();
+  const resolvedSecret =
+    parsed.keepExistingSecret && existing
+      ? decryptSecret(existing.auth_secret_encrypted)
+      : (parsed.authSecret ?? "");
+  if (!resolvedSecret) {
+    throw new Error("Auth Secret is required for endpoint test.");
+  }
+
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    ...buildAuthHeadersFromInput({ authType: parsed.authType, authHeader: parsed.authHeader, authSecret: resolvedSecret }),
+    ...(parsed.customHeaders ?? {})
+  };
+
+  const url = withPath(parsed.baseUrl, parsed.path);
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const timer = setTimeout(() => controller.abort(), parsed.timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: parsed.method,
+      headers,
+      body: parsed.method === "GET" || parsed.method === "DELETE" ? undefined : JSON.stringify(parsed.body ?? {}),
+      signal: controller.signal
+    });
+    const rawText = await res.text();
+    let parsedResponse: unknown = rawText;
+    try {
+      parsedResponse = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      parsedResponse = rawText;
+    }
+    return {
+      ok: res.ok,
+      status: res.status,
+      statusText: res.statusText,
+      url,
+      elapsedMs: Date.now() - startedAt,
+      response: parsedResponse
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function saveDraftMapping(input: unknown) {
   const parsed = saveMappingSchema.parse(input);
   const validation = validateMappingRows(parsed.mappings);

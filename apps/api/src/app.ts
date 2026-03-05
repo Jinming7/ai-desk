@@ -343,6 +343,15 @@ app.post(
   })
 );
 
+app.post(
+  "/api/v1/internal/configuration/endpoint/test",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const result = await onesSyncService.testEndpoint(req.body);
+    res.status(result.ok ? 200 : 400).json(result);
+  })
+);
+
 app.get(
   "/api/v1/internal/ones-sync/ticket-types",
   requireInternalRequest,

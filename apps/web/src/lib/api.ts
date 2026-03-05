@@ -513,6 +513,39 @@ export async function discoverOnesProjects(input: {
   return (await res.json()) as { projects: Array<{ key: string; name: string }>; nextCursor: string | null };
 }
 
+export async function testIntegrationEndpoint(input: {
+  baseUrl: string;
+  authType: "bearer" | "header";
+  authHeader: string;
+  authSecret?: string;
+  keepExistingSecret?: boolean;
+  customHeaders?: Record<string, string>;
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  path: string;
+  body?: unknown;
+  timeoutMs: number;
+}) {
+  const res = await fetch(`${API}/api/v1/internal/configuration/endpoint/test`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(input)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Endpoint test failed: ${data.status ?? res.status} ${data.statusText ?? ""}`);
+  }
+  return data as {
+    ok: boolean;
+    status: number;
+    statusText: string;
+    url: string;
+    elapsedMs: number;
+    response: unknown;
+  };
+}
+
 export async function listFailedWebhookEvents() {
   const res = await fetch(`${API}/api/v1/internal/configuration/webhook/failed`, {
     headers: { "x-portal-surface": "internal" }
