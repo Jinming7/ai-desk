@@ -68,7 +68,6 @@ export function OnesSyncConfigPage() {
   const [editingAuthSecret, setEditingAuthSecret] = useState(false);
 
   const [form, setForm] = useState<{
-    profileName: string;
     baseUrl: string;
     authType: "bearer" | "header";
     authHeader: string;
@@ -85,7 +84,6 @@ export function OnesSyncConfigPage() {
     updatedBy: string;
     updatedAt: string;
   }>({
-    profileName: "default",
     baseUrl: "",
     authType: "bearer",
     authHeader: "Authorization",
@@ -150,7 +148,6 @@ export function OnesSyncConfigPage() {
       ]);
       if (config) {
         setForm((prev) => ({
-          profileName: config.profileName,
           baseUrl: config.baseUrl,
           authType: config.authType,
           authHeader: config.authHeader,
@@ -213,7 +210,7 @@ export function OnesSyncConfigPage() {
     setSuccess(null);
     try {
       await updateOnesSyncConfig({
-        profileName: form.profileName,
+        profileName: "default",
         baseUrl: form.baseUrl,
         authType: form.authType,
         authHeader: form.authHeader,
@@ -375,10 +372,6 @@ export function OnesSyncConfigPage() {
         <section className="rounded-mdplus border border-slate-200 bg-white p-4">
           <h2 className="text-sm font-semibold text-[#16171A]">Connection</h2>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
-            <label className="space-y-1">
-              <span className="text-xs font-medium text-slate-600">Profile Name</span>
-              <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="default" value={form.profileName} onChange={(e) => setForm((p) => ({ ...p, profileName: e.target.value }))} />
-            </label>
             <label className="space-y-1">
               <span className="text-xs font-medium text-slate-600">Base URL</span>
               <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="https://demo688.ones.pro/" value={form.baseUrl} onChange={(e) => setForm((p) => ({ ...p, baseUrl: e.target.value }))} />
