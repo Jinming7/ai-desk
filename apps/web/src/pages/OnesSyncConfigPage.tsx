@@ -60,6 +60,7 @@ export function OnesSyncConfigPage() {
   const [projects, setProjects] = useState<Array<{ key: string; name: string }>>([]);
   const [projectCursor, setProjectCursor] = useState<string | null>(null);
   const [projectNextCursor, setProjectNextCursor] = useState<string | null>(null);
+  const [projectListLoading, setProjectListLoading] = useState(false);
   const [failedWebhookEvents, setFailedWebhookEvents] = useState<Array<{ id: string; event_type: string; ones_ticket_key: string | null; error: string | null; retries: number; received_at: string }>>([]);
   const [health, setHealth] = useState<{ failedWebhookCount: number; topErrors: string[]; updatedAt: string } | null>(null);
   const [authSecretMasked, setAuthSecretMasked] = useState("");
@@ -272,7 +273,7 @@ export function OnesSyncConfigPage() {
   };
 
   const fetchProjects = async (cursor: string | null = null) => {
-    setSaving(true);
+    setProjectListLoading(true);
     setError(null);
     try {
       const result = await discoverOnesProjects({
@@ -297,9 +298,50 @@ export function OnesSyncConfigPage() {
     } catch (err) {
       setError((err as Error).message);
     } finally {
-      setSaving(false);
+      setProjectListLoading(false);
     }
   };
+
+  const loadProjectsOnDemand = async () => {
+    if (projectListLoading || projects.length > 0 || !canDiscoverProjects) return;
+    await fetchProjects(null);
+  };
+
+  useEffect(() => {
+    if (loading) return;
+    if (!form.onesProjectKey || !canDiscoverProjects || projectListLoading) return;
+    if (projects.some((p) => p.key === form.onesProjectKey)) return;
+
+    const loadUntilSelected = async () => {
+      let cursor: string | null = null;
+      let guard = 0;
+      while (guard < 5) {
+        guard += 1;
+        const result = await discoverOnesProjects({
+          baseUrl: form.baseUrl,
+          authType: form.authType,
+          authHeader: form.authHeader,
+          authSecret: authSecretDirty ? form.authSecret : undefined,
+          keepExistingSecret: !authSecretDirty,
+          teamId: form.onesTeamId,
+          limit: 50,
+          cursor: cursor ?? undefined,
+          listProjectsPath: form.listProjectsPath,
+          timeoutMs: form.timeoutMs
+        });
+        setProjects((prev) => {
+          const merged = [...prev];
+          for (const row of result.projects) {
+            if (!merged.some((p) => p.key === row.key)) merged.push(row);
+          }
+          return merged;
+        });
+        cursor = result.nextCursor;
+        if (!cursor || result.projects.some((p) => p.key === form.onesProjectKey)) break;
+      }
+    };
+    void loadUntilSelected();
+  }, [loading, form.onesProjectKey, form.baseUrl, form.authType, form.authHeader, form.onesTeamId, form.listProjectsPath, form.timeoutMs, authSecretDirty, form.authSecret, canDiscoverProjects, projectListLoading, projects]);
 
   if (loading) return <div className="mx-auto max-w-7xl px-4 py-8 text-sm text-slate-600">Loading configuration...</div>;
 
@@ -457,24 +499,30 @@ export function OnesSyncConfigPage() {
             </article>
           </div>
           <div className="mt-4 grid gap-3 md:grid-cols-2">
-            {projects.length > 0 ? (
-              <label className="space-y-1">
-                <span className="text-xs font-medium text-slate-600">Selected Project</span>
-                <select className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))}>
-                  <option value="">Select ONES Project</option>
-                  {projects.map((project) => (
-                    <option key={project.key} value={project.key}>
-                      {project.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : (
-              <label className="space-y-1">
-                <span className="text-xs font-medium text-slate-600">Selected Project</span>
-                <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" placeholder="ONES Project Key" value={form.onesProjectKey} onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))} />
-              </label>
-            )}
+            <label className="space-y-1">
+              <span className="text-xs font-medium text-slate-600">Selected Project</span>
+              <select
+                className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm"
+                value={form.onesProjectKey}
+                onFocus={() => void loadProjectsOnDemand()}
+                onClick={() => void loadProjectsOnDemand()}
+                onChange={(e) => setForm((p) => ({ ...p, onesProjectKey: e.target.value }))}
+                disabled={projectListLoading || !canDiscoverProjects}
+              >
+                <option value="">Select ONES Project</option>
+                {form.onesProjectKey && !projects.some((p) => p.key === form.onesProjectKey) && (
+                  <option value={form.onesProjectKey}>{form.onesProjectKey}</option>
+                )}
+                {projects.map((project) => (
+                  <option key={project.key} value={project.key}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-slate-500">
+                {projectListLoading ? "Loading project list..." : "Project list is loaded when you open this dropdown."}
+              </p>
+            </label>
             <label className="space-y-1">
               <span className="text-xs font-medium text-slate-600">Timeout (ms)</span>
               <input className="w-full rounded-mdplus border border-slate-200 px-3 py-2 text-sm" type="number" min={5000} max={60000} placeholder="15000" value={form.timeoutMs} onChange={(e) => setForm((p) => ({ ...p, timeoutMs: Number(e.target.value) || 15000 }))} />
@@ -485,23 +533,13 @@ export function OnesSyncConfigPage() {
             </label>
           </div>
           <div className="mt-3 flex gap-2">
-            <button className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" disabled={saving || !canDiscoverProjects} onClick={() => void fetchProjects(null)}>
-              Fetch Projects
-            </button>
-            <button
-              className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm disabled:opacity-60"
-              disabled={saving || !projectNextCursor || !canDiscoverProjects}
-              onClick={() => void fetchProjects(projectNextCursor)}
-            >
-              Load Next Page
-            </button>
             <button className="rounded-mdplus bg-brand-500 px-3 py-2 text-sm text-white disabled:opacity-70" disabled={saving} onClick={() => void saveConfig()}>
               Save Configuration
             </button>
           </div>
-          {projectNextCursor && (
+          {projectNextCursor && projects.length > 0 && (
             <p className="mt-2 text-xs text-slate-500">
-              Next cursor available: <code>{projectNextCursor}</code>
+              More projects are available and will be loaded when needed.
             </p>
           )}
         </section>
