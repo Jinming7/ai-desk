@@ -462,8 +462,6 @@ export async function discoverProjects(input: unknown) {
     "Content-Type": "application/json",
     ...buildAuthHeadersFromInput({ ...parsed, authSecret: resolvedSecret })
   };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), parsed.timeoutMs);
   let requestUrl = "";
   try {
     const pathWithTeam = resolvePathTemplate(parsed.listProjectsPath, { teamId: parsed.teamId });
@@ -475,12 +473,30 @@ export async function discoverProjects(input: unknown) {
     url.searchParams.set("limit", String(parsed.limit));
     if (parsed.cursor) url.searchParams.set("cursor", parsed.cursor);
     requestUrl = url.toString();
-    const res = await fetch(requestUrl, { headers, signal: controller.signal });
-    if (!res.ok) {
-      throw new Error(`ONES ${res.status}: ${await res.text()}`);
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt <= 1; attempt += 1) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), parsed.timeoutMs);
+      try {
+        const res = await fetch(requestUrl, { headers, signal: controller.signal });
+        clearTimeout(timer);
+        if (!res.ok) {
+          throw new Error(`ONES ${res.status}: ${await res.text()}`);
+        }
+        const raw = await res.json();
+        return parseProjectDiscoveryPage(raw);
+      } catch (error) {
+        clearTimeout(timer);
+        lastError = error as Error;
+        const message = lastError.message || "";
+        const isRetryableNetworkError = message.includes("fetch failed") || message.includes("ConnectTimeoutError") || message.includes("aborted");
+        if (!isRetryableNetworkError || attempt === 1) {
+          throw lastError;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
     }
-    const raw = await res.json();
-    return parseProjectDiscoveryPage(raw);
+    throw lastError ?? new Error("discover projects failed");
   } catch (error) {
     const message = error instanceof Error ? error.message : "request failed";
     const cause = error && typeof error === "object" && "cause" in error ? String((error as { cause: unknown }).cause) : "";
@@ -494,8 +510,6 @@ export async function discoverProjects(input: unknown) {
       cause
     });
     throw new Error(`Project discovery failed: ${message}${cause ? ` | cause: ${cause}` : ""}${requestUrl ? ` | url: ${requestUrl}` : ""}`);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
