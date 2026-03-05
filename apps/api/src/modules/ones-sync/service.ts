@@ -66,26 +66,31 @@ function withPath(baseUrl: string, path: string) {
 }
 
 function buildAuthHeaders(config: repo.OnesSyncConfigRecord, token: string): Record<string, string> {
-  if (config.auth_type === "bearer") {
+  const normalizedToken = token.trim();
+  const requiresBearer = config.auth_type === "bearer" || config.auth_header.toLowerCase() === "authorization";
+  if (requiresBearer) {
     return {
-      [config.auth_header]: token.startsWith("Bearer ") ? token : `Bearer ${token}`
+      [config.auth_header]: normalizedToken.startsWith("Bearer ") ? normalizedToken : `Bearer ${normalizedToken}`
     };
   }
-  return { [config.auth_header]: token };
+  return { [config.auth_header]: normalizedToken };
 }
 
 function buildAuthHeadersFromInput(input: { authType: "bearer" | "header"; authHeader: string; authSecret: string }) {
-  if (input.authType === "bearer") {
+  const normalizedToken = input.authSecret.trim();
+  const requiresBearer = input.authType === "bearer" || input.authHeader.toLowerCase() === "authorization";
+  if (requiresBearer) {
     return {
-      [input.authHeader]: input.authSecret.startsWith("Bearer ") ? input.authSecret : `Bearer ${input.authSecret}`
+      [input.authHeader]: normalizedToken.startsWith("Bearer ") ? normalizedToken : `Bearer ${normalizedToken}`
     };
   }
-  return { [input.authHeader]: input.authSecret };
+  return { [input.authHeader]: normalizedToken };
 }
 
 async function onesFetch(config: repo.OnesSyncConfigRecord, path: string, init?: RequestInit) {
   const token = decryptSecret(config.auth_secret_encrypted);
   const headers: Record<string, string> = {
+    Accept: "application/json",
     "Content-Type": "application/json",
     ...buildAuthHeaders(config, token),
     ...(init?.headers as Record<string, string> | undefined)
@@ -441,7 +446,7 @@ export async function discoverProjects(input: unknown) {
     limit: z.coerce.number().int().positive().max(100).default(50),
     cursor: z.string().optional(),
     listProjectsPath: z.string().min(1).default("/openapi/v2/project/projects"),
-    timeoutMs: z.coerce.number().int().positive().max(60000).default(12000)
+    timeoutMs: z.coerce.number().int().positive().max(60000).default(6000)
   }).parse(input);
   const existing = await repo.getActiveConfig();
   const resolvedSecret =
@@ -453,6 +458,7 @@ export async function discoverProjects(input: unknown) {
   }
 
   const headers: Record<string, string> = {
+    Accept: "application/json",
     "Content-Type": "application/json",
     ...buildAuthHeadersFromInput({ ...parsed, authSecret: resolvedSecret })
   };
