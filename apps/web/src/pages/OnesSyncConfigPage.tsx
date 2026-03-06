@@ -106,6 +106,40 @@ function unresolved(path: string) {
   return /\{[a-zA-Z0-9_]+\}/.test(path);
 }
 
+function appendQuery(path: string, key: string, value: string) {
+  if (!value.trim()) return path;
+  const [base, hash] = path.split("#", 2);
+  const [pathname, query] = base.split("?", 2);
+  const params = new URLSearchParams(query ?? "");
+  if (!params.has(key)) {
+    params.set(key, value);
+  }
+  const rebuilt = `${pathname}${params.toString() ? `?${params.toString()}` : ""}`;
+  return hash ? `${rebuilt}#${hash}` : rebuilt;
+}
+
+function extractArrayByHint(response: unknown, hint: string): unknown[] | null {
+  if (Array.isArray(response)) return response;
+  if (!response || typeof response !== "object") return null;
+  const root = response as Record<string, unknown>;
+  const data = root.data as Record<string, unknown> | unknown[] | undefined;
+
+  const candidates: unknown[] = [
+    root[hint],
+    root.items,
+    root.list,
+    data,
+    Array.isArray(data) ? data : (data as Record<string, unknown> | undefined)?.[hint],
+    Array.isArray(data) ? undefined : (data as Record<string, unknown> | undefined)?.items,
+    Array.isArray(data) ? undefined : (data as Record<string, unknown> | undefined)?.list
+  ];
+
+  for (const item of candidates) {
+    if (Array.isArray(item)) return item;
+  }
+  return null;
+}
+
 export function OnesSyncConfigPage() {
   const [step, setStep] = useState<Step>(0);
   const [loading, setLoading] = useState(true);
@@ -333,7 +367,19 @@ export function OnesSyncConfigPage() {
     try {
       const rawPath = endpointPaths[def.key];
       if (!rawPath?.trim()) throw new Error(`${def.label}: path required`);
-      const resolvedPath = applyPlaceholders(rawPath, runtimeVars);
+      let resolvedPath = applyPlaceholders(rawPath, runtimeVars);
+      if (def.method === "GET") {
+        resolvedPath = appendQuery(resolvedPath, "teamID", teamId);
+        if (projectKey) {
+          resolvedPath = appendQuery(resolvedPath, "projectID", projectKey);
+          resolvedPath = appendQuery(resolvedPath, "projectKey", projectKey);
+        }
+        const issueTypeKeyForTest = allowedIssueTypes[0] ?? issueTypes[0]?.key ?? "";
+        if (def.key === "listIssueFieldsPath" && issueTypeKeyForTest) {
+          resolvedPath = appendQuery(resolvedPath, "issueTypeID", issueTypeKeyForTest);
+          resolvedPath = appendQuery(resolvedPath, "issueTypeKey", issueTypeKeyForTest);
+        }
+      }
       if (unresolved(resolvedPath)) {
         throw new Error(`${def.label}: unresolved placeholders remain (${resolvedPath})`);
       }
@@ -359,10 +405,17 @@ export function OnesSyncConfigPage() {
         body,
         timeoutMs
       });
+      if (result.response && typeof result.response === "object") {
+        const objectResponse = result.response as Record<string, unknown>;
+        if (typeof objectResponse.errorMsg === "string" || typeof objectResponse.errorCode === "string") {
+          throw new Error(
+            `${def.label}: ONES API error ${String(objectResponse.errorCode ?? "UNKNOWN")} - ${String(objectResponse.errorMsg ?? "Request failed")}`
+          );
+        }
+      }
       if (def.responsePath) {
-        const source = (result.response as Record<string, unknown>) ?? {};
-        const bucket = source[def.responsePath] ?? source.data ?? source.items;
-        if (!Array.isArray(bucket)) {
+        const bucket = extractArrayByHint(result.response, def.responsePath);
+        if (!bucket) {
           throw new Error(`${def.label}: response path "${def.responsePath}" is not an array`);
         }
       }

@@ -29,7 +29,12 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-const aiAdapter = env.OPENCLAW_GATEWAY_TOKEN ? new WsOpenClawAdapter() : new MockOpenClawAdapter();
+const aiAdapter =
+  env.NODE_ENV === "test"
+    ? new MockOpenClawAdapter()
+    : env.OPENCLAW_GATEWAY_TOKEN
+      ? new WsOpenClawAdapter()
+      : new MockOpenClawAdapter();
 
 if (env.NODE_ENV !== "test") {
   setInterval(() => {

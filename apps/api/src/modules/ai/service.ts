@@ -11,6 +11,7 @@ import * as settings from "../settings/repository.js";
 function normalizeAction(action: string): OpenClawDecisionAction {
   if (action === "ask_info") return "ask_user";
   if (action === "auto_resolve") return "resolve";
+  if (action === "none") return "none";
   if (action === "escalate" || action === "ask_user" || action === "resolve") return action;
   return "ask_user";
 }
@@ -22,6 +23,7 @@ function containsCjk(text: string): boolean {
 function normalizeReplyToEnglish(action: OpenClawDecisionAction, text: string): string {
   const trimmed = text.trim();
   if (!trimmed) {
+    if (action === "none") return "";
     return action === "resolve"
       ? "Thanks for your report. We have applied a fix and marked this ticket as resolved. Please verify and let us know if you still see the issue."
       : action === "escalate"
@@ -35,7 +37,9 @@ function normalizeReplyToEnglish(action: OpenClawDecisionAction, text: string): 
     if (action === "escalate") {
       return "Thanks for your report. We need deeper technical analysis, so this ticket has been escalated to our R&D team.";
     }
-    return "Thanks for contacting support. Your ticket currently lacks actionable details. Please provide the exact issue, expected result, actual result, and reproduction steps.";
+    return action === "none"
+      ? ""
+      : "Thanks for contacting support. Your ticket currently lacks actionable details. Please provide the exact issue, expected result, actual result, and reproduction steps.";
   }
   return trimmed;
 }
@@ -233,6 +237,16 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
         evidence: result.evidence
       });
       return result;
+    }
+
+    if (result.action === "none") {
+      await tickets.addAuditLog(ticketId, "ai_triage_no_action", null, null, {
+        action: "none",
+        traceId,
+        stage: "triage_no_action",
+        confidence: result.confidence,
+        evidence: result.evidence
+      });
     }
 
     return result;

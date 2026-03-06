@@ -1081,7 +1081,7 @@ export async function updateOnesTicketByFlow(input: {
 
 export async function getDataSourceMode(): Promise<"ones_primary" | "local_mirror"> {
   const config = await repo.getActiveConfig();
-  return config?.data_source_mode ?? "ones_primary";
+  return config?.data_source_mode ?? "local_mirror";
 }
 
 export async function ingestWebhook(input: unknown) {

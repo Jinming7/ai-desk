@@ -23,15 +23,31 @@ export interface OnesSyncConfigRecord {
   allowed_ticket_type_keys: string[];
   status_mapping_json: Record<string, unknown>;
   workflow_mapping_json: Record<string, unknown>;
-  config_version: number;
-  publish_state: "draft" | "published";
-  publish_checks_json: Record<string, unknown>;
-  change_reason: string | null;
-  rolled_back_from: string | null;
+  config_version?: number;
+  publish_state?: "draft" | "published";
+  publish_checks_json?: Record<string, unknown>;
+  change_reason?: string | null;
+  rolled_back_from?: string | null;
   is_active: boolean;
   updated_by: string;
   updated_at: string;
   created_at: string;
+}
+
+let hasConfigVersionColumnCache: boolean | null = null;
+
+async function hasConfigVersionColumn(): Promise<boolean> {
+  if (hasConfigVersionColumnCache !== null) return hasConfigVersionColumnCache;
+  const result = await pool.query<{ exists: boolean }>(
+    `SELECT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_name = 'ones_sync_config'
+        AND column_name = 'config_version'
+    ) AS exists`
+  );
+  hasConfigVersionColumnCache = Boolean(result.rows[0]?.exists);
+  return hasConfigVersionColumnCache;
 }
 
 export interface OnesTicketTypeCacheRecord {
@@ -91,49 +107,83 @@ export async function upsertActiveConfig(input: {
   rolledBackFrom?: string | null;
   updatedBy: string;
 }): Promise<OnesSyncConfigRecord> {
-  const currentVersion = await pool.query<{ version: number }>("SELECT COALESCE(MAX(config_version), 0) AS version FROM ones_sync_config");
-  const nextVersion = (currentVersion.rows[0]?.version ?? 0) + 1;
+  const hasEnhancedColumns = await hasConfigVersionColumn();
+  let nextVersion = 1;
+  if (hasEnhancedColumns) {
+    const currentVersion = await pool.query<{ version: number }>("SELECT COALESCE(MAX(config_version), 0) AS version FROM ones_sync_config");
+    nextVersion = (currentVersion.rows[0]?.version ?? 0) + 1;
+  }
   await pool.query("UPDATE ones_sync_config SET is_active = false WHERE is_active = true");
   const id = uuidv4();
-  const result = await pool.query<OnesSyncConfigRecord>(
-    `INSERT INTO ones_sync_config (
-      id, profile_name, base_url, auth_type, auth_header, auth_secret_encrypted,
-      create_ticket_path, list_projects_path, list_ticket_types_path, list_fields_path_template,
-      timeout_ms, retries, data_source_mode, ones_project_key, ones_team_id, schema_hash, schema_synced_at,
-      endpoint_templates_json, allowed_ticket_type_keys, status_mapping_json, workflow_mapping_json,
-      config_version, publish_state, publish_checks_json, change_reason, rolled_back_from, is_active, updated_by
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19::jsonb,$20::jsonb,$21::jsonb,$22,$23,$24::jsonb,$25,$26,true,$27)
-    RETURNING *`,
-    [
-      id,
-      input.profileName,
-      input.baseUrl,
-      input.authType,
-      input.authHeader,
-      input.authSecretEncrypted,
-      input.createTicketPath,
-      input.listProjectsPath,
-      input.listTicketTypesPath,
-      input.listFieldsPathTemplate,
-      input.timeoutMs,
-      input.retries,
-      input.dataSourceMode,
-      input.onesProjectKey ?? null,
-      input.onesTeamId ?? null,
-      input.schemaHash ?? null,
-      input.schemaSyncedAt ?? null,
-      JSON.stringify(input.endpointTemplates ?? {}),
-      JSON.stringify(input.allowedTicketTypeKeys ?? []),
-      JSON.stringify(input.statusMapping ?? {}),
-      JSON.stringify(input.workflowMapping ?? {}),
-      nextVersion,
-      input.publishState ?? "draft",
-      JSON.stringify(input.publishChecks ?? {}),
-      input.changeReason ?? null,
-      input.rolledBackFrom ?? null,
-      input.updatedBy
-    ]
-  );
+  const result = hasEnhancedColumns
+    ? await pool.query<OnesSyncConfigRecord>(
+        `INSERT INTO ones_sync_config (
+          id, profile_name, base_url, auth_type, auth_header, auth_secret_encrypted,
+          create_ticket_path, list_projects_path, list_ticket_types_path, list_fields_path_template,
+          timeout_ms, retries, data_source_mode, ones_project_key, ones_team_id, schema_hash, schema_synced_at,
+          endpoint_templates_json, allowed_ticket_type_keys, status_mapping_json, workflow_mapping_json,
+          config_version, publish_state, publish_checks_json, change_reason, rolled_back_from, is_active, updated_by
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19::jsonb,$20::jsonb,$21::jsonb,$22,$23,$24::jsonb,$25,$26,true,$27)
+        RETURNING *`,
+        [
+          id,
+          input.profileName,
+          input.baseUrl,
+          input.authType,
+          input.authHeader,
+          input.authSecretEncrypted,
+          input.createTicketPath,
+          input.listProjectsPath,
+          input.listTicketTypesPath,
+          input.listFieldsPathTemplate,
+          input.timeoutMs,
+          input.retries,
+          input.dataSourceMode,
+          input.onesProjectKey ?? null,
+          input.onesTeamId ?? null,
+          input.schemaHash ?? null,
+          input.schemaSyncedAt ?? null,
+          JSON.stringify(input.endpointTemplates ?? {}),
+          JSON.stringify(input.allowedTicketTypeKeys ?? []),
+          JSON.stringify(input.statusMapping ?? {}),
+          JSON.stringify(input.workflowMapping ?? {}),
+          nextVersion,
+          input.publishState ?? "draft",
+          JSON.stringify(input.publishChecks ?? {}),
+          input.changeReason ?? null,
+          input.rolledBackFrom ?? null,
+          input.updatedBy
+        ]
+      )
+    : await pool.query<OnesSyncConfigRecord>(
+        `INSERT INTO ones_sync_config (
+          id, profile_name, base_url, auth_type, auth_header, auth_secret_encrypted,
+          create_ticket_path, list_projects_path, list_ticket_types_path, list_fields_path_template,
+          timeout_ms, retries, data_source_mode, ones_project_key, ones_team_id, schema_hash, schema_synced_at,
+          is_active, updated_by
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,true,$18)
+        RETURNING *`,
+        [
+          id,
+          input.profileName,
+          input.baseUrl,
+          input.authType,
+          input.authHeader,
+          input.authSecretEncrypted,
+          input.createTicketPath,
+          input.listProjectsPath,
+          input.listTicketTypesPath,
+          input.listFieldsPathTemplate,
+          input.timeoutMs,
+          input.retries,
+          input.dataSourceMode,
+          input.onesProjectKey ?? null,
+          input.onesTeamId ?? null,
+          input.schemaHash ?? null,
+          input.schemaSyncedAt ?? null,
+          input.updatedBy
+        ]
+      );
   return result.rows[0];
 }
 
@@ -143,8 +193,11 @@ export async function getConfigById(id: string): Promise<OnesSyncConfigRecord | 
 }
 
 export async function listConfigHistory(limit = 20): Promise<OnesSyncConfigRecord[]> {
+  const hasEnhancedColumns = await hasConfigVersionColumn();
   const result = await pool.query<OnesSyncConfigRecord>(
-    "SELECT * FROM ones_sync_config ORDER BY config_version DESC, updated_at DESC LIMIT $1",
+    hasEnhancedColumns
+      ? "SELECT * FROM ones_sync_config ORDER BY config_version DESC, updated_at DESC LIMIT $1"
+      : "SELECT * FROM ones_sync_config ORDER BY updated_at DESC LIMIT $1",
     [limit]
   );
   return result.rows;

@@ -1,4 +1,4 @@
-export type OpenClawDecisionAction = "resolve" | "ask_user" | "escalate";
+export type OpenClawDecisionAction = "resolve" | "ask_user" | "escalate" | "none";
 
 export interface OpenClawAnalyzeInput {
   ticket_id: string;
