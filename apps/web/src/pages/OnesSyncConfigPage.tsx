@@ -118,18 +118,18 @@ export function OnesSyncConfigPage() {
   });
 
   const [workItemEndpoints, setWorkItemEndpoints] = useState<EndpointConfig[]>([
-    { key: "workitems.list", label: "Get Work Item List", method: "GET", path: "/api/v1/tickets?project={{project.key}}", responsePath: "tickets" },
-    { key: "workitems.detail", label: "Get Work Item Details", method: "GET", path: "/api/v1/tickets/{{workItem.id}}" },
-    { key: "workitems.create", label: "Create Work Item", method: "POST", path: "/api/v1/tickets", bodyTemplate: "{\n  \"title\": \"{{summary}}\",\n  \"description\": \"{{description}}\",\n  \"onesTicketTypeKey\": \"{{issueTypeId}}\"\n}" },
-    { key: "workitems.workflow", label: "Execute Workflow (Change Status)", method: "POST", path: "/api/v1/tickets/{{workItem.id}}/transition", bodyTemplate: "{\n  \"transition\": {\n    \"id\": \"{{transition.id}}\"\n  }\n}" },
-    { key: "workitems.status", label: "Get Work Item Status List", method: "GET", path: "/api/v1/ticket-statuses", responsePath: "statuses" }
+    { key: "workitems.list", label: "Get Work Item List", method: "GET", path: "", responsePath: "data" },
+    { key: "workitems.detail", label: "Get Work Item Details", method: "GET", path: "" },
+    { key: "workitems.create", label: "Create Work Item", method: "POST", path: "", bodyTemplate: "{\n  \"summary\": \"{{summary}}\",\n  \"description\": \"{{description}}\"\n}" },
+    { key: "workitems.workflow", label: "Execute Workflow (Change Status)", method: "POST", path: "", bodyTemplate: "{\n  \"transition\": {\n    \"id\": \"{{transition.id}}\"\n  }\n}" },
+    { key: "workitems.status", label: "Get Work Item Status List", method: "GET", path: "", responsePath: "data" }
   ]);
 
   const [commentEndpoints, setCommentEndpoints] = useState<EndpointConfig[]>([
-    { key: "comments.list", label: "Get Comments", method: "GET", path: "/api/v1/tickets/{{workItem.id}}/comments", responsePath: "comments" },
-    { key: "comments.add", label: "Add Comment", method: "POST", path: "/api/v1/tickets/{{workItem.id}}/comments", bodyTemplate: "{\n  \"body\": \"{{comment.body}}\"\n}" },
-    { key: "comments.update", label: "Update Comment", method: "PATCH", path: "/api/v1/tickets/{{workItem.id}}/comments/{{comment.id}}", bodyTemplate: "{\n  \"body\": \"{{comment.body}}\"\n}" },
-    { key: "comments.delete", label: "Delete Comment", method: "DELETE", path: "/api/v1/tickets/{{workItem.id}}/comments/{{comment.id}}" }
+    { key: "comments.list", label: "Get Comments", method: "GET", path: "", responsePath: "data" },
+    { key: "comments.add", label: "Add Comment", method: "POST", path: "", bodyTemplate: "{\n  \"body\": \"{{comment.body}}\"\n}" },
+    { key: "comments.update", label: "Update Comment", method: "PATCH", path: "", bodyTemplate: "{\n  \"body\": \"{{comment.body}}\"\n}" },
+    { key: "comments.delete", label: "Delete Comment", method: "DELETE", path: "" }
   ]);
 
   const runtimePlaceholders = useMemo(
@@ -186,14 +186,6 @@ export function OnesSyncConfigPage() {
         setRetries(config.retries);
         setSelectedProjectKey(config.onesProjectKey ?? "");
         setProjectsEndpoint((p) => ({ ...p, path: config.listProjectsPath }));
-        setWorkItemEndpoints((prev) =>
-          prev.map((item) => {
-            if (item.key === "workitems.create") return { ...item, path: config.createTicketPath };
-            if (item.key === "workitems.list") return { ...item, path: config.listTicketTypesPath };
-            if (item.key === "workitems.status") return { ...item, path: config.listTicketTypesPath };
-            return item;
-          })
-        );
       }
     } catch (e) {
       setError((e as Error).message);
@@ -208,10 +200,19 @@ export function OnesSyncConfigPage() {
 
   const runEndpointTest = async (endpoint: EndpointConfig, setResult: (result: TestResult) => void) => {
     if (!baseUrl.trim()) return setError("Base URL is required.");
+    if (!endpoint.path.trim()) {
+      throw new Error(`${endpoint.label}: endpoint path is required.`);
+    }
     const resolvedPath = resolveTemplatePath(endpoint.path, runtimePlaceholders);
+    if (resolvedPath.includes("{{")) {
+      throw new Error(`${endpoint.label}: unresolved placeholders remain in path.`);
+    }
     let body: unknown = undefined;
     if (endpoint.bodyTemplate?.trim()) {
       const resolvedBody = resolveTemplatePath(endpoint.bodyTemplate, runtimePlaceholders);
+      if (resolvedBody.includes("{{")) {
+        throw new Error(`${endpoint.label}: unresolved placeholders remain in request body template.`);
+      }
       try {
         body = JSON.parse(resolvedBody);
       } catch {
@@ -517,7 +518,7 @@ export function OnesSyncConfigPage() {
                     <select className="rounded-mdplus border border-slate-200 px-2 py-2 text-sm" value={ep.method} onChange={(e) => setEndpoint("workitem", ep.key, (item) => ({ ...item, method: e.target.value as HttpMethod }))}>
                       {["GET", "POST", "PUT", "PATCH", "DELETE"].map((m) => <option key={m} value={m}>{m}</option>)}
                     </select>
-                    <input className="md:col-span-2 rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={ep.path} onChange={(e) => setEndpoint("workitem", ep.key, (item) => ({ ...item, path: e.target.value }))} />
+                    <input className="md:col-span-2 rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={ep.path} onChange={(e) => setEndpoint("workitem", ep.key, (item) => ({ ...item, path: e.target.value }))} placeholder="Enter ONES OpenAPI path" />
                     <input className="rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={ep.responsePath || ""} onChange={(e) => setEndpoint("workitem", ep.key, (item) => ({ ...item, responsePath: e.target.value }))} placeholder="Response Data Path" />
                   </div>
                   {ep.method !== "GET" && (
@@ -545,7 +546,7 @@ export function OnesSyncConfigPage() {
                     <select className="rounded-mdplus border border-slate-200 px-2 py-2 text-sm" value={ep.method} onChange={(e) => setEndpoint("comment", ep.key, (item) => ({ ...item, method: e.target.value as HttpMethod }))}>
                       {["GET", "POST", "PUT", "PATCH", "DELETE"].map((m) => <option key={m} value={m}>{m}</option>)}
                     </select>
-                    <input className="md:col-span-2 rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={ep.path} onChange={(e) => setEndpoint("comment", ep.key, (item) => ({ ...item, path: e.target.value }))} />
+                    <input className="md:col-span-2 rounded-mdplus border border-slate-200 px-3 py-2 text-sm" value={ep.path} onChange={(e) => setEndpoint("comment", ep.key, (item) => ({ ...item, path: e.target.value }))} placeholder="Enter ONES OpenAPI path" />
                   </div>
                   {ep.method !== "GET" && ep.method !== "DELETE" && (
                     <textarea className="mt-2 w-full rounded-mdplus border border-slate-200 px-3 py-2 font-mono text-xs" rows={3} value={ep.bodyTemplate || ""} onChange={(e) => setEndpoint("comment", ep.key, (item) => ({ ...item, bodyTemplate: e.target.value }))} />

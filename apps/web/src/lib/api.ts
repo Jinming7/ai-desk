@@ -534,7 +534,7 @@ export async function testIntegrationEndpoint(input: {
   });
   const data = await res.json();
   if (!res.ok) {
-    throw new Error(`Endpoint test failed: ${data.status ?? res.status} ${data.statusText ?? ""}`);
+    throw new Error(data.error ? `Endpoint test failed: ${data.error}` : `Endpoint test failed: ${data.status ?? res.status} ${data.statusText ?? ""}`);
   }
   return data as {
     ok: boolean;
@@ -543,6 +543,7 @@ export async function testIntegrationEndpoint(input: {
     url: string;
     elapsedMs: number;
     response: unknown;
+    error?: string | null;
   };
 }
 

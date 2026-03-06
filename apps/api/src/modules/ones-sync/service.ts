@@ -557,18 +557,28 @@ export async function testEndpoint(input: unknown) {
     });
     const rawText = await res.text();
     let parsedResponse: unknown = rawText;
+    const contentType = res.headers.get("content-type") ?? "";
+    const isJsonContentType = contentType.toLowerCase().includes("application/json");
     try {
       parsedResponse = rawText ? JSON.parse(rawText) : {};
     } catch {
       parsedResponse = rawText;
     }
+    const looksLikeHtml =
+      typeof parsedResponse === "string" &&
+      /^\s*<!doctype html/i.test(parsedResponse);
+    const isStructuredJson = isJsonContentType && !looksLikeHtml;
+    const validationError = isStructuredJson
+      ? null
+      : `Expected JSON response from API endpoint, but got content-type: ${contentType || "unknown"}`;
     return {
-      ok: res.ok,
+      ok: res.ok && isStructuredJson,
       status: res.status,
-      statusText: res.statusText,
+      statusText: res.ok && !isStructuredJson ? "Invalid API response" : res.statusText,
       url,
       elapsedMs: Date.now() - startedAt,
-      response: parsedResponse
+      response: parsedResponse,
+      error: validationError
     };
   } finally {
     clearTimeout(timer);
