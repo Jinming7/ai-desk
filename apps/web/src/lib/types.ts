@@ -131,6 +131,15 @@ export interface OnesSyncConfig {
   listProjectsPath: string;
   listTicketTypesPath: string;
   listFieldsPathTemplate: string;
+  endpointTemplates?: Record<string, string>;
+  allowedTicketTypeKeys?: string[];
+  statusMapping?: Record<string, string>;
+  workflowMapping?: Record<string, string>;
+  configVersion?: number;
+  publishState?: "draft" | "published";
+  publishChecks?: Record<string, unknown>;
+  changeReason?: string | null;
+  rolledBackFrom?: string | null;
   timeoutMs: number;
   retries: number;
   dataSourceMode: "ones_primary" | "local_mirror";
@@ -140,6 +149,18 @@ export interface OnesSyncConfig {
   schemaSyncedAt?: string | null;
   updatedBy: string;
   updatedAt: string;
+}
+
+export interface OnesConfigHistoryItem {
+  id: string;
+  version: number;
+  profileName: string;
+  publishState: "draft" | "published";
+  updatedBy: string;
+  updatedAt: string;
+  changeReason: string | null;
+  rolledBackFrom: string | null;
+  isActive: boolean;
 }
 
 export interface OnesCatalogStatus {

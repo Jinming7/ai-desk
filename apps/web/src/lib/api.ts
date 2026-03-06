@@ -1,4 +1,4 @@
-import type { AgentQueueTicket, AiAgentMode, AiEscalation, OnesCatalogStatus, OnesSyncConfig, OnesTicketType, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
+import type { AgentQueueTicket, AiAgentMode, AiEscalation, OnesCatalogStatus, OnesConfigHistoryItem, OnesSyncConfig, OnesTicketType, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
 
 const API = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 
@@ -367,6 +367,13 @@ export async function updateOnesSyncConfig(input: {
   listProjectsPath: string;
   listTicketTypesPath: string;
   listFieldsPathTemplate: string;
+  endpointTemplates?: Record<string, string>;
+  allowedTicketTypeKeys?: string[];
+  statusMapping?: Record<string, string>;
+  workflowMapping?: Record<string, string>;
+  publishState?: "draft" | "published";
+  publishChecks?: Record<string, unknown>;
+  changeReason?: string;
   timeoutMs: number;
   retries: number;
   dataSourceMode: "ones_primary" | "local_mirror";
@@ -384,6 +391,66 @@ export async function updateOnesSyncConfig(input: {
   if (!res.ok) throw new Error("Failed to update ONES sync config");
   const data = await res.json();
   return data.config;
+}
+
+export async function discoverOnesIssueStatuses(input?: { teamId?: string; projectKey?: string }) {
+  const params = new URLSearchParams();
+  if (input?.teamId) params.set("teamId", input.teamId);
+  if (input?.projectKey) params.set("projectKey", input.projectKey);
+  const q = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetch(`${API}/api/v1/internal/configuration/statuses/discover${q}`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to discover ONES issue statuses");
+  return (await res.json()).statuses as Array<{ key: string; name: string; source: Record<string, unknown> }>;
+}
+
+export async function getOnesConfigHistory(limit = 20): Promise<OnesConfigHistoryItem[]> {
+  const res = await fetch(`${API}/api/v1/internal/configuration/history?limit=${limit}`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load config history");
+  return (await res.json()).history as OnesConfigHistoryItem[];
+}
+
+export async function runOnesPublishPreflight() {
+  const res = await fetch(`${API}/api/v1/internal/configuration/publish/preflight`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Preflight failed: ${(data.errors ?? []).join(" | ") || "unknown error"}`);
+  return data as { ready: boolean; checks: Record<string, boolean>; errors: string[] };
+}
+
+export async function publishOnesConfig(actor = "support_admin", reason?: string) {
+  const res = await fetch(`${API}/api/v1/internal/configuration/publish`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ actor, reason })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to publish ONES configuration");
+  return (await res.json()).config as OnesSyncConfig;
+}
+
+export async function rollbackOnesConfig(configId: string, actor = "support_admin", reason?: string) {
+  const res = await fetch(`${API}/api/v1/internal/configuration/rollback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify({ configId, actor, reason })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to rollback ONES configuration");
+  return (await res.json()).config as OnesSyncConfig;
 }
 
 export async function discoverOnesTicketTypes(actor = "support_admin"): Promise<OnesTicketType[]> {
@@ -509,8 +576,14 @@ export async function discoverOnesProjects(input: {
   }).catch((error) => {
     throw asUserError(error);
   });
-  if (!res.ok) throw new Error("Failed to discover ONES projects");
-  return (await res.json()) as { projects: Array<{ key: string; name: string }>; nextCursor: string | null };
+  const data = await res.json();
+  if (!res.ok) {
+    const raw = typeof data?.error === "string" ? data.error : "Failed to discover ONES projects";
+    if (raw.includes("401")) throw new Error(`Failed to discover ONES projects: 401 Unauthorized. ${raw}`);
+    if (raw.includes("403")) throw new Error(`Failed to discover ONES projects: 403 Forbidden. ${raw}`);
+    throw new Error(raw);
+  }
+  return data as { projects: Array<{ key: string; name: string }>; nextCursor: string | null };
 }
 
 export async function testIntegrationEndpoint(input: {

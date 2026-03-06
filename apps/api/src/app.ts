@@ -273,7 +273,7 @@ app.get(
 app.get(
   "/api/v1/ones/ticket-types",
   asyncHandler(async (_req, res) => {
-    const rows = await onesSyncService.listTicketTypes();
+    const rows = await onesSyncService.listCustomerTicketTypes();
     res.json({ ticketTypes: rows });
   })
 );
@@ -349,6 +349,59 @@ app.post(
   asyncHandler(async (req, res) => {
     const result = await onesSyncService.testEndpoint(req.body);
     res.status(result.ok ? 200 : 400).json(result);
+  })
+);
+
+app.get(
+  "/api/v1/internal/configuration/statuses/discover",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const teamId = z.string().optional().parse(req.query.teamId);
+    const projectKey = z.string().optional().parse(req.query.projectKey);
+    const statuses = await onesSyncService.discoverIssueStatuses({ teamId, projectKey });
+    res.json({ statuses });
+  })
+);
+
+app.get(
+  "/api/v1/internal/configuration/history",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const limit = z.coerce.number().int().min(1).max(100).default(20).parse(req.query.limit);
+    const history = await onesSyncService.listConfigHistory(limit);
+    res.json({ history });
+  })
+);
+
+app.post(
+  "/api/v1/internal/configuration/publish/preflight",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const result = await onesSyncService.runPublishPreflight();
+    res.status(result.ready ? 200 : 400).json(result);
+  })
+);
+
+app.post(
+  "/api/v1/internal/configuration/publish",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const actor = z.string().default("internal_operator").parse(req.body?.actor);
+    const reason = z.string().max(500).optional().parse(req.body?.reason);
+    const config = await onesSyncService.publishConfig(actor, reason);
+    res.json({ config });
+  })
+);
+
+app.post(
+  "/api/v1/internal/configuration/rollback",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const configId = z.string().uuid().parse(req.body?.configId);
+    const actor = z.string().default("internal_operator").parse(req.body?.actor);
+    const reason = z.string().max(500).optional().parse(req.body?.reason);
+    const config = await onesSyncService.rollbackConfig(configId, actor, reason);
+    res.json({ config });
   })
 );
 

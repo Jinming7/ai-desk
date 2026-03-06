@@ -42,10 +42,10 @@ const envSchema = z.object({
   FEATURE_DEEP_RETRIEVAL: z.coerce.boolean().default(true),
   ONES_SYNC_ENCRYPTION_KEY: z.string().default("dev-only-change-me-32-char-key"),
   ONES_SYNC_DEFAULT_BASE_URL: z.string().default("https://ones.com"),
-  ONES_SYNC_DEFAULT_PROJECTS_PATH: z.string().default("/openapi/v2/project/projects"),
-  ONES_SYNC_DEFAULT_TICKET_TYPES_PATH: z.string().default("/api/v1/ticket-types"),
-  ONES_SYNC_DEFAULT_FIELDS_PATH_TEMPLATE: z.string().default("/api/v1/ticket-types/{ticketTypeKey}/fields"),
-  ONES_SYNC_DEFAULT_CREATE_TICKET_PATH: z.string().default("/api/v1/tickets")
+  ONES_SYNC_DEFAULT_PROJECTS_PATH: z.string().default("/project/projects"),
+  ONES_SYNC_DEFAULT_TICKET_TYPES_PATH: z.string().default("/project/issueTypes"),
+  ONES_SYNC_DEFAULT_FIELDS_PATH_TEMPLATE: z.string().default("/project/issueFields"),
+  ONES_SYNC_DEFAULT_CREATE_TICKET_PATH: z.string().default("/project/issues")
 });
 
 export const env = envSchema.parse(process.env);

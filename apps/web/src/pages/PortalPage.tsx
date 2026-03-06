@@ -77,6 +77,8 @@ export function PortalPage() {
       .catch(() => setOnesTypes([]));
   }, []);
 
+  const noCustomerTypes = onesTypes.length === 0;
+
   const submit = async () => {
     if (!service) return;
     if (title.trim().length < 3) {
@@ -313,6 +315,13 @@ export function PortalPage() {
                   </button>
                 ))}
               </div>
+            </div>
+          )}
+          {unresolved && noCustomerTypes && (
+            <div className="mt-4 w-full rounded-2xl border border-amber-200 bg-amber-50 p-4 text-left md:w-[60%]">
+              <p className="text-xs text-amber-700">
+                Ticket types are not available yet. Ask support admin to publish Configuration whitelist for customer portal.
+              </p>
             </div>
           )}
           {!searching && query.trim().length >= 2 && !searchResult && !searchError && (

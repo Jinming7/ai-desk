@@ -15,6 +15,11 @@ export async function submitTicketWorkflow(input: TicketCreateInput, adapter: Op
   const dataSourceMode = await onesSyncService.getDataSourceMode();
 
   if (input.onesTicketTypeKey) {
+    const allowed = await onesSyncService.isCustomerTicketTypeAllowed(input.onesTicketTypeKey);
+    if (!allowed) {
+      await ticketsRepo.deleteTicket(ticket.id);
+      throw new Error(`Ticket type ${input.onesTicketTypeKey} is not allowed for customer portal`);
+    }
     try {
       const config = await onesSyncService.getConfig();
       const ones = await onesSyncService.createOnesTicket({

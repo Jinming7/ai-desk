@@ -16,6 +16,13 @@ const configInputSchema = z.object({
   listProjectsPath: z.string().min(1).default("/api/v1/projects"),
   listTicketTypesPath: z.string().min(1),
   listFieldsPathTemplate: z.string().min(1),
+  endpointTemplates: z.record(z.string(), z.string()).default({}),
+  allowedTicketTypeKeys: z.array(z.string().min(1)).default([]),
+  statusMapping: z.record(z.string(), z.string()).default({}),
+  workflowMapping: z.record(z.string(), z.string()).default({}),
+  publishState: z.enum(["draft", "published"]).default("draft"),
+  publishChecks: z.record(z.string(), z.unknown()).default({}),
+  changeReason: z.string().max(500).optional(),
   timeoutMs: z.coerce.number().int().positive().max(60000).default(12000),
   retries: z.coerce.number().int().min(0).max(3).default(1),
   dataSourceMode: z.enum(["ones_primary", "local_mirror"]).default("ones_primary"),
@@ -23,6 +30,25 @@ const configInputSchema = z.object({
   onesTeamId: z.string().optional(),
   actor: z.string().min(1).default("internal_operator")
 });
+
+const endpointTemplateDefaults = {
+  listProjectsPath: "/project/projects",
+  listIssueTypesPath: "/project/issueTypes",
+  listIssueFieldsPath: "/project/issueFields",
+  listIssueStatusesPath: "/project/issueStatuses",
+  listIssuesPath: "/project/issues",
+  getIssuePathTemplate: "/project/issues/{issueID}",
+  createIssuePath: "/project/issues",
+  updateIssuePathTemplate: "/project/issues/{issueID}",
+  deleteIssuePathTemplate: "/project/issues/{issueID}",
+  listIssueWorkflowsPathTemplate: "/project/issues/{issueID}/workflows",
+  executeIssueWorkflowPathTemplate: "/project/issues/{issueID}",
+  listCommentsPathTemplate: "/project/issues/{issueID}/comments",
+  getCommentPathTemplate: "/project/issues/{issueID}/comments/{commentsID}",
+  addCommentPathTemplate: "/project/issues/{issueID}/comments",
+  updateCommentPathTemplate: "/project/issues/{issueID}/comments/{commentsID}",
+  deleteCommentPathTemplate: "/project/issues/{issueID}/comments/{commentsID}"
+} as const;
 
 const mappingRowSchema = z.object({
   source: z.string().min(1),
@@ -60,9 +86,18 @@ const webhookInputSchema = z.object({
 });
 
 function withPath(baseUrl: string, path: string) {
-  const normalizedBase = baseUrl.replace(/\/$/, "");
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-  return `${normalizedBase}${normalizedPath}`;
+  const base = new URL(baseUrl);
+  const basePath = base.pathname.replace(/\/$/, "");
+  const baseHasOpenApiPrefix = /\/openapi\/v\d+$/i.test(basePath);
+  const shouldInjectOpenApiPrefix = !baseHasOpenApiPrefix && normalizedPath.startsWith("/project/");
+  const effectiveBasePath = shouldInjectOpenApiPrefix ? "/openapi/v2" : (basePath || "");
+  const finalPath = `${effectiveBasePath}${normalizedPath}`.replace(/\/{2,}/g, "/");
+  return `${base.origin}${finalPath}`;
 }
 
 function buildAuthHeaders(config: repo.OnesSyncConfigRecord, token: string): Record<string, string> {
@@ -148,6 +183,29 @@ function parseFields(raw: unknown): unknown[] {
   const envelope = raw as Record<string, unknown>;
   const list = envelope.fields ?? envelope.data ?? [];
   return Array.isArray(list) ? list : [];
+}
+
+function parseIssueStatuses(raw: unknown): Array<{ key: string; name: string; source: Record<string, unknown> }> {
+  if (Array.isArray(raw)) {
+    return raw
+      .map((row) => row as Record<string, unknown>)
+      .map((row) => ({
+        key: String(row.key ?? row.id ?? row.statusID ?? row.uuid ?? ""),
+        name: String(row.name ?? row.title ?? row.key ?? row.id ?? ""),
+        source: row
+      }))
+      .filter((row) => row.key.length > 0);
+  }
+  const envelope = raw as Record<string, unknown>;
+  const list = envelope.statuses ?? envelope.items ?? envelope.data;
+  return parseIssueStatuses(list);
+}
+
+function resolveEndpointTemplates(config: repo.OnesSyncConfigRecord): Record<string, string> {
+  return {
+    ...endpointTemplateDefaults,
+    ...(config.endpoint_templates_json ?? {})
+  };
 }
 
 function resolvePathTemplate(
@@ -299,6 +357,15 @@ export async function getConfig() {
     listProjectsPath: config.list_projects_path,
     listTicketTypesPath: config.list_ticket_types_path,
     listFieldsPathTemplate: config.list_fields_path_template,
+    endpointTemplates: resolveEndpointTemplates(config),
+    allowedTicketTypeKeys: config.allowed_ticket_type_keys ?? [],
+    statusMapping: config.status_mapping_json ?? {},
+    workflowMapping: config.workflow_mapping_json ?? {},
+    configVersion: config.config_version ?? 1,
+    publishState: config.publish_state ?? "draft",
+    publishChecks: config.publish_checks_json ?? {},
+    changeReason: config.change_reason,
+    rolledBackFrom: config.rolled_back_from,
     timeoutMs: config.timeout_ms,
     retries: config.retries,
     dataSourceMode: config.data_source_mode,
@@ -331,6 +398,13 @@ export async function upsertConfig(input: unknown) {
     listProjectsPath: parsed.listProjectsPath,
     listTicketTypesPath: parsed.listTicketTypesPath,
     listFieldsPathTemplate: parsed.listFieldsPathTemplate,
+    endpointTemplates: parsed.endpointTemplates,
+    allowedTicketTypeKeys: parsed.allowedTicketTypeKeys,
+    statusMapping: parsed.statusMapping,
+    workflowMapping: parsed.workflowMapping,
+    publishState: parsed.publishState,
+    publishChecks: parsed.publishChecks,
+    changeReason: parsed.changeReason ?? null,
     timeoutMs: parsed.timeoutMs,
     retries: parsed.retries,
     dataSourceMode: parsed.dataSourceMode,
@@ -342,7 +416,14 @@ export async function upsertConfig(input: unknown) {
     actor: parsed.actor,
     scope: "config",
     eventType: "config_updated",
-    payload: { profileName: parsed.profileName, baseUrl: parsed.baseUrl, keepExistingSecret: parsed.keepExistingSecret }
+    payload: {
+      profileName: parsed.profileName,
+      baseUrl: parsed.baseUrl,
+      keepExistingSecret: parsed.keepExistingSecret,
+      allowedTicketTypeKeys: parsed.allowedTicketTypeKeys,
+      publishState: parsed.publishState,
+      changeReason: parsed.changeReason ?? null
+    }
   });
   return {
     id: saved.id,
@@ -355,6 +436,15 @@ export async function upsertConfig(input: unknown) {
     listProjectsPath: saved.list_projects_path,
     listTicketTypesPath: saved.list_ticket_types_path,
     listFieldsPathTemplate: saved.list_fields_path_template,
+    endpointTemplates: resolveEndpointTemplates(saved),
+    allowedTicketTypeKeys: saved.allowed_ticket_type_keys ?? [],
+    statusMapping: saved.status_mapping_json ?? {},
+    workflowMapping: saved.workflow_mapping_json ?? {},
+    configVersion: saved.config_version ?? 1,
+    publishState: saved.publish_state ?? "draft",
+    publishChecks: saved.publish_checks_json ?? {},
+    changeReason: saved.change_reason,
+    rolledBackFrom: saved.rolled_back_from,
     timeoutMs: saved.timeout_ms,
     retries: saved.retries,
     dataSourceMode: saved.data_source_mode,
@@ -372,7 +462,8 @@ export async function discoverTicketTypes(actor = "internal_operator") {
   if (!config) {
     throw new Error("ONES sync config not set");
   }
-  const typesPath = resolvePathTemplate(config.list_ticket_types_path, {
+  const endpoints = resolveEndpointTemplates(config);
+  const typesPath = resolvePathTemplate(endpoints.listIssueTypesPath ?? config.list_ticket_types_path, {
     teamId: config.ones_team_id,
     projectKey: config.ones_project_key
   });
@@ -381,7 +472,7 @@ export async function discoverTicketTypes(actor = "internal_operator") {
   const rows: Array<{ key: string; name: string; fields: unknown[]; source: Record<string, unknown> }> = [];
 
   for (const type of ticketTypes) {
-    const fieldsPath = resolvePathTemplate(config.list_fields_path_template, {
+    const fieldsPath = resolvePathTemplate(endpoints.listIssueFieldsPath ?? config.list_fields_path_template, {
       teamId: config.ones_team_id,
       projectKey: config.ones_project_key,
       ticketTypeKey: type.key
@@ -407,6 +498,14 @@ export async function discoverTicketTypes(actor = "internal_operator") {
     listProjectsPath: config.list_projects_path,
     listTicketTypesPath: config.list_ticket_types_path,
     listFieldsPathTemplate: config.list_fields_path_template,
+    endpointTemplates: config.endpoint_templates_json ?? {},
+    allowedTicketTypeKeys: config.allowed_ticket_type_keys ?? [],
+    statusMapping: config.status_mapping_json ?? {},
+    workflowMapping: config.workflow_mapping_json ?? {},
+    publishState: config.publish_state ?? "draft",
+    publishChecks: config.publish_checks_json ?? {},
+    changeReason: config.change_reason,
+    rolledBackFrom: config.rolled_back_from,
     timeoutMs: config.timeout_ms,
     retries: config.retries,
     dataSourceMode: config.data_source_mode,
@@ -433,6 +532,40 @@ export async function listTicketTypes() {
     fields: row.fields_json,
     syncedAt: row.synced_at
   }));
+}
+
+export async function listCustomerTicketTypes() {
+  const [rows, config] = await Promise.all([repo.listTicketTypeCache(), repo.getActiveConfig()]);
+  const allowed = new Set((config?.allowed_ticket_type_keys ?? []).map(String));
+  const filtered = rows.filter((row) => allowed.has(row.type_key));
+  return filtered.map((row) => ({
+    key: row.type_key,
+    name: row.type_name,
+    fields: row.fields_json,
+    syncedAt: row.synced_at
+  }));
+}
+
+export async function isCustomerTicketTypeAllowed(ticketTypeKey: string): Promise<boolean> {
+  const config = await repo.getActiveConfig();
+  const allowed = new Set((config?.allowed_ticket_type_keys ?? []).map(String));
+  if (allowed.size === 0) return false;
+  return allowed.has(ticketTypeKey);
+}
+
+export async function discoverIssueStatuses(input: {
+  teamId?: string;
+  projectKey?: string;
+}) {
+  const config = await repo.getActiveConfig();
+  if (!config) throw new Error("ONES sync config not set");
+  const endpoints = resolveEndpointTemplates(config);
+  const path = resolvePathTemplate(endpoints.listIssueStatusesPath ?? "/project/issueStatuses", {
+    teamId: input.teamId ?? config.ones_team_id,
+    projectKey: input.projectKey ?? config.ones_project_key
+  });
+  const raw = await onesFetch(config, path).then((res) => res.json());
+  return parseIssueStatuses(raw);
 }
 
 export async function discoverProjects(input: unknown) {
@@ -704,6 +837,167 @@ export async function getCatalogStatus() {
   };
 }
 
+export async function runPublishPreflight() {
+  const config = await repo.getActiveConfig();
+  if (!config) {
+    return {
+      ready: false,
+      checks: {
+        connection: false,
+        endpoints: false,
+        whitelist: false,
+        mappings: false
+      },
+      errors: ["ONES sync config not set"]
+    };
+  }
+  const errors: string[] = [];
+  const endpoints = resolveEndpointTemplates(config);
+  const requiredEndpointKeys = [
+    "listProjectsPath",
+    "listIssueTypesPath",
+    "listIssueFieldsPath",
+    "listIssueStatusesPath",
+    "createIssuePath",
+    "listCommentsPathTemplate",
+    "addCommentPathTemplate",
+    "updateCommentPathTemplate",
+    "deleteCommentPathTemplate"
+  ] as const;
+
+  const hasConnection = Boolean(config.base_url && config.auth_secret_encrypted && config.ones_team_id);
+  if (!hasConnection) errors.push("Missing base_url/token/team_id connection requirements.");
+
+  const missingEndpoints = requiredEndpointKeys.filter((key) => !String(endpoints[key] ?? "").trim());
+  if (missingEndpoints.length) errors.push(`Missing required endpoint templates: ${missingEndpoints.join(", ")}`);
+
+  const whitelist = config.allowed_ticket_type_keys ?? [];
+  if (!whitelist.length) errors.push("At least one allowed issue type must be selected for customer portal.");
+
+  let mappingsValid = true;
+  for (const typeKey of whitelist) {
+    const activeCreate = await repo.getLatestMapping(typeKey, "create", "active");
+    if (!activeCreate) {
+      mappingsValid = false;
+      errors.push(`Missing active create mapping for ticket type ${typeKey}`);
+    }
+  }
+
+  return {
+    ready: errors.length === 0,
+    checks: {
+      connection: hasConnection,
+      endpoints: missingEndpoints.length === 0,
+      whitelist: whitelist.length > 0,
+      mappings: mappingsValid
+    },
+    errors
+  };
+}
+
+export async function publishConfig(actor = "internal_operator", reason?: string) {
+  const preflight = await runPublishPreflight();
+  if (!preflight.ready) {
+    throw new Error(`Preflight failed: ${preflight.errors.join(" | ")}`);
+  }
+  const active = await repo.getActiveConfig();
+  if (!active) throw new Error("ONES sync config not set");
+  const saved = await repo.upsertActiveConfig({
+    profileName: active.profile_name,
+    baseUrl: active.base_url,
+    authType: active.auth_type,
+    authHeader: active.auth_header,
+    authSecretEncrypted: active.auth_secret_encrypted,
+    createTicketPath: active.create_ticket_path,
+    listProjectsPath: active.list_projects_path,
+    listTicketTypesPath: active.list_ticket_types_path,
+    listFieldsPathTemplate: active.list_fields_path_template,
+    endpointTemplates: active.endpoint_templates_json ?? {},
+    allowedTicketTypeKeys: active.allowed_ticket_type_keys ?? [],
+    statusMapping: active.status_mapping_json ?? {},
+    workflowMapping: active.workflow_mapping_json ?? {},
+    publishState: "published",
+    publishChecks: preflight.checks,
+    changeReason: reason ?? active.change_reason,
+    rolledBackFrom: active.rolled_back_from,
+    timeoutMs: active.timeout_ms,
+    retries: active.retries,
+    dataSourceMode: active.data_source_mode,
+    onesProjectKey: active.ones_project_key,
+    onesTeamId: active.ones_team_id,
+    schemaHash: active.schema_hash,
+    schemaSyncedAt: active.schema_synced_at,
+    updatedBy: actor
+  });
+  await repo.addOnesSyncAudit({
+    actor,
+    scope: "config",
+    eventType: "config_published",
+    payload: { configId: saved.id, configVersion: saved.config_version, reason: reason ?? null, checks: preflight.checks }
+  });
+  return getConfig();
+}
+
+export async function rollbackConfig(targetConfigId: string, actor = "internal_operator", reason?: string) {
+  const target = await repo.getConfigById(targetConfigId);
+  if (!target) throw new Error("Target config not found");
+
+  const saved = await repo.upsertActiveConfig({
+    profileName: target.profile_name,
+    baseUrl: target.base_url,
+    authType: target.auth_type,
+    authHeader: target.auth_header,
+    authSecretEncrypted: target.auth_secret_encrypted,
+    createTicketPath: target.create_ticket_path,
+    listProjectsPath: target.list_projects_path,
+    listTicketTypesPath: target.list_ticket_types_path,
+    listFieldsPathTemplate: target.list_fields_path_template,
+    endpointTemplates: target.endpoint_templates_json ?? {},
+    allowedTicketTypeKeys: target.allowed_ticket_type_keys ?? [],
+    statusMapping: target.status_mapping_json ?? {},
+    workflowMapping: target.workflow_mapping_json ?? {},
+    publishState: target.publish_state ?? "draft",
+    publishChecks: target.publish_checks_json ?? {},
+    changeReason: reason ?? target.change_reason,
+    rolledBackFrom: target.id,
+    timeoutMs: target.timeout_ms,
+    retries: target.retries,
+    dataSourceMode: target.data_source_mode,
+    onesProjectKey: target.ones_project_key,
+    onesTeamId: target.ones_team_id,
+    schemaHash: target.schema_hash,
+    schemaSyncedAt: target.schema_synced_at,
+    updatedBy: actor
+  });
+  await repo.addOnesSyncAudit({
+    actor,
+    scope: "config",
+    eventType: "config_rolled_back",
+    payload: {
+      fromConfigId: targetConfigId,
+      toConfigId: saved.id,
+      toVersion: saved.config_version,
+      reason: reason ?? null
+    }
+  });
+  return getConfig();
+}
+
+export async function listConfigHistory(limit = 20) {
+  const rows = await repo.listConfigHistory(limit);
+  return rows.map((row) => ({
+    id: row.id,
+    version: row.config_version,
+    profileName: row.profile_name,
+    publishState: row.publish_state,
+    updatedBy: row.updated_by,
+    updatedAt: row.updated_at,
+    changeReason: row.change_reason,
+    rolledBackFrom: row.rolled_back_from,
+    isActive: row.is_active
+  }));
+}
+
 export async function createOnesTicket(input: {
   ticketTypeKey: string;
   context: Record<string, unknown>;
@@ -712,6 +1006,7 @@ export async function createOnesTicket(input: {
   if (!config) {
     throw new Error("ONES sync config not set");
   }
+  const endpoints = resolveEndpointTemplates(config);
   const activeMapping = await repo.getLatestMapping(input.ticketTypeKey, "create", "active");
   const mappingRows = (activeMapping?.mapping_json ?? []) as Array<z.infer<typeof mappingRowSchema>>;
   const fallbackMapping: Array<z.infer<typeof mappingRowSchema>> = [
@@ -725,10 +1020,11 @@ export async function createOnesTicket(input: {
   }
 
   const requestBody = {
-    ticketTypeKey: input.ticketTypeKey,
-    fields: built.payload
+    issueTypeID: input.ticketTypeKey,
+    ...built.payload
   };
-  const raw = await onesFetch(config, config.create_ticket_path, {
+  const createPath = endpoints.createIssuePath ?? config.create_ticket_path;
+  const raw = await onesFetch(config, createPath, {
     method: "POST",
     body: JSON.stringify(requestBody)
   }).then((res) => res.json()) as Record<string, unknown>;
@@ -748,20 +1044,38 @@ export async function updateOnesTicketByFlow(input: {
 }) {
   const config = await repo.getActiveConfig();
   if (!config) throw new Error("ONES sync config not set");
+  const endpoints = resolveEndpointTemplates(config);
 
   const activeMapping = await repo.getLatestMapping(input.ticketTypeKey, input.flow, "active");
   const mappingRows = (activeMapping?.mapping_json ?? []) as Array<z.infer<typeof mappingRowSchema>>;
   const built = buildPayloadFromMapping(mappingRows, input.context);
   if (built.errors.length) throw new Error(`ONES mapping validation failed: ${built.errors.join("; ")}`);
 
-  const path = input.flow === "transition"
-    ? `${config.create_ticket_path}/${encodeURIComponent(input.onesTicketKey)}/transition`
-    : input.flow === "comment"
-    ? `${config.create_ticket_path}/${encodeURIComponent(input.onesTicketKey)}/comments`
-    : `${config.create_ticket_path}/${encodeURIComponent(input.onesTicketKey)}`;
+  let path = "";
+  let method: "POST" | "PATCH" = "POST";
+  let body = built.payload;
+  if (input.flow === "transition") {
+    const targetStatus = String(input.context.toStatus ?? "");
+    const workflowID = String((config.workflow_mapping_json ?? {})[targetStatus] ?? "");
+    path = resolvePathTemplate(
+      endpoints.executeIssueWorkflowPathTemplate ?? "/project/issues/{issueID}",
+      { ticketTypeKey: input.ticketTypeKey, projectKey: config.ones_project_key, teamId: config.ones_team_id }
+    ).replace("{issueID}", encodeURIComponent(input.onesTicketKey));
+    body = {
+      action: "executeWorkflow",
+      workflowID: workflowID || built.payload.workflowID || built.payload.transitionID
+    };
+  } else if (input.flow === "comment") {
+    path = (endpoints.addCommentPathTemplate ?? "/project/issues/{issueID}/comments")
+      .replace("{issueID}", encodeURIComponent(input.onesTicketKey));
+    body = { content: String(input.context.body ?? built.payload.body ?? "") };
+  } else {
+    path = (endpoints.updateIssuePathTemplate ?? "/project/issues/{issueID}")
+      .replace("{issueID}", encodeURIComponent(input.onesTicketKey));
+    method = "PATCH";
+  }
 
-  const method = input.flow === "update" ? "PATCH" : "POST";
-  const raw = await onesFetch(config, path, { method, body: JSON.stringify(built.payload) }).then((res) => res.json()) as Record<string, unknown>;
+  const raw = await onesFetch(config, path, { method, body: JSON.stringify(body) }).then((res) => res.json()) as Record<string, unknown>;
   return raw;
 }
 
@@ -866,6 +1180,18 @@ export async function bootstrapDefaultConfigIfMissing() {
     listProjectsPath: env.ONES_SYNC_DEFAULT_PROJECTS_PATH,
     listTicketTypesPath: env.ONES_SYNC_DEFAULT_TICKET_TYPES_PATH,
     listFieldsPathTemplate: env.ONES_SYNC_DEFAULT_FIELDS_PATH_TEMPLATE,
+    endpointTemplates: {
+      ...endpointTemplateDefaults,
+      listProjectsPath: env.ONES_SYNC_DEFAULT_PROJECTS_PATH,
+      listIssueTypesPath: env.ONES_SYNC_DEFAULT_TICKET_TYPES_PATH,
+      listIssueFieldsPath: env.ONES_SYNC_DEFAULT_FIELDS_PATH_TEMPLATE
+    },
+    allowedTicketTypeKeys: [],
+    statusMapping: {},
+    workflowMapping: {},
+    publishState: "draft",
+    publishChecks: {},
+    changeReason: "bootstrap default config",
     timeoutMs: 12000,
     retries: 1,
     dataSourceMode: "ones_primary",
