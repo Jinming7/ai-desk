@@ -1,0 +1,75 @@
+@import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap");
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --brand-primary: #0064ff;
+  --brand-cyan: #33ddff;
+  --text-primary: #16171a;
+  --text-secondary: #696a6d;
+  --bg-base: #ffffff;
+  --line-base: #e5e7eb;
+  color: var(--text-primary);
+  background-color: var(--bg-base);
+  font-family: "Plus Jakarta Sans", Inter, "PingFang SC", "Noto Sans", "Segoe UI", sans-serif;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.nexus-portal-bg {
+  background:
+    radial-gradient(900px 380px at 50% 14%, rgba(0, 100, 255, 0.1) 0%, rgba(255, 255, 255, 0) 72%),
+    radial-gradient(820px 300px at 75% 18%, rgba(51, 221, 255, 0.1) 0%, rgba(255, 255, 255, 0) 68%),
+    radial-gradient(circle at 50% 22%, #ffffff 0%, #f7f8fa 100%);
+}
+
+.nexus-hero-title {
+  font-size: 64px;
+  font-weight: 500;
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+  color: #111827;
+}
+
+.search-shell {
+  border: 1px solid #d1d5db;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.search-shell:hover {
+  border-color: #9ca3af;
+}
+
+.search-shell:focus-within {
+  border-color: var(--brand-primary);
+  animation: pulseGlow 2.6s ease-in-out infinite;
+}
+
+.nexus-focus-pulse {
+  animation: pulseGlow 2.6s ease-in-out infinite;
+}
+
+@keyframes pulseGlow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px rgba(0, 100, 255, 0.24), 0 0 28px rgba(0, 100, 255, 0.12);
+  }
+  50% {
+    box-shadow: 0 0 0 2px rgba(0, 100, 255, 0.32), 0 0 36px rgba(0, 100, 255, 0.2);
+  }
+}
+
+@media (max-width: 768px) {
+  .nexus-hero-title {
+    font-size: 44px;
+  }
+}
