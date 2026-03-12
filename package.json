@@ -8,6 +8,7 @@
   ],
   "scripts": {
     "dev": "concurrently \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:reset": "bash ./scripts/dev-reset.sh",
     "dev:api": "npm run dev -w apps/api",
     "dev:web": "npm run dev -w apps/web",
     "build": "npm run build -w apps/api && npm run build -w apps/web",

@@ -12,6 +12,8 @@ const configInputSchema = z.object({
   authHeader: z.string().min(1).default("Authorization"),
   authSecret: z.string().min(1).optional(),
   keepExistingSecret: z.coerce.boolean().default(false),
+  systemAuthSecret: z.string().min(1).optional(),
+  keepExistingSystemSecret: z.coerce.boolean().default(false),
   createTicketPath: z.string().min(1),
   listProjectsPath: z.string().min(1).default("/api/v1/projects"),
   listTicketTypesPath: z.string().min(1),
@@ -34,8 +36,8 @@ const configInputSchema = z.object({
 const endpointTemplateDefaults = {
   listProjectsPath: "/project/projects",
   listIssueTypesPath: "/project/issueTypes",
-  listIssueFieldsPath: "/project/issueFields",
-  listIssueStatusesPath: "/project/issueStatuses",
+  listIssueFieldsPath: "/project/api/ones-project/team/{teamID}/issue_form/fields",
+  listIssueStatusesPath: "/project/api/ones-project/team/{teamID}/v2/field/reference_object/query",
   listIssuesPath: "/project/issues",
   getIssuePathTemplate: "/project/issues/{issueID}",
   createIssuePath: "/project/issues",
@@ -49,6 +51,8 @@ const endpointTemplateDefaults = {
   updateCommentPathTemplate: "/project/issues/{issueID}/comments/{commentsID}",
   deleteCommentPathTemplate: "/project/issues/{issueID}/comments/{commentsID}"
 } as const;
+
+const statusMappingFallbackWarnings = new Set<string>();
 
 const mappingRowSchema = z.object({
   source: z.string().min(1),
@@ -76,6 +80,33 @@ const rollbackSchema = z.object({
   actor: z.string().min(1).default("internal_operator")
 });
 
+function isTransientDbError(error: unknown) {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return (
+    message.includes("connection terminated due to connection timeout") ||
+    message.includes("timeout") ||
+    message.includes("econnreset") ||
+    message.includes("connection terminated unexpectedly") ||
+    message.includes("could not connect")
+  );
+}
+
+async function withTransientDbRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientDbError(error) || attempt === 1) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+  throw new Error(`${label} failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+}
+
 const webhookInputSchema = z.object({
   eventId: z.string().min(1),
   eventType: z.string().min(1),
@@ -92,12 +123,27 @@ function withPath(baseUrl: string, path: string) {
 
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   const base = new URL(baseUrl);
+  // Internal system APIs must always hit origin root, regardless of any base path like /openapi/v2.
+  if (normalizedPath.startsWith("/project/api/")) {
+    return `${base.origin}${normalizedPath}`;
+  }
   const basePath = base.pathname.replace(/\/$/, "");
   const baseHasOpenApiPrefix = /\/openapi\/v\d+$/i.test(basePath);
-  const shouldInjectOpenApiPrefix = !baseHasOpenApiPrefix && normalizedPath.startsWith("/project/");
+  const isInternalProjectApi = normalizedPath.startsWith("/project/api/");
+  const shouldInjectOpenApiPrefix = !baseHasOpenApiPrefix && normalizedPath.startsWith("/project/") && !isInternalProjectApi;
   const effectiveBasePath = shouldInjectOpenApiPrefix ? "/openapi/v2" : (basePath || "");
   const finalPath = `${effectiveBasePath}${normalizedPath}`.replace(/\/{2,}/g, "/");
   return `${base.origin}${finalPath}`;
+}
+
+function appendQuery(path: string, key: string, value: string) {
+  if (!value?.trim()) return path;
+  const [base, hash] = path.split("#", 2);
+  const [pathname, query] = base.split("?", 2);
+  const params = new URLSearchParams(query ?? "");
+  if (!params.has(key)) params.set(key, value);
+  const rebuilt = `${pathname}${params.toString() ? `?${params.toString()}` : ""}`;
+  return hash ? `${rebuilt}#${hash}` : rebuilt;
 }
 
 function buildAuthHeaders(config: repo.OnesSyncConfigRecord, token: string): Record<string, string> {
@@ -122,27 +168,62 @@ function buildAuthHeadersFromInput(input: { authType: "bearer" | "header"; authH
   return { [input.authHeader]: normalizedToken };
 }
 
-async function onesFetch(config: repo.OnesSyncConfigRecord, path: string, init?: RequestInit) {
+function buildInternalSystemHeaders(config: repo.OnesSyncConfigRecord, token: string): Record<string, string> {
+  const normalizedToken = token.trim();
+  const authValue = normalizedToken.startsWith("Bearer ") ? normalizedToken : `Bearer ${normalizedToken}`;
+  const base = new URL(config.base_url);
+  const headers: Record<string, string> = {
+    Authorization: authValue,
+    Origin: base.origin,
+    Referer: `${base.origin}/project/`
+  };
+  if (config.ones_team_id?.trim()) {
+    headers["ones-check-id"] = config.ones_team_id.trim();
+    headers["ones-check-point"] = "team";
+  }
+  return headers;
+}
+
+async function onesFetch(
+  config: repo.OnesSyncConfigRecord,
+  path: string,
+  init?: RequestInit,
+  options?: { timeoutMs?: number; retries?: number }
+) {
   const token = decryptSecret(config.auth_secret_encrypted);
+  return onesFetchWithToken(config, path, token, init, options);
+}
+
+async function onesFetchWithToken(
+  config: repo.OnesSyncConfigRecord,
+  path: string,
+  token: string,
+  init?: RequestInit,
+  options?: { timeoutMs?: number; retries?: number }
+) {
+  const url = withPath(config.base_url, path);
+  const isInternalSystemApi = new URL(url).pathname.startsWith("/project/api/");
   const headers: Record<string, string> = {
     Accept: "application/json",
     "Content-Type": "application/json",
-    ...buildAuthHeaders(config, token),
+    ...(isInternalSystemApi ? buildInternalSystemHeaders(config, token) : buildAuthHeaders(config, token)),
     ...(init?.headers as Record<string, string> | undefined)
   };
-  const url = withPath(config.base_url, path);
+  const effectiveTimeoutMs = Math.max(1000, options?.timeoutMs ?? config.timeout_ms);
+  const effectiveRetries = Math.max(0, options?.retries ?? config.retries);
+  const endpointPath = new URL(url).pathname;
 
   let lastError: Error | null = null;
-  for (let attempt = 0; attempt <= config.retries; attempt += 1) {
+  for (let attempt = 0; attempt <= effectiveRetries; attempt += 1) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), config.timeout_ms);
+    const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
     try {
       const response = await fetch(url, { ...init, headers, signal: controller.signal });
       clearTimeout(timer);
       if (!response.ok) {
         const body = await response.text();
         const retriable = response.status === 429 || response.status >= 500;
-        if (retriable && attempt < config.retries) {
+        if (retriable && attempt < effectiveRetries) {
           const backoffMs = Math.min(2000, 200 * Math.pow(2, attempt));
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
           continue;
@@ -152,8 +233,14 @@ async function onesFetch(config: repo.OnesSyncConfigRecord, path: string, init?:
       return response;
     } catch (error) {
       clearTimeout(timer);
-      lastError = error as Error;
-      if (attempt < config.retries) {
+      const err = error as Error;
+      const isAbort =
+        err?.name === "AbortError" ||
+        (typeof err?.message === "string" && /aborted/i.test(err.message));
+      lastError = isAbort
+        ? new Error(`ONES request timeout after ${effectiveTimeoutMs}ms (${endpointPath})`)
+        : err;
+      if (attempt < effectiveRetries) {
         const backoffMs = Math.min(2000, 200 * Math.pow(2, attempt));
         await new Promise((resolve) => setTimeout(resolve, backoffMs));
       }
@@ -186,8 +273,9 @@ function parseFields(raw: unknown): unknown[] {
 }
 
 function parseIssueStatuses(raw: unknown): Array<{ key: string; name: string; source: Record<string, unknown> }> {
-  if (Array.isArray(raw)) {
-    return raw
+  if (!raw || typeof raw !== "object") return [];
+  const normalize = (list: unknown[]): Array<{ key: string; name: string; source: Record<string, unknown> }> =>
+    list
       .map((row) => row as Record<string, unknown>)
       .map((row) => ({
         key: String(row.key ?? row.id ?? row.statusID ?? row.uuid ?? ""),
@@ -195,10 +283,44 @@ function parseIssueStatuses(raw: unknown): Array<{ key: string; name: string; so
         source: row
       }))
       .filter((row) => row.key.length > 0);
+
+  if (Array.isArray(raw)) {
+    return normalize(raw);
   }
   const envelope = raw as Record<string, unknown>;
-  const list = envelope.statuses ?? envelope.items ?? envelope.data;
-  return parseIssueStatuses(list);
+  const data = envelope.data && typeof envelope.data === "object" ? (envelope.data as Record<string, unknown>) : null;
+  const result = envelope.result && typeof envelope.result === "object" ? (envelope.result as Record<string, unknown>) : null;
+  const list =
+    envelope.statuses ??
+    envelope.items ??
+    result?.statuses ??
+    result?.items ??
+    result?.list ??
+    data?.statuses ??
+    data?.items ??
+    data?.list ??
+    envelope.list ??
+    envelope.data;
+  const parsed = parseIssueStatuses(list);
+  if (parsed.length > 0) return parsed;
+
+  // Fallback: deep scan first array node that looks like status refs (uuid/key + name).
+  const queue: unknown[] = [raw];
+  const seen = new Set<unknown>();
+  while (queue.length > 0) {
+    const node = queue.shift();
+    if (!node || typeof node !== "object" || seen.has(node)) continue;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      const normalized = normalize(node);
+      if (normalized.length > 0) return normalized;
+      continue;
+    }
+    for (const value of Object.values(node as Record<string, unknown>)) {
+      if (value && typeof value === "object") queue.push(value);
+    }
+  }
+  return [];
 }
 
 function resolveEndpointTemplates(config: repo.OnesSyncConfigRecord): Record<string, string> {
@@ -249,13 +371,89 @@ function parseProjects(raw: unknown): Array<{ key: string; name: string }> {
     return raw
       .map((row) => row as Record<string, unknown>)
       .map((row) => ({
-        key: String(row.key ?? row.uuid ?? row.id ?? ""),
+        key: String(row.id ?? row.uuid ?? row.key ?? ""),
         name: String(row.name ?? row.title ?? row.key ?? row.id ?? "")
       }))
       .filter((row) => row.key);
   }
   const envelope = raw as Record<string, unknown>;
   return parseProjects(envelope.projects ?? envelope.data ?? envelope.items ?? []);
+}
+
+function parseIssues(raw: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(raw)) {
+    return raw.map((row) => (row && typeof row === "object" ? (row as Record<string, unknown>) : {}));
+  }
+  const envelope = raw as Record<string, unknown>;
+  const data = (envelope.data ?? envelope.result ?? envelope) as Record<string, unknown>;
+  const list = data.issues ?? data.items ?? data.list ?? envelope.issues ?? envelope.items ?? envelope.list ?? [];
+  return Array.isArray(list)
+    ? list.map((row) => (row && typeof row === "object" ? (row as Record<string, unknown>) : {}))
+    : [];
+}
+
+function extractIssueTypeFromIssue(row: Record<string, unknown>): { key: string; name: string; metadata: Record<string, unknown> } | null {
+  const candidates: Array<unknown> = [
+    row.issueType,
+    row.issue_type,
+    row.type,
+    row.workItemType,
+    row.work_item_type
+  ];
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate === "object") {
+      const obj = candidate as Record<string, unknown>;
+      const key = String(obj.key ?? obj.id ?? obj.uuid ?? "").trim();
+      const name = String(obj.name ?? obj.title ?? key).trim();
+      if (key) {
+        return { key, name: name || key, metadata: obj };
+      }
+    }
+    if (typeof candidate === "string" && candidate.trim()) {
+      const key = candidate.trim();
+      return { key, name: key, metadata: {} };
+    }
+  }
+  return null;
+}
+
+function extractIssueProjectRefs(row: Record<string, unknown>): string[] {
+  const refs = new Set<string>();
+  const directCandidates = [row.projectID, row.projectId, row.projectKey, row.projectUUID, row.project, row.project_id];
+  for (const candidate of directCandidates) {
+    if (typeof candidate === "string" && candidate.trim()) refs.add(candidate.trim());
+  }
+  if (row.project && typeof row.project === "object") {
+    const project = row.project as Record<string, unknown>;
+    const nestedCandidates = [project.id, project.key, project.uuid, project.projectID, project.projectId, project.projectKey];
+    for (const candidate of nestedCandidates) {
+      if (typeof candidate === "string" && candidate.trim()) refs.add(candidate.trim());
+    }
+  }
+  return Array.from(refs);
+}
+
+function normalizeIssueTypeField(raw: Record<string, unknown>) {
+  const key = String(raw.key ?? raw.id ?? raw.uuid ?? "").trim();
+  const typeObj = raw.type && typeof raw.type === "object" ? (raw.type as Record<string, unknown>) : null;
+  const typeValue = typeObj ? String(typeObj.value_type ?? typeObj.uuid ?? "text") : String(raw.type ?? raw.valueType ?? raw.fieldType ?? "text");
+  return {
+    key,
+    label: String((raw.label ?? raw.name ?? key) || "Field"),
+    type: typeValue,
+    required: Boolean(raw.required ?? false),
+    visible: true,
+    options: Array.isArray(raw.options)
+      ? raw.options.map((opt) => {
+          if (opt && typeof opt === "object") {
+            const obj = opt as Record<string, unknown>;
+            return { value: String(obj.value ?? obj.key ?? obj.id ?? ""), label: String(obj.label ?? obj.name ?? obj.value ?? "") };
+          }
+          return { value: String(opt), label: String(opt) };
+        })
+      : [],
+    defaultValue: raw.default ?? raw.defaultValue ?? ""
+  };
 }
 
 function parseProjectDiscoveryPage(raw: unknown): { projects: Array<{ key: string; name: string }>; nextCursor: string | null } {
@@ -353,6 +551,7 @@ export async function getConfig() {
     authType: config.auth_type,
     authHeader: config.auth_header,
     authSecretMasked: maskSecret(decryptSecret(config.auth_secret_encrypted)),
+    systemAuthSecretMasked: config.system_auth_secret_encrypted ? maskSecret(decryptSecret(config.system_auth_secret_encrypted)) : "",
     createTicketPath: config.create_ticket_path,
     listProjectsPath: config.list_projects_path,
     listTicketTypesPath: config.list_ticket_types_path,
@@ -388,30 +587,39 @@ export async function upsertConfig(input: unknown) {
   if (!resolvedSecret) {
     throw new Error("Auth Secret is required when no existing token is available.");
   }
-  const saved = await repo.upsertActiveConfig({
-    profileName: parsed.profileName,
-    baseUrl: parsed.baseUrl,
-    authType: parsed.authType,
-    authHeader: parsed.authHeader,
-    authSecretEncrypted: encryptSecret(resolvedSecret),
-    createTicketPath: parsed.createTicketPath,
-    listProjectsPath: parsed.listProjectsPath,
-    listTicketTypesPath: parsed.listTicketTypesPath,
-    listFieldsPathTemplate: parsed.listFieldsPathTemplate,
-    endpointTemplates: parsed.endpointTemplates,
-    allowedTicketTypeKeys: parsed.allowedTicketTypeKeys,
-    statusMapping: parsed.statusMapping,
-    workflowMapping: parsed.workflowMapping,
-    publishState: parsed.publishState,
-    publishChecks: parsed.publishChecks,
-    changeReason: parsed.changeReason ?? null,
-    timeoutMs: parsed.timeoutMs,
-    retries: parsed.retries,
-    dataSourceMode: parsed.dataSourceMode,
-    onesProjectKey: parsed.onesProjectKey,
-    onesTeamId: parsed.onesTeamId,
-    updatedBy: parsed.actor
-  });
+  const resolvedSystemSecret =
+    parsed.keepExistingSystemSecret && existing?.system_auth_secret_encrypted
+      ? decryptSecret(existing.system_auth_secret_encrypted)
+      : (parsed.systemAuthSecret ?? "");
+  const saved = await withTransientDbRetry(
+    () =>
+      repo.upsertActiveConfig({
+        profileName: parsed.profileName,
+        baseUrl: parsed.baseUrl,
+        authType: parsed.authType,
+        authHeader: parsed.authHeader,
+        authSecretEncrypted: encryptSecret(resolvedSecret),
+        systemAuthSecretEncrypted: resolvedSystemSecret ? encryptSecret(resolvedSystemSecret) : null,
+        createTicketPath: parsed.createTicketPath,
+        listProjectsPath: parsed.listProjectsPath,
+        listTicketTypesPath: parsed.listTicketTypesPath,
+        listFieldsPathTemplate: parsed.listFieldsPathTemplate,
+        endpointTemplates: parsed.endpointTemplates,
+        allowedTicketTypeKeys: parsed.allowedTicketTypeKeys,
+        statusMapping: parsed.statusMapping,
+        workflowMapping: parsed.workflowMapping,
+        publishState: parsed.publishState,
+        publishChecks: parsed.publishChecks,
+        changeReason: parsed.changeReason ?? null,
+        timeoutMs: parsed.timeoutMs,
+        retries: parsed.retries,
+        dataSourceMode: parsed.dataSourceMode,
+        onesProjectKey: parsed.onesProjectKey,
+        onesTeamId: parsed.onesTeamId,
+        updatedBy: parsed.actor
+      }),
+    "Save ONES config"
+  );
   await repo.addOnesSyncAudit({
     actor: parsed.actor,
     scope: "config",
@@ -432,6 +640,7 @@ export async function upsertConfig(input: unknown) {
     authType: saved.auth_type,
     authHeader: saved.auth_header,
     authSecretMasked: maskSecret(resolvedSecret),
+    systemAuthSecretMasked: resolvedSystemSecret ? maskSecret(resolvedSystemSecret) : "",
     createTicketPath: saved.create_ticket_path,
     listProjectsPath: saved.list_projects_path,
     listTicketTypesPath: saved.list_ticket_types_path,
@@ -535,37 +744,111 @@ export async function listTicketTypes() {
 }
 
 export async function listCustomerTicketTypes() {
-  const [rows, config] = await Promise.all([repo.listTicketTypeCache(), repo.getActiveConfig()]);
-  const allowed = new Set((config?.allowed_ticket_type_keys ?? []).map(String));
-  const filtered = rows.filter((row) => allowed.has(row.type_key));
-  return filtered.map((row) => ({
-    key: row.type_key,
-    name: row.type_name,
-    fields: row.fields_json,
-    syncedAt: row.synced_at
-  }));
+  const config = await repo.getActiveConfig();
+  if (!config?.ones_project_key) return [];
+  const [rows, typeConfigs] = await Promise.all([
+    repo.listTicketTypeCache(),
+    repo.listProjectIssueTypeConfigs(config.ones_project_key)
+  ]);
+  const cacheByType = new Map(rows.map((row) => [row.type_key, row]));
+  const enabledConfigs = typeConfigs.filter((item) => item.enabled_for_customer);
+  return enabledConfigs.map((projectTypeConfig) => {
+    const cache = cacheByType.get(projectTypeConfig.issue_type_key);
+    const configuredSchema = (projectTypeConfig.field_schema_json ?? []) as unknown[];
+    return {
+      key: projectTypeConfig.issue_type_key,
+      name: projectTypeConfig.issue_type_name || cache?.type_name || projectTypeConfig.issue_type_key,
+      fields: configuredSchema.length ? configuredSchema : (cache?.fields_json ?? []),
+      syncedAt: cache?.synced_at ?? projectTypeConfig.updated_at
+    };
+  });
 }
 
 export async function isCustomerTicketTypeAllowed(ticketTypeKey: string): Promise<boolean> {
   const config = await repo.getActiveConfig();
-  const allowed = new Set((config?.allowed_ticket_type_keys ?? []).map(String));
-  if (allowed.size === 0) return false;
-  return allowed.has(ticketTypeKey);
+  if (!config?.ones_project_key) return false;
+  const typeConfig = await repo.getProjectIssueTypeConfig(config.ones_project_key, ticketTypeKey);
+  return Boolean(typeConfig?.enabled_for_customer);
 }
 
 export async function discoverIssueStatuses(input: {
   teamId?: string;
   projectKey?: string;
+  issueTypeKey?: string;
 }) {
   const config = await repo.getActiveConfig();
   if (!config) throw new Error("ONES sync config not set");
-  const endpoints = resolveEndpointTemplates(config);
-  const path = resolvePathTemplate(endpoints.listIssueStatusesPath ?? "/project/issueStatuses", {
-    teamId: input.teamId ?? config.ones_team_id,
-    projectKey: input.projectKey ?? config.ones_project_key
-  });
-  const raw = await onesFetch(config, path).then((res) => res.json());
-  return parseIssueStatuses(raw);
+  const teamId = input.teamId ?? config.ones_team_id;
+  const projectKey = input.projectKey ?? config.ones_project_key;
+  if (!teamId?.trim()) throw new Error("Team ID is required for status discovery.");
+  if (!projectKey?.trim()) throw new Error("Project key is required for status discovery.");
+  if (!input.issueTypeKey?.trim()) throw new Error("Issue type key is required for status discovery.");
+
+  const path = resolvePathTemplate(
+    "/project/api/ones-project/team/{teamID}/v2/field/reference_object/query",
+    { teamId, projectKey, ticketTypeKey: input.issueTypeKey }
+  );
+
+  const tokenCandidates: string[] = [];
+  try {
+    if (config.system_auth_secret_encrypted?.trim()) {
+      tokenCandidates.push(decryptSecret(config.system_auth_secret_encrypted));
+    }
+  } catch {
+    // ignore invalid encrypted payload; fallback to access token path below
+  }
+  try {
+    tokenCandidates.push(decryptSecret(config.auth_secret_encrypted));
+  } catch {
+    // ignore; handled by empty candidates check
+  }
+  const uniqueTokens = Array.from(new Set(tokenCandidates.filter((x) => x?.trim())));
+  if (uniqueTokens.length === 0) {
+    throw new Error("No valid token configured. Save Access Token (and optional System API Token) in Step 1.");
+  }
+
+  const callStatusEndpoint = async (token: string) =>
+    onesFetchWithToken(
+      config,
+      path,
+      token,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          limit: -1,
+          include_fields: ["uuid", "name"],
+          field_uuid: "field005",
+          keyword: "",
+          condition: {
+            project_uuid: projectKey,
+            issue_type_uuid: input.issueTypeKey
+          }
+        })
+      },
+      {
+        timeoutMs: Math.max(12000, config.timeout_ms),
+        retries: Math.max(1, config.retries)
+      }
+    ).then((res) => res.json());
+
+  let lastAuthError: Error | null = null;
+  for (const token of uniqueTokens) {
+    try {
+      const rawWithIssueType = await callStatusEndpoint(token);
+      return parseIssueStatuses(rawWithIssueType);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("InvalidToken") || message.includes("AuthFailure") || message.includes("401")) {
+        lastAuthError = error as Error;
+        continue;
+      }
+      throw error;
+    }
+  }
+  if (lastAuthError) {
+    throw new Error("Authentication failed for status query (System API Token and Access Token both rejected).");
+  }
+  return [];
 }
 
 export async function discoverProjects(input: unknown) {
@@ -644,6 +927,306 @@ export async function discoverProjects(input: unknown) {
       cause
     });
     throw new Error(`Project discovery failed: ${message}${cause ? ` | cause: ${cause}` : ""}${requestUrl ? ` | url: ${requestUrl}` : ""}`);
+  }
+}
+
+export async function discoverProjectIssueTypes(input: unknown) {
+  const parsed = z.object({
+    projectKey: z.string().min(1),
+    actor: z.string().default("internal_operator")
+  }).parse(input);
+  const config = await repo.getActiveConfig();
+  if (!config) throw new Error("ONES sync config not set");
+  if (!config.ones_team_id) throw new Error("Team ID is required in active configuration");
+
+  const endpoints = resolveEndpointTemplates(config);
+  const listIssuesPath = endpoints.listIssuesPath ?? "/project/issues";
+  let path = resolvePathTemplate(listIssuesPath, {
+    teamId: config.ones_team_id,
+    projectKey: parsed.projectKey
+  });
+  path = appendQuery(path, "teamID", config.ones_team_id);
+  path = appendQuery(path, "projectID", parsed.projectKey);
+  path = appendQuery(path, "projectId", parsed.projectKey);
+  path = appendQuery(path, "projectKey", parsed.projectKey);
+  path = appendQuery(path, "projectUUID", parsed.projectKey);
+  path = appendQuery(path, "project", parsed.projectKey);
+  path = appendQuery(path, "limit", "100");
+
+  const issueTypes = new Map<string, { key: string; name: string; metadata: Record<string, unknown> }>();
+  let cursor: string | null = null;
+  let pages = 0;
+  do {
+    const pagePath = cursor ? appendQuery(path, "cursor", cursor) : path;
+    const raw = await onesFetch(config, pagePath).then((res) => res.json());
+    const issues = parseIssues(raw);
+    for (const issue of issues) {
+      const projectRefs = extractIssueProjectRefs(issue);
+      if (projectRefs.length > 0 && !projectRefs.includes(parsed.projectKey)) {
+        continue;
+      }
+      const issueType = extractIssueTypeFromIssue(issue);
+      if (!issueType) continue;
+      issueTypes.set(issueType.key, issueType);
+    }
+    const page = parseProjectDiscoveryPage(raw);
+    cursor = page.nextCursor;
+    pages += 1;
+  } while (cursor && pages < 20);
+
+  const discovered = Array.from(issueTypes.values()).sort((a, b) => a.name.localeCompare(b.name));
+  await repo.upsertDiscoveredIssueTypes({
+    projectKey: parsed.projectKey,
+    issueTypes: discovered,
+    updatedBy: parsed.actor
+  });
+  await repo.addOnesSyncAudit({
+    actor: parsed.actor,
+    scope: "project_issue_type",
+    eventType: "discover_project_issue_types",
+    payload: { projectKey: parsed.projectKey, count: discovered.length }
+  });
+  return listProjectIssueTypes(parsed.projectKey);
+}
+
+export async function listProjectIssueTypes(projectKey: string) {
+  const rows = await withTransientDbRetry(() => repo.listProjectIssueTypeConfigs(projectKey), "List project issue types");
+  return rows.map((row) => ({
+    projectKey: row.project_key,
+    key: row.issue_type_key,
+    name: row.issue_type_name,
+    enabledForCustomer: row.enabled_for_customer,
+    configured: Array.isArray(row.field_schema_json) && row.field_schema_json.length > 0,
+    updatedAt: row.updated_at
+  }));
+}
+
+export async function setProjectIssueTypeExposure(input: unknown) {
+  const parsed = z.object({
+    projectKey: z.string().min(1),
+    issueTypeKey: z.string().min(1),
+    issueTypeName: z.string().min(1).optional(),
+    enabledForCustomer: z.boolean(),
+    actor: z.string().default("internal_operator")
+  }).parse(input);
+  const saved = await withTransientDbRetry(async () => {
+    const current = await repo.getProjectIssueTypeConfig(parsed.projectKey, parsed.issueTypeKey);
+    return repo.upsertProjectIssueTypeConfig({
+      projectKey: parsed.projectKey,
+      issueTypeKey: parsed.issueTypeKey,
+      issueTypeName: parsed.issueTypeName ?? current?.issue_type_name ?? parsed.issueTypeKey,
+      enabledForCustomer: parsed.enabledForCustomer,
+      updatedBy: parsed.actor
+    });
+  }, "Set issue type exposure");
+  await repo.addOnesSyncAudit({
+    actor: parsed.actor,
+    scope: "project_issue_type",
+    eventType: "set_issue_type_exposure",
+    payload: {
+      projectKey: parsed.projectKey,
+      issueTypeKey: parsed.issueTypeKey,
+      enabledForCustomer: parsed.enabledForCustomer
+    }
+  });
+  return saved;
+}
+
+export async function getProjectIssueTypeFields(input: { projectKey: string; issueTypeKey: string }) {
+  const config = await withTransientDbRetry(() => repo.getActiveConfig(), "Load active config for issue fields");
+  if (!config) throw new Error("ONES sync config not set");
+  const endpoints = resolveEndpointTemplates(config);
+  const configuredTemplate = endpoints.listIssueFieldsPath ?? config.list_fields_path_template;
+  // Hard pin to internal project API contract when old OpenAPI template still exists in DB.
+  const internalFieldsTemplate = "/project/api/ones-project/team/{teamID}/issue_form/fields";
+  const fieldsPathTemplate =
+    typeof configuredTemplate === "string" && configuredTemplate.includes("/issue_form/fields")
+      ? configuredTemplate
+      : internalFieldsTemplate;
+  const path = resolvePathTemplate(fieldsPathTemplate, {
+    teamId: config.ones_team_id,
+    projectKey: input.projectKey,
+    ticketTypeKey: input.issueTypeKey
+  });
+  const tokenCandidates: string[] = [];
+  try {
+    if (config.system_auth_secret_encrypted?.trim()) {
+      tokenCandidates.push(decryptSecret(config.system_auth_secret_encrypted));
+    }
+  } catch {
+    // ignore invalid encrypted payload; fallback to access token path below
+  }
+  try {
+    tokenCandidates.push(decryptSecret(config.auth_secret_encrypted));
+  } catch {
+    // ignore; handled by empty candidates check
+  }
+  const uniqueTokens = Array.from(new Set(tokenCandidates.filter((x) => x?.trim())));
+  if (uniqueTokens.length === 0) {
+    throw new Error("No valid token configured. Save Access Token (and optional System API Token) in Step 1.");
+  }
+
+  let raw: unknown;
+  let lastAuthError: Error | null = null;
+  for (const token of uniqueTokens) {
+    try {
+      raw = await onesFetchWithToken(
+        config,
+        path,
+        token,
+        {
+        method: "POST",
+        body: JSON.stringify({
+          form_context: {
+            project_uuid: input.projectKey,
+            issue_type_uuid: input.issueTypeKey,
+            form_type: "create"
+          }
+        })
+      },
+      {
+          timeoutMs: Math.max(12000, config.timeout_ms),
+          retries: Math.max(1, config.retries)
+      }
+      ).then((res) => res.json());
+      break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("InvalidToken") || message.includes("AuthFailure") || message.includes("401")) {
+        lastAuthError = error as Error;
+        continue;
+      }
+      if (message.includes("404")) {
+        throw new Error(
+          `Issue form fields endpoint not found. Ensure it uses internal API path '/project/api/ones-project/team/{teamID}/issue_form/fields' and valid internal token context.`
+        );
+      }
+      throw error;
+    }
+  }
+  if (raw === undefined && lastAuthError) {
+    throw new Error("Authentication failed for field query (System API Token and Access Token both rejected).");
+  }
+  if (raw === undefined) {
+    throw new Error("Issue fields query failed.");
+  }
+  const fields = parseFields(raw)
+    .map((row) => (row && typeof row === "object" ? normalizeIssueTypeField(row as Record<string, unknown>) : null))
+    .filter((row): row is ReturnType<typeof normalizeIssueTypeField> => Boolean(row?.key));
+  return fields;
+}
+
+export async function getProjectIssueTypeConfig(input: { projectKey: string; issueTypeKey: string }) {
+  const row = await withTransientDbRetry(
+    () => repo.getProjectIssueTypeConfig(input.projectKey, input.issueTypeKey),
+    "Load project issue type config"
+  );
+  return {
+    projectKey: input.projectKey,
+    issueTypeKey: input.issueTypeKey,
+    issueTypeName: row?.issue_type_name ?? input.issueTypeKey,
+    enabledForCustomer: row?.enabled_for_customer ?? false,
+    fieldSchema: (row?.field_schema_json ?? []) as unknown[],
+    statusMapping: (row?.status_mapping_json ?? {}) as Record<string, string>,
+    updatedAt: row?.updated_at ?? null,
+    updatedBy: row?.updated_by ?? null
+  };
+}
+
+export async function saveProjectIssueTypeConfig(input: unknown) {
+  const parsed = z.object({
+    projectKey: z.string().min(1),
+    issueTypeKey: z.string().min(1),
+    issueTypeName: z.string().min(1).optional(),
+    fieldSchema: z.array(
+      z.object({
+        key: z.string().min(1),
+        label: z.string().min(1),
+        type: z.string().min(1).default("text"),
+        required: z.boolean().default(false),
+        visible: z.boolean().default(true),
+        options: z.array(z.object({ value: z.string(), label: z.string() })).default([]),
+        defaultValue: z.any().optional()
+      })
+    ).default([]),
+    statusMapping: z.record(z.string(), z.string()).default({}),
+    actor: z.string().default("internal_operator")
+  }).parse(input);
+
+  const missingRequired = parsed.fieldSchema.filter((field) => field.required && !field.visible);
+  if (missingRequired.length > 0) {
+    throw new Error(`Required fields cannot be hidden: ${missingRequired.map((x) => x.label).join(", ")}`);
+  }
+
+  const saved = await withTransientDbRetry(() => repo.upsertProjectIssueTypeConfig({
+    projectKey: parsed.projectKey,
+    issueTypeKey: parsed.issueTypeKey,
+    issueTypeName: parsed.issueTypeName ?? parsed.issueTypeKey,
+    fieldSchema: parsed.fieldSchema,
+    statusMapping: parsed.statusMapping,
+    updatedBy: parsed.actor
+  }), "Save issue type config");
+  await repo.addOnesSyncAudit({
+    actor: parsed.actor,
+    scope: "project_issue_type",
+    eventType: "save_issue_type_config",
+    payload: {
+      projectKey: parsed.projectKey,
+      issueTypeKey: parsed.issueTypeKey,
+      fieldCount: parsed.fieldSchema.length,
+      statusMapSize: Object.keys(parsed.statusMapping).length
+    }
+  });
+  return saved;
+}
+
+export async function resolveCustomerStatusLabel(input: { issueTypeKey?: string | null; internalStatus: string }) {
+  const config = await repo.getActiveConfig();
+  if (!config?.ones_project_key || !input.issueTypeKey) {
+    return { label: input.internalStatus, fallback: true };
+  }
+  const row = await repo.getProjectIssueTypeConfig(config.ones_project_key, input.issueTypeKey);
+  const mapped = String((row?.status_mapping_json as Record<string, unknown> | undefined)?.[input.internalStatus] ?? "").trim();
+  if (!mapped) {
+    const warningKey = `${config.ones_project_key}:${input.issueTypeKey}:${input.internalStatus}`;
+    if (!statusMappingFallbackWarnings.has(warningKey)) {
+      statusMappingFallbackWarnings.add(warningKey);
+      await repo.addOnesSyncAudit({
+        actor: "system",
+        scope: "status_mapping",
+        eventType: "status_mapping_fallback",
+        payload: {
+          projectKey: config.ones_project_key,
+          issueTypeKey: input.issueTypeKey,
+          internalStatus: input.internalStatus
+        }
+      });
+    }
+    return { label: input.internalStatus, fallback: true };
+  }
+  return { label: mapped, fallback: false };
+}
+
+export async function validateCustomerTicketPayload(input: { ticketTypeKey: string; onesFields?: Record<string, unknown> }) {
+  const config = await repo.getActiveConfig();
+  if (!config?.ones_project_key) return;
+  const typeConfig = await repo.getProjectIssueTypeConfig(config.ones_project_key, input.ticketTypeKey);
+  const schema = (typeConfig?.field_schema_json ?? []) as Array<Record<string, unknown>>;
+  if (!schema.length) return;
+  const fields = input.onesFields ?? {};
+  const errors: string[] = [];
+  for (const field of schema) {
+    if (!Boolean(field.required)) continue;
+    if (!Boolean(field.visible ?? true)) continue;
+    const key = String(field.key ?? "");
+    const value = fields[key];
+    const empty = value === undefined || value === null || String(value).trim().length === 0;
+    if (empty) {
+      errors.push(`${String(field.label ?? key)} is required`);
+    }
+  }
+  if (errors.length) {
+    throw new Error(`Invalid payload: ${errors.join("; ")}`);
   }
 }
 
@@ -1021,7 +1604,8 @@ export async function createOnesTicket(input: {
 
   const requestBody = {
     issueTypeID: input.ticketTypeKey,
-    ...built.payload
+    ...built.payload,
+    ...((input.context.fields as Record<string, unknown> | undefined) ?? {})
   };
   const createPath = endpoints.createIssuePath ?? config.create_ticket_path;
   const raw = await onesFetch(config, createPath, {

@@ -3,6 +3,7 @@ import { env } from "../../config/env.js";
 import { pool } from "../../db/client.js";
 import type { OpenClawAdapter } from "../../infrastructure/openclaw/types.js";
 import * as aiRepo from "../ai/repository.js";
+import { resolveOpenClawRuntime } from "../ai/agent-router.js";
 import { SearchOrchestrator } from "../ai/search-orchestrator.js";
 import type { SearchReference } from "../ai/types.js";
 import * as ticketService from "../tickets/service.js";
@@ -131,6 +132,7 @@ async function processEscalation(escalationId: string, adapter: OpenClawAdapter)
     });
 
     const orchestrator = new SearchOrchestrator(adapter);
+    const runtime = resolveOpenClawRuntime({ intent: "retrieval", sessionId: escalation.session_id });
     let bestConfidence = 0;
     let bestAnswer = "";
     let bestRefs: SearchReference[] = [];
@@ -139,7 +141,7 @@ async function processEscalation(escalationId: string, adapter: OpenClawAdapter)
     const queries = [escalation.question, `${escalation.question} troubleshooting`, `${escalation.question} root cause`];
     for (let i = 0; i < Math.min(env.OPENCLAW_DEEP_SEARCH_MAX_ROUNDS, queries.length); i += 1) {
       attempts += 1;
-      const response = await orchestrator.search(queries[i], `${escalation.id}-round-${i + 1}`);
+      const response = await orchestrator.search(queries[i], `${escalation.id}-round-${i + 1}`, runtime);
       if (response.confidence > bestConfidence) {
         bestConfidence = response.confidence;
         bestAnswer = response.answer;

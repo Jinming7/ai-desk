@@ -41,8 +41,14 @@ export interface OpenClawSearchOutput {
   hits: OpenClawSearchResultItem[];
 }
 
+export interface OpenClawRuntimeContext {
+  agentId?: string;
+  sessionKey?: string;
+  intent?: "retrieval" | "clarify" | "execution";
+}
+
 export interface OpenClawAdapter {
-  analyzeTicket(input: OpenClawAnalyzeInput, idempotencyKey: string): Promise<OpenClawAnalyzeOutput>;
-  searchKnowledge(input: OpenClawSearchInput, idempotencyKey: string): Promise<OpenClawSearchOutput>;
+  analyzeTicket(input: OpenClawAnalyzeInput, idempotencyKey: string, runtime?: OpenClawRuntimeContext): Promise<OpenClawAnalyzeOutput>;
+  searchKnowledge(input: OpenClawSearchInput, idempotencyKey: string, runtime?: OpenClawRuntimeContext): Promise<OpenClawSearchOutput>;
   healthCheck(): Promise<{ ok: boolean; mode: "ws" | "mock"; detail?: string }>;
 }

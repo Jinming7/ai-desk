@@ -1,0 +1,100 @@
+{
+  "inviteSkillSelections": {
+    "assistant": [
+      "/Users/jeremypeng/Downloads/Workspace/Ticket Management/.golutra/skills/project-development-quality-maintainability"
+    ],
+    "member": [
+      "/Users/jeremypeng/Downloads/Workspace/Ticket Management/.golutra/skills/project-development-quality-maintainability"
+    ]
+  },
+  "memberSequence": {
+    "codex-member-ticket_management": 2,
+    "gemini-member-ticket_management": 2,
+    "openclaw-assistant-ticket_management": 2,
+    "openclaw-member-ticket_management": 2
+  },
+  "members": [
+    {
+      "autoStartTerminal": false,
+      "avatar": "css:orbit",
+      "id": "01J00000000000000000000000",
+      "name": "群主",
+      "role": "",
+      "roleKey": "members.roles.owner",
+      "roleType": "owner",
+      "status": "online"
+    },
+    {
+      "autoStartTerminal": true,
+      "avatar": "css:ember",
+      "collaborationMode": true,
+      "id": "01KK16WJRYGNF731RSZ01ZS9T8",
+      "name": "1-gemini-member-ticket_management",
+      "role": "",
+      "roleKey": "members.roles.member",
+      "roleType": "member",
+      "sandboxed": false,
+      "skillPaths": [
+        "/Users/jeremypeng/Downloads/Workspace/Ticket Management/.golutra/skills/project-development-quality-maintainability"
+      ],
+      "status": "online",
+      "terminalCommand": "gemini",
+      "terminalType": "gemini",
+      "unlimitedAccess": true
+    },
+    {
+      "autoStartTerminal": true,
+      "avatar": "css:mint",
+      "collaborationMode": true,
+      "id": "01KK16WRNFBZWM4JXN2YZQQMF5",
+      "name": "1-codex-member-ticket_management",
+      "role": "",
+      "roleKey": "members.roles.member",
+      "roleType": "member",
+      "sandboxed": false,
+      "skillPaths": [
+        "/Users/jeremypeng/Downloads/Workspace/Ticket Management/.golutra/skills/project-development-quality-maintainability"
+      ],
+      "status": "online",
+      "terminalCommand": "codex",
+      "terminalType": "codex",
+      "unlimitedAccess": true
+    },
+    {
+      "autoStartTerminal": true,
+      "avatar": "css:ember",
+      "collaborationMode": true,
+      "id": "01KK16X60YRQRFVCT9AGAA2561",
+      "name": "1-openclaw-assistant-ticket_management",
+      "role": "",
+      "roleKey": "members.roles.aiAssistant",
+      "roleType": "assistant",
+      "sandboxed": false,
+      "skillPaths": [
+        "/Users/jeremypeng/Downloads/Workspace/Ticket Management/.golutra/skills/project-development-quality-maintainability"
+      ],
+      "status": "online",
+      "terminalCommand": "openclaw",
+      "terminalType": "openclaw",
+      "unlimitedAccess": true
+    }
+  ],
+  "projectId": "b2756dbdc360169102b31690081510c49f4dedd1d433b40b34e2e616acc6d45d",
+  "roadmap": {
+    "objective": "",
+    "tasks": []
+  },
+  "terminal": {
+    "recentClosedTabs": [
+      {
+        "closedAt": 1773128357840,
+        "memberId": "01KK16X60YRQRFVCT9AGAA2561"
+      },
+      {
+        "closedAt": 1773128357839,
+        "memberId": "01KK16WJRYGNF731RSZ01ZS9T8"
+      }
+    ]
+  },
+  "version": 1
+}

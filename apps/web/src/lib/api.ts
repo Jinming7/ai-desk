@@ -108,17 +108,38 @@ export async function searchKnowledge(input: {
   query: string;
   sessionId?: string;
   conversation?: string[];
+  answerLanguage?: "zh" | "en";
 }): Promise<SearchResult> {
-  const res = await fetch(`${API}/api/v1/ai/search`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input)
-  }).catch((error) => {
-    throw asUserError(error);
-  });
-  if (!res.ok) throw new Error("Failed to search knowledge base");
-  const data = await res.json();
-  return data.result;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const res = await fetch(`${API}/api/v1/ai/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input)
+    }).catch((error) => {
+      throw asUserError(error);
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      return data.result;
+    }
+
+    const errorText = await res.text();
+    const normalized = errorText.toLowerCase();
+    const retryable =
+      normalized.includes("connection timeout") ||
+      normalized.includes("connection terminated") ||
+      normalized.includes("econnreset");
+    if (retryable && attempt === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      continue;
+    }
+    if (retryable) {
+      throw new Error("Knowledge base is temporarily busy. Please retry in a few seconds.");
+    }
+    throw new Error("Failed to search knowledge base");
+  }
+  throw new Error("Failed to search knowledge base");
 }
 
 export async function createChatTicketDraft(input: {

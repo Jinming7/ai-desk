@@ -4,6 +4,7 @@ import type {
   OpenClawAdapter,
   OpenClawAnalyzeInput,
   OpenClawAnalyzeOutput,
+  OpenClawRuntimeContext,
   OpenClawSearchInput,
   OpenClawSearchOutput
 } from "./types.js";
@@ -37,7 +38,11 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     }
   }
 
-  async analyzeTicket(input: OpenClawAnalyzeInput, idempotencyKey: string): Promise<OpenClawAnalyzeOutput> {
+  async analyzeTicket(
+    input: OpenClawAnalyzeInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawAnalyzeOutput> {
     return this.withRetry(async () => {
       try {
         const result = await this.callMethod("ticket.analyze", { ...input, idempotency_key: idempotencyKey });
@@ -47,12 +52,16 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         if (!message.includes("unknown method")) {
           throw error;
         }
-        return this.analyzeViaAgent(input, idempotencyKey);
+        return this.analyzeViaAgent(input, idempotencyKey, runtime);
       }
     });
   }
 
-  async searchKnowledge(input: OpenClawSearchInput, idempotencyKey: string): Promise<OpenClawSearchOutput> {
+  async searchKnowledge(
+    input: OpenClawSearchInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSearchOutput> {
     return this.withRetry(async () => {
       try {
         const result = await this.callMethod(
@@ -71,12 +80,16 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         if (!message.includes("unknown method")) {
           throw error;
         }
-        return this.searchViaAgent(input, idempotencyKey);
+        return this.searchViaAgent(input, idempotencyKey, runtime);
       }
     });
   }
 
-  private async analyzeViaAgent(input: OpenClawAnalyzeInput, idempotencyKey: string): Promise<OpenClawAnalyzeOutput> {
+  private async analyzeViaAgent(
+    input: OpenClawAnalyzeInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawAnalyzeOutput> {
     const prompt = [
       "You are first-line ticket triage.",
       "Return ONLY valid JSON with keys:",
@@ -92,9 +105,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `history: ${JSON.stringify(input.history)}`
     ].join("\n");
 
-    const runId = await this.startAgentRun(prompt, idempotencyKey);
+    const runId = await this.startAgentRun(prompt, idempotencyKey, runtime);
     await this.waitAgentRun(runId);
-    const text = await this.fetchLatestAssistantText();
+    const text = await this.fetchLatestAssistantText(runtime);
     const parsed = this.parseFirstJson(text) as Partial<OpenClawAnalyzeOutput>;
     const reply = typeof parsed.reply === "string" ? parsed.reply : "";
     return {
@@ -107,7 +120,11 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  private async searchViaAgent(input: OpenClawSearchInput, idempotencyKey: string): Promise<OpenClawSearchOutput> {
+  private async searchViaAgent(
+    input: OpenClawSearchInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSearchOutput> {
     const prompt = [
       "You are knowledge retrieval assistant.",
       "Return ONLY valid JSON with keys:",
@@ -118,9 +135,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `index: ${input.index}`
     ].join("\n");
 
-    const runId = await this.startAgentRun(prompt, idempotencyKey);
+    const runId = await this.startAgentRun(prompt, idempotencyKey, runtime);
     await this.waitAgentRun(runId);
-    const text = await this.fetchLatestAssistantText();
+    const text = await this.fetchLatestAssistantText(runtime);
     const parsed = this.parseFirstJson(text) as Record<string, unknown>;
     const rawHits = Array.isArray(parsed.hits) ? parsed.hits : [];
     const hits = rawHits.map((item, index) => {
@@ -139,10 +156,18 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  private async startAgentRun(message: string, idempotencyKey: string): Promise<string> {
+  private resolveAgentRuntime(runtime?: OpenClawRuntimeContext): { agentId: string; sessionKey: string } {
+    return {
+      agentId: runtime?.agentId?.trim() || env.OPENCLAW_AGENT_ID || "main",
+      sessionKey: runtime?.sessionKey?.trim() || env.OPENCLAW_AGENT_SESSION_KEY || `agent:main:${Date.now()}`
+    };
+  }
+
+  private async startAgentRun(message: string, idempotencyKey: string, runtime?: OpenClawRuntimeContext): Promise<string> {
+    const agentRuntime = this.resolveAgentRuntime(runtime);
     const payload = (await this.callMethod("agent", {
-      agentId: env.OPENCLAW_AGENT_ID || undefined,
-      sessionKey: env.OPENCLAW_AGENT_SESSION_KEY || undefined,
+      agentId: agentRuntime.agentId,
+      sessionKey: agentRuntime.sessionKey,
       message,
       timeout: env.OPENCLAW_AGENT_TIMEOUT_MS,
       idempotencyKey
@@ -173,9 +198,10 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     throw new Error(`OpenClaw agent wait status: ${payload?.status ?? "unknown"}`);
   }
 
-  private async fetchLatestAssistantText(): Promise<string> {
+  private async fetchLatestAssistantText(runtime?: OpenClawRuntimeContext): Promise<string> {
+    const agentRuntime = this.resolveAgentRuntime(runtime);
     const history = (await this.callMethod("chat.history", {
-      sessionKey: env.OPENCLAW_AGENT_SESSION_KEY,
+      sessionKey: agentRuntime.sessionKey,
       limit: 12
     })) as { messages?: Array<Record<string, unknown>> };
 

@@ -10,7 +10,19 @@ import {
   ticketListQuerySchema,
   ticketReplySchema
 } from "./contracts/tickets.js";
-import { aiEscalateRequestSchema, aiSearchRequestSchema } from "./contracts/ai-search.js";
+import {
+  aiEscalateRequestSchema,
+  aiSearchRequestSchema,
+  aiTicketDraftRequestSchema,
+  aiTicketSubmitRequestSchema
+} from "./contracts/ai-search.js";
+import {
+  kbEnqueueSyncSchema,
+  kbRepoRegistrationSchema,
+  kbRetrievalQuerySchema,
+  kbRunJobsSchema,
+  kbWebhookHeadersSchema
+} from "./contracts/github-kb.js";
 import * as ticketService from "./modules/tickets/service.js";
 import * as agentService from "./modules/agent/service.js";
 import * as aiService from "./modules/ai/service.js";
@@ -20,6 +32,7 @@ import * as workflowService from "./modules/workflow/service.js";
 import * as settingsService from "./modules/settings/service.js";
 import * as onesSyncService from "./modules/ones-sync/service.js";
 import * as supportUxService from "./modules/support-ux/service.js";
+import * as githubKbService from "./modules/github-kb/service.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
 import { env } from "./config/env.js";
@@ -36,10 +49,29 @@ const aiAdapter =
       ? new WsOpenClawAdapter()
       : new MockOpenClawAdapter();
 
+async function enrichCustomerStatus<T extends { status: string; ones_ticket_type_key?: string | null }>(ticket: T) {
+  const mapped = await onesSyncService.resolveCustomerStatusLabel({
+    issueTypeKey: ticket.ones_ticket_type_key ?? null,
+    internalStatus: ticket.status
+  });
+  return { ...ticket, customer_status_label: mapped.label };
+}
+
 if (env.NODE_ENV !== "test") {
   setInterval(() => {
     void onesSyncService.reconcileReadModel(20).catch(() => undefined);
   }, 5 * 60 * 1000);
+
+  if (env.GITHUB_KB_ENABLED) {
+    void githubKbService.bootstrapRepositoryFromEnvIfConfigured().catch(() => undefined);
+    void githubKbService.validateStartupConfig().catch(() => undefined);
+    setInterval(() => {
+      void githubKbService.runDueSyncJobs(env.GITHUB_KB_WORKER_BATCH_SIZE).catch(() => undefined);
+    }, env.GITHUB_KB_WORKER_INTERVAL_SECONDS * 1000);
+    setInterval(() => {
+      void githubKbService.pollAndEnqueueIncremental(env.GITHUB_KB_POLL_BATCH_SIZE).catch(() => undefined);
+    }, Math.max(30, env.GITHUB_KB_WORKER_INTERVAL_SECONDS) * 1000);
+  }
 }
 
 function requireInternalRequest(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -76,8 +108,47 @@ app.post(
   "/api/v1/ai/search",
   asyncHandler(async (req, res) => {
     const body = aiSearchRequestSchema.parse(req.body);
-    const result = await aiService.runSearchMode(body.query, aiAdapter);
+    const result = await aiService.runSearchMode(body.query, aiAdapter, {
+      sessionId: body.sessionId,
+      conversation: body.conversation,
+      answerLanguage: body.answerLanguage
+    });
     res.json({ result });
+  })
+);
+
+app.post(
+  "/api/v1/ai/handoff/draft",
+  asyncHandler(async (req, res) => {
+    const body = aiTicketDraftRequestSchema.parse(req.body);
+    const draft = await aiService.buildTicketDraftFromConversation({
+      sessionId: body.sessionId,
+      question: body.question,
+      conversation: body.conversation,
+      retrievalTraces: body.retrievalTraces
+    });
+    res.status(201).json({ draft });
+  })
+);
+
+app.post(
+  "/api/v1/ai/handoff/submit",
+  asyncHandler(async (req, res) => {
+    const body = aiTicketSubmitRequestSchema.parse(req.body);
+    const { payload } = await aiService.buildTicketPayloadFromDraft({
+      draftId: body.draftId,
+      overrides: {
+        title: body.title,
+        description: body.description,
+        serviceCategory: body.serviceCategory,
+        onesTicketTypeKey: body.onesTicketTypeKey,
+        onesFields: body.onesFields,
+        customer: body.customer
+      }
+    });
+    const created = await workflowService.submitTicketWorkflow(payload, aiAdapter);
+    await aiService.markTicketDraftSubmitted(body.draftId, created.ticket.id);
+    res.status(201).json({ ticket: created.ticket, triage: created.triage, triageError: created.triageError });
   })
 );
 
@@ -123,7 +194,8 @@ app.get(
   asyncHandler(async (req, res) => {
     const query = ticketListQuerySchema.parse(req.query);
     const tickets = await ticketService.listTickets(query);
-    res.json({ tickets });
+    const enriched = await Promise.all(tickets.map((ticket) => enrichCustomerStatus(ticket)));
+    res.json({ tickets: enriched });
   })
 );
 
@@ -132,7 +204,8 @@ app.get(
   asyncHandler(async (req, res) => {
     const id = z.string().parse(req.params.id);
     const data = await ticketService.getTicketDetail(id);
-    res.json(data);
+    const ticket = await enrichCustomerStatus(data.ticket);
+    res.json({ ...data, ticket });
   })
 );
 
@@ -349,6 +422,89 @@ app.post(
 );
 
 app.post(
+  "/api/v1/internal/configuration/project-issue-types/discover",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const result = await onesSyncService.discoverProjectIssueTypes(req.body);
+    res.json({ issueTypes: result });
+  })
+);
+
+app.get(
+  "/api/v1/internal/configuration/project-issue-types",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const projectKey = z.string().min(1).parse(req.query.projectKey);
+    const issueTypes = await onesSyncService.listProjectIssueTypes(projectKey);
+    res.json({ issueTypes });
+  })
+);
+
+app.put(
+  "/api/v1/internal/configuration/project-issue-types/:issueTypeKey/exposure",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const issueTypeKey = z.string().min(1).parse(req.params.issueTypeKey);
+    const projectKey = z.string().min(1).parse(req.body?.projectKey);
+    const enabledForCustomer = z.coerce.boolean().parse(req.body?.enabledForCustomer);
+    const issueTypeName = z.string().optional().parse(req.body?.issueTypeName);
+    const actor = z.string().default("internal_operator").parse(req.body?.actor);
+    const saved = await onesSyncService.setProjectIssueTypeExposure({
+      projectKey,
+      issueTypeKey,
+      issueTypeName,
+      enabledForCustomer,
+      actor
+    });
+    res.json({ config: saved });
+  })
+);
+
+app.get(
+  "/api/v1/internal/configuration/project-issue-types/:issueTypeKey/fields",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const issueTypeKey = z.string().min(1).parse(req.params.issueTypeKey);
+    const projectKey = z.string().min(1).parse(req.query.projectKey);
+    const fields = await onesSyncService.getProjectIssueTypeFields({ projectKey, issueTypeKey });
+    res.json({ fields });
+  })
+);
+
+app.get(
+  "/api/v1/internal/configuration/project-issue-types/:issueTypeKey/config",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const issueTypeKey = z.string().min(1).parse(req.params.issueTypeKey);
+    const projectKey = z.string().min(1).parse(req.query.projectKey);
+    const config = await onesSyncService.getProjectIssueTypeConfig({ projectKey, issueTypeKey });
+    res.json({ config });
+  })
+);
+
+app.put(
+  "/api/v1/internal/configuration/project-issue-types/:issueTypeKey/config",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const issueTypeKey = z.string().min(1).parse(req.params.issueTypeKey);
+    const projectKey = z.string().min(1).parse(req.body?.projectKey);
+    const issueTypeName = z.string().optional().parse(req.body?.issueTypeName);
+    const actor = z.string().default("internal_operator").parse(req.body?.actor);
+    const fieldSchema = z.array(z.any()).default([]).parse(req.body?.fieldSchema ?? []);
+    const statusMapping = z.record(z.string(), z.string()).default({}).parse(req.body?.statusMapping ?? {});
+    const config = await onesSyncService.saveProjectIssueTypeConfig({
+      projectKey,
+      issueTypeKey,
+      issueTypeName,
+      fieldSchema,
+      statusMapping,
+      actor
+    });
+    res.json({ config });
+  })
+);
+
+app.post(
   "/api/v1/internal/configuration/endpoint/test",
   requireInternalRequest,
   asyncHandler(async (req, res) => {
@@ -363,7 +519,8 @@ app.get(
   asyncHandler(async (req, res) => {
     const teamId = z.string().optional().parse(req.query.teamId);
     const projectKey = z.string().optional().parse(req.query.projectKey);
-    const statuses = await onesSyncService.discoverIssueStatuses({ teamId, projectKey });
+    const issueTypeKey = z.string().min(1).parse(req.query.issueTypeKey);
+    const statuses = await onesSyncService.discoverIssueStatuses({ teamId, projectKey, issueTypeKey });
     res.json({ statuses });
   })
 );
@@ -540,6 +697,156 @@ app.post(
   asyncHandler(async (req, res) => {
     const limit = z.coerce.number().int().min(1).max(200).default(50).parse(req.body?.limit ?? 50);
     const result = await onesSyncService.reconcileReadModel(limit);
+    res.json({ result });
+  })
+);
+
+app.get(
+  "/api/v1/internal/kb/repos",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const repos = await githubKbService.listRepositories();
+    res.json({ repos });
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/repos/register",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const body = kbRepoRegistrationSchema.parse(req.body);
+    const result = await githubKbService.registerRepository(body);
+    res.status(201).json(result);
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/sync/full",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const body = kbEnqueueSyncSchema.parse({ ...req.body, mode: "full", source: "manual" });
+    const job = await githubKbService.enqueueSyncJob({
+      repoId: body.repoId,
+      branch: body.branch,
+      mode: "full",
+      source: "manual",
+      beforeCommitSha: body.beforeCommitSha,
+      afterCommitSha: body.afterCommitSha,
+      payload: body.payload,
+      idempotencyKey: body.idempotencyKey
+    });
+    res.status(202).json({ job });
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/sync/incremental",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const body = kbEnqueueSyncSchema.parse({ ...req.body, mode: "incremental", source: "manual" });
+    const job = await githubKbService.enqueueSyncJob({
+      repoId: body.repoId,
+      branch: body.branch,
+      mode: "incremental",
+      source: "manual",
+      beforeCommitSha: body.beforeCommitSha,
+      afterCommitSha: body.afterCommitSha,
+      payload: body.payload,
+      idempotencyKey: body.idempotencyKey
+    });
+    res.status(202).json({ job });
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/sync/reindex",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const repoId = z.string().uuid().parse(req.body?.repoId);
+    const branch = z.string().default("main").parse(req.body?.branch);
+    const job = await githubKbService.triggerReindex(repoId, branch);
+    res.status(202).json({ job });
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/sync/run",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const body = kbRunJobsSchema.parse(req.body);
+    const result = await githubKbService.runDueSyncJobs(body.limit);
+    res.json({ result });
+  })
+);
+
+app.get(
+  "/api/v1/internal/kb/sync/jobs",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const limit = z.coerce.number().int().min(1).max(200).default(50).parse(req.query.limit);
+    const jobs = await githubKbService.listSyncJobs(limit);
+    res.json({ jobs });
+  })
+);
+
+app.get(
+  "/api/v1/internal/kb/sync/health",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const health = await githubKbService.getSyncHealthSummary();
+    res.json({ health });
+  })
+);
+
+app.get(
+  "/api/v1/internal/kb/metrics",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const metrics = await githubKbService.getMetricsSummary();
+    res.json({ metrics });
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/compliance/read-only",
+  requireInternalRequest,
+  asyncHandler(async (_req, res) => {
+    const compliance = await githubKbService.runReadOnlyComplianceCheck();
+    res.json({ compliance });
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/webhook/github",
+  asyncHandler(async (req, res) => {
+    const headers = kbWebhookHeadersSchema.parse({
+      event: req.header("x-github-event"),
+      delivery: req.header("x-github-delivery"),
+      signature256: req.header("x-hub-signature-256")
+    });
+    const payload = (req.body ?? {}) as Record<string, unknown>;
+    const result = await githubKbService.ingestGithubWebhook({
+      event: headers.event,
+      delivery: headers.delivery,
+      signature256: headers.signature256,
+      payload
+    });
+    res.status(result.accepted ? 202 : 400).json({ result });
+  })
+);
+
+app.post(
+  "/api/v1/kb/retrieval/query",
+  asyncHandler(async (req, res) => {
+    const body = kbRetrievalQuerySchema.parse(req.body);
+    const result = await githubKbService.retrieveKnowledge({
+      query: body.query,
+      profile: body.profile,
+      repoId: body.repoId,
+      branch: body.branch,
+      topK: body.topK,
+      includeFallback: body.includeFallback
+    });
     res.json({ result });
   })
 );

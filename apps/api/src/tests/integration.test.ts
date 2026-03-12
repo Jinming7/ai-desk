@@ -7,7 +7,22 @@ import { pool } from "../db/client.js";
 let baseUrl = "";
 let server: ReturnType<typeof app.listen>;
 
+function assertSafeTestDatabase() {
+  const url = process.env.DATABASE_URL ?? "";
+  const isLocal =
+    /localhost|127\.0\.0\.1/i.test(url) ||
+    /test/i.test(url);
+  if (!isLocal) {
+    throw new Error(
+      `Refusing to run integration tests against non-test database: ${url}`
+    );
+  }
+}
+
 async function resetDb() {
+  await pool.query("DELETE FROM ai_search_handoff_events");
+  await pool.query("DELETE FROM ai_search_ticket_drafts");
+  await pool.query("DELETE FROM ai_search_dialog_states");
   await pool.query("DELETE FROM ai_search_escalation_events");
   await pool.query("DELETE FROM ai_search_escalations");
   await pool.query("DELETE FROM ai_search_metrics_events");
@@ -49,6 +64,7 @@ async function waitForEscalationTerminal(escalationId: string) {
 }
 
 before(async () => {
+  assertSafeTestDatabase();
   server = app.listen(0);
   await new Promise<void>((resolve) => server.once("listening", () => resolve()));
   const { port } = server.address() as AddressInfo;
@@ -106,6 +122,96 @@ test("SEARCH_MODE fallback exposes KB_RETRIEVAL_UNAVAILABLE when OpenClaw retrie
   assert.equal(data.result.suggested_next_step, "submit_ticket");
   assert.equal(data.result.unresolved_reason_code, "KB_RETRIEVAL_UNAVAILABLE");
   assert.equal(data.result.references.length, 0);
+});
+
+test("0-citation multi-turn reaches handoff CTA after 3 rounds", async () => {
+  const q = "thisquerywillnotmatchkbx";
+
+  const r1 = await fetch(`${baseUrl}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: q })
+  });
+  assert.equal(r1.status, 200);
+  const d1 = (await r1.json()) as {
+    result: { session_id: string; clarification_round: number; show_create_ticket_now: boolean };
+  };
+  assert.equal(d1.result.clarification_round, 1);
+  assert.equal(d1.result.show_create_ticket_now, false);
+
+  const r2 = await fetch(`${baseUrl}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: q, sessionId: d1.result.session_id, conversation: [q, "need more info"] })
+  });
+  assert.equal(r2.status, 200);
+  const d2 = (await r2.json()) as {
+    result: { clarification_round: number; show_create_ticket_now: boolean };
+  };
+  assert.equal(d2.result.clarification_round, 2);
+  assert.equal(d2.result.show_create_ticket_now, false);
+
+  const r3 = await fetch(`${baseUrl}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: q, sessionId: d1.result.session_id, conversation: [q, "still failing"] })
+  });
+  assert.equal(r3.status, 200);
+  const d3 = (await r3.json()) as {
+    result: { clarification_round: number; show_create_ticket_now: boolean; state: string };
+  };
+  assert.equal(d3.result.clarification_round, 3);
+  assert.equal(d3.result.show_create_ticket_now, true);
+  assert.equal(d3.result.state, "TICKET_HANDOFF_RECOMMENDED");
+});
+
+test("chat handoff draft and submit creates ticket", async () => {
+  const searchRes = await fetch(`${baseUrl}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "thisquerywillnotmatchkbx" })
+  });
+  assert.equal(searchRes.status, 200);
+  const searchData = (await searchRes.json()) as { result: { session_id: string; citations: unknown[] } };
+
+  const draftRes = await fetch(`${baseUrl}/api/v1/ai/handoff/draft`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: searchData.result.session_id,
+      question: "Cannot complete deployment",
+      conversation: ["Cannot complete deployment", "Asked for logs", "Pod crashlooping"],
+      retrievalTraces: searchData.result.citations
+    })
+  });
+  assert.equal(draftRes.status, 201);
+  const draftData = (await draftRes.json()) as { draft: { id: string; title: string; description: string } };
+  assert.equal(draftData.draft.title.length > 0, true);
+
+  const submitRes = await fetch(`${baseUrl}/api/v1/ai/handoff/submit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      draftId: draftData.draft.id,
+      title: `${draftData.draft.title} [confirmed]`,
+      description: draftData.draft.description
+    })
+  });
+  assert.equal(submitRes.status, 201);
+  const submitData = (await submitRes.json()) as { ticket: { id: string; title: string } };
+  assert.equal(submitData.ticket.id.length > 0, true);
+  assert.equal(submitData.ticket.title.includes("[confirmed]"), true);
+});
+
+test("search response language matches Chinese query", async () => {
+  const response = await fetch(`${baseUrl}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "登录回调失败怎么处理" })
+  });
+  assert.equal(response.status, 200);
+  const data = (await response.json()) as { result: { answer_language: "zh" | "en" } };
+  assert.equal(data.result.answer_language, "zh");
 });
 
 test("quick ticket escalation is idempotent per unresolved session", async () => {

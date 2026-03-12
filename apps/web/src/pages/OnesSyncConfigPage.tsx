@@ -14,10 +14,10 @@ import {
 } from "../lib/api";
 import type { OnesProjectIssueType, OnesProjectIssueTypeConfig, OnesSyncConfig } from "../lib/types";
 
-type Step = 0 | 1 | 2;
+type Step = 0 | 1;
 type ToastKind = "error" | "success";
 type ToastItem = { id: number; kind: ToastKind; message: string };
-const steps = ["1. Setup & Project", "2. Ticket Types", "3. Publish"] as const;
+const steps = ["1. Setup & Project", "2. Ticket Types"] as const;
 const INTERNAL_ISSUE_FORM_FIELDS_PATH = "/project/api/ones-project/team/{teamID}/issue_form/fields";
 
 function categorizeProjectDiscoveryError(message: string) {
@@ -619,6 +619,27 @@ export function OnesSyncConfigPage() {
     setFieldPickerOpen(false);
   };
 
+  const handleNext = async () => {
+    if (step === 0) {
+      if (!canProceedSetup) return;
+      if (setupDirty) {
+        setSaving(true);
+        try {
+          await upsertDraftConfig();
+        } catch (e) {
+          setError((e as Error).message);
+          setSaving(false);
+          return;
+        }
+        setSaving(false);
+      }
+      setStep(1);
+      return;
+    }
+    if (enabledTypeCount === 0) return;
+    await handleSaveDraft();
+  };
+
   if (loading) return <div className="mx-auto max-w-6xl px-6 py-10 text-sm text-slate-600">Loading configuration...</div>;
 
   return (
@@ -647,7 +668,7 @@ export function OnesSyncConfigPage() {
       </div>
 
       <section className="rounded-mdplus border border-slate-200 bg-white p-4">
-        <ol className="grid gap-2 md:grid-cols-3">
+        <ol className="grid gap-2 md:grid-cols-2">
           {steps.map((name, index) => (
             <li
               key={name}
@@ -898,30 +919,20 @@ export function OnesSyncConfigPage() {
         </section>
       )}
 
-      {step === 2 && (
-        <section className="rounded-mdplus border border-slate-200 bg-white p-5">
-          <h2 className="text-lg font-semibold text-[#16171A]">Publish</h2>
-          <p className="mt-2 text-sm text-slate-600">This flow is save-immediate. Draft save already takes effect for customer portal runtime.</p>
-          <button className="mt-4 rounded-mdplus border border-slate-300 px-4 py-2 text-sm" onClick={() => void handleSaveDraft()} disabled={saving}>
-            Save Draft
-          </button>
-        </section>
-      )}
-
       <section className="flex items-center justify-between rounded-mdplus border border-slate-200 bg-white p-4">
         <button
           className="rounded-mdplus border border-slate-300 px-4 py-2 text-sm disabled:opacity-40"
-          onClick={() => setStep(step === 0 ? 0 : step === 1 ? 0 : 1)}
+          onClick={() => setStep(0)}
           disabled={step === 0}
         >
           Back
         </button>
         <button
           className="rounded-mdplus bg-brand-500 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
-          onClick={() => setStep(step === 0 ? 1 : step === 1 ? 2 : 2)}
-          disabled={(step === 0 && !canProceedSetup) || (step === 1 && enabledTypeCount === 0) || step === 2}
+          onClick={() => void handleNext()}
+          disabled={saving || (step === 0 && !canProceedSetup) || (step === 1 && enabledTypeCount === 0)}
         >
-          Next
+          {step === 0 ? "Next" : "Save & Finish"}
         </button>
       </section>
 

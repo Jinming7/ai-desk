@@ -9,7 +9,10 @@
     "start": "node dist/index.js",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed:mock": "tsx src/db/seed-mock.ts",
-    "test:integration": "NODE_ENV=test tsx --test src/tests/integration.test.ts"
+    "test:integration": "NODE_ENV=test tsx --test src/tests/integration.test.ts",
+    "test:github-kb": "NODE_ENV=test tsx --test src/tests/github-kb.integration.test.ts",
+    "kb:worker": "tsx src/modules/github-kb/worker.ts",
+    "kb:eval": "tsx src/modules/github-kb/eval.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

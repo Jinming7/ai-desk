@@ -2,6 +2,7 @@ import type {
   OpenClawAdapter,
   OpenClawAnalyzeInput,
   OpenClawAnalyzeOutput,
+  OpenClawRuntimeContext,
   OpenClawSearchInput,
   OpenClawSearchOutput
 } from "./types.js";
@@ -12,24 +13,27 @@ const mockCorpus: Array<{ id: string; title: string; content: string; sourceUrl:
     title: "Troubleshoot SSO Login Callback Failures",
     content:
       "Verify callback URL and tenant mapping, check clock skew, and collect browser console + request id before escalation.",
-    sourceUrl: "https://kb.nexusflow.local/auth/sso-callback"
+    sourceUrl:
+      "https://github.com/BangWork/docs-com/blob/8d8f2ee6875f2d146f8f0d3bd82f51a8cb4d0a11/docs/sso-callback.md"
   },
   {
     id: "kb-api-002",
     title: "Reset API Token and Validate Integration Access",
     content: "For 401 issues rotate API token, confirm workspace permissions, and validate using curl.",
-    sourceUrl: "https://kb.nexusflow.local/api/token-reset"
+    sourceUrl:
+      "https://github.com/BangWork/docs-com/blob/8d8f2ee6875f2d146f8f0d3bd82f51a8cb4d0a11/docs/api-token-reset.md"
   },
   {
     id: "kb-billing-003",
     title: "Fix Billing Permission Denied Errors",
     content: "Rebind billing admin role, refresh SSO claims, and retest checkout permissions.",
-    sourceUrl: "https://kb.nexusflow.local/account/billing-permissions"
+    sourceUrl:
+      "https://github.com/BangWork/docs-com/blob/8d8f2ee6875f2d146f8f0d3bd82f51a8cb4d0a11/docs/billing-permissions.md"
   }
 ];
 
 export class MockOpenClawAdapter implements OpenClawAdapter {
-  async analyzeTicket(input: OpenClawAnalyzeInput): Promise<OpenClawAnalyzeOutput> {
+  async analyzeTicket(input: OpenClawAnalyzeInput, _idempotencyKey: string, _runtime?: OpenClawRuntimeContext): Promise<OpenClawAnalyzeOutput> {
     const combined = `${input.title} ${input.description}`;
 
     if (/simulate_openclaw_failure/i.test(`${input.title} ${input.description}`)) {
@@ -79,7 +83,7 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  async searchKnowledge(input: OpenClawSearchInput): Promise<OpenClawSearchOutput> {
+  async searchKnowledge(input: OpenClawSearchInput, _idempotencyKey: string, _runtime?: OpenClawRuntimeContext): Promise<OpenClawSearchOutput> {
     if (/simulate_openclaw_failure/i.test(input.query)) {
       throw new Error("Simulated OpenClaw KB retrieval failure");
     }
