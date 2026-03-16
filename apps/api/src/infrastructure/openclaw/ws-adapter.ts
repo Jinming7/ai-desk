@@ -1,10 +1,16 @@
+import fs from "node:fs/promises";
 import { WebSocket } from "ws";
 import { env } from "../../config/env.js";
+import { detectMimeType, resolveAttachmentPath } from "../../modules/ai/multimodal.js";
 import type {
   OpenClawAdapter,
   OpenClawAnalyzeInput,
   OpenClawAnalyzeOutput,
+  OpenClawClassifyIntentInput,
+  OpenClawClassifyIntentOutput,
   OpenClawRuntimeContext,
+  OpenClawSearchAnswerInput,
+  OpenClawSearchAnswerOutput,
   OpenClawSearchInput,
   OpenClawSearchOutput
 } from "./types.js";
@@ -25,6 +31,12 @@ interface RpcRes {
   error?: { code: string; message: string };
 }
 
+type OpenClawChatAttachment = {
+  type: "image";
+  mimeType: string;
+  content: string;
+};
+
 export class WsOpenClawAdapter implements OpenClawAdapter {
   private consecutiveFailures = 0;
   private readonly requestedScopes = env.OPENCLAW_REQUEST_SCOPES.split(",").map((item) => item.trim()).filter(Boolean);
@@ -44,6 +56,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawAnalyzeOutput> {
     return this.withRetry(async () => {
+      if (input.attachments?.length) {
+        return this.analyzeViaChat(input, idempotencyKey, runtime);
+      }
       try {
         const result = await this.callMethod("ticket.analyze", { ...input, idempotency_key: idempotencyKey });
         return result as OpenClawAnalyzeOutput;
@@ -52,7 +67,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         if (!message.includes("unknown method")) {
           throw error;
         }
-        return this.analyzeViaAgent(input, idempotencyKey, runtime);
+        return this.analyzeViaChat(input, idempotencyKey, runtime);
       }
     });
   }
@@ -63,6 +78,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawSearchOutput> {
     return this.withRetry(async () => {
+      if (input.attachments?.length) {
+        return this.searchViaChat(input, idempotencyKey, runtime);
+      }
       try {
         const result = await this.callMethod(
           "kb.search",
@@ -80,12 +98,136 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         if (!message.includes("unknown method")) {
           throw error;
         }
-        return this.searchViaAgent(input, idempotencyKey, runtime);
+        return this.searchViaChat(input, idempotencyKey, runtime);
       }
     });
   }
 
-  private async analyzeViaAgent(
+  async answerSearchQuery(
+    input: OpenClawSearchAnswerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSearchAnswerOutput> {
+    return this.withRetry(async () => {
+      const historyLines: string[] = [];
+      if (input.conversationHistory?.length) {
+        const recent = input.conversationHistory.slice(-6);
+        historyLines.push("=== Conversation History (most recent 6 turns) ===");
+        for (const turn of recent) {
+          historyLines.push(`[${turn.role}]: ${turn.content}`);
+        }
+        historyLines.push("=== End History ===");
+      }
+
+      const prompt = [
+        "You are search-bot, a grounded support retrieval assistant.",
+        "",
+        "## Instructions",
+        "1. Your answer MUST directly address the user's question. Do NOT give generic troubleshooting steps when the references contain a specific answer.",
+        "2. If the references contain relevant information, cite and synthesize it into a concrete answer.",
+        "3. If the draft_answer already contains a specific conclusion, preserve and enhance it — do NOT replace it with a vague clarification.",
+        "4. Only ask for clarification when you genuinely lack enough information to answer. Do NOT default to clarification.",
+        "5. If a capability is not explicitly shown in the provided references, say: 不确定（文档未显示）.",
+        "6. Classify the user's question yourself before answering.",
+        "",
+        "## Output Format",
+        "Return ONLY valid JSON with keys:",
+        "answer, style(kb_answer|diagnosis|clarification), summary, assessment, steps(string[]), validation(string[]), required_inputs(string[]), suggested_next_step(self_serve|submit_ticket)",
+        "",
+        ...(historyLines.length ? [...historyLines, ""] : []),
+        `language: ${input.language}`,
+        `route_hint: ${input.routeHint ?? "none"}`,
+        `grounded: ${input.grounded ? "true" : "false"}`,
+        `user_query: ${input.query}`,
+        `references: ${JSON.stringify(input.references)}`,
+        `draft_answer: ${JSON.stringify(input.draftAnswer ?? null)}`
+      ].join("\n");
+
+      const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments);
+      await this.waitAgentRun(runId);
+      const text = await this.fetchLatestAssistantText(runtime);
+      const parsed = this.parseFirstJson(text) as Partial<OpenClawSearchAnswerOutput>;
+      return {
+        answer: typeof parsed.answer === "string" ? parsed.answer : typeof parsed.summary === "string" ? parsed.summary : "",
+        style: parsed.style,
+        summary: typeof parsed.summary === "string" ? parsed.summary : "",
+        assessment: typeof parsed.assessment === "string" ? parsed.assessment : undefined,
+        steps: Array.isArray(parsed.steps) ? parsed.steps.map((x) => String(x)) : [],
+        validation: Array.isArray(parsed.validation) ? parsed.validation.map((x) => String(x)) : [],
+        required_inputs: Array.isArray(parsed.required_inputs) ? parsed.required_inputs.map((x) => String(x)) : undefined,
+        suggested_next_step: parsed.suggested_next_step
+      };
+    });
+  }
+
+  async classifyIntent(
+    input: OpenClawClassifyIntentInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawClassifyIntentOutput> {
+    return this.withRetry(async () => {
+      const contextLines: string[] = [];
+      if (input.conversationContext?.length) {
+        contextLines.push("Previous conversation context:");
+        for (const msg of input.conversationContext.slice(-4)) {
+          contextLines.push(`- ${msg}`);
+        }
+      }
+
+      const prompt = [
+        "You are an intent classifier for a technical support system.",
+        "",
+        "## Task",
+        "Classify the user's query into an intent and a routing category.",
+        "",
+        "## Intent categories",
+        "- api_operation: Questions about API endpoints, HTTP requests, SDK usage, OpenAPI docs",
+        "- feature_usage: How-to questions about product features, UI navigation, workflows",
+        "- troubleshooting: Error reports, failures, timeout, crash, unexpected behavior",
+        "- concept_explanation: What-is questions, comparisons, conceptual understanding",
+        "- configuration: Setup, deployment, config, integration, OAuth/token configuration",
+        "- general: Vague or unclassifiable queries",
+        "",
+        "## Route categories",
+        "- openapi_doc: Query specifically asks about OpenAPI/REST endpoint documentation",
+        "- infra_runbook: Infrastructure troubleshooting (k8s, pods, volumes, database ops)",
+        "- integration_diagnosis: Third-party integration failures (GitHub/GitLab/Slack + error)",
+        "- product_diagnosis: Product bug reports with concrete evidence",
+        "- kb_guidance: Answerable from knowledge base (most feature/config/troubleshooting questions)",
+        "- clarification: Query is too vague to route without more information",
+        "",
+        "## Rules",
+        "- If the query mentions auth/OAuth/token in a configuration context (e.g. 'how to configure OAuth'), classify as configuration + kb_guidance, NOT api_operation",
+        "- If the query has concrete error details + integration keywords, classify as troubleshooting + integration_diagnosis",
+        "- If there is conversation context, use it to disambiguate vague queries — prefer kb_guidance over clarification",
+        "- Only use clarification when the query is truly uninformative (e.g. just 'help' or 'hi')",
+        "",
+        "## Output",
+        "Return ONLY valid JSON: {intent, route, confidence(0..1), reasoning(short string)}",
+        "",
+        ...(contextLines.length ? [...contextLines, ""] : []),
+        `language: ${input.language}`,
+        `user_query: ${input.query}`
+      ].join("\n");
+
+      const runId = await this.startChatRun(prompt, idempotencyKey, runtime);
+      await this.waitAgentRun(runId);
+      const text = await this.fetchLatestAssistantText(runtime);
+      const parsed = this.parseFirstJson(text) as Partial<OpenClawClassifyIntentOutput>;
+
+      const validIntents = ["api_operation", "feature_usage", "troubleshooting", "concept_explanation", "configuration", "general"];
+      const validRoutes = ["openapi_doc", "infra_runbook", "integration_diagnosis", "product_diagnosis", "kb_guidance", "clarification"];
+
+      return {
+        intent: validIntents.includes(parsed.intent as string) ? parsed.intent! : "general",
+        route: validRoutes.includes(parsed.route as string) ? parsed.route! : "kb_guidance",
+        confidence: this.normalizeConfidence(parsed.confidence),
+        reasoning: typeof parsed.reasoning === "string" ? parsed.reasoning : ""
+      };
+    });
+  }
+
+  private async analyzeViaChat(
     input: OpenClawAnalyzeInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
@@ -105,7 +247,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `history: ${JSON.stringify(input.history)}`
     ].join("\n");
 
-    const runId = await this.startAgentRun(prompt, idempotencyKey, runtime);
+    const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments);
     await this.waitAgentRun(runId);
     const text = await this.fetchLatestAssistantText(runtime);
     const parsed = this.parseFirstJson(text) as Partial<OpenClawAnalyzeOutput>;
@@ -120,7 +262,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  private async searchViaAgent(
+  private async searchViaChat(
     input: OpenClawSearchInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
@@ -135,7 +277,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `index: ${input.index}`
     ].join("\n");
 
-    const runId = await this.startAgentRun(prompt, idempotencyKey, runtime);
+    const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments);
     await this.waitAgentRun(runId);
     const text = await this.fetchLatestAssistantText(runtime);
     const parsed = this.parseFirstJson(text) as Record<string, unknown>;
@@ -180,6 +322,50 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       throw new Error(payload.summary || "OpenClaw agent run failed");
     }
     return payload.runId;
+  }
+
+  private async startChatRun(
+    message: string,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext,
+    attachmentUrls?: string[]
+  ): Promise<string> {
+    const agentRuntime = this.resolveAgentRuntime(runtime);
+    const attachments = await this.buildChatAttachments(attachmentUrls);
+    const payload = (await this.callMethod("chat.send", {
+      sessionKey: agentRuntime.sessionKey,
+      message,
+      deliver: false,
+      idempotencyKey,
+      ...(attachments.length ? { attachments } : {})
+    })) as { runId?: string; status?: string; summary?: string };
+
+    if (!payload?.runId) {
+      throw new Error("OpenClaw chat.send did not return runId");
+    }
+    if (payload.status === "error") {
+      throw new Error(payload.summary || "OpenClaw chat.send failed");
+    }
+    return payload.runId;
+  }
+
+  private async buildChatAttachments(attachmentUrls?: string[]): Promise<OpenClawChatAttachment[]> {
+    const results: OpenClawChatAttachment[] = [];
+
+    for (const item of attachmentUrls ?? []) {
+      const filePath = await resolveAttachmentPath(item);
+      if (!filePath) continue;
+      const mimeType = detectMimeType(filePath);
+      if (!mimeType.startsWith("image/")) continue;
+      const binary = await fs.readFile(filePath);
+      results.push({
+        type: "image",
+        mimeType,
+        content: binary.toString("base64")
+      });
+    }
+
+    return results;
   }
 
   private async waitAgentRun(runId: string): Promise<void> {

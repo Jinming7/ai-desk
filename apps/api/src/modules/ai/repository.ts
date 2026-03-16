@@ -51,23 +51,39 @@ export async function updateSearchSession(input: {
 
 export async function saveSearchReferences(sessionId: string, references: SearchReference[]): Promise<void> {
   await pool.query(`DELETE FROM ai_search_references WHERE session_id = $1`, [sessionId]);
-  for (const reference of references) {
-    await pool.query(
-      `INSERT INTO ai_search_references (
-        id, session_id, document_id, title, snippet, source_url, score, retrieved_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [
-        uuidv4(),
-        sessionId,
-        reference.documentId,
-        reference.title,
-        reference.snippet,
-        reference.sourceUrl,
-        reference.score,
-        reference.retrievedAt
-      ]
+  if (references.length === 0) return;
+
+  // Batch insert all references in a single query
+  const columns = 12;
+  const placeholders: string[] = [];
+  const values: unknown[] = [];
+  for (let i = 0; i < references.length; i++) {
+    const offset = i * columns;
+    placeholders.push(
+      `($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7},$${offset + 8},$${offset + 9},$${offset + 10},$${offset + 11},$${offset + 12})`
+    );
+    const ref = references[i];
+    values.push(
+      uuidv4(),
+      sessionId,
+      ref.documentId,
+      ref.title,
+      ref.snippet,
+      ref.sourceUrl,
+      ref.repoSourceUrl ?? null,
+      ref.repo ?? null,
+      ref.path ?? null,
+      ref.commitSha ?? null,
+      ref.score,
+      ref.retrievedAt
     );
   }
+  await pool.query(
+    `INSERT INTO ai_search_references (
+      id, session_id, document_id, title, snippet, source_url, repo_source_url, repo, path, commit_sha, score, retrieved_at
+    ) VALUES ${placeholders.join(",")}`,
+    values
+  );
 }
 
 export async function logMetric(input: {
@@ -127,10 +143,14 @@ export async function getSearchSessionWithReferences(id: string): Promise<
     title: string;
     snippet: string;
     source_url: string;
+    repo_source_url: string | null;
+    repo: string | null;
+    path: string | null;
+    commit_sha: string | null;
     score: string;
     retrieved_at: string;
   }>(
-    `SELECT document_id, title, snippet, source_url, score::text, retrieved_at
+    `SELECT document_id, title, snippet, source_url, repo_source_url, repo, path, commit_sha, score::text, retrieved_at
      FROM ai_search_references
      WHERE session_id = $1
      ORDER BY score DESC`,
@@ -150,6 +170,10 @@ export async function getSearchSessionWithReferences(id: string): Promise<
       title: row.title,
       snippet: row.snippet,
       sourceUrl: row.source_url,
+      repoSourceUrl: row.repo_source_url ?? undefined,
+      repo: row.repo ?? undefined,
+      path: row.path ?? undefined,
+      commitSha: row.commit_sha ?? undefined,
       score: Number(row.score),
       retrievedAt: row.retrieved_at
     }))
