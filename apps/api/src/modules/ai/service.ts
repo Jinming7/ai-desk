@@ -286,18 +286,25 @@ async function classifyQuery(
   const combined = [input.query, ...(input.conversation ?? [])].join("\n").trim();
   const regexResult = classifyQuerySync(input);
 
-  // Try agent-based classification when adapter supports it
+  // Try agent-based classification when adapter supports it.
+  // Use a short timeout (5s) so this never blocks the main flow.
   if (adapter?.classifyIntent) {
     try {
       const language = containsCjk(combined) ? "zh" : "en";
-      const agentResult = await adapter.classifyIntent(
-        {
-          query: input.query,
-          language,
-          conversationContext: input.conversation
-        },
-        `classify:${Date.now()}:${input.query.slice(0, 32)}`
+      const classifyTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("classifyIntent timeout")), 5000)
       );
+      const agentResult = await Promise.race([
+        adapter.classifyIntent(
+          {
+            query: input.query,
+            language,
+            conversationContext: input.conversation
+          },
+          `classify:${Date.now()}:${input.query.slice(0, 32)}`
+        ),
+        classifyTimeout
+      ]);
 
       // Use agent result if confidence is reasonable
       if (agentResult.confidence >= 0.5) {
@@ -312,7 +319,7 @@ async function classifyQuery(
         };
       }
     } catch {
-      // Fall through to regex-based classification
+      // Fall through to regex-based classification on timeout or error
     }
   }
 

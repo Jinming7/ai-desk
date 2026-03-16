@@ -165,66 +165,65 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawClassifyIntentOutput> {
-    return this.withRetry(async () => {
-      const contextLines: string[] = [];
-      if (input.conversationContext?.length) {
-        contextLines.push("Previous conversation context:");
-        for (const msg of input.conversationContext.slice(-4)) {
-          contextLines.push(`- ${msg}`);
-        }
+    // No retry for classification — it's an optional enhancement; regex fallback is always available.
+    const contextLines: string[] = [];
+    if (input.conversationContext?.length) {
+      contextLines.push("Previous conversation context:");
+      for (const msg of input.conversationContext.slice(-4)) {
+        contextLines.push(`- ${msg}`);
       }
+    }
 
-      const prompt = [
-        "You are an intent classifier for a technical support system.",
-        "",
-        "## Task",
-        "Classify the user's query into an intent and a routing category.",
-        "",
-        "## Intent categories",
-        "- api_operation: Questions about API endpoints, HTTP requests, SDK usage, OpenAPI docs",
-        "- feature_usage: How-to questions about product features, UI navigation, workflows",
-        "- troubleshooting: Error reports, failures, timeout, crash, unexpected behavior",
-        "- concept_explanation: What-is questions, comparisons, conceptual understanding",
-        "- configuration: Setup, deployment, config, integration, OAuth/token configuration",
-        "- general: Vague or unclassifiable queries",
-        "",
-        "## Route categories",
-        "- openapi_doc: Query specifically asks about OpenAPI/REST endpoint documentation",
-        "- infra_runbook: Infrastructure troubleshooting (k8s, pods, volumes, database ops)",
-        "- integration_diagnosis: Third-party integration failures (GitHub/GitLab/Slack + error)",
-        "- product_diagnosis: Product bug reports with concrete evidence",
-        "- kb_guidance: Answerable from knowledge base (most feature/config/troubleshooting questions)",
-        "- clarification: Query is too vague to route without more information",
-        "",
-        "## Rules",
-        "- If the query mentions auth/OAuth/token in a configuration context (e.g. 'how to configure OAuth'), classify as configuration + kb_guidance, NOT api_operation",
-        "- If the query has concrete error details + integration keywords, classify as troubleshooting + integration_diagnosis",
-        "- If there is conversation context, use it to disambiguate vague queries — prefer kb_guidance over clarification",
-        "- Only use clarification when the query is truly uninformative (e.g. just 'help' or 'hi')",
-        "",
-        "## Output",
-        "Return ONLY valid JSON: {intent, route, confidence(0..1), reasoning(short string)}",
-        "",
-        ...(contextLines.length ? [...contextLines, ""] : []),
-        `language: ${input.language}`,
-        `user_query: ${input.query}`
-      ].join("\n");
+    const prompt = [
+      "You are an intent classifier for a technical support system.",
+      "",
+      "## Task",
+      "Classify the user's query into an intent and a routing category.",
+      "",
+      "## Intent categories",
+      "- api_operation: Questions about API endpoints, HTTP requests, SDK usage, OpenAPI docs",
+      "- feature_usage: How-to questions about product features, UI navigation, workflows",
+      "- troubleshooting: Error reports, failures, timeout, crash, unexpected behavior",
+      "- concept_explanation: What-is questions, comparisons, conceptual understanding",
+      "- configuration: Setup, deployment, config, integration, OAuth/token configuration",
+      "- general: Vague or unclassifiable queries",
+      "",
+      "## Route categories",
+      "- openapi_doc: Query specifically asks about OpenAPI/REST endpoint documentation",
+      "- infra_runbook: Infrastructure troubleshooting (k8s, pods, volumes, database ops)",
+      "- integration_diagnosis: Third-party integration failures (GitHub/GitLab/Slack + error)",
+      "- product_diagnosis: Product bug reports with concrete evidence",
+      "- kb_guidance: Answerable from knowledge base (most feature/config/troubleshooting questions)",
+      "- clarification: Query is too vague to route without more information",
+      "",
+      "## Rules",
+      "- If the query mentions auth/OAuth/token in a configuration context (e.g. 'how to configure OAuth'), classify as configuration + kb_guidance, NOT api_operation",
+      "- If the query has concrete error details + integration keywords, classify as troubleshooting + integration_diagnosis",
+      "- If there is conversation context, use it to disambiguate vague queries — prefer kb_guidance over clarification",
+      "- Only use clarification when the query is truly uninformative (e.g. just 'help' or 'hi')",
+      "",
+      "## Output",
+      "Return ONLY valid JSON: {intent, route, confidence(0..1), reasoning(short string)}",
+      "",
+      ...(contextLines.length ? [...contextLines, ""] : []),
+      `language: ${input.language}`,
+      `user_query: ${input.query}`
+    ].join("\n");
 
-      const runId = await this.startChatRun(prompt, idempotencyKey, runtime);
-      await this.waitAgentRun(runId);
-      const text = await this.fetchLatestAssistantText(runtime);
-      const parsed = this.parseFirstJson(text) as Partial<OpenClawClassifyIntentOutput>;
+    const runId = await this.startChatRun(prompt, idempotencyKey, runtime);
+    await this.waitAgentRun(runId);
+    const text = await this.fetchLatestAssistantText(runtime);
+    const parsed = this.parseFirstJson(text) as Partial<OpenClawClassifyIntentOutput>;
 
-      const validIntents = ["api_operation", "feature_usage", "troubleshooting", "concept_explanation", "configuration", "general"];
-      const validRoutes = ["openapi_doc", "infra_runbook", "integration_diagnosis", "product_diagnosis", "kb_guidance", "clarification"];
+    const validIntents = ["api_operation", "feature_usage", "troubleshooting", "concept_explanation", "configuration", "general"];
+    const validRoutes = ["openapi_doc", "infra_runbook", "integration_diagnosis", "product_diagnosis", "kb_guidance", "clarification"];
 
-      return {
-        intent: validIntents.includes(parsed.intent as string) ? parsed.intent! : "general",
-        route: validRoutes.includes(parsed.route as string) ? parsed.route! : "kb_guidance",
-        confidence: this.normalizeConfidence(parsed.confidence),
-        reasoning: typeof parsed.reasoning === "string" ? parsed.reasoning : ""
-      };
-    });
+    return {
+      intent: validIntents.includes(parsed.intent as string) ? parsed.intent! : "general",
+      route: validRoutes.includes(parsed.route as string) ? parsed.route! : "kb_guidance",
+      confidence: this.normalizeConfidence(parsed.confidence),
+      reasoning: typeof parsed.reasoning === "string" ? parsed.reasoning : ""
+    };
   }
 
   private async analyzeViaChat(
