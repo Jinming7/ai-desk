@@ -535,6 +535,15 @@ export async function searchKeywordCandidates(input: {
   const limitParam = where.values.length + 2;
 
   if (hasCjk) {
+    const CJK_STOP_WORDS = new Set([
+      "的", "是", "在", "了", "和", "有", "可以", "能", "能不能", "是否",
+      "我", "你", "他", "她", "它", "们", "这", "那", "哪",
+      "怎么", "如何", "什么", "哪个", "哪些", "为什么", "多少",
+      "一个", "目前", "通过", "使用", "进行", "需要", "已经", "正在",
+      "吗", "呢", "吧", "啊", "呀", "嘛", "么",
+      "会", "到", "从", "把", "被", "让", "给", "对", "于",
+      "不", "没", "没有", "还", "也", "都", "就", "才",
+    ]);
     const splitTokens = input.query
       .toLowerCase()
       .split(/[\s,，。！？!?.:/_-]+/)
@@ -542,6 +551,7 @@ export async function searchKeywordCandidates(input: {
       .filter(Boolean);
     const expandedTokens = new Set<string>();
     for (const token of splitTokens) {
+      if (CJK_STOP_WORDS.has(token)) continue;
       expandedTokens.add(token);
       if (/[\u3400-\u9FBF]/.test(token) && token.length >= 3) {
         for (let i = 0; i < token.length - 1; i += 1) {

@@ -429,9 +429,6 @@ function filterReferencesByIntent(query: string, references: SearchReference[]):
     return true;
   });
 
-  if (intent === "api_operation") {
-    return matched;
-  }
   return matched.length ? matched : references;
 }
 
@@ -1062,33 +1059,55 @@ function buildOpenApiLookupFallback(query: string, language: "zh" | "en"): Struc
 function buildOpenApiClarificationFallback(language: "zh" | "en"): StructuredSearchAnswer {
   if (language === "zh") {
     return {
-      summary: "这是 ONES OpenAPI 文档问题，不该直接转产品问题；但当前还缺少具体对象，无法继续精确到接口。",
-      assessment: "当前至少可以确认这是文档/接口问答场景，不是产品缺陷。下一步只需要补接口对象，不需要再补一堆泛化上下文。",
-      style: "clarification",
+      summary: "这是 ONES OpenAPI 相关问题。以下是常见的 API 对象和操作入口，请告诉我你具体需要哪个接口的信息。",
+      assessment: "当前可以确认这是文档/接口问答场景。如果能明确对象或接口路径，可以给出更精确的答案。",
+      style: "kb_answer",
       steps: [
-        "请明确你问的是哪个对象：issue / comment / attachment / watcher / wiki / project / worklog。",
-        "如果你已经有接口路径，直接贴 `Method + Path`。",
-        "如果你是在问某个参数怎么拿，直接贴参数名，例如 `issueTypeID`、`teamID`、`projectID`。"
+        "常见 API 对象：issue（工作项）、wiki（知识库页面）、project（项目）、user（用户）、field（属性）、sprint（迭代）。",
+        "如果你已有接口路径，直接贴 `Method + Path`（如 `GET /project/issues`），我可以给出参数和示例。",
+        "如果你在问某个参数怎么获取（如 issueTypeID、teamID），直接说参数名即可。"
       ],
-      validation: ["补上对象或接口路径后，应能直接收敛到明确接口。"]
+      validation: ["明确对象后，可直接收敛到具体接口文档。"]
     };
   }
   return {
-    summary: "This is an ONES OpenAPI documentation question, not a product defect, but I still need the target object before I can narrow it to the exact endpoint.",
-    assessment: "The route is already clear: this is documentation/API guidance, not product diagnosis. I only need the object scope, not generic extra context.",
-    style: "clarification",
+    summary: "This is an ONES OpenAPI question. Here are the common API objects and entry points — let me know which specific endpoint you need.",
+    assessment: "This is clearly documentation/API guidance. Specifying the object or endpoint path will yield a precise answer.",
+    style: "kb_answer",
     steps: [
-      "Tell me the target object: issue / comment / attachment / watcher / wiki / project / worklog.",
-      "If you already have an endpoint path, provide `Method + Path` directly.",
-      "If you are asking how to obtain a parameter, provide the parameter name such as `issueTypeID`, `teamID`, or `projectID`."
+      "Common API objects: issue, wiki, project, user, field, sprint.",
+      "If you have an endpoint path, provide `Method + Path` (e.g. `GET /project/issues`) for detailed parameters and examples.",
+      "If you need to obtain a specific parameter (e.g. issueTypeID, teamID), just name it."
     ],
-    validation: ["Once the object or endpoint path is provided, the answer should narrow down to the exact API."]
+    validation: ["Once the target object is specified, the answer will narrow down to the exact API."]
   };
 }
 
-function buildKBGuidanceFallback(query: string, language: "zh" | "en"): StructuredSearchAnswer {
+function buildKBGuidanceFallback(query: string, language: "zh" | "en", refs?: SearchReference[]): StructuredSearchAnswer {
   const intent = detectIntent(query);
   const requiredInputs = buildRequiredInputs(language, intent, query);
+
+  // When we have references, produce a kb_answer instead of clarification
+  if (refs && refs.length > 0) {
+    const refSummary = refs.slice(0, 3).map((r) => r.title).join("、");
+    if (language === "zh") {
+      return {
+        summary: `基于以下知识文档为你解答：${refSummary}`,
+        assessment: "已找到相关知识文档，以下是基于文档的答案。",
+        style: "kb_answer",
+        steps: refs.slice(0, 3).map((r) => `${r.title}：${r.snippet.slice(0, 150)}`),
+        validation: ["如果答案未完全覆盖你的问题，请补充具体场景细节。"]
+      };
+    }
+    return {
+      summary: `Based on the following knowledge documents: ${refSummary}`,
+      assessment: "Found relevant knowledge documents. Here is the answer based on them.",
+      style: "kb_answer",
+      steps: refs.slice(0, 3).map((r) => `${r.title}: ${r.snippet.slice(0, 150)}`),
+      validation: ["If this doesn't fully address your question, provide more specific context."]
+    };
+  }
+
   if (language === "zh") {
     return {
       summary: "当前还没有命中足够可靠的知识库文档，先补最关键的一条上下文，我再继续收敛到可执行答案。",
@@ -1158,6 +1177,20 @@ function resolveSearchBotDecision(input: {
   }
 
   if (classification.route === "openapi_doc") {
+    // When we have effective references, prefer building answer from them
+    if (input.effectiveReferences.length > 0) {
+      const structuredAnswer = groundedAnswer ?? buildKBGuidanceFallback(query || response.query, language, input.effectiveReferences);
+      return {
+        answer: structuredAnswer.summary,
+        structuredAnswer,
+        state: "GROUNDABLE_ANSWER_READY",
+        clarificationRound: 0,
+        showCreateTicketNow: false,
+        followUpQuestion: null,
+        selfServeResolved: true,
+        effectiveReferences: input.effectiveReferences
+      };
+    }
     const structuredAnswer =
       buildOpenApiRequestFallback(query || response.query, language) ??
       buildOpenApiLookupFallback(query || response.query, language) ??
@@ -1219,7 +1252,7 @@ function resolveSearchBotDecision(input: {
   }
 
   if (classification.route === "kb_guidance") {
-    const structuredAnswer = groundedAnswer ?? buildKBGuidanceFallback(query || response.query, language);
+    const structuredAnswer = groundedAnswer ?? buildKBGuidanceFallback(query || response.query, language, input.effectiveReferences);
     const isClarification = structuredAnswer.style === "clarification";
     return {
       answer: structuredAnswer.summary,
@@ -1235,16 +1268,17 @@ function resolveSearchBotDecision(input: {
 
   const trulyVague = isTrulyVagueQuery(query || response.query);
   if (!trulyVague) {
-    const structuredAnswer = buildKBGuidanceFallback(query || response.query, language);
+    const structuredAnswer = buildKBGuidanceFallback(query || response.query, language, input.effectiveReferences);
+    const isClarification = structuredAnswer.style === "clarification";
     return {
       answer: structuredAnswer.summary,
       structuredAnswer,
-      state: "CLARIFICATION_REQUIRED",
-      clarificationRound: 1,
+      state: isClarification ? "CLARIFICATION_REQUIRED" : "GROUNDABLE_ANSWER_READY",
+      clarificationRound: isClarification ? 1 : 0,
       showCreateTicketNow: false,
-      followUpQuestion: structuredAnswer.summary,
-      selfServeResolved: false,
-      effectiveReferences: []
+      followUpQuestion: isClarification ? structuredAnswer.summary : null,
+      selfServeResolved: !isClarification,
+      effectiveReferences: isClarification ? [] : input.effectiveReferences
     };
   }
 
@@ -1639,9 +1673,6 @@ export async function runSearchMode(
     effectiveReferences = [];
   }
   const showCitationsToUser = response.retrievalStatus === "grounded" && !lowConfidence;
-  if (forceScopedReferences && effectiveReferences.length > 0 && !effectiveReferences.some(isOpenApiReference)) {
-    effectiveReferences = [];
-  }
   const citationsValid = hasValidCitations(effectiveReferences);
   const grounded = response.retrievalStatus === "grounded" && citationsValid && effectiveReferences.length > 0;
   let selfServeResolved = grounded;
@@ -1715,7 +1746,8 @@ export async function runSearchMode(
           sourceUrl: item.sourceUrl,
           path: getCitationMeta(item).path
         })),
-        draftAnswer: fallbackStructuredAnswer
+        // Only pass draftAnswer if it contains useful content (not a generic clarification template)
+        draftAnswer: fallbackStructuredAnswer && fallbackStructuredAnswer.style !== "clarification"
           ? {
               answer: fallbackDecision.answer,
               style: fallbackStructuredAnswer.style,
@@ -1737,7 +1769,7 @@ export async function runSearchMode(
     const summaryOk = agentAnswer.summary?.trim() && agentAnswer.summary.trim().length > 20;
     const stepsOk = Array.isArray(agentAnswer.steps) && agentAnswer.steps.length >= 1;
     const answerOk = agentAnswer.answer?.trim() && agentAnswer.answer.trim().length > 20;
-    const passesQualityGate = summaryOk && (stepsOk || answerOk);
+    const passesQualityGate = summaryOk || answerOk;
 
     if (passesQualityGate) {
       agentSynthesized = true;
@@ -1873,8 +1905,9 @@ export async function runSearchMode(
   }
   await Promise.all(metricPromises);
 
-  // Only show citations to the user when confidence is sufficient
-  const userFacingReferences = showCitationsToUser ? effectiveReferences : [];
+  // Always show references to the user — let them decide relevance.
+  // Previously we hid references when confidence was low, but that removes useful context.
+  const userFacingReferences = effectiveReferences;
   const citations = userFacingReferences
     .filter((ref) => Boolean(ref.sourceUrl))
     .map((item) => ({

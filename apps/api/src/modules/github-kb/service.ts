@@ -393,14 +393,55 @@ function buildQueryVariants(query: string): string[] {
   }
 
   const replacements: Array<[RegExp, string]> = [
+    // English normalizations
     [/webhook/gi, "webhook"],
     [/openapi|open\s*api/gi, "open api"],
+    // General terms
     [/配置/g, "configuration"],
     [/开启|启用/g, "enable"],
     [/关闭|禁用/g, "disable"],
     [/功能/g, "feature"],
     [/重装|重建/g, "reinstall"],
-    [/文档/g, "documentation"]
+    [/文档/g, "documentation"],
+    // API related
+    [/接口/g, "API endpoint"],
+    [/开放平台/g, "open platform openapi"],
+    [/调用/g, "call request"],
+    [/请求/g, "request"],
+    [/响应/g, "response"],
+    [/参数/g, "parameter"],
+    [/鉴权/g, "authorization auth"],
+    [/授权/g, "authorization auth"],
+    // ONES product objects
+    [/工作项/g, "issue work item"],
+    [/项目/g, "project"],
+    [/迭代/g, "sprint iteration"],
+    [/属性/g, "field property"],
+    [/字段/g, "field property"],
+    [/页面组/g, "space wiki space"],
+    [/页面/g, "page wiki page"],
+    [/知识库/g, "wiki knowledge base"],
+    [/工时/g, "worklog man hour"],
+    [/评论/g, "comment"],
+    [/附件/g, "attachment"],
+    [/成员/g, "user member"],
+    [/用户/g, "user member"],
+    [/团队/g, "team"],
+    [/工单/g, "ticket issue"],
+    [/看板/g, "board kanban"],
+    [/流水线/g, "pipeline"],
+    [/测试用例/g, "testcase"],
+    [/需求/g, "requirement story"],
+    [/缺陷/g, "bug defect"],
+    // Action verbs
+    [/创建|新建/g, "create add"],
+    [/删除/g, "delete remove"],
+    [/修改|更新|编辑/g, "update edit modify"],
+    [/查询|获取|查看/g, "get list query"],
+    [/统计/g, "count statistics"],
+    [/导出/g, "export"],
+    [/导入/g, "import"],
+    [/搜索/g, "search"],
   ];
 
   let translated = normalized.toLowerCase();
@@ -412,7 +453,7 @@ function buildQueryVariants(query: string): string[] {
     variants.add(translated);
   }
 
-  return [...variants].filter((item) => item.length > 0).slice(0, 4);
+  return [...variants].filter((item) => item.length > 0).slice(0, 6);
 }
 
 function buildRetrievalCacheKey(input: {

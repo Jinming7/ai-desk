@@ -119,28 +119,49 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         historyLines.push("=== End History ===");
       }
 
+      const refLines: string[] = [];
+      if (input.references.length > 0) {
+        refLines.push("=== References (from KB search) ===");
+        for (const ref of input.references) {
+          refLines.push(`- [${ref.title}](${ref.sourceUrl})`);
+          if (ref.snippet) refLines.push(`  ${ref.snippet.slice(0, 300)}`);
+        }
+        refLines.push("=== End References ===");
+      }
+
       const prompt = [
-        "You are search-bot, a grounded support retrieval assistant.",
+        "You are an expert technical support assistant for ONES, a project management and collaboration platform.",
         "",
-        "## Instructions",
-        "1. Your answer MUST directly address the user's question. Do NOT give generic troubleshooting steps when the references contain a specific answer.",
-        "2. If the references contain relevant information, cite and synthesize it into a concrete answer.",
-        "3. If the draft_answer already contains a specific conclusion, preserve and enhance it — do NOT replace it with a vague clarification.",
-        "4. Only ask for clarification when you genuinely lack enough information to answer. Do NOT default to clarification.",
-        "5. If a capability is not explicitly shown in the provided references, say: 不确定（文档未显示）.",
-        "6. Classify the user's question yourself before answering.",
+        "## Primary Goal",
+        "Answer the user's question as specifically and helpfully as possible.",
+        "",
+        "## Answer Strategy (in priority order)",
+        "1. If references contain relevant information, cite them and give a concrete answer with specific details.",
+        "2. If references are insufficient but you know the answer from your own knowledge, give it directly.",
+        "3. If you partially know the answer, give what you know and clearly state what you are unsure about.",
+        "4. ONLY output style=clarification as an absolute LAST RESORT when you truly cannot help at all.",
+        "",
+        "## Critical Rules",
+        "- NEVER output generic templates like '请明确你问的是哪个对象' or '以下是常见的API对象' — the user already told you what they want.",
+        "- For API questions: ALWAYS provide specific Method + Path, key parameters, and documentation URL if known.",
+        "- For configuration questions: ALWAYS provide specific steps with settings paths.",
+        "- For troubleshooting: ALWAYS provide diagnostic commands and expected outputs.",
+        "- If a draft_answer is provided with style=clarification, IGNORE it completely and answer from scratch using your own knowledge.",
+        "- If a draft_answer is provided with style=kb_answer or diagnosis and contains useful content, you may enhance it.",
+        "- Answer in the same language as the user's query.",
+        "- Prefer style=kb_answer for most answers. Use style=diagnosis only for troubleshooting with escalation potential.",
         "",
         "## Output Format",
         "Return ONLY valid JSON with keys:",
-        "answer, style(kb_answer|diagnosis|clarification), summary, assessment, steps(string[]), validation(string[]), required_inputs(string[]), suggested_next_step(self_serve|submit_ticket)",
+        "answer (string: detailed answer text), style (kb_answer|diagnosis|clarification), summary (string: one-line summary), assessment (string: optional), steps (string[]: actionable steps), validation (string[]: how to verify), required_inputs (string[]: only if clarification), suggested_next_step (self_serve|submit_ticket)",
         "",
         ...(historyLines.length ? [...historyLines, ""] : []),
+        ...(refLines.length ? [...refLines, ""] : []),
         `language: ${input.language}`,
         `route_hint: ${input.routeHint ?? "none"}`,
         `grounded: ${input.grounded ? "true" : "false"}`,
         `user_query: ${input.query}`,
-        `references: ${JSON.stringify(input.references)}`,
-        `draft_answer: ${JSON.stringify(input.draftAnswer ?? null)}`
+        ...(input.draftAnswer && input.draftAnswer.style !== "clarification" ? [`draft_answer: ${JSON.stringify(input.draftAnswer)}`] : [])
       ].join("\n");
 
       const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments);

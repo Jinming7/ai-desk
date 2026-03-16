@@ -38,7 +38,7 @@ const envSchema = z.object({
   OPENCLAW_CIRCUIT_BREAKER_THRESHOLD: z.coerce.number().default(5),
   OPENCLAW_SEARCH_TOP_K: z.coerce.number().default(5),
   OPENCLAW_DEEP_SEARCH_MAX_ROUNDS: z.coerce.number().default(3),
-  AI_SEARCH_ANSWER_CONFIDENCE_THRESHOLD: z.coerce.number().default(0.62),
+  AI_SEARCH_ANSWER_CONFIDENCE_THRESHOLD: z.coerce.number().default(0.35),
   AGENT_RESOLUTION_CONFIDENCE_THRESHOLD: z.coerce.number().default(0.76),
   DISABLE_AI_TRIAGE_FALLBACK: z.coerce.boolean().default(true),
   FEATURE_KB_GROUNDED_SEARCH: z.coerce.boolean().default(true),

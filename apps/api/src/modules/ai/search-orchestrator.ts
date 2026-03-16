@@ -124,7 +124,7 @@ export class SearchOrchestrator {
             answer: msg.lowConfidence,
             confidence: result.confidence,
             references,
-            retrievalStatus: "no_results",
+            retrievalStatus: "grounded",
             unresolvedReasonCode: "LOW_CONFIDENCE"
           };
         }
@@ -182,7 +182,7 @@ export class SearchOrchestrator {
           answer: msg.lowConfidence,
           confidence: topConfidence,
           references,
-          retrievalStatus: "no_results",
+          retrievalStatus: "grounded",
           unresolvedReasonCode: "LOW_CONFIDENCE"
         };
       }
