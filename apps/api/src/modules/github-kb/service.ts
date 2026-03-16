@@ -9,11 +9,13 @@ import {
   compareCommits,
   getBranchHead,
   getFileContentAtCommit,
+  getRepositoryDefaultBranch,
   getRepoFullName,
   listFilesAtCommit,
   validateReadOnlyAccess
 } from "./github-client.js";
 import { parseMarkdownSections } from "./markdown.js";
+import { buildPublicSourceUrl } from "./public-url.js";
 import * as repo from "./repository.js";
 import type { KbSyncSource, RepoRegistration, RetrievalHit, RetrievalProfile, RetrievalResponse, SyncJob } from "./types.js";
 
@@ -36,6 +38,19 @@ function parseRepoOwnerName(repoUrl: string): { owner: string; name: string } {
   const parts = url.pathname.replace(/^\//, "").replace(/\.git$/i, "").split("/").filter(Boolean);
   if (parts.length < 2) throw new Error(`Invalid GitHub repo url: ${repoUrl}`);
   return { owner: parts[0], name: parts[1] };
+}
+
+function pickDefaultPublicBaseUrl(repoUrl: string, explicit?: string): string | undefined {
+  if (explicit) return explicit;
+  try {
+    const parsed = parseRepoOwnerName(repoUrl);
+    if (parsed.owner.toLowerCase() === "bangwork" && parsed.name.toLowerCase() === "docs-com") {
+      return "https://docs.ones.com";
+    }
+  } catch {
+    return explicit;
+  }
+  return explicit;
 }
 
 function globToRegex(glob: string): RegExp {
@@ -64,6 +79,118 @@ function decodeBase64Url(input: string): Buffer {
   let value = input.trim().replace(/-/g, "+").replace(/_/g, "/");
   while (value.length % 4 !== 0) value += "=";
   return Buffer.from(value, "base64");
+}
+
+function looksLikeGithubBlobUrl(url: string): boolean {
+  try {
+    return new URL(url).hostname === "github.com";
+  } catch {
+    return false;
+  }
+}
+
+function isBranchNotFoundError(error: unknown): boolean {
+  const message = (error as Error)?.message?.toLowerCase?.() ?? "";
+  return message.includes("failed to get branch head: 404") || message.includes("branch not found");
+}
+
+async function resolveRegistrationBranch(
+  registration: RepoRegistration,
+  requestedBranch?: string,
+  actor = "system"
+): Promise<{ registration: RepoRegistration; branch: string; corrected: boolean }> {
+  const candidate = requestedBranch?.trim() || registration.default_branch;
+  try {
+    await getBranchHead(registration, candidate);
+    return { registration, branch: candidate, corrected: false };
+  } catch (error) {
+    if (!isBranchNotFoundError(error)) {
+      throw error;
+    }
+  }
+
+  const actualBranch = await getRepositoryDefaultBranch(registration);
+  const existing = await repo.findActiveRepoByOwnerNameBranch(registration.repo_owner, registration.repo_name, actualBranch);
+  if (existing && existing.id !== registration.id) {
+    await repo.deactivateRepoRegistration(registration.id, actor);
+    return { registration: existing, branch: actualBranch, corrected: true };
+  }
+
+  await repo.updateRepoDefaultBranch(registration.id, actualBranch, actor);
+  await repo.deactivateOtherRepoRegistrations(registration.repo_owner, registration.repo_name, registration.id);
+  const updated = (await repo.getRepoRegistrationById(registration.id)) ?? { ...registration, default_branch: actualBranch };
+  return { registration: updated, branch: actualBranch, corrected: actualBranch !== candidate };
+}
+
+async function resolveBranchForRegistrationInput(input: {
+  repoUrl: string;
+  repoOwner: string;
+  repoName: string;
+  publicBaseUrl?: string;
+  defaultBranch?: string;
+  includePaths: string[];
+  excludePaths: string[];
+  pollingIntervalSeconds: number;
+  actor: string;
+}): Promise<string> {
+  const candidate = input.defaultBranch?.trim();
+  const probe: RepoRegistration = {
+    id: "probe",
+    repo_owner: input.repoOwner,
+    repo_name: input.repoName,
+    repo_url: input.repoUrl,
+    public_base_url: input.publicBaseUrl ?? null,
+    default_branch: candidate || "main",
+    include_paths: input.includePaths,
+    exclude_paths: input.excludePaths,
+    polling_interval_seconds: input.pollingIntervalSeconds,
+    auth_mode: "github_token_readonly",
+    is_active: true,
+    last_validated_at: null,
+    last_validation_error: null,
+    created_by: input.actor,
+    created_at: new Date(0).toISOString(),
+    updated_at: new Date(0).toISOString()
+  };
+
+  if (candidate) {
+    try {
+      await getBranchHead(probe, candidate);
+      return candidate;
+    } catch (error) {
+      if (!isBranchNotFoundError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  return getRepositoryDefaultBranch(probe);
+}
+
+async function hydratePublicSourceUrls(hits: RetrievalHit[]): Promise<RetrievalHit[]> {
+  if (!hits.length) return hits;
+  const repoIds = [...new Set(hits.map((item) => item.repoId).filter(Boolean))];
+  const registrations = new Map<string, RepoRegistration | null>();
+  await Promise.all(
+    repoIds.map(async (repoId) => {
+      registrations.set(repoId, await repo.getRepoRegistrationById(repoId).catch(() => null));
+    })
+  );
+
+  return Promise.all(
+    hits.map(async (hit) => {
+      const registration = registrations.get(hit.repoId);
+      if (!registration?.public_base_url) return hit;
+      const isPublicDocUrl = hit.sourceUrl.startsWith(registration.public_base_url);
+      if (!(looksLikeGithubBlobUrl(hit.sourceUrl) || isPublicDocUrl)) return hit;
+
+      const content = await getFileContentAtCommit(registration, hit.path, hit.commitSha).catch(() => "");
+      const publicSourceUrl = buildPublicSourceUrl(registration, hit.path, content);
+      if (!publicSourceUrl) return hit;
+      if (publicSourceUrl === hit.sourceUrl) return hit;
+      return { ...hit, sourceUrl: publicSourceUrl };
+    })
+  );
 }
 
 function decodeOpenApiBlob(content: string): Record<string, unknown> | null {
@@ -367,6 +494,8 @@ async function indexDocument(registration: RepoRegistration, branch: string, com
   const content = await getFileContentAtCommit(registration, path, commitSha);
   const normalizedContent = enrichIndexableContent(path, content);
   const contentHash = sha256(content);
+  const repoSourceUrl = buildSourceUrl(registration, path, commitSha);
+  const publicSourceUrl = buildPublicSourceUrl(registration, path, content);
   let title = pickTitle(path, normalizedContent);
   if (isOpenApiPath(path)) {
     const apiDoc = decodeOpenApiBlob(content);
@@ -379,13 +508,16 @@ async function indexDocument(registration: RepoRegistration, branch: string, com
     branch,
     path,
     title,
-    sourceUrl: buildSourceUrl(registration, path, commitSha),
+    sourceUrl: publicSourceUrl ?? repoSourceUrl,
+    repoSourceUrl,
+    publicSourceUrl,
     commitSha,
     contentHash,
     content: normalizedContent,
     metadata: {
       parser: "markdown-ast-lite",
       contentTransform: normalizedContent === content ? "none" : "openapi_api_blob_decode",
+      publicSourceUrlResolved: Boolean(publicSourceUrl),
       includePaths: registration.include_paths,
       excludePaths: registration.exclude_paths
     }
@@ -422,25 +554,27 @@ async function indexDocument(registration: RepoRegistration, branch: string, com
 }
 
 async function runFullSync(job: SyncJob, registration: RepoRegistration): Promise<{ indexed: number; deactivated: number; head: string }> {
-  const branch = job.branch || registration.default_branch;
-  const head = job.after_commit_sha ?? (await getBranchHead(registration, branch));
-  const files = await listFilesAtCommit(registration, head);
+  const resolved = await resolveRegistrationBranch(registration, job.branch, "sync_worker");
+  const branch = resolved.branch;
+  const effectiveRegistration = resolved.registration;
+  const head = job.after_commit_sha ?? (await getBranchHead(effectiveRegistration, branch));
+  const files = await listFilesAtCommit(effectiveRegistration, head);
   const markdownFiles = files
     .filter((file) => /\.(md|mdx)$/i.test(file.path))
-    .filter((file) => isPathIncluded(file.path, registration.include_paths, registration.exclude_paths));
+    .filter((file) => isPathIncluded(file.path, effectiveRegistration.include_paths, effectiveRegistration.exclude_paths));
 
   for (const file of markdownFiles) {
-    await indexDocument(registration, branch, head, file.path);
+    await indexDocument(effectiveRegistration, branch, head, file.path);
   }
 
   const deactivated = await repo.deactivateDocumentsMissingFromSnapshot(
-    registration.id,
+    effectiveRegistration.id,
     branch,
     markdownFiles.map((file) => file.path)
   );
 
   await repo.upsertCheckpoint({
-    repoId: registration.id,
+    repoId: effectiveRegistration.id,
     branch,
     lastSyncedCommitSha: head,
     fullSync: true
@@ -450,13 +584,15 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
 }
 
 async function runIncrementalSync(job: SyncJob, registration: RepoRegistration): Promise<{ indexed: number; removed: number; head: string }> {
-  const branch = job.branch || registration.default_branch;
-  const checkpoint = await repo.getCheckpoint(registration.id, branch);
+  const resolved = await resolveRegistrationBranch(registration, job.branch, "sync_worker");
+  const branch = resolved.branch;
+  const effectiveRegistration = resolved.registration;
+  const checkpoint = await repo.getCheckpoint(effectiveRegistration.id, branch);
   const before = job.before_commit_sha ?? checkpoint?.last_synced_commit_sha ?? null;
-  const after = job.after_commit_sha ?? (await getBranchHead(registration, branch));
+  const after = job.after_commit_sha ?? (await getBranchHead(effectiveRegistration, branch));
 
   if (!before) {
-    const full = await runFullSync(job, registration);
+    const full = await runFullSync({ ...job, branch }, effectiveRegistration);
     return { indexed: full.indexed, removed: full.deactivated, head: full.head };
   }
 
@@ -464,19 +600,19 @@ async function runIncrementalSync(job: SyncJob, registration: RepoRegistration):
     return { indexed: 0, removed: 0, head: after };
   }
 
-  const changed = await compareCommits(registration, before, after);
+  const changed = await compareCommits(effectiveRegistration, before, after);
   const toIndex = new Set<string>();
   let removed = 0;
 
   for (const file of changed) {
     if (!/\.(md|mdx)$/i.test(file.filename)) continue;
     if (file.status === "removed") {
-      await repo.deactivateDocumentByPath(registration.id, branch, file.filename);
+      await repo.deactivateDocumentByPath(effectiveRegistration.id, branch, file.filename);
       removed += 1;
       continue;
     }
     if (file.status === "renamed" && file.previous_filename) {
-      await repo.deactivateDocumentByPath(registration.id, branch, file.previous_filename);
+      await repo.deactivateDocumentByPath(effectiveRegistration.id, branch, file.previous_filename);
     }
     if (isPathIncluded(file.filename, registration.include_paths, registration.exclude_paths)) {
       toIndex.add(file.filename);
@@ -484,11 +620,11 @@ async function runIncrementalSync(job: SyncJob, registration: RepoRegistration):
   }
 
   for (const path of toIndex) {
-    await indexDocument(registration, branch, after, path);
+    await indexDocument(effectiveRegistration, branch, after, path);
   }
 
   await repo.upsertCheckpoint({
-    repoId: registration.id,
+    repoId: effectiveRegistration.id,
     branch,
     lastSyncedCommitSha: after,
     fullSync: false
@@ -527,23 +663,38 @@ export async function validateStartupConfig(): Promise<{ healthy: boolean; check
 
 export async function registerRepository(input: {
   repoUrl: string;
-  defaultBranch: string;
+  publicBaseUrl?: string;
+  defaultBranch?: string;
   includePaths: string[];
   excludePaths: string[];
   pollingIntervalSeconds: number;
   actor: string;
 }) {
   const parsed = parseRepoOwnerName(input.repoUrl);
+  const publicBaseUrl = pickDefaultPublicBaseUrl(input.repoUrl, input.publicBaseUrl);
+  const resolvedBranch = await resolveBranchForRegistrationInput({
+    repoUrl: input.repoUrl,
+    repoOwner: parsed.owner,
+    repoName: parsed.name,
+    publicBaseUrl,
+    defaultBranch: input.defaultBranch,
+    includePaths: input.includePaths,
+    excludePaths: input.excludePaths,
+    pollingIntervalSeconds: input.pollingIntervalSeconds,
+    actor: input.actor
+  });
   const registration = await repo.upsertRepoRegistration({
     repoOwner: parsed.owner,
     repoName: parsed.name,
     repoUrl: input.repoUrl,
-    defaultBranch: input.defaultBranch,
+    publicBaseUrl,
+    defaultBranch: resolvedBranch,
     includePaths: input.includePaths,
     excludePaths: input.excludePaths,
     pollingIntervalSeconds: input.pollingIntervalSeconds,
     createdBy: input.actor
   });
+  await repo.deactivateOtherRepoRegistrations(parsed.owner, parsed.name, registration.id);
 
   const validation = await validateReadOnlyAccess(registration).catch((error) => ({
     ok: false,
@@ -565,7 +716,7 @@ export async function listRepositories() {
 
 export async function enqueueSyncJob(input: {
   repoId: string;
-  branch: string;
+  branch?: string;
   mode: "full" | "incremental" | "reindex";
   source: KbSyncSource;
   beforeCommitSha?: string;
@@ -573,12 +724,18 @@ export async function enqueueSyncJob(input: {
   payload?: Record<string, unknown>;
   idempotencyKey?: string;
 }) {
+  const registration = await repo.getRepoRegistrationById(input.repoId);
+  if (!registration || !registration.is_active) {
+    throw new Error(`Repository registration not found or inactive: ${input.repoId}`);
+  }
+  const resolved = await resolveRegistrationBranch(registration, input.branch, "sync_enqueue");
   const idempotencyKey =
-    input.idempotencyKey ?? `${input.mode}:${input.repoId}:${input.branch}:${input.beforeCommitSha ?? "none"}:${input.afterCommitSha ?? Date.now()}`;
+    input.idempotencyKey ??
+    `${input.mode}:${resolved.registration.id}:${resolved.branch}:${input.beforeCommitSha ?? "none"}:${input.afterCommitSha ?? Date.now()}`;
 
   return repo.enqueueSyncJob({
-    repoId: input.repoId,
-    branch: input.branch,
+    repoId: resolved.registration.id,
+    branch: resolved.branch,
     syncMode: input.mode,
     source: input.source,
     idempotencyKey,
@@ -669,22 +826,24 @@ export async function pollAndEnqueueIncremental(limit = env.GITHUB_KB_POLL_BATCH
   let enqueued = 0;
 
   for (const registration of registrations.slice(0, limit)) {
-    const branch = registration.default_branch;
-    const latest = await getBranchHead(registration, branch);
-    const checkpoint = await repo.getCheckpoint(registration.id, branch);
+    const resolved = await resolveRegistrationBranch(registration, registration.default_branch, "polling");
+    const branch = resolved.branch;
+    const effectiveRegistration = resolved.registration;
+    const latest = await getBranchHead(effectiveRegistration, branch);
+    const checkpoint = await repo.getCheckpoint(effectiveRegistration.id, branch);
     const previous = checkpoint?.last_synced_commit_sha;
     if (previous && previous === latest) {
       continue;
     }
 
     await enqueueSyncJob({
-      repoId: registration.id,
+      repoId: effectiveRegistration.id,
       branch,
       mode: previous ? "incremental" : "full",
       source: "polling",
       beforeCommitSha: previous ?? undefined,
       afterCommitSha: latest,
-      idempotencyKey: `poll:${registration.id}:${branch}:${previous ?? "none"}:${latest}`
+      idempotencyKey: `poll:${effectiveRegistration.id}:${branch}:${previous ?? "none"}:${latest}`
     });
     enqueued += 1;
   }
@@ -1036,6 +1195,7 @@ export async function retrieveKnowledge(input: {
         branch: doc.branch,
         path: doc.path,
         sourceUrl: doc.sourceUrl,
+        repoSourceUrl: doc.repoSourceUrl,
         commitSha: doc.commitSha,
         title: doc.title,
         headingPath: "FALLBACK",
@@ -1050,6 +1210,7 @@ export async function retrieveKnowledge(input: {
   }
 
   hits = await enrichOpenApiHits(hits, answerLanguage).catch(() => hits);
+  hits = await hydratePublicSourceUrls(hits).catch(() => hits);
   // Guardrail: fallback-only retrieval must not be treated as grounded-high-confidence.
   if (hits.length > 0 && hits.every((item) => item.rankSignals?.fallback)) {
     confidence = Math.min(confidence, Math.max(0, cfg.threshold - 0.12));
@@ -1144,7 +1305,7 @@ export async function runReadOnlyComplianceCheck(): Promise<{ blockedWriteMethod
   }
 }
 
-export async function triggerReindex(repoId: string, branch: string) {
+export async function triggerReindex(repoId: string, branch?: string) {
   return enqueueSyncJob({
     repoId,
     branch,
@@ -1163,6 +1324,7 @@ export async function bootstrapRepositoryFromEnvIfConfigured(): Promise<void> {
 
   const { registration } = await registerRepository({
     repoUrl: env.GITHUB_KB_BOOTSTRAP_REPO_URL,
+    publicBaseUrl: env.GITHUB_KB_BOOTSTRAP_PUBLIC_BASE_URL,
     defaultBranch: env.GITHUB_KB_BOOTSTRAP_BRANCH,
     includePaths: includePaths.length ? includePaths : ["**/*.md"],
     excludePaths,

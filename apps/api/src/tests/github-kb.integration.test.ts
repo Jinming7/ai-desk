@@ -52,7 +52,7 @@ test("full sync builds index and retrieval returns source citation", async () =>
     body: JSON.stringify({
       repoUrl: "mock://acme/ticket-kb",
       defaultBranch: "main",
-      includePaths: ["docs/**/*.md"],
+      includePaths: ["docs/*.md", "docs/**/*.md"],
       excludePaths: [],
       pollingIntervalSeconds: 60,
       actor: "test"
@@ -111,6 +111,139 @@ test("full sync builds index and retrieval returns source citation", async () =>
   assert.equal(typeof body.result.hits[0].commitSha, "string");
 });
 
+test("retrieval prefers public docs url when repo registration configures docs base", async () => {
+  const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({
+      repoUrl: "mock://acme/ticket-kb",
+      publicBaseUrl: "https://docs.ones.com",
+      defaultBranch: "main",
+      includePaths: ["docs/*.md", "docs/**/*.md"],
+      excludePaths: [],
+      pollingIntervalSeconds: 60,
+      actor: "test"
+    })
+  });
+  assert.equal(register.status, 201);
+  const regPayload = (await register.json()) as { registration: { id: string; default_branch: string } };
+
+  await fetch(`${baseUrl}/api/v1/internal/kb/sync/full`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({
+      repoId: regPayload.registration.id,
+      branch: regPayload.registration.default_branch,
+      afterCommitSha: "mockc2",
+      idempotencyKey: "test-public-docs-url"
+    })
+  });
+
+  await fetch(`${baseUrl}/api/v1/internal/kb/sync/run`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({ limit: 20 })
+  });
+
+  const retrieval = await fetch(`${baseUrl}/api/v1/kb/retrieval/query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query: "token scope mismatch",
+      profile: "search",
+      repoId: regPayload.registration.id,
+      includeFallback: false
+    })
+  });
+  assert.equal(retrieval.status, 200);
+
+  const body = (await retrieval.json()) as {
+    result: {
+      hits: Array<{ sourceUrl: string; repoSourceUrl: string; path: string }>;
+    };
+  };
+
+  assert.equal(body.result.hits.length > 0, true);
+  assert.equal(body.result.hits[0].path.startsWith("docs/"), true);
+  assert.equal(body.result.hits[0].sourceUrl.startsWith("https://docs.ones.com/"), true);
+  assert.equal(body.result.hits[0].repoSourceUrl.includes("github.com"), true);
+});
+
+test("deploy docs public url honors frontmatter id instead of file name", async () => {
+  const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({
+      repoUrl: "mock://acme/ticket-kb",
+      publicBaseUrl: "https://docs.ones.com",
+      defaultBranch: "main",
+      includePaths: ["deploy-docs/*.md", "deploy-docs/**/*.md"],
+      excludePaths: [],
+      pollingIntervalSeconds: 60,
+      actor: "test"
+    })
+  });
+  assert.equal(register.status, 201);
+  const regPayload = (await register.json()) as { registration: { id: string; default_branch: string } };
+
+  await fetch(`${baseUrl}/api/v1/internal/kb/sync/full`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({
+      repoId: regPayload.registration.id,
+      branch: regPayload.registration.default_branch,
+      afterCommitSha: "mockc2",
+      idempotencyKey: "test-deploy-docs-id-route"
+    })
+  });
+
+  await fetch(`${baseUrl}/api/v1/internal/kb/sync/run`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({ limit: 20 })
+  });
+
+  const retrieval = await fetch(`${baseUrl}/api/v1/kb/retrieval/query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query: "KubeVersionMismatch",
+      profile: "search",
+      repoId: regPayload.registration.id,
+      includeFallback: false
+    })
+  });
+  assert.equal(retrieval.status, 200);
+
+  const body = (await retrieval.json()) as {
+    result: {
+      hits: Array<{ sourceUrl: string; path: string }>;
+    };
+  };
+
+  assert.equal(body.result.hits.length > 0, true);
+  assert.equal(body.result.hits[0].path, "deploy-docs/troubleshooting/infra/k3s-alert-handler.md");
+  assert.equal(body.result.hits[0].sourceUrl, "https://docs.ones.com/zh-Hans/deploy/troubleshooting/infra/alert-handler");
+});
+
 test("incremental sync is idempotent and propagates deletion", async () => {
   const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
     method: "POST",
@@ -121,7 +254,7 @@ test("incremental sync is idempotent and propagates deletion", async () => {
     body: JSON.stringify({
       repoUrl: "mock://acme/ticket-kb",
       defaultBranch: "main",
-      includePaths: ["docs/**/*.md"],
+      includePaths: ["docs/*.md", "docs/**/*.md"],
       pollingIntervalSeconds: 60,
       actor: "test"
     })

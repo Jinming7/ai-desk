@@ -18,11 +18,15 @@ const mockRepoSnapshots: Record<string, Record<string, MockSnapshot>> = {
     mockc2: {
       "docs/auth.md": "# Auth Guide\n\nRotate token, verify callback URL, and clear local cache before retry.",
       "docs/runbook.md": "# Incident Runbook\n\nEscalate high severity incidents within 10 minutes.",
-      "docs/api.md": "# API Access\n\n401 usually means token scope mismatch or expired secret."
+      "docs/api.md": "# API Access\n\n401 usually means token scope mismatch or expired secret.",
+      "deploy-docs/troubleshooting/infra/k3s-alert-handler.md":
+        "---\nid: alert-handler\nsidebar_label: Alert故障处理\n---\n\n# Alert故障处理\n\n本文介绍关于 k3s/k8s 常见告警主题处理及解决方案。\n\n## KubeVersionMismatch\n\n- 优先级: P4\n- 描述: There are $value different semantic versions of Kubernetes components running.\n- 解决方法: 立即处理，联系 ONES 进行处理。"
     },
     mockc3: {
       "docs/auth.md": "# Auth Guide\n\nRotate token, verify callback URL, clear cache, then re-login.",
-      "docs/api.md": "# API Access\n\nCheck token scope, tenant binding, and rate limit headers."
+      "docs/api.md": "# API Access\n\nCheck token scope, tenant binding, and rate limit headers.",
+      "deploy-docs/troubleshooting/infra/k3s-alert-handler.md":
+        "---\nid: alert-handler\nsidebar_label: Alert故障处理\n---\n\n# Alert故障处理\n\n本文介绍关于 k3s/k8s 常见告警主题处理及解决方案。\n\n## KubeVersionMismatch\n\n- 优先级: P4\n- 描述: There are $value different semantic versions of Kubernetes components running.\n- 解决方法: 立即处理，联系 ONES 进行处理。"
     }
   }
 };
@@ -189,6 +193,29 @@ export async function getBranchHead(registration: RepoRegistration, branch?: str
     throw new Error(`Branch ${targetBranch} returned no commit SHA`);
   }
   return sha;
+}
+
+export async function getRepositoryDefaultBranch(registration: RepoRegistration): Promise<string> {
+  const repo = parseRepoIdentity(registration.repo_url);
+  if (repo.mock) {
+    const heads = mockRepoHeads[buildMockKey(repo)] ?? {};
+    const [firstBranch] = Object.keys(heads);
+    if (!firstBranch) {
+      throw new Error(`Mock repository has no branches: ${buildMockKey(repo)}`);
+    }
+    return firstBranch;
+  }
+
+  const response = await githubRequest(`/repos/${repo.owner}/${repo.name}`);
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Failed to get repository metadata: ${response.status} ${body}`);
+  }
+  const payload = (await response.json()) as { default_branch?: string };
+  if (!payload.default_branch) {
+    throw new Error("Repository metadata returned no default_branch");
+  }
+  return payload.default_branch;
 }
 
 export async function listFilesAtCommit(registration: RepoRegistration, commitSha: string): Promise<GitHubTreeFile[]> {

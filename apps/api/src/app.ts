@@ -1,8 +1,12 @@
 import express from "express";
 import cors from "cors";
 import { z } from "zod";
+import fs from "node:fs/promises";
+import path from "node:path";
 import {
   agentQueueQuerySchema,
+  fileUploadSchema,
+  imageUploadSchema,
   ticketBulkActionSchema,
   ticketAssignSchema,
   ticketCreateSchema,
@@ -33,6 +37,8 @@ import * as settingsService from "./modules/settings/service.js";
 import * as onesSyncService from "./modules/ones-sync/service.js";
 import * as supportUxService from "./modules/support-ux/service.js";
 import * as githubKbService from "./modules/github-kb/service.js";
+import { getAiTopology } from "./modules/ai/agent-router.js";
+import { getAiCapabilities } from "./modules/ai/multimodal.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
 import { env } from "./config/env.js";
@@ -40,7 +46,12 @@ import { asyncHandler } from "./utils/http.js";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
+
+const uploadsRoot = path.resolve(process.cwd(), "uploads");
+const imagesUploadRoot = path.join(uploadsRoot, "images");
+const filesUploadRoot = path.join(uploadsRoot, "files");
+app.use("/uploads", express.static(uploadsRoot));
 
 const aiAdapter =
   env.NODE_ENV === "test"
@@ -48,6 +59,13 @@ const aiAdapter =
     : env.OPENCLAW_GATEWAY_TOKEN
       ? new WsOpenClawAdapter()
       : new MockOpenClawAdapter();
+
+const aiTopology = getAiTopology();
+if (env.NODE_ENV !== "test") {
+  console.info(
+    `[ai-topology] searchBot=${aiTopology.searchBot.orchestration} openclawAgentBound=${String(aiTopology.searchBot.openclawAgentBound)} ticketAgent=${aiTopology.ticketAgent.agentId}`
+  );
+}
 
 async function enrichCustomerStatus<T extends { status: string; ones_ticket_type_key?: string | null }>(ticket: T) {
   const mapped = await onesSyncService.resolveCustomerStatusLabel({
@@ -84,7 +102,16 @@ function requireInternalRequest(req: express.Request, res: express.Response, nex
 }
 
 app.get("/api/v1/health", (_req, res) => {
-  res.json({ ok: true, service: "nexusflow-api", openclaw: env.OPENCLAW_GATEWAY_TOKEN ? "ws" : "mock" });
+  res.json({
+    ok: true,
+    service: "nexusflow-api",
+    openclaw: env.OPENCLAW_GATEWAY_TOKEN ? "ws" : "mock",
+    aiTopology
+  });
+});
+
+app.get("/api/v1/internal/ai/topology", requireInternalRequest, (_req, res) => {
+  res.json(getAiTopology());
 });
 
 app.get(
@@ -92,6 +119,74 @@ app.get(
   asyncHandler(async (_req, res) => {
     const health = await aiAdapter.healthCheck();
     res.status(health.ok ? 200 : 503).json(health);
+  })
+);
+
+app.post(
+  "/api/v1/uploads/images",
+  asyncHandler(async (req, res) => {
+    const body = imageUploadSchema.parse(req.body);
+    const match = body.dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    if (!match) {
+      res.status(400).json({ error: "Invalid image payload" });
+      return;
+    }
+
+    const [, mimeType, base64Payload] = match;
+    if (mimeType !== body.contentType) {
+      res.status(400).json({ error: "Image content type mismatch" });
+      return;
+    }
+
+    const extension = mimeType.split("/")[1]?.replace("jpeg", "jpg") || "png";
+    const safeName = body.filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const imageId = `${Date.now()}-${safeName}`;
+    const finalName = imageId.endsWith(`.${extension}`) ? imageId : `${imageId}.${extension}`;
+    const absolutePath = path.join(imagesUploadRoot, finalName);
+
+    await fs.mkdir(imagesUploadRoot, { recursive: true });
+    await fs.writeFile(absolutePath, Buffer.from(base64Payload, "base64"));
+
+    res.status(201).json({
+      attachment: {
+        url: `/uploads/images/${finalName}`,
+        name: body.filename,
+        contentType: body.contentType
+      }
+    });
+  })
+);
+
+app.post(
+  "/api/v1/uploads/files",
+  asyncHandler(async (req, res) => {
+    const body = fileUploadSchema.parse(req.body);
+    const match = body.dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) {
+      res.status(400).json({ error: "Invalid file payload" });
+      return;
+    }
+
+    const [, mimeType, base64Payload] = match;
+    if (mimeType !== body.contentType) {
+      res.status(400).json({ error: "File content type mismatch" });
+      return;
+    }
+
+    const safeName = body.filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const fileId = `${Date.now()}-${safeName}`;
+    const absolutePath = path.join(filesUploadRoot, fileId);
+
+    await fs.mkdir(filesUploadRoot, { recursive: true });
+    await fs.writeFile(absolutePath, Buffer.from(base64Payload, "base64"));
+
+    res.status(201).json({
+      attachment: {
+        url: `/uploads/files/${fileId}`,
+        name: body.filename,
+        contentType: body.contentType
+      }
+    });
   })
 );
 
@@ -111,9 +206,18 @@ app.post(
     const result = await aiService.runSearchMode(body.query, aiAdapter, {
       sessionId: body.sessionId,
       conversation: body.conversation,
-      answerLanguage: body.answerLanguage
+      answerLanguage: body.answerLanguage,
+      imageAttachments: body.imageAttachments,
+      attachments: body.attachments
     });
     res.json({ result });
+  })
+);
+
+app.get(
+  "/api/v1/ai/capabilities",
+  asyncHandler(async (_req, res) => {
+    res.json({ capabilities: await getAiCapabilities() });
   })
 );
 
@@ -140,6 +244,7 @@ app.post(
       overrides: {
         title: body.title,
         description: body.description,
+        attachments: body.attachments,
         serviceCategory: body.serviceCategory,
         onesTicketTypeKey: body.onesTicketTypeKey,
         onesFields: body.onesFields,

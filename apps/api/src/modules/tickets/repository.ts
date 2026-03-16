@@ -101,7 +101,7 @@ export async function createTicket(input: TicketCreateInput): Promise<TicketReco
     authorType: "CUSTOMER",
     authorName: input.customer.name,
     body: input.description,
-    attachments: [],
+    attachments: input.attachments ?? [],
     isAiGenerated: false,
     aiConfidence: null
   });

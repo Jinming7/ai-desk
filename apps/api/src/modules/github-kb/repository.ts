@@ -10,6 +10,7 @@ export async function upsertRepoRegistration(input: {
   repoOwner: string;
   repoName: string;
   repoUrl: string;
+  publicBaseUrl?: string;
   defaultBranch: string;
   includePaths: string[];
   excludePaths: string[];
@@ -25,16 +26,18 @@ export async function upsertRepoRegistration(input: {
     const result = await pool.query<RepoRegistration>(
       `UPDATE kb_repo_registrations
        SET repo_url = $1,
-           include_paths = $2::text[],
-           exclude_paths = $3::text[],
-           polling_interval_seconds = $4,
+           public_base_url = $2,
+           include_paths = $3::text[],
+           exclude_paths = $4::text[],
+           polling_interval_seconds = $5,
            is_active = true,
-           updated_by = $5,
+           updated_by = $6,
            updated_at = NOW()
-       WHERE id = $6
+       WHERE id = $7
        RETURNING *`,
       [
         input.repoUrl,
+        input.publicBaseUrl ?? null,
         input.includePaths,
         input.excludePaths,
         input.pollingIntervalSeconds,
@@ -46,16 +49,17 @@ export async function upsertRepoRegistration(input: {
   }
 
   const result = await pool.query<RepoRegistration>(
-    `INSERT INTO kb_repo_registrations (
-      id, repo_owner, repo_name, repo_url, default_branch, include_paths, exclude_paths,
+      `INSERT INTO kb_repo_registrations (
+      id, repo_owner, repo_name, repo_url, public_base_url, default_branch, include_paths, exclude_paths,
       polling_interval_seconds, created_by, updated_by
-    ) VALUES ($1,$2,$3,$4,$5,$6::text[],$7::text[],$8,$9,$9)
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7::text[],$8::text[],$9,$10,$10)
     RETURNING *`,
     [
       uuidv4(),
       input.repoOwner,
       input.repoName,
       input.repoUrl,
+      input.publicBaseUrl ?? null,
       input.defaultBranch,
       input.includePaths,
       input.excludePaths,
@@ -74,6 +78,41 @@ export async function setRepoValidation(repoId: string, errorMessage: string | n
          updated_at = NOW()
      WHERE id = $1`,
     [repoId, errorMessage]
+  );
+}
+
+export async function updateRepoDefaultBranch(repoId: string, branch: string, actor = "system"): Promise<void> {
+  await pool.query(
+    `UPDATE kb_repo_registrations
+     SET default_branch = $2,
+         updated_by = $3,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [repoId, branch, actor]
+  );
+}
+
+export async function deactivateRepoRegistration(repoId: string, actor = "system"): Promise<void> {
+  await pool.query(
+    `UPDATE kb_repo_registrations
+     SET is_active = false,
+         updated_by = $2,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [repoId, actor]
+  );
+}
+
+export async function deactivateOtherRepoRegistrations(repoOwner: string, repoName: string, keepRepoId: string): Promise<void> {
+  await pool.query(
+    `UPDATE kb_repo_registrations
+     SET is_active = false,
+         updated_at = NOW()
+     WHERE repo_owner = $1
+       AND repo_name = $2
+       AND id <> $3
+       AND is_active = true`,
+    [repoOwner, repoName, keepRepoId]
   );
 }
 
@@ -250,6 +289,8 @@ export async function upsertDocument(input: {
   path: string;
   title: string;
   sourceUrl: string;
+  repoSourceUrl: string;
+  publicSourceUrl: string | null;
   commitSha: string;
   contentHash: string;
   content: string;
@@ -258,13 +299,16 @@ export async function upsertDocument(input: {
   const docKey = `${input.repoId}:${input.path}`;
   const result = await pool.query<KbDocument>(
     `INSERT INTO kb_documents (
-      id, repo_id, doc_key, branch, path, title, source_url, commit_sha, content_hash, content, metadata_json, is_active
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,true)
+      id, repo_id, doc_key, branch, path, title, source_url, repo_source_url, public_source_url,
+      commit_sha, content_hash, content, metadata_json, is_active
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,true)
     ON CONFLICT (repo_id, branch, path)
     DO UPDATE SET
       doc_key = EXCLUDED.doc_key,
       title = EXCLUDED.title,
       source_url = EXCLUDED.source_url,
+      repo_source_url = EXCLUDED.repo_source_url,
+      public_source_url = EXCLUDED.public_source_url,
       commit_sha = EXCLUDED.commit_sha,
       content_hash = EXCLUDED.content_hash,
       content = EXCLUDED.content,
@@ -280,6 +324,8 @@ export async function upsertDocument(input: {
       input.path,
       input.title,
       input.sourceUrl,
+      input.repoSourceUrl,
+      input.publicSourceUrl,
       input.commitSha,
       input.contentHash,
       input.content,
@@ -428,6 +474,7 @@ export async function searchVectorCandidates(input: {
     branch: string;
     path: string;
     source_url: string;
+    repo_source_url: string;
     commit_sha: string;
     title: string;
     heading_path: string;
@@ -442,6 +489,7 @@ export async function searchVectorCandidates(input: {
       chunk.branch,
       chunk.path,
       doc.source_url,
+      doc.repo_source_url,
       chunk.commit_sha,
       doc.title,
       chunk.heading_path,
@@ -465,6 +513,7 @@ export async function searchVectorCandidates(input: {
     branch: row.branch,
     path: row.path,
     sourceUrl: row.source_url,
+    repoSourceUrl: row.repo_source_url,
     commitSha: row.commit_sha,
     title: row.title,
     headingPath: row.heading_path,
@@ -525,6 +574,7 @@ export async function searchKeywordCandidates(input: {
       branch: string;
       path: string;
       source_url: string;
+      repo_source_url: string;
       commit_sha: string;
       title: string;
       heading_path: string;
@@ -539,6 +589,7 @@ export async function searchKeywordCandidates(input: {
         chunk.branch,
         chunk.path,
         doc.source_url,
+        doc.repo_source_url,
         chunk.commit_sha,
         doc.title,
         chunk.heading_path,
@@ -562,6 +613,7 @@ export async function searchKeywordCandidates(input: {
       branch: row.branch,
       path: row.path,
       sourceUrl: row.source_url,
+      repoSourceUrl: row.repo_source_url,
       commitSha: row.commit_sha,
       title: row.title,
       headingPath: row.heading_path,
@@ -604,6 +656,7 @@ export async function searchKeywordCandidates(input: {
     branch: string;
     path: string;
     source_url: string;
+    repo_source_url: string;
     commit_sha: string;
     title: string;
     heading_path: string;
@@ -618,6 +671,7 @@ export async function searchKeywordCandidates(input: {
       chunk.branch,
       chunk.path,
       doc.source_url,
+      doc.repo_source_url,
       chunk.commit_sha,
       doc.title,
       chunk.heading_path,
@@ -653,6 +707,7 @@ export async function searchKeywordCandidates(input: {
     branch: row.branch,
     path: row.path,
     sourceUrl: row.source_url,
+    repoSourceUrl: row.repo_source_url,
     commitSha: row.commit_sha,
     title: row.title,
     headingPath: row.heading_path,
@@ -667,7 +722,7 @@ export async function listCandidateDocumentsForFallback(input: {
   branch?: string;
   query: string;
   limit: number;
-}): Promise<Array<{ repoId: string; path: string; sourceUrl: string; title: string; commitSha: string; branch: string; repo: string }>> {
+}): Promise<Array<{ repoId: string; path: string; sourceUrl: string; repoSourceUrl: string; title: string; commitSha: string; branch: string; repo: string }>> {
   const conditions: string[] = ["doc.is_active = true"];
   const values: unknown[] = [];
 
@@ -689,6 +744,7 @@ export async function listCandidateDocumentsForFallback(input: {
     repo_id: string;
     path: string;
     source_url: string;
+    repo_source_url: string;
     title: string;
     commit_sha: string;
     branch: string;
@@ -698,6 +754,7 @@ export async function listCandidateDocumentsForFallback(input: {
       doc.repo_id,
       doc.path,
       doc.source_url,
+      doc.repo_source_url,
       doc.title,
       doc.commit_sha,
       doc.branch,
@@ -715,6 +772,7 @@ export async function listCandidateDocumentsForFallback(input: {
     repoId: row.repo_id,
     path: row.path,
     sourceUrl: row.source_url,
+    repoSourceUrl: row.repo_source_url,
     title: row.title,
     commitSha: row.commit_sha,
     branch: row.branch,

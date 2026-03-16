@@ -3,6 +3,8 @@ import type {
   OpenClawAnalyzeInput,
   OpenClawAnalyzeOutput,
   OpenClawRuntimeContext,
+  OpenClawSearchAnswerInput,
+  OpenClawSearchAnswerOutput,
   OpenClawSearchInput,
   OpenClawSearchOutput
 } from "./types.js";
@@ -123,6 +125,35 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
         score: Number(item.score.toFixed(3)),
         sourceUrl: item.doc.sourceUrl
       }))
+    };
+  }
+
+  async answerSearchQuery(
+    input: OpenClawSearchAnswerInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSearchAnswerOutput> {
+    if (input.draftAnswer) {
+      return {
+        answer: input.draftAnswer.answer,
+        style: input.draftAnswer.style,
+        summary: input.draftAnswer.summary,
+        assessment: input.draftAnswer.assessment,
+        steps: input.draftAnswer.steps,
+        validation: input.draftAnswer.validation,
+        required_inputs: input.draftAnswer.required_inputs,
+        suggested_next_step: input.draftAnswer.style === "diagnosis" ? "submit_ticket" : "self_serve"
+      };
+    }
+
+    return {
+      answer: input.language === "zh" ? "当前缺少足够证据。" : "There is not enough evidence yet.",
+      style: "clarification",
+      summary: input.language === "zh" ? "当前缺少足够证据。" : "There is not enough evidence yet.",
+      assessment: input.language === "zh" ? "请补充关键信息。" : "Please add key context.",
+      steps: [],
+      validation: [],
+      suggested_next_step: "submit_ticket"
     };
   }
 

@@ -3,7 +3,7 @@ import { env } from "../../config/env.js";
 import { pool } from "../../db/client.js";
 import type { OpenClawAdapter } from "../../infrastructure/openclaw/types.js";
 import * as aiRepo from "../ai/repository.js";
-import { resolveOpenClawRuntime } from "../ai/agent-router.js";
+import { buildSearchRuntime } from "../ai/agent-router.js";
 import { SearchOrchestrator } from "../ai/search-orchestrator.js";
 import type { SearchReference } from "../ai/types.js";
 import * as ticketService from "../tickets/service.js";
@@ -132,7 +132,7 @@ async function processEscalation(escalationId: string, adapter: OpenClawAdapter)
     });
 
     const orchestrator = new SearchOrchestrator(adapter);
-    const runtime = resolveOpenClawRuntime({ intent: "retrieval", sessionId: escalation.session_id });
+    const runtime = buildSearchRuntime({ intent: "retrieval", sessionId: escalation.session_id });
     let bestConfidence = 0;
     let bestAnswer = "";
     let bestRefs: SearchReference[] = [];
@@ -169,6 +169,7 @@ async function processEscalation(escalationId: string, adapter: OpenClawAdapter)
     const ticket = await ticketService.createTicket({
       title: `[AI Escalation] ${escalation.question.slice(0, 100)}`,
       description: `${escalation.question}\n\nReason: ${escalation.reason_code}\nDeep retrieval confidence: ${bestConfidence.toFixed(3)}`,
+      attachments: [],
       serviceCategory: "technical_support",
       priority: "P2",
       customer: {

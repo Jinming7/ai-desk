@@ -1,9 +1,13 @@
-import { UserRound } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { ImagePlus, Paperclip, UserRound, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { StatusBadge } from "../components/StatusBadge";
-import { getTicketDetail, replyTicket } from "../lib/api";
-import type { Ticket, TicketMessage } from "../lib/types";
+import { getTicketDetail, replyTicket, uploadAttachment } from "../lib/api";
+import type { Ticket, TicketMessage, UploadedAttachment } from "../lib/types";
+
+function isImageUrl(url: string) {
+  return /\/uploads\/images\/|(\.png|\.jpe?g|\.gif|\.webp)(?:\?|$)/i.test(url);
+}
 
 function formatRemaining(slaDueAt?: string) {
   if (!slaDueAt) return "Not set";
@@ -21,6 +25,9 @@ export function TicketDetailPage() {
   const [replyBody, setReplyBody] = useState("");
   const [replying, setReplying] = useState(false);
   const [replyError, setReplyError] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<UploadedAttachment[]>([]);
+  const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const load = () => {
     if (!id) return;
@@ -64,6 +71,7 @@ export function TicketDetailPage() {
       author_name: "Acme User",
       author_type: "CUSTOMER",
       body: replyBody.trim(),
+      attachments: attachments.map((item) => item.url),
       is_ai_generated: false,
       created_at: new Date().toISOString()
     };
@@ -72,7 +80,8 @@ export function TicketDetailPage() {
     setReplyBody("");
 
     try {
-      await replyTicket(id, cachedBody);
+      await replyTicket(id, cachedBody, attachments.map((item) => item.url));
+      setAttachments([]);
       load();
     } catch (error) {
       setMessages((prev) => prev.filter((m) => m.id !== optimisticMessage.id));
@@ -80,6 +89,24 @@ export function TicketDetailPage() {
       setReplyBody(cachedBody);
     } finally {
       setReplying(false);
+    }
+  };
+
+  const uploadFiles = async (fileList: FileList | File[]) => {
+    const files = Array.from(fileList);
+    if (!files.length) {
+      setReplyError("No files selected.");
+      return;
+    }
+    setUploadingAttachment(true);
+    setReplyError(null);
+    try {
+      const uploaded = await Promise.all(files.map((file) => uploadAttachment(file)));
+      setAttachments((prev) => [...prev, ...uploaded]);
+    } catch (error) {
+      setReplyError((error as Error).message);
+    } finally {
+      setUploadingAttachment(false);
     }
   };
 
@@ -107,6 +134,28 @@ export function TicketDetailPage() {
               <span>{new Date(message.created_at).toLocaleString()}</span>
             </div>
             <p className="whitespace-pre-wrap text-sm text-slate-700">{message.body}</p>
+            {(message.attachments?.length ?? 0) > 0 && (
+              <div className="mt-3 flex flex-wrap gap-3">
+                {message.attachments.map((attachment) => (
+                  <a
+                    key={attachment}
+                    href={attachment}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex min-w-[12rem] items-center gap-3 overflow-hidden rounded-2xl border border-[#D9E4FF] bg-white p-3"
+                  >
+                    {isImageUrl(attachment) ? (
+                      <img src={attachment} alt="attachment" className="h-16 w-16 rounded-xl object-cover" />
+                    ) : (
+                      <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-slate-100 text-xs font-semibold text-slate-600">
+                        FILE
+                      </span>
+                    )}
+                    <span className="max-w-[14rem] truncate text-sm text-slate-700">{attachment.split("/").pop()}</span>
+                  </a>
+                ))}
+              </div>
+            )}
           </article>
         ))}
 
@@ -118,10 +167,69 @@ export function TicketDetailPage() {
             placeholder="Type your message..."
             value={replyBody}
             onChange={(e) => setReplyBody(e.target.value)}
+            onPaste={(e) => {
+              const files = Array.from(e.clipboardData.files ?? []).filter((file) => file.type.startsWith("image/"));
+              if (!files.length) return;
+              e.preventDefault();
+              void uploadFiles(files);
+            }}
           />
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              const files = e.target.files;
+              if (files?.length) void uploadFiles(files);
+              e.currentTarget.value = "";
+            }}
+          />
+          {(attachments.length > 0 || uploadingAttachment) && (
+            <div className="mt-3 rounded-2xl border border-[#CFE0FF] bg-[linear-gradient(180deg,rgba(255,255,255,0.98),rgba(242,247,255,0.96))] p-3">
+              <div className="flex items-center gap-2 text-xs font-medium text-[#3050C8]">
+                <ImagePlus size={14} />
+                <span>Attachments will be sent with this reply.</span>
+              </div>
+              {attachments.length > 0 && (
+                <div className="mt-3 flex flex-wrap gap-3">
+                  {attachments.map((item) => (
+                    <div key={item.url} className="relative flex items-center gap-3 overflow-hidden rounded-2xl border border-[#D9E4FF] bg-white p-2 pr-10">
+                      {item.contentType.startsWith("image/") ? (
+                        <img src={item.url} alt={item.name} className="h-16 w-16 rounded-xl object-cover" />
+                      ) : (
+                        <span className="inline-flex h-16 w-16 items-center justify-center rounded-xl bg-slate-100 text-xs font-semibold text-slate-600">
+                          FILE
+                        </span>
+                      )}
+                      <div className="min-w-0">
+                        <p className="max-w-[12rem] truncate text-sm font-medium text-slate-700">{item.name}</p>
+                        <p className="text-xs text-slate-500">{item.contentType || "application/octet-stream"}</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setAttachments((prev) => prev.filter((attachment) => attachment.url !== item.url))}
+                        className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full bg-black/55 text-white"
+                        aria-label="Remove attachment"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {replyError && <p className="mt-2 text-xs text-rose-600">{replyError}</p>}
           <div className="mt-3 flex items-center justify-between">
-            <div className="text-xs text-slate-500">Attach files by dragging into this area (skeleton)</div>
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="inline-flex items-center gap-2 text-xs font-medium text-brand-600"
+            >
+              <Paperclip size={14} />
+              {uploadingAttachment ? "Uploading attachment..." : "Upload file or paste screenshot"}
+            </button>
             <button
               disabled={replying}
               onClick={() => void onSendReply()}

@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const kbRepoRegistrationSchema = z.object({
   repoUrl: z.string().min(1),
+  publicBaseUrl: z.string().url().optional(),
   defaultBranch: z.string().min(1).default("main"),
   includePaths: z.array(z.string().min(1)).default(["**/*.md"]),
   excludePaths: z.array(z.string().min(1)).default([]),

@@ -8,6 +8,7 @@ export interface RepoRegistration {
   repo_owner: string;
   repo_name: string;
   repo_url: string;
+  public_base_url: string | null;
   default_branch: string;
   include_paths: string[];
   exclude_paths: string[];
@@ -59,6 +60,8 @@ export interface KbDocument {
   path: string;
   title: string;
   source_url: string;
+  repo_source_url: string;
+  public_source_url: string | null;
   commit_sha: string;
   content_hash: string;
   content: string;
@@ -116,6 +119,7 @@ export interface RetrievalHit {
   branch: string;
   path: string;
   sourceUrl: string;
+  repoSourceUrl: string;
   commitSha: string;
   title: string;
   headingPath: string;

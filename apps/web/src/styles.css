@@ -183,12 +183,20 @@ html,
 }
 
 .chat-input-textarea {
+  display: block;
   resize: none;
-  max-height: 140px;
+  max-height: 220px;
   min-height: 40px;
+  width: 100%;
   overflow-y: auto;
-  padding-top: 8px;
-  padding-bottom: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.55) transparent;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  padding-right: 8px;
   border: none;
   background: transparent;
   color: #111827;
@@ -199,6 +207,27 @@ html,
 
 .chat-input-textarea::placeholder {
   color: #98a2b3;
+}
+
+.chat-input-textarea::-webkit-scrollbar {
+  width: 8px;
+}
+
+.chat-input-textarea::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-input-textarea::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.42);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.chat-input-textarea::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 138, 164, 0.58);
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 
 .chat-send-btn {

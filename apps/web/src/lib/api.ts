@@ -1,5 +1,6 @@
 import type {
   AgentQueueTicket,
+  AiCapabilities,
   AiAgentMode,
   AiEscalation,
   OnesCatalogStatus,
@@ -12,13 +13,18 @@ import type {
   SearchResult,
   Ticket,
   TicketMessage,
-  TicketStatus
+  TicketStatus,
+  UploadedAttachment
 } from "./types";
 
-const API = (
-  import.meta.env.VITE_API_BASE_URL ||
-  ""
-).replace(/\/$/, "");
+const API = (() => {
+  const configured = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+  if (typeof window !== "undefined" && /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname)) {
+    return "";
+  }
+  if (configured) return configured;
+  return "";
+})();
 
 function asUserError(error: unknown): Error {
   if (error instanceof TypeError) {
@@ -65,6 +71,7 @@ export async function getTicketDetail(id: string): Promise<{ ticket: Ticket; mes
 export async function createTicket(payload: {
   title: string;
   description: string;
+  attachments?: string[];
   serviceCategory?: "technical_support" | "feature_consulting" | "account_issue";
   onesTicketTypeKey?: string;
   onesFields?: Record<string, unknown>;
@@ -79,6 +86,7 @@ export async function createTicket(payload: {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ...payload,
+      attachments: payload.attachments ?? [],
       priority: "P3",
       serviceCategory: payload.serviceCategory ?? "technical_support",
       customer,
@@ -106,6 +114,8 @@ export async function createTicket(payload: {
 
 export async function searchKnowledge(input: {
   query: string;
+  imageAttachments?: string[];
+  attachments?: string[];
   sessionId?: string;
   conversation?: string[];
   answerLanguage?: "zh" | "en";
@@ -142,6 +152,15 @@ export async function searchKnowledge(input: {
   throw new Error("Failed to search knowledge base");
 }
 
+export async function getAiCapabilities(): Promise<AiCapabilities> {
+  const res = await fetch(`${API}/api/v1/ai/capabilities`).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load AI capabilities");
+  const data = await res.json();
+  return data.capabilities;
+}
+
 export async function createChatTicketDraft(input: {
   sessionId: string;
   question: string;
@@ -168,6 +187,7 @@ export async function submitChatTicketDraft(input: {
   customer?: { id: string; name: string; email?: string };
   title?: string;
   description?: string;
+  attachments?: string[];
   serviceCategory?: "technical_support" | "feature_consulting" | "account_issue";
   onesTicketTypeKey?: string;
   onesFields?: Record<string, unknown>;
@@ -177,6 +197,7 @@ export async function submitChatTicketDraft(input: {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ...input,
+      attachments: input.attachments ?? [],
       onesFields: input.onesFields ?? {}
     })
   }).catch((error) => {
@@ -244,7 +265,7 @@ export async function getAiMetricsSummary(): Promise<{
   return data.metrics;
 }
 
-export async function replyTicket(id: string, body: string) {
+export async function replyTicket(id: string, body: string, attachments: string[] = []) {
   const res = await fetch(`${API}/api/v1/tickets/${id}/replies`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -252,7 +273,7 @@ export async function replyTicket(id: string, body: string) {
       body,
       authorType: "CUSTOMER",
       authorName: "Acme User",
-      attachments: []
+      attachments
     })
   }).catch((error) => {
     throw asUserError(error);
@@ -260,7 +281,7 @@ export async function replyTicket(id: string, body: string) {
   if (!res.ok) throw new Error("Failed to send reply");
 }
 
-export async function replyTicketAsAgent(id: string, body: string, authorName = "Support Team") {
+export async function replyTicketAsAgent(id: string, body: string, authorName = "Support Team", attachments: string[] = []) {
   const res = await fetch(`${API}/api/v1/tickets/${id}/replies`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
@@ -268,12 +289,80 @@ export async function replyTicketAsAgent(id: string, body: string, authorName = 
       body,
       authorType: "AGENT",
       authorName,
-      attachments: []
+      attachments
     })
   }).catch((error) => {
     throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to send agent reply");
+}
+
+export async function uploadImageAttachment(file: File): Promise<UploadedAttachment> {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(new Error("Failed to read image"));
+    reader.readAsDataURL(file);
+  });
+
+  const res = await fetch(`${API}/api/v1/uploads/images`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      contentType: file.type,
+      dataUrl
+    })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Failed to upload image");
+  }
+
+  const data = await res.json();
+  return {
+    ...data.attachment,
+    url: data.attachment.url.startsWith("http") ? data.attachment.url : `${API}${data.attachment.url}`
+  };
+}
+
+export async function uploadAttachment(file: File): Promise<UploadedAttachment> {
+  if (file.type.startsWith("image/")) {
+    return uploadImageAttachment(file);
+  }
+
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
+
+  const res = await fetch(`${API}/api/v1/uploads/files`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      contentType: file.type || "application/octet-stream",
+      dataUrl
+    })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Failed to upload file");
+  }
+
+  const data = await res.json();
+  return {
+    ...data.attachment,
+    url: data.attachment.url.startsWith("http") ? data.attachment.url : `${API}${data.attachment.url}`
+  };
 }
 
 export async function listAgentTickets(queue: "pending" | "mine" | "all", assignee?: string): Promise<AgentQueueTicket[]> {

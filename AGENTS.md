@@ -2,7 +2,7 @@
 
 ## Default Frontend Rule (Mandatory)
 - For all frontend design and implementation tasks in this workspace, always follow:
-  - `/Users/jeremypeng/Downloads/Workspace/Ticket Management/docs/03_Frontend_Design_Standards_Figma.md`
+  - `/Users/jeremypeng/Downloads/Workspace/TicketManagement/docs/03_Frontend_Design_Standards_Figma.md`
 - Treat this file as the primary UI design standard unless the user explicitly overrides it.
 - If there is a conflict between existing page styles and the standard, follow the standard for new pages and document migration impact for existing pages.
 

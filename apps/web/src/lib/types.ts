@@ -37,8 +37,22 @@ export interface TicketMessage {
   author_name: string;
   author_type: "CUSTOMER" | "AGENT";
   body: string;
+  attachments: string[];
   is_ai_generated: boolean;
   created_at: string;
+}
+
+export interface UploadedAttachment {
+  url: string;
+  name: string;
+  contentType: string;
+}
+
+export interface AiCapabilities {
+  imageInputEnabled: boolean;
+  provider: "openai" | "disabled";
+  model: string | null;
+  reason: string;
 }
 
 export interface AgentQueueTicket {
@@ -81,6 +95,10 @@ export interface SearchReference {
   title: string;
   snippet: string;
   sourceUrl: string;
+  repoSourceUrl?: string;
+  repo?: string;
+  path?: string;
+  commitSha?: string;
   score: number;
   retrievedAt: string;
 }
@@ -95,6 +113,7 @@ export interface SearchResult {
     steps: string[];
     validation: string[];
     required_inputs?: string[];
+    style?: "kb_answer" | "diagnosis" | "clarification";
   };
   confidence: number;
   suggested_next_step: "self_serve" | "submit_ticket";

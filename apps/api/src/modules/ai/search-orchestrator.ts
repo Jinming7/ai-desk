@@ -7,14 +7,45 @@ export class SearchOrchestrator {
   constructor(private readonly adapter: OpenClawAdapter) {}
 
   normalizeQuery(query: string): string {
-    return query.trim().replace(/\s+/g, " ");
+    const compact = query.trim().replace(/\s+/g, " ");
+    const urlMatch = compact.match(/https?:\/\/[^\s"']+\/openapi\/v2\/[^\s"']+/i);
+    if (!urlMatch) return compact;
+
+    const methodMatch = compact.match(/\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/i);
+    const errorCodeMatch = compact.match(/"errorCode"\s*:\s*"([^"]+)"/i);
+    const errorMsgMatch = compact.match(/"errorMsg"\s*:\s*"([^"]+)"/i);
+    const statusFieldMatch = compact.match(/"status"\s*:\s*"([^"]+)"/i);
+
+    let pathname = urlMatch[0];
+    try {
+      const parsed = new URL(urlMatch[0]);
+      pathname = `${parsed.pathname}${parsed.search}`;
+    } catch {
+      pathname = urlMatch[0];
+    }
+
+    const signals = [
+      methodMatch?.[1]?.toUpperCase(),
+      pathname,
+      errorCodeMatch?.[1] ? `errorCode ${errorCodeMatch[1]}` : "",
+      errorMsgMatch?.[1] ? `errorMsg ${errorMsgMatch[1]}` : "",
+      statusFieldMatch?.[1] ? `payload status ${statusFieldMatch[1]}` : "",
+      compact.includes('"issueTypeID"') ? "issueTypeID" : "",
+      compact.includes('"fieldValues"') ? "fieldValues" : "",
+      compact.includes('"watchers"') ? "watchers" : ""
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    return signals || compact;
   }
 
   async search(
     query: string,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext,
-    answerLanguage?: "zh" | "en"
+    answerLanguage?: "zh" | "en",
+    attachments: string[] = []
   ): Promise<SearchResponseEnvelope> {
     const normalized = this.normalizeQuery(query);
     const lang = answerLanguage ?? "en";
@@ -54,53 +85,59 @@ export class SearchOrchestrator {
     // already indexed KB data whenever available.
     // OpenClaw retrieval is kept as fallback only when local retrieval throws.
     try {
-      const result = await githubKbService.retrieveKnowledgeWithRetry({
-        query: normalized,
-        answerLanguage: lang,
-        profile: "search",
-        topK: env.OPENCLAW_SEARCH_TOP_K,
-        includeFallback: true
-      });
+      if (!attachments.length) {
+        const result = await githubKbService.retrieveKnowledgeWithRetry({
+          query: normalized,
+          answerLanguage: lang,
+          profile: "search",
+          topK: env.OPENCLAW_SEARCH_TOP_K,
+          includeFallback: true
+        });
 
-      const references: SearchReference[] = result.hits.map((hit) => ({
-        documentId: hit.documentId,
-        title: hit.title,
-        snippet: hit.snippet,
-        sourceUrl: hit.sourceUrl,
-        score: hit.score,
-        retrievedAt: new Date().toISOString()
-      }));
+        const references: SearchReference[] = result.hits.map((hit) => ({
+          documentId: hit.documentId,
+          title: hit.title,
+          snippet: hit.snippet,
+          sourceUrl: hit.sourceUrl,
+          repoSourceUrl: hit.repoSourceUrl,
+          repo: hit.repo,
+          path: hit.path,
+          commitSha: hit.commitSha,
+          score: hit.score,
+          retrievedAt: new Date().toISOString()
+        }));
 
-      if (!references.length) {
+        if (!references.length) {
+          return {
+            query: normalized,
+            answer: msg.noMatch,
+            confidence: 0,
+            references: [],
+            retrievalStatus: "no_results",
+            unresolvedReasonCode: "NO_MATCHING_KB"
+          };
+        }
+
+        if (result.confidence < env.AI_SEARCH_ANSWER_CONFIDENCE_THRESHOLD) {
+          return {
+            query: normalized,
+            answer: msg.lowConfidence,
+            confidence: result.confidence,
+            references,
+            retrievalStatus: "no_results",
+            unresolvedReasonCode: "LOW_CONFIDENCE"
+          };
+        }
+
         return {
           query: normalized,
-          answer: msg.noMatch,
-          confidence: 0,
-          references: [],
-          retrievalStatus: "no_results",
-          unresolvedReasonCode: "NO_MATCHING_KB"
-        };
-      }
-
-      if (result.confidence < env.AI_SEARCH_ANSWER_CONFIDENCE_THRESHOLD) {
-        return {
-          query: normalized,
-          answer: msg.lowConfidence,
+          answer: result.answer || `Based on \"${references[0].title}\", follow the referenced steps.`,
           confidence: result.confidence,
           references,
-          retrievalStatus: "no_results",
-          unresolvedReasonCode: "LOW_CONFIDENCE"
+          retrievalStatus: "grounded",
+          unresolvedReasonCode: null
         };
       }
-
-      return {
-        query: normalized,
-        answer: result.answer || `Based on \"${references[0].title}\", follow the referenced steps.`,
-        confidence: result.confidence,
-        references,
-        retrievalStatus: "grounded",
-        unresolvedReasonCode: null
-      };
     } catch {
       // continue to OpenClaw fallback below
     }
@@ -110,7 +147,8 @@ export class SearchOrchestrator {
         {
           query: normalized,
           topK: env.OPENCLAW_SEARCH_TOP_K,
-          index: env.OPENCLAW_SEARCH_INDEX
+          index: env.OPENCLAW_SEARCH_INDEX,
+          attachments
         },
         idempotencyKey,
         runtime

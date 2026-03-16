@@ -3,6 +3,10 @@ export interface SearchReference {
   title: string;
   snippet: string;
   sourceUrl: string;
+  repoSourceUrl?: string;
+  repo?: string;
+  path?: string;
+  commitSha?: string;
   score: number;
   retrievedAt: string;
 }
@@ -13,6 +17,7 @@ export interface StructuredSearchAnswer {
   steps: string[];
   validation: string[];
   required_inputs?: string[];
+  style?: "kb_answer" | "diagnosis" | "clarification";
 }
 
 export type SearchDialogState =
