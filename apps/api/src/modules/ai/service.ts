@@ -1579,7 +1579,8 @@ export async function runSearchMode(
   const runtime = buildSearchRuntime({ intent: searchIntent, sessionId });
   const orchestrator = new SearchOrchestrator(adapter);
   const trimmedQuery = query.trim();
-  const resolvedQuery = trimmedQuery || previousDialog?.transcript?.at(-1)?.content || "";
+  const transcript = previousDialog?.transcript;
+  const resolvedQuery = trimmedQuery || (transcript?.length ? transcript[transcript.length - 1].content : "") || "";
   const attachments = options?.attachments ?? options?.imageAttachments ?? [];
   const imageAttachments = options?.imageAttachments ?? attachments.filter((item) => item.includes("/uploads/images/"));
   const classification = await classifyQuery({
