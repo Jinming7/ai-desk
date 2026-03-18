@@ -128,6 +128,9 @@ export interface RetrievalHit {
   vectorScore?: number;
   lexicalScore?: number;
   rankSignals?: Record<string, number>;
+  supportMetadata?: Record<string, unknown>;
+  chunkMetadata?: Record<string, unknown>;
+  docMetadata?: Record<string, unknown>;
 }
 
 export interface RetrievalResponse {

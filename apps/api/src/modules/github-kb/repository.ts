@@ -185,7 +185,40 @@ export async function enqueueSyncJob(input: {
 }): Promise<SyncJob> {
   const existing = await pool.query<SyncJob>(`SELECT * FROM kb_sync_jobs WHERE idempotency_key = $1 LIMIT 1`, [input.idempotencyKey]);
   if (existing.rowCount) {
-    return existing.rows[0];
+    const job = existing.rows[0];
+    if (job.status === "dead_letter") {
+      const revived = await pool.query<SyncJob>(
+        `UPDATE kb_sync_jobs
+         SET repo_id = $2,
+             branch = $3,
+             sync_mode = $4,
+             source = $5,
+             status = 'queued',
+             attempts = 0,
+             before_commit_sha = $6,
+             after_commit_sha = $7,
+             payload_json = $8::jsonb,
+             error_message = NULL,
+             started_at = NULL,
+             finished_at = NULL,
+             next_run_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [
+          job.id,
+          input.repoId,
+          input.branch,
+          input.syncMode,
+          input.source,
+          input.beforeCommitSha ?? null,
+          input.afterCommitSha ?? null,
+          toJson(input.payload ?? {})
+        ]
+      );
+      return revived.rows[0];
+    }
+    return job;
   }
 
   const result = await pool.query<SyncJob>(
@@ -387,9 +420,9 @@ export async function upsertChunk(input: {
   contentHash: string;
   tokenCount: number;
   metadata: Record<string, unknown>;
-  embedding: string;
-  embeddingModel: string;
-  embeddingVersion: string;
+  embedding: string | null;
+  embeddingModel: string | null;
+  embeddingVersion: string | null;
 }): Promise<void> {
   await pool.query(
     `INSERT INTO kb_chunks (
@@ -480,6 +513,8 @@ export async function searchVectorCandidates(input: {
     heading_path: string;
     snippet: string;
     vector_score: string;
+    chunk_metadata_json: Record<string, unknown> | null;
+    doc_metadata_json: Record<string, unknown> | null;
   }>(
     `SELECT
       chunk.id AS chunk_id,
@@ -494,7 +529,9 @@ export async function searchVectorCandidates(input: {
       doc.title,
       chunk.heading_path,
       LEFT(chunk.content, 400) AS snippet,
-      (1 - (chunk.embedding <=> $${vectorParam}::vector))::text AS vector_score
+      (1 - (chunk.embedding <=> $${vectorParam}::vector))::text AS vector_score,
+      chunk.metadata_json AS chunk_metadata_json,
+      doc.metadata_json AS doc_metadata_json
      FROM kb_chunks chunk
      INNER JOIN kb_documents doc ON doc.id = chunk.doc_id
      INNER JOIN kb_repo_registrations reg ON reg.id = chunk.repo_id
@@ -519,7 +556,12 @@ export async function searchVectorCandidates(input: {
     headingPath: row.heading_path,
     snippet: row.snippet,
     score: Number(row.vector_score),
-    vectorScore: Number(row.vector_score)
+    vectorScore: Number(row.vector_score),
+    chunkMetadata: row.chunk_metadata_json ?? undefined,
+    docMetadata: row.doc_metadata_json ?? undefined,
+    supportMetadata:
+      ((row.chunk_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined ??
+      ((row.doc_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined
   }));
 }
 
@@ -590,6 +632,8 @@ export async function searchKeywordCandidates(input: {
       heading_path: string;
       snippet: string;
       lexical_score: string;
+      chunk_metadata_json: Record<string, unknown> | null;
+      doc_metadata_json: Record<string, unknown> | null;
     }>(
       `SELECT
         chunk.id AS chunk_id,
@@ -604,7 +648,9 @@ export async function searchKeywordCandidates(input: {
         doc.title,
         chunk.heading_path,
         LEFT(chunk.content, 400) AS snippet,
-        (${scoreExpr})::text AS lexical_score
+        (${scoreExpr})::text AS lexical_score,
+        chunk.metadata_json AS chunk_metadata_json,
+        doc.metadata_json AS doc_metadata_json
        FROM kb_chunks chunk
        INNER JOIN kb_documents doc ON doc.id = chunk.doc_id
        INNER JOIN kb_repo_registrations reg ON reg.id = chunk.repo_id
@@ -629,7 +675,12 @@ export async function searchKeywordCandidates(input: {
       headingPath: row.heading_path,
       snippet: row.snippet || row.title,
       score: Number(row.lexical_score),
-      lexicalScore: Number(row.lexical_score)
+      lexicalScore: Number(row.lexical_score),
+      chunkMetadata: row.chunk_metadata_json ?? undefined,
+      docMetadata: row.doc_metadata_json ?? undefined,
+      supportMetadata:
+        ((row.chunk_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined ??
+        ((row.doc_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined
     }));
   }
 
@@ -672,6 +723,8 @@ export async function searchKeywordCandidates(input: {
     heading_path: string;
     snippet: string;
     lexical_score: string;
+    chunk_metadata_json: Record<string, unknown> | null;
+    doc_metadata_json: Record<string, unknown> | null;
   }>(
     `SELECT
       chunk.id AS chunk_id,
@@ -692,7 +745,9 @@ export async function searchKeywordCandidates(input: {
       (
         ts_rank_cd(chunk.search_vector, websearch_to_tsquery('english', $${queryParam}))
         + ${tokenScore}
-      )::text AS lexical_score
+      )::text AS lexical_score,
+      chunk.metadata_json AS chunk_metadata_json,
+      doc.metadata_json AS doc_metadata_json
      FROM kb_chunks chunk
      INNER JOIN kb_documents doc ON doc.id = chunk.doc_id
      INNER JOIN kb_repo_registrations reg ON reg.id = chunk.repo_id
@@ -723,7 +778,12 @@ export async function searchKeywordCandidates(input: {
     headingPath: row.heading_path,
     snippet: row.snippet || row.title,
     score: Number(row.lexical_score),
-    lexicalScore: Number(row.lexical_score)
+    lexicalScore: Number(row.lexical_score),
+    chunkMetadata: row.chunk_metadata_json ?? undefined,
+    docMetadata: row.doc_metadata_json ?? undefined,
+    supportMetadata:
+      ((row.chunk_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined ??
+      ((row.doc_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined
   }));
 }
 

@@ -39,6 +39,47 @@ function detectLang(text: string): "zh" | "en" {
   return /[\u3400-\u9FBF]/.test(text) ? "zh" : "en";
 }
 
+function uniqueStrings(values: Array<string | null | undefined>, limit = 6) {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const item of values) {
+    const value = String(item ?? "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    output.push(value);
+    if (output.length >= limit) break;
+  }
+  return output;
+}
+
+function buildHandoffCtaCopy(input: {
+  lang: "zh" | "en";
+  mode?: "grounded" | "partial" | "clarification" | "handoff";
+  verdict?: "verified" | "partial" | "unsupported";
+}) {
+  const { lang, mode, verdict } = input;
+  if (lang === "zh") {
+    if (mode === "handoff" && verdict === "unsupported") {
+      return "建议直接创建工单，我们会自动预填你已提供的上下文。";
+    }
+    if (mode === "handoff") {
+      return "建议转交人工支持继续处理，创建工单后会自动预填上下文。";
+    }
+    return "当前还不能形成稳定结论，建议创建工单并自动预填上下文。";
+  }
+  if (mode === "handoff" && verdict === "unsupported") {
+    return "Create a ticket now and we will prefill the context you already shared.";
+  }
+  if (mode === "handoff") {
+    return "This case is better handled by human support. Create a ticket now with prefilled context.";
+  }
+  return "A stable conclusion is not ready yet. Create a ticket now with prefilled context.";
+}
+
+function getAttachmentUploadError(lang: "zh" | "en") {
+  return lang === "zh" ? "附件上传失败，请稍后重试。" : "Failed to upload attachment. Please try again.";
+}
+
 function isImageAttachment(item: Pick<UploadedAttachment, "url" | "contentType">) {
   return item.contentType.startsWith("image/") || /\/uploads\/images\/|(\.png|\.jpe?g|\.gif|\.webp)(?:\?|$)/i.test(item.url);
 }
@@ -114,7 +155,13 @@ function t(lang: "zh" | "en") {
         clueAuth: "鉴权方式与 token scope",
         clueRole: "用户角色/账号",
         clueOp: "执行的具体操作",
-        cluePerm: "权限配置截图或描述"
+        cluePerm: "权限配置截图或描述",
+        appliesTo: "适用范围",
+        prerequisites: "前提条件",
+        limits: "限制与风险",
+        whyNeedThis: "为什么还需要这条信息",
+        nextQuestion: "请先回答这一个问题",
+        sources: "来源"
       }
     : {
         hero: "How can we help you?",
@@ -172,7 +219,13 @@ function t(lang: "zh" | "en") {
         clueAuth: "Auth mode/token scope used",
         clueRole: "User role/account",
         clueOp: "Operation attempted",
-        cluePerm: "Permission configuration snapshot"
+        cluePerm: "Permission configuration snapshot",
+        appliesTo: "Applies to",
+        prerequisites: "Prerequisites",
+        limits: "Limits and risks",
+        whyNeedThis: "Why this is still needed",
+        nextQuestion: "Answer this one question first",
+        sources: "Sources"
       };
 }
 
@@ -249,7 +302,32 @@ export function PortalPage() {
   const uiLang: "zh" | "en" = detailResult?.answer_language ?? detectLang(latestUserQuestion || query || "");
   const copy = t(uiLang);
   const summaryText = detailResult?.structured_answer?.summary ?? detailResult?.answer ?? "";
-  const answerStyle = detailResult?.structured_answer?.style ?? (detailResult?.follow_up_question ? "clarification" : "kb_answer");
+  const supportAnswer = detailResult?.support_answer;
+  const supportVerification = detailResult?.verification;
+  const summaryFromSupport = supportAnswer?.direct_answer?.trim();
+  const summaryTextResolved = summaryFromSupport || detailResult?.structured_answer?.summary || detailResult?.answer || "";
+  const isInfrastructureHandoff =
+    detailResult?.retrieval_status === "kb_unavailable" &&
+    supportAnswer?.mode === "handoff" &&
+    supportVerification?.verdict === "unsupported";
+  const answerStyle =
+    supportAnswer?.mode === "clarification"
+      ? "clarification"
+      : supportAnswer?.mode === "handoff" || supportAnswer?.mode === "partial"
+      ? "diagnosis"
+      : detailResult?.structured_answer?.style ?? (detailResult?.follow_up_question ? "clarification" : "kb_answer");
+  const supportWhy = supportAnswer?.why ?? [];
+  const supportSteps = supportAnswer?.what_to_do_now?.length ? supportAnswer.what_to_do_now : detailResult?.structured_answer?.steps ?? [];
+  const supportMissingInfo = uniqueStrings(
+    [...(supportAnswer?.still_need_to_confirm ?? []), ...(detailResult?.structured_answer?.required_inputs ?? [])],
+    3
+  );
+  const clarificationReason = null;
+  const handoffCtaText = buildHandoffCtaCopy({
+    lang: uiLang,
+    mode: supportAnswer?.mode,
+    verdict: supportVerification?.verdict
+  });
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   const uploadFiles = async (fileList: FileList | File[]) => {
@@ -264,8 +342,8 @@ export function PortalPage() {
       const uploaded = await Promise.all(files.map((file) => uploadAttachment(file)));
       setComposerAttachments((prev) => [...prev, ...uploaded]);
       setTicketAttachments((prev) => [...prev, ...uploaded.filter((item) => !prev.some((existing) => existing.url === item.url))]);
-    } catch (error) {
-      setAttachmentError((error as Error).message);
+    } catch {
+      setAttachmentError(getAttachmentUploadError(uiLang));
     } finally {
       setUploadingAttachment(false);
     }
@@ -553,15 +631,15 @@ export function PortalPage() {
   };
 
   const onCreateTicketNow = async () => {
-    if (!searchResult?.session_id) return;
+    if (!latestResult?.session_id) return;
     setDraftLoading(true);
     setDraftError(null);
     try {
       const draft = await createChatTicketDraft({
-        sessionId: searchResult.session_id,
+        sessionId: latestResult.session_id,
         question: chatMessages.filter((item) => item.role === "user").at(-1)?.content ?? "",
         conversation: chatMessages.map((item) => item.content),
-        retrievalTraces: searchResult.citations
+        retrievalTraces: latestResult.citations
       });
       setChatDraft(draft);
       setTitle(draft.title);
@@ -779,10 +857,47 @@ export function PortalPage() {
                         : "Current assessment"
                       : copy.oneLineConclusion}
                 </p>
-                <div className="mt-3 space-y-2 text-[17px] font-semibold text-[#111827]">{renderReadableText(summaryText, "summary", "summary")}</div>
+                <div className="mt-3 space-y-2 text-[17px] font-semibold text-[#111827]">{renderReadableText(summaryTextResolved, "summary", "summary")}</div>
               </div>
 
-              {detailResult.structured_answer && (
+              {supportAnswer ? (
+                <div className="mt-4 space-y-3 rounded-2xl border border-slate-200 bg-slate-50/85 p-4">
+                  {supportWhy.length > 0 && answerStyle !== "clarification" && (
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{uiLang === "zh" ? "为什么这样判断" : "Why"}</p>
+                      <div className="mt-2 space-y-2 text-sm text-slate-800">
+                        {supportWhy.slice(0, 4).map((item, idx) => (
+                          <div key={`${item}-${idx}`}>{renderReadableText(item, `support-why-${idx}`, "detail")}</div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {supportSteps.length > 0 && (
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        {answerStyle === "clarification" ? copy.nextQuestion : copy.whatNow}
+                      </p>
+                      <ol className="mt-1 list-decimal space-y-1.5 pl-5 text-sm leading-6 text-slate-800">
+                        {supportSteps.slice(0, 4).map((step, idx) => (
+                          <li key={`${step}-${idx}`}>{renderInlineCode(step, `support-step-${idx}`)}</li>
+                        ))}
+                      </ol>
+                    </div>
+                  )}
+                  {supportMissingInfo.length > 0 && (
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        {uiLang === "zh" ? "还需要确认" : "Still need to confirm"}
+                      </p>
+                      <ul className="mt-1 list-disc space-y-1.5 pl-5 text-sm leading-6 text-slate-800">
+                        {supportMissingInfo.map((item, idx) => (
+                          <li key={`${item}-${idx}`}>{renderInlineCode(item, `support-limit-${idx}`)}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              ) : detailResult.structured_answer ? (
                 <div className="mt-4 space-y-3 rounded-2xl border border-slate-200 bg-slate-50/85 p-4">
                   {detailResult.structured_answer.assessment && answerStyle === "diagnosis" && (
                     <div>
@@ -833,7 +948,7 @@ export function PortalPage() {
                     </div>
                   )}
                 </div>
-              )}
+              ) : null}
 
               {primaryReference && (
                 <div className="mt-3 rounded-xl border border-emerald-100 bg-emerald-50 p-3">
@@ -852,25 +967,33 @@ export function PortalPage() {
                 </div>
               )}
 
-              {(detailResult.follow_up_question || (answerStyle === "clarification" && (detailResult.structured_answer?.required_inputs?.length ?? 0) > 0)) && (
+              {(detailResult.follow_up_question || clarificationReason || supportMissingInfo.length > 0) && (
                 <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                  {clarificationReason && (
+                    <div className="mb-3">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{copy.whyNeedThis}</p>
+                      <div className="mt-2 space-y-2 text-sm text-slate-800">{renderReadableText(clarificationReason, "clarify-reason", "detail")}</div>
+                    </div>
+                  )}
                   {detailResult.follow_up_question && (
                     <div className="space-y-2 text-sm text-slate-800">{renderReadableText(detailResult.follow_up_question, "followup", "detail")}</div>
+                  )}
+                  {supportMissingInfo.length > 0 && (
+                    <div className="mt-3">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{copy.minNeed}</p>
+                      <ul className="mt-1 list-disc space-y-1.5 pl-5 text-sm leading-6 text-slate-800">
+                        {supportMissingInfo.map((item, idx) => (
+                          <li key={`${item}-${idx}`}>{renderInlineCode(item, `support-need-${idx}`)}</li>
+                        ))}
+                      </ul>
+                    </div>
                   )}
                 </div>
               )}
 
               {showCreateTicketNow && (
                 <div className="mt-4 rounded-xl border border-orange-200 bg-orange-50 p-3">
-                  <p className="text-xs text-orange-700">
-                    {answerStyle === "diagnosis"
-                      ? uiLang === "zh"
-                        ? "当前判断更像产品问题，建议直接创建工单并自动预填上下文。"
-                        : "This looks more like a product issue. Create a ticket now with prefilled context."
-                      : uiLang === "zh"
-                        ? "当前证据仍不足，建议创建工单并自动预填上下文。"
-                        : "Evidence is still insufficient. Create a ticket now with prefilled context."}
-                  </p>
+                  <p className="text-xs text-orange-700">{handoffCtaText}</p>
                   <button
                     onClick={() => void onCreateTicketNow()}
                     disabled={draftLoading}

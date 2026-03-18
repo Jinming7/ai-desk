@@ -2,7 +2,7 @@ import { Sparkles } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { StatusBadge } from "../components/StatusBadge";
-import { assignTicket, getTicketDetail, replyTicketAsAgent, transitionTicket } from "../lib/api";
+import { applyAiSuggestion as applyAiSuggestionRequest, assignTicket, getTicketDetail, replyTicketAsAgent, transitionTicket } from "../lib/api";
 import type { Ticket, TicketMessage } from "../lib/types";
 
 function computeSlaRisk(ticket: Ticket): "healthy" | "at_risk" | "breached" {
@@ -118,6 +118,20 @@ export function AgentTicketDetailPage() {
     setError(null);
     try {
       await assignTicket(id, assigneeType, assigneeName.trim() || (assigneeType === "RND_TEAM" ? "R&D Team" : "Support Team"), "manual_claim");
+      await load();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const applyInsight = async () => {
+    if (!id) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await applyAiSuggestionRequest(id, ticket?.ai_last_trace_id ?? undefined);
       await load();
     } catch (err) {
       setError((err as Error).message);
@@ -248,19 +262,28 @@ export function AgentTicketDetailPage() {
         </aside>
 
         <aside className="space-y-3 rounded-mdplus border border-slate-200 bg-white p-4">
-          <h2 className="text-sm font-semibold text-[#16171A]">AI Panel</h2>
+          <h2 className="text-sm font-semibold text-[#16171A]">AI Support Insight</h2>
           <div className="rounded-mdplus border border-brand-100 bg-brand-50 p-3 text-xs text-slate-700">
             <div className="mb-1 flex items-center gap-1 text-brand-600">
               <Sparkles size={12} /> AI First Line
             </div>
-            <p>Mode snapshot: {ticket.ai_mode_snapshot ?? "AI_ON"}</p>
-            <p className="mt-1">Suggested action: {ticket.ai_last_action ?? "ask_user"}</p>
-            <p className="mt-1">Confidence: {ticket.ai_last_confidence ?? "-"}</p>
-            <p className="mt-1">Model: {ticket.ai_last_model ?? "-"}</p>
-            <p className="mt-1">Fallback applied: {ticket.ai_last_fallback_applied ? "yes" : "no"}</p>
-            <p className="mt-1">Trace ID: {ticket.ai_last_trace_id ?? "-"}</p>
+            <p className="text-sm font-medium text-slate-900">{ticket.triage_support_insight?.direct_answer ?? "AI insight is not available yet."}</p>
+            <div className="mt-3 grid gap-2">
+              <p>Recommended action: {ticket.triage_support_insight?.recommended_action ?? ticket.ai_last_action ?? "ask_user"}</p>
+              <p>Confidence: {ticket.ai_last_confidence ?? "-"}</p>
+              <p>Trace ID: {ticket.ai_last_trace_id ?? "-"}</p>
+              {!!ticket.triage_support_insight?.verified_evidence?.length && (
+                <p>Verified evidence: {ticket.triage_support_insight.verified_evidence.join(" · ")}</p>
+              )}
+              {!!ticket.triage_support_insight?.customer_reply && (
+                <div className="rounded border border-brand-100 bg-white/80 p-2 text-slate-800">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Customer reply preview</p>
+                  <p className="mt-1 whitespace-pre-wrap text-sm leading-6">{ticket.triage_support_insight.customer_reply}</p>
+                </div>
+              )}
+            </div>
           </div>
-          <button className="w-full rounded border border-slate-200 px-3 py-2 text-xs" disabled={saving} onClick={() => void runTransition("WAITING_CUSTOMER", "manual_waiting_customer")}>
+          <button className="w-full rounded border border-slate-200 px-3 py-2 text-xs" disabled={saving} onClick={() => void applyInsight()}>
             Apply AI Suggestion
           </button>
           <button

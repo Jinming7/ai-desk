@@ -1,4 +1,5 @@
 import { env } from "../../config/env.js";
+import { fetchWithNodeCompat } from "../../utils/fetch-compat.js";
 import type { CompareFile, GitHubReadValidation, GitHubTreeFile, RepoRegistration } from "./types.js";
 
 interface RepoIdentity {
@@ -75,13 +76,13 @@ function assertReadMethod(method: string) {
   }
 }
 
-function getGithubHeaders(extra?: Record<string, string>) {
+function getGithubHeaders(extra?: Record<string, string>, includeAuth = true) {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "User-Agent": "nexusflow-github-kb-readonly",
     ...(extra ?? {})
   };
-  if (env.GITHUB_TOKEN_READONLY) {
+  if (includeAuth && env.GITHUB_TOKEN_READONLY) {
     headers.Authorization = `Bearer ${env.GITHUB_TOKEN_READONLY}`;
   }
   return headers;
@@ -90,11 +91,18 @@ function getGithubHeaders(extra?: Record<string, string>) {
 async function githubRequest(path: string, method = "GET", extraHeaders?: Record<string, string>) {
   assertReadMethod(method);
   const base = env.GITHUB_API_BASE_URL.replace(/\/$/, "");
-  const response = await fetch(`${base}${path}`, {
-    method,
-    headers: getGithubHeaders(extraHeaders)
-  });
-  return response;
+  const doRequest = (includeAuth: boolean) =>
+    fetchWithNodeCompat(`${base}${path}`, {
+      method,
+      headers: getGithubHeaders(extraHeaders, includeAuth)
+    });
+
+  const response = await doRequest(true);
+  if (response.status !== 401 || !env.GITHUB_TOKEN_READONLY) {
+    return response;
+  }
+
+  return doRequest(false);
 }
 
 function mockGetSnapshot(repo: RepoIdentity, commitSha: string): MockSnapshot {

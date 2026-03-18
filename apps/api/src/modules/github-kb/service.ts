@@ -1,4 +1,7 @@
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { access, readdir, readFile } from "node:fs/promises";
+import path from "node:path";
 import zlib from "node:zlib";
 import { env } from "../../config/env.js";
 import { buildChunks } from "./chunker.js";
@@ -22,6 +25,23 @@ import type { KbSyncSource, RepoRegistration, RetrievalHit, RetrievalProfile, Re
 const RETRIEVAL_CACHE_TTL_MS = 90_000;
 const RETRIEVAL_CACHE_MAX = 300;
 const retrievalCache = new Map<string, { expiresAt: number; value: RetrievalResponse }>();
+const LOCAL_DOCS_SUPPORTED_ROOTS = ["docs", "deploy-docs", "open-docs", "i18n", "blog"];
+const LOCAL_DOCS_SKIP_DIRS = new Set([".git", ".github", ".claude", "node_modules", ".docusaurus", "build", "dist"]);
+
+interface SyncExecutionResult {
+  indexed: number;
+  head: string;
+  finished: boolean;
+  nextCursor: string | null;
+  deactivated?: number;
+  removed?: number;
+}
+
+interface LocalMirrorBatchResult extends SyncExecutionResult {
+  deactivated: number;
+  total: number;
+  remaining: number;
+}
 
 function sha256(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
@@ -38,6 +58,130 @@ function parseRepoOwnerName(repoUrl: string): { owner: string; name: string } {
   const parts = url.pathname.replace(/^\//, "").replace(/\.git$/i, "").split("/").filter(Boolean);
   if (parts.length < 2) throw new Error(`Invalid GitHub repo url: ${repoUrl}`);
   return { owner: parts[0], name: parts[1] };
+}
+
+function isDocsComRepo(owner: string, name: string): boolean {
+  return owner.toLowerCase() === "bangwork" && name.toLowerCase() === "docs-com";
+}
+
+function isDocsComRegistration(registration: RepoRegistration): boolean {
+  return isDocsComRepo(registration.repo_owner, registration.repo_name);
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readGitValue(rootDir: string, args: string[], fallback: string): string {
+  try {
+    return execFileSync("git", ["-C", rootDir, ...args], { encoding: "utf8" }).trim() || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function getLocalDocsMirrorState(registration: RepoRegistration): Promise<{ rootDir: string; head: string; branch: string } | null> {
+  if (!isDocsComRegistration(registration)) return null;
+  const rootDir = env.LOCAL_DOCS_COM_PATH;
+  if (!(await pathExists(rootDir))) return null;
+  const head = readGitValue(rootDir, ["rev-parse", "HEAD"], "local");
+  const branch = readGitValue(rootDir, ["rev-parse", "--abbrev-ref", "HEAD"], registration.default_branch || "master");
+  return { rootDir, head, branch };
+}
+
+async function collectLocalMirrorMarkdownFiles(
+  rootDir: string,
+  includePaths: string[],
+  excludePaths: string[],
+  relativeDir = ""
+): Promise<string[]> {
+  const dirPath = path.join(rootDir, relativeDir);
+  const entries = await readdir(dirPath, { withFileTypes: true });
+  const output: string[] = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith(".") && entry.name !== ".well-known") continue;
+    if (entry.isDirectory()) {
+      if (LOCAL_DOCS_SKIP_DIRS.has(entry.name)) continue;
+      output.push(...(await collectLocalMirrorMarkdownFiles(rootDir, includePaths, excludePaths, path.join(relativeDir, entry.name))));
+      continue;
+    }
+    if (!entry.isFile() || !/\.(md|mdx)$/i.test(entry.name)) continue;
+    const relativePath = path.posix.join(relativeDir.split(path.sep).join(path.posix.sep), entry.name);
+    if (isPathIncluded(relativePath, includePaths, excludePaths)) {
+      output.push(relativePath);
+    }
+  }
+  return output;
+}
+
+async function collectLocalMirrorSnapshot(
+  registration: RepoRegistration,
+  localMirror: { rootDir: string; head: string; branch: string }
+): Promise<string[]> {
+  const fileGroups = await Promise.all(
+    LOCAL_DOCS_SUPPORTED_ROOTS.map(async (subdir) =>
+      ((await pathExists(path.join(localMirror.rootDir, subdir)))
+        ? collectLocalMirrorMarkdownFiles(localMirror.rootDir, registration.include_paths, registration.exclude_paths, subdir)
+        : Promise.resolve([]))
+    )
+  );
+  return fileGroups.flat().sort((left, right) => left.localeCompare(right, "en"));
+}
+
+function sliceSnapshotForBackfill(paths: string[], cursor?: string, limit?: number): {
+  files: string[];
+  total: number;
+  remaining: number;
+  nextCursor: string | null;
+  finished: boolean;
+} {
+  const normalizedLimit = Number.isFinite(limit) && (limit ?? 0) > 0 ? Math.max(1, Math.floor(limit as number)) : paths.length;
+  const startIndex = cursor ? paths.findIndex((item) => item > cursor) : 0;
+  const safeStart = startIndex >= 0 ? startIndex : paths.length;
+  const files = paths.slice(safeStart, safeStart + normalizedLimit);
+  const consumed = safeStart + files.length;
+  const remaining = Math.max(0, paths.length - consumed);
+  return {
+    files,
+    total: paths.length,
+    remaining,
+    nextCursor: remaining > 0 ? files[files.length - 1] ?? cursor ?? null : null,
+    finished: remaining === 0
+  };
+}
+
+async function indexLocalMirrorPaths(input: {
+  registration: RepoRegistration;
+  branch: string;
+  commitSha: string;
+  rootDir: string;
+  paths: string[];
+}): Promise<number> {
+  let indexed = 0;
+  for (const relativePath of input.paths) {
+    const absolutePath = path.join(input.rootDir, relativePath);
+    const content = await readFile(absolutePath, "utf8").catch(() => "");
+    if (!content.trim()) continue;
+    await indexDocumentContent({
+      registration: input.registration,
+      branch: input.branch,
+      commitSha: input.commitSha,
+      path: relativePath,
+      content
+    });
+    indexed += 1;
+  }
+  return indexed;
+}
+
+function getLocalMirrorCursor(job: SyncJob): string | undefined {
+  const cursor = job.payload_json?.cursor;
+  return typeof cursor === "string" && cursor.trim() ? cursor.trim() : undefined;
 }
 
 function pickDefaultPublicBaseUrl(repoUrl: string, explicit?: string): string | undefined {
@@ -99,6 +243,14 @@ async function resolveRegistrationBranch(
   requestedBranch?: string,
   actor = "system"
 ): Promise<{ registration: RepoRegistration; branch: string; corrected: boolean }> {
+  const localMirror = await getLocalDocsMirrorState(registration);
+  if (localMirror) {
+    return {
+      registration,
+      branch: requestedBranch?.trim() || localMirror.branch || registration.default_branch,
+      corrected: false
+    };
+  }
   const candidate = requestedBranch?.trim() || registration.default_branch;
   try {
     await getBranchHead(registration, candidate);
@@ -133,6 +285,10 @@ async function resolveBranchForRegistrationInput(input: {
   pollingIntervalSeconds: number;
   actor: string;
 }): Promise<string> {
+  if (isDocsComRepo(input.repoOwner, input.repoName) && (await pathExists(env.LOCAL_DOCS_COM_PATH))) {
+    const localBranch = readGitValue(env.LOCAL_DOCS_COM_PATH, ["rev-parse", "--abbrev-ref", "HEAD"], input.defaultBranch || "master");
+    return input.defaultBranch?.trim() || localBranch;
+  }
   const candidate = input.defaultBranch?.trim();
   const probe: RepoRegistration = {
     id: "probe",
@@ -237,6 +393,125 @@ function toSearchableApiText(apiDoc: Record<string, unknown>): string {
     .join("\n");
 }
 
+function uniqueStrings(input: Array<string | undefined | null>, limit = 6): string[] {
+  const seen = new Set<string>();
+  const values: string[] = [];
+  for (const item of input) {
+    const value = String(item ?? "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    values.push(value);
+    if (values.length >= limit) break;
+  }
+  return values;
+}
+
+function findMatches(input: string, pattern: RegExp, limit = 6): string[] {
+  const matches = [...input.matchAll(pattern)].map((item) => item[1]?.trim()).filter(Boolean);
+  return uniqueStrings(matches, limit);
+}
+
+function inferProductArea(path: string, content: string): string {
+  const normalizedPath = path.toLowerCase();
+  const normalizedContent = content.toLowerCase();
+  if (normalizedPath.includes("/openapi/")) return "openapi";
+  if (normalizedPath.includes("/integrations/") || /oauth|sso|webhook|github|gitlab|slack|teams/.test(normalizedContent)) return "integrations";
+  if (normalizedPath.includes("/wiki/") || /wiki|page group|space/.test(normalizedContent)) return "wiki";
+  if (normalizedPath.includes("/deploy-docs/") || /kubernetes|pod|pvc|volume|cluster/.test(normalizedContent)) return "deployment";
+  if (/issue|project|sprint|field|comment|attachment/.test(normalizedContent)) return "project_management";
+  return "general";
+}
+
+function inferDeploymentModel(path: string, content: string): string {
+  const normalizedPath = path.toLowerCase();
+  const normalizedContent = content.toLowerCase();
+  if (normalizedPath.includes("/deploy-docs/") || /private deployment|私有部署|本地部署|on-prem/i.test(content)) return "private_deployment";
+  if (/public cloud|公有云|saas/i.test(content)) return "public_cloud";
+  return "shared";
+}
+
+function inferEvidenceKind(path: string, title: string, content: string): string {
+  const normalizedPath = path.toLowerCase();
+  const normalizedTitle = title.toLowerCase();
+  const normalizedContent = content.toLowerCase();
+  if (normalizedPath.includes("/openapi/")) return "api_operation";
+  if (normalizedPath.includes("/troubleshooting/") || /troubleshoot|troubleshooting|排查|故障/.test(normalizedTitle)) return "troubleshooting";
+  if (/limitation|限制|注意事项|not supported|unsupported/.test(normalizedContent)) return "constraint";
+  if (/how to|步骤|guide|配置|setup|configure/.test(normalizedTitle) || normalizedPath.includes("/guide/")) return "procedure";
+  return "capability";
+}
+
+function extractVersionScope(content: string): string[] {
+  return uniqueStrings(
+    [
+      ...findMatches(content, /Added in:\s*([^\n|]+)/gi, 4),
+      ...findMatches(content, /版本[：:]\s*([^\n]+)/gi, 2)
+    ],
+    6
+  );
+}
+
+function extractSupportEvidenceMetadata(input: {
+  path: string;
+  title: string;
+  content: string;
+  apiDoc?: Record<string, unknown> | null;
+  inherited?: Record<string, unknown>;
+}): Record<string, unknown> {
+  const inherited = input.inherited ?? {};
+  const evidenceKind = inferEvidenceKind(input.path, input.title, input.content);
+  const productArea = inferProductArea(input.path, input.content);
+  const deploymentModel = inferDeploymentModel(input.path, input.content);
+  const permissions = uniqueStrings([
+    ...(Array.isArray(input.apiDoc?.security)
+      ? (input.apiDoc?.security as Array<Record<string, unknown>>).flatMap((item) =>
+          Object.values(item).flatMap((value) => (Array.isArray(value) ? value.map((scope) => String(scope)) : []))
+        )
+      : []),
+    ...findMatches(input.content, /(?:scope|权限)[：:\s`]*([A-Za-z0-9:_-]+)/gi, 6)
+  ]);
+  const appliesTo = uniqueStrings([
+    deploymentModel === "public_cloud" ? "public_cloud" : undefined,
+    deploymentModel === "private_deployment" ? "private_deployment" : undefined,
+    productArea !== "general" ? productArea : undefined
+  ]);
+  const limitations = uniqueStrings([
+    ...findMatches(input.content, /(?:限制|注意|Limitations?|Notes?)[：:\s-]*([^\n.。]+)/gi, 6),
+    ...(String(input.content).includes("not a bulk export") ? ["not a bulk export endpoint"] : [])
+  ]);
+  const prerequisites = uniqueStrings([
+    ...findMatches(input.content, /(?:Prerequisites?|前提|需要|必须)[：:\s-]*([^\n.。]+)/gi, 6),
+    ...permissions.map((scope) => `scope:${scope}`)
+  ]);
+  const actions = uniqueStrings([
+    String(input.apiDoc?.method ?? ""),
+    ...findMatches(input.content, /\b(create|update|delete|get|list|search|export|import|configure|deploy|escalate)\b/gi, 6)
+  ]);
+  const objects = uniqueStrings([
+    String(input.apiDoc?.path ?? "")
+      .split("/")
+      .filter((segment) => segment && !segment.startsWith("{"))
+      .slice(-2)
+      .join("/"),
+    ...findMatches(input.content, /\b(issue|comment|attachment|project|wiki|space|page|sprint|field|token|oauth|ticket)\b/gi, 6)
+  ]);
+  const versionScope = extractVersionScope(input.content);
+
+  return {
+    ...inherited,
+    evidence_kind: evidenceKind,
+    applies_to: appliesTo,
+    product_area: productArea,
+    deployment_model: deploymentModel,
+    objects,
+    actions,
+    permissions,
+    prerequisites,
+    limitations,
+    version_scope: versionScope
+  };
+}
+
 function enrichIndexableContent(path: string, rawContent: string): string {
   if (!/open-docs\/docs\/openapi\/api\/.+\.api\.mdx$/i.test(path)) {
     return rawContent;
@@ -296,7 +571,7 @@ function cleanSnippet(raw: string): string {
     .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 240);
+    .slice(0, 600);
 }
 
 function isOpenApiPath(path: string): boolean {
@@ -495,6 +770,16 @@ async function embedWithRetry(text: string): Promise<{ vectorLiteral: string; mo
   throw lastError ?? new Error("Embedding failed");
 }
 
+async function embedChunkBestEffort(
+  text: string
+): Promise<{ vectorLiteral: string; model: string; version: string } | null> {
+  try {
+    return await embedWithRetry(text);
+  } catch {
+    return null;
+  }
+}
+
 function isTransientDbError(error: unknown): boolean {
   const message = (error as Error)?.message?.toLowerCase?.() ?? "";
   return (
@@ -533,17 +818,41 @@ export async function retrieveKnowledgeWithRetry(input: {
 
 async function indexDocument(registration: RepoRegistration, branch: string, commitSha: string, path: string): Promise<void> {
   const content = await getFileContentAtCommit(registration, path, commitSha);
+  await indexDocumentContent({
+    registration,
+    branch,
+    commitSha,
+    path,
+    content
+  });
+}
+
+async function indexDocumentContent(input: {
+  registration: RepoRegistration;
+  branch: string;
+  commitSha: string;
+  path: string;
+  content: string;
+}): Promise<void> {
+  const { registration, branch, commitSha, path, content } = input;
   const normalizedContent = enrichIndexableContent(path, content);
   const contentHash = sha256(content);
   const repoSourceUrl = buildSourceUrl(registration, path, commitSha);
   const publicSourceUrl = buildPublicSourceUrl(registration, path, content);
   let title = pickTitle(path, normalizedContent);
+  let apiDoc: Record<string, unknown> | null = null;
   if (isOpenApiPath(path)) {
-    const apiDoc = decodeOpenApiBlob(content);
+    apiDoc = decodeOpenApiBlob(content);
     if (apiDoc) {
       title = buildOpenApiTitle(apiDoc, path);
     }
   }
+  const docSupportEvidence = extractSupportEvidenceMetadata({
+    path,
+    title,
+    content: normalizedContent,
+    apiDoc
+  });
   const doc = await repo.upsertDocument({
     repoId: registration.id,
     branch,
@@ -560,7 +869,8 @@ async function indexDocument(registration: RepoRegistration, branch: string, com
       contentTransform: normalizedContent === content ? "none" : "openapi_api_blob_decode",
       publicSourceUrlResolved: Boolean(publicSourceUrl),
       includePaths: registration.include_paths,
-      excludePaths: registration.exclude_paths
+      excludePaths: registration.exclude_paths,
+      supportEvidence: docSupportEvidence
     }
   });
 
@@ -573,7 +883,14 @@ async function indexDocument(registration: RepoRegistration, branch: string, com
   });
 
   for (const chunk of chunks) {
-    const embedded = await embedWithRetry(chunk.content);
+    const chunkSupportEvidence = extractSupportEvidenceMetadata({
+      path,
+      title: String(chunk.metadata.sectionTitle ?? title),
+      content: chunk.content,
+      apiDoc,
+      inherited: docSupportEvidence
+    });
+    const embedded = await embedChunkBestEffort(chunk.content);
     await repo.upsertChunk({
       id: chunk.id,
       docId: doc.id,
@@ -586,15 +903,106 @@ async function indexDocument(registration: RepoRegistration, branch: string, com
       content: chunk.content,
       contentHash: chunk.contentHash,
       tokenCount: chunk.tokenCount,
-      metadata: chunk.metadata,
-      embedding: embedded.vectorLiteral,
-      embeddingModel: embedded.model,
-      embeddingVersion: embedded.version
+      metadata: {
+        ...chunk.metadata,
+        supportEvidence: chunkSupportEvidence,
+        embeddingState: embedded ? "ready" : "missing"
+      },
+      embedding: embedded?.vectorLiteral ?? null,
+      embeddingModel: embedded?.model ?? null,
+      embeddingVersion: embedded?.version ?? null
     });
   }
 }
 
-async function runFullSync(job: SyncJob, registration: RepoRegistration): Promise<{ indexed: number; deactivated: number; head: string }> {
+async function runLocalMirrorFullSync(
+  job: SyncJob,
+  registration: RepoRegistration,
+  localMirror: { rootDir: string; head: string; branch: string }
+): Promise<LocalMirrorBatchResult> {
+  const branch = job.branch || localMirror.branch || registration.default_branch;
+  return runLocalMirrorSyncBatch({
+    registration,
+    branch,
+    localMirror,
+    cursor: getLocalMirrorCursor(job),
+    limit: env.GITHUB_KB_LOCAL_MIRROR_BATCH_SIZE
+  });
+}
+
+async function runLocalMirrorSyncBatch(input: {
+  registration: RepoRegistration;
+  branch: string;
+  localMirror: { rootDir: string; head: string; branch: string };
+  cursor?: string;
+  limit: number;
+}): Promise<LocalMirrorBatchResult> {
+  const markdownFiles = await collectLocalMirrorSnapshot(input.registration, input.localMirror);
+  const window = sliceSnapshotForBackfill(markdownFiles, input.cursor, input.limit);
+  const indexed = await indexLocalMirrorPaths({
+    registration: input.registration,
+    branch: input.branch,
+    commitSha: input.localMirror.head,
+    rootDir: input.localMirror.rootDir,
+    paths: window.files
+  });
+
+  let deactivated = 0;
+  if (window.finished) {
+    deactivated = await repo.deactivateDocumentsMissingFromSnapshot(input.registration.id, input.branch, markdownFiles);
+    await repo.upsertCheckpoint({
+      repoId: input.registration.id,
+      branch: input.branch,
+      lastSyncedCommitSha: input.localMirror.head,
+      fullSync: true
+    });
+  }
+
+  return {
+    indexed,
+    deactivated,
+    head: input.localMirror.head,
+    total: window.total,
+    remaining: window.remaining,
+    nextCursor: window.nextCursor,
+    finished: window.finished
+  };
+}
+
+function buildSyntheticSyncJob(input: {
+  repoId: string;
+  branch: string;
+  mode: "full" | "incremental" | "reindex";
+  source: KbSyncSource;
+}): SyncJob {
+  const now = new Date().toISOString();
+  return {
+    id: `synthetic-${Date.now()}`,
+    repo_id: input.repoId,
+    branch: input.branch,
+    sync_mode: input.mode,
+    source: input.source,
+    status: "running",
+    idempotency_key: `synthetic:${input.repoId}:${input.branch}:${input.mode}:${Date.now()}`,
+    before_commit_sha: null,
+    after_commit_sha: null,
+    payload_json: {},
+    attempts: 0,
+    max_attempts: 1,
+    next_run_at: now,
+    started_at: now,
+    finished_at: null,
+    error_message: null,
+    created_at: now,
+    updated_at: now
+  };
+}
+
+async function runFullSync(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
+  const localMirror = await getLocalDocsMirrorState(registration);
+  if (localMirror) {
+    return runLocalMirrorFullSync(job, registration, localMirror);
+  }
   const resolved = await resolveRegistrationBranch(registration, job.branch, "sync_worker");
   const branch = resolved.branch;
   const effectiveRegistration = resolved.registration;
@@ -621,10 +1029,20 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
     fullSync: true
   });
 
-  return { indexed: markdownFiles.length, deactivated, head };
+  return { indexed: markdownFiles.length, deactivated, head, finished: true, nextCursor: null };
 }
 
-async function runIncrementalSync(job: SyncJob, registration: RepoRegistration): Promise<{ indexed: number; removed: number; head: string }> {
+async function runIncrementalSync(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
+  const localMirror = await getLocalDocsMirrorState(registration);
+  if (localMirror) {
+    const branch = job.branch || localMirror.branch || registration.default_branch;
+    const checkpoint = await repo.getCheckpoint(registration.id, branch);
+    if (checkpoint?.last_synced_commit_sha && checkpoint.last_synced_commit_sha === localMirror.head) {
+      return { indexed: 0, removed: 0, head: localMirror.head, finished: true, nextCursor: null };
+    }
+    const full = await runLocalMirrorFullSync({ ...job, branch }, registration, localMirror);
+    return { indexed: full.indexed, removed: full.deactivated, head: full.head, finished: full.finished, nextCursor: full.nextCursor };
+  }
   const resolved = await resolveRegistrationBranch(registration, job.branch, "sync_worker");
   const branch = resolved.branch;
   const effectiveRegistration = resolved.registration;
@@ -634,11 +1052,11 @@ async function runIncrementalSync(job: SyncJob, registration: RepoRegistration):
 
   if (!before) {
     const full = await runFullSync({ ...job, branch }, effectiveRegistration);
-    return { indexed: full.indexed, removed: full.deactivated, head: full.head };
+    return { indexed: full.indexed, removed: full.deactivated, head: full.head, finished: full.finished, nextCursor: full.nextCursor };
   }
 
   if (before === after) {
-    return { indexed: 0, removed: 0, head: after };
+    return { indexed: 0, removed: 0, head: after, finished: true, nextCursor: null };
   }
 
   const changed = await compareCommits(effectiveRegistration, before, after);
@@ -671,12 +1089,29 @@ async function runIncrementalSync(job: SyncJob, registration: RepoRegistration):
     fullSync: false
   });
 
-  return { indexed: toIndex.size, removed, head: after };
+  return { indexed: toIndex.size, removed, head: after, finished: true, nextCursor: null };
 }
 
-async function runReindex(job: SyncJob, registration: RepoRegistration): Promise<{ indexed: number; head: string }> {
+async function runReindex(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
   const full = await runFullSync({ ...job, sync_mode: "full" }, registration);
-  return { indexed: full.indexed, head: full.head };
+  return { indexed: full.indexed, head: full.head, finished: full.finished, nextCursor: full.nextCursor };
+}
+
+async function enqueueLocalMirrorContinuation(job: SyncJob, registration: RepoRegistration, result: SyncExecutionResult): Promise<void> {
+  if (result.finished || !result.nextCursor) return;
+  await enqueueSyncJob({
+    repoId: registration.id,
+    branch: job.branch,
+    mode: job.sync_mode,
+    source: job.source,
+    beforeCommitSha: job.before_commit_sha ?? undefined,
+    afterCommitSha: result.head,
+    payload: {
+      ...job.payload_json,
+      cursor: result.nextCursor
+    },
+    idempotencyKey: `local-mirror:${job.sync_mode}:${registration.id}:${job.branch}:${result.head}:${result.nextCursor}`
+  });
 }
 
 export async function validateStartupConfig(): Promise<{ healthy: boolean; checkedRepos: number }> {
@@ -688,6 +1123,11 @@ export async function validateStartupConfig(): Promise<{ healthy: boolean; check
   let healthy = true;
 
   for (const registration of repos) {
+    const localMirror = await getLocalDocsMirrorState(registration);
+    if (localMirror) {
+      await repo.setRepoValidation(registration.id, null);
+      continue;
+    }
     const validation = await validateReadOnlyAccess(registration).catch((error) => ({
       ok: false,
       scopes: [],
@@ -737,11 +1177,18 @@ export async function registerRepository(input: {
   });
   await repo.deactivateOtherRepoRegistrations(parsed.owner, parsed.name, registration.id);
 
-  const validation = await validateReadOnlyAccess(registration).catch((error) => ({
-    ok: false,
-    scopes: [],
-    message: (error as Error).message
-  }));
+  const localMirror = await getLocalDocsMirrorState(registration);
+  const validation = localMirror
+    ? {
+        ok: true,
+        scopes: ["local_mirror"],
+        message: "validated via local docs-com mirror"
+      }
+    : await validateReadOnlyAccess(registration).catch((error) => ({
+        ok: false,
+        scopes: [],
+        message: (error as Error).message
+      }));
 
   await repo.setRepoValidation(registration.id, validation.ok ? null : validation.message);
 
@@ -769,7 +1216,10 @@ export async function enqueueSyncJob(input: {
   if (!registration || !registration.is_active) {
     throw new Error(`Repository registration not found or inactive: ${input.repoId}`);
   }
-  const resolved = await resolveRegistrationBranch(registration, input.branch, "sync_enqueue");
+  const localMirror = await getLocalDocsMirrorState(registration);
+  const resolved = localMirror
+    ? { registration, branch: input.branch?.trim() || localMirror.branch || registration.default_branch }
+    : await resolveRegistrationBranch(registration, input.branch, "sync_enqueue");
   const idempotencyKey =
     input.idempotencyKey ??
     `${input.mode}:${resolved.registration.id}:${resolved.branch}:${input.beforeCommitSha ?? "none"}:${input.afterCommitSha ?? Date.now()}`;
@@ -800,13 +1250,18 @@ export async function runDueSyncJobs(limit: number): Promise<{ processed: number
         throw new Error(`Repository registration not found or inactive: ${job.repo_id}`);
       }
 
-      const validation = await validateReadOnlyAccess(registration);
-      if (!validation.ok) {
-        throw new Error(`Read-only validation failed: ${validation.message}`);
+      const localMirror = await getLocalDocsMirrorState(registration);
+      if (!localMirror) {
+        const validation = await validateReadOnlyAccess(registration);
+        if (!validation.ok) {
+          throw new Error(`Read-only validation failed: ${validation.message}`);
+        }
       }
 
+      let executionResult: SyncExecutionResult;
       if (job.sync_mode === "full") {
         const result = await runFullSync(job, registration);
+        executionResult = result;
         await repo.recordMetric({
           repoId: registration.id,
           metricName: "kb_full_sync_docs",
@@ -815,6 +1270,7 @@ export async function runDueSyncJobs(limit: number): Promise<{ processed: number
         });
       } else if (job.sync_mode === "incremental") {
         const result = await runIncrementalSync(job, registration);
+        executionResult = result;
         await repo.recordMetric({
           repoId: registration.id,
           metricName: "kb_incremental_sync_docs",
@@ -823,12 +1279,17 @@ export async function runDueSyncJobs(limit: number): Promise<{ processed: number
         });
       } else {
         const result = await runReindex(job, registration);
+        executionResult = result;
         await repo.recordMetric({
           repoId: registration.id,
           metricName: "kb_reindex_docs",
           metricValue: result.indexed,
           tags: { branch: job.branch, commit: result.head }
         });
+      }
+
+      if (localMirror) {
+        await enqueueLocalMirrorContinuation(job, registration, executionResult);
       }
 
       await repo.markSyncJobSucceeded(job.id);
@@ -867,6 +1328,25 @@ export async function pollAndEnqueueIncremental(limit = env.GITHUB_KB_POLL_BATCH
   let enqueued = 0;
 
   for (const registration of registrations.slice(0, limit)) {
+    const localMirror = await getLocalDocsMirrorState(registration);
+    if (localMirror) {
+      const branch = localMirror.branch || registration.default_branch;
+      const checkpoint = await repo.getCheckpoint(registration.id, branch);
+      if (checkpoint?.last_synced_commit_sha === localMirror.head) {
+        continue;
+      }
+      await enqueueSyncJob({
+        repoId: registration.id,
+        branch,
+        mode: checkpoint?.last_synced_commit_sha ? "incremental" : "full",
+        source: "polling",
+        beforeCommitSha: checkpoint?.last_synced_commit_sha ?? undefined,
+        afterCommitSha: localMirror.head,
+        idempotencyKey: `poll:local:${registration.id}:${branch}:${checkpoint?.last_synced_commit_sha ?? "none"}:${localMirror.head}`
+      });
+      enqueued += 1;
+      continue;
+    }
     const resolved = await resolveRegistrationBranch(registration, registration.default_branch, "polling");
     const branch = resolved.branch;
     const effectiveRegistration = resolved.registration;
@@ -894,6 +1374,58 @@ export async function pollAndEnqueueIncremental(limit = env.GITHUB_KB_POLL_BATCH
 
 export async function listSyncJobs(limit = 50) {
   return repo.listRecentSyncJobs(limit);
+}
+
+export async function backfillRepositoryFromLocalMirror(
+  repoId?: string,
+  options?: { cursor?: string; limit?: number }
+): Promise<{
+  repoId: string;
+  repo: string;
+  branch: string;
+  indexed: number;
+  deactivated: number;
+  head: string;
+  total: number;
+  remaining: number;
+  nextCursor: string | null;
+  finished: boolean;
+}> {
+  const registration = repoId
+    ? await repo.getRepoRegistrationById(repoId)
+    : (await repo.listActiveRepoRegistrations()).find((item) => isDocsComRegistration(item)) ?? null;
+  if (!registration || !registration.is_active) {
+    throw new Error(`Repository registration not found or inactive: ${repoId ?? "docs-com"}`);
+  }
+
+  const localMirror = await getLocalDocsMirrorState(registration);
+  if (!localMirror) {
+    throw new Error("Local docs-com mirror is not available");
+  }
+
+  const branch = registration.default_branch;
+  const batch = await runLocalMirrorSyncBatch({
+    registration,
+    branch,
+    localMirror,
+    cursor: options?.cursor,
+    limit: options?.limit ?? env.GITHUB_KB_LOCAL_MIRROR_BATCH_SIZE
+  });
+
+  await repo.setRepoValidation(registration.id, null);
+
+  return {
+    repoId: registration.id,
+    repo: `${registration.repo_owner}/${registration.repo_name}`,
+    branch,
+    indexed: batch.indexed,
+    deactivated: batch.deactivated,
+    head: batch.head,
+    total: batch.total,
+    remaining: batch.remaining,
+    nextCursor: batch.nextCursor,
+    finished: batch.finished
+  };
 }
 
 function verifyWebhookSignature(payload: Record<string, unknown>, signature?: string): boolean {

@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { env } from "../../config/env.js";
+import { fetchWithNodeCompat } from "../../utils/fetch-compat.js";
 
 function hashToUnitFloat(input: string): number {
   const digest = crypto.createHash("sha256").update(input).digest();
@@ -43,18 +44,31 @@ export async function embedText(text: string): Promise<{ vector: number[]; model
     throw new Error("GITHUB_KB_EMBEDDING_API_KEY is required when embedding provider is openai");
   }
 
-  const response = await fetch(`${env.GITHUB_KB_EMBEDDING_API_BASE.replace(/\/$/, "")}/embeddings`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${env.GITHUB_KB_EMBEDDING_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: env.GITHUB_KB_EMBEDDING_MODEL,
-      input: text,
-      encoding_format: "float"
-    })
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), env.GITHUB_KB_EMBEDDING_TIMEOUT_MS);
+  let response: Awaited<ReturnType<typeof fetchWithNodeCompat>>;
+  try {
+    response = await fetchWithNodeCompat(`${env.GITHUB_KB_EMBEDDING_API_BASE.replace(/\/$/, "")}/embeddings`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${env.GITHUB_KB_EMBEDDING_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: env.GITHUB_KB_EMBEDDING_MODEL,
+        input: text,
+        encoding_format: "float"
+      }),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if ((error as Error)?.name === "AbortError") {
+      throw new Error(`Embedding API timed out after ${env.GITHUB_KB_EMBEDDING_TIMEOUT_MS}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     const body = await response.text();

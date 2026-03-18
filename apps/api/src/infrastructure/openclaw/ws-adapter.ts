@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import { WebSocket } from "ws";
 import { env } from "../../config/env.js";
@@ -9,11 +10,21 @@ import type {
   OpenClawClassifyIntentInput,
   OpenClawClassifyIntentOutput,
   OpenClawRuntimeContext,
+  OpenClawSupportPlannerInput,
+  OpenClawSupportVerifierInput,
+  OpenClawSupportWriterInput,
   OpenClawSearchAnswerInput,
   OpenClawSearchAnswerOutput,
   OpenClawSearchInput,
   OpenClawSearchOutput
 } from "./types.js";
+import type {
+  DraftSupportAnswer,
+  SupportCaseFrame,
+  SupportEvidenceBundle,
+  SupportVerificationResult,
+  TriageSupportInsight
+} from "../../modules/ai/types.js";
 
 interface RpcReq {
   type: "req";
@@ -36,6 +47,107 @@ type OpenClawChatAttachment = {
   mimeType: string;
   content: string;
 };
+
+type SessionLifecycleStage =
+  | "search-answer"
+  | "planner"
+  | "support-writer"
+  | "support-verifier"
+  | "triage-writer"
+  | "triage-verifier"
+  | "classify"
+  | "ticket-analyze"
+  | "kb-search"
+  | "json-prompt";
+
+type ManagedRunSession = {
+  sessionKey: string;
+  baseSessionKey: string;
+  stage: SessionLifecycleStage;
+  createdAt: number;
+  lastUsedAt: number;
+  endedAt: number | null;
+};
+
+const managedRunSessions = new Map<string, ManagedRunSession>();
+
+function sanitizeSessionPart(input: string): string {
+  return input.replace(/[^a-zA-Z0-9:_-]/g, "_").slice(0, 180);
+}
+
+function compactSupportMetadata(metadata: unknown): Record<string, unknown> | undefined {
+  const value = (metadata ?? {}) as Record<string, unknown>;
+  const permissions = Array.isArray(value.permissions) ? value.permissions.map((item) => String(item)).slice(0, 4) : [];
+  const prerequisites = Array.isArray(value.prerequisites) ? value.prerequisites.map((item) => String(item)).slice(0, 3) : [];
+  const limitations = Array.isArray(value.limitations) ? value.limitations.map((item) => String(item)).slice(0, 3) : [];
+  const compact = {
+    evidence_kind: typeof value.evidence_kind === "string" ? value.evidence_kind : undefined,
+    product_area: typeof value.product_area === "string" ? value.product_area : undefined,
+    deployment_model: typeof value.deployment_model === "string" ? value.deployment_model : undefined,
+    permissions,
+    prerequisites,
+    limitations
+  };
+  return Object.values(compact).some((item) => (Array.isArray(item) ? item.length > 0 : Boolean(item))) ? compact : undefined;
+}
+
+function compactEvidenceBundle(
+  bundle: SupportEvidenceBundle,
+  options?: { primaryLimit?: number; supplementalLimit?: number; snippetMax?: number }
+) {
+  const primaryLimit = options?.primaryLimit ?? 3;
+  const supplementalLimit = options?.supplementalLimit ?? 2;
+  const snippetMax = options?.snippetMax ?? 220;
+  const trimReference = (reference: SupportEvidenceBundle["primary"][number]) => ({
+    documentId: reference.documentId,
+    title: reference.title,
+    headingPath: reference.headingPath,
+    sourceUrl: reference.sourceUrl,
+    path: reference.path,
+    snippet: reference.snippet.slice(0, snippetMax),
+    score: reference.score,
+    supportMetadata: compactSupportMetadata(reference.supportMetadata)
+  });
+
+  return {
+    primary: bundle.primary.slice(0, primaryLimit).map(trimReference),
+    supplemental: bundle.supplemental.slice(0, supplementalLimit).map(trimReference),
+    evidence_gaps: bundle.evidence_gaps.slice(0, 3),
+    confidence: bundle.confidence,
+    fallbackUsed: bundle.fallbackUsed,
+    resolvedQueries: bundle.resolvedQueries.slice(0, 4)
+  };
+}
+
+function compactDraftSupportAnswerForVerification(answer?: DraftSupportAnswer) {
+  if (!answer) return undefined;
+  return {
+    direct_answer: answer.direct_answer,
+    claims: answer.claims.slice(0, 6),
+    next_actions: answer.next_actions.slice(0, 4),
+    unknowns: answer.unknowns.slice(0, 3),
+    escalation_needed: answer.escalation_needed
+  };
+}
+
+function compactTriageInsightForVerification(insight?: TriageSupportInsight) {
+  if (!insight) return undefined;
+  return {
+    direct_answer: insight.direct_answer,
+    recommended_action: insight.recommended_action,
+    customer_reply: insight.customer_reply,
+    customer_reply_policy: insight.customer_reply_policy,
+    support_summary: insight.support_summary,
+    verified_evidence: insight.verified_evidence.slice(0, 4),
+    risk_flags: insight.risk_flags.slice(0, 4),
+    missing_info: insight.missing_info.slice(0, 3),
+    verifier_verdict: insight.verifier_verdict
+  };
+}
+
+function roundMs(value: number): number {
+  return Math.max(0, Math.round(value));
+}
 
 export class WsOpenClawAdapter implements OpenClawAdapter {
   private consecutiveFailures = 0;
@@ -164,9 +276,10 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         ...(input.draftAnswer && input.draftAnswer.style !== "clarification" ? [`draft_answer: ${JSON.stringify(input.draftAnswer)}`] : [])
       ].join("\n");
 
-      const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments);
-      await this.waitAgentRun(runId);
-      const text = await this.fetchLatestAssistantText(runtime);
+      const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "search-answer");
+      const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments, sessionKey);
+      await this.waitAgentRun(runId, sessionKey);
+      const text = await this.fetchLatestAssistantText(sessionKey);
       const parsed = this.parseFirstJson(text) as Partial<OpenClawSearchAnswerOutput>;
       return {
         answer: typeof parsed.answer === "string" ? parsed.answer : typeof parsed.summary === "string" ? parsed.summary : "",
@@ -179,6 +292,244 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         suggested_next_step: parsed.suggested_next_step
       };
     });
+  }
+
+  async planSupportCase(
+    input: OpenClawSupportPlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportCaseFrame> {
+    const prompt = [
+      "You are a support case planner for ONES.",
+      "Return ONLY valid JSON with keys:",
+      "goal, symptom, object, action_type, deployment_model, product_area, constraints(string[]), missing_critical_info(string[]), retrieval_queries(string[]), query_plan({concept_queries:string[], object_queries:string[], behavior_queries:string[]})",
+      "Rules:",
+      "- Summarize the user goal and symptom crisply.",
+      "- Propose 2 to 4 retrieval queries optimized for a documentation knowledge base.",
+      "- Only put genuinely blocking items into missing_critical_info.",
+      "- Keep deployment_model to one of: public_cloud, private_deployment, shared, unknown.",
+      "- Keep product_area concise.",
+      `context_type: ${input.contextType}`,
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      ...(input.conversationHistory?.length
+        ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
+        : []),
+      ...(input.ticketContext
+        ? [
+            `ticket_priority: ${input.ticketContext.priority}`,
+            `customer_meta: ${JSON.stringify(input.ticketContext.customerMeta)}`,
+            `ticket_history: ${JSON.stringify(input.ticketContext.history.slice(-6))}`
+          ]
+        : [])
+    ].join("\n");
+
+    const parsed = (await this.runJsonPrompt(prompt, `${idempotencyKey}:planner`, runtime, undefined, "planner")) as Partial<SupportCaseFrame>;
+    const queryPlan = (parsed.query_plan as unknown as Record<string, unknown> | undefined) ?? undefined;
+    return {
+      goal: typeof parsed.goal === "string" ? parsed.goal : input.query,
+      symptom: typeof parsed.symptom === "string" ? parsed.symptom : input.query,
+      object: typeof parsed.object === "string" ? parsed.object : "unspecified",
+      action_type: typeof parsed.action_type === "string" ? parsed.action_type : "troubleshooting",
+      deployment_model: typeof parsed.deployment_model === "string" ? parsed.deployment_model : "unknown",
+      product_area: typeof parsed.product_area === "string" ? parsed.product_area : "general",
+      constraints: Array.isArray(parsed.constraints) ? parsed.constraints.map((item) => String(item)) : [],
+      missing_critical_info: Array.isArray(parsed.missing_critical_info) ? parsed.missing_critical_info.map((item) => String(item)) : [],
+      retrieval_queries: Array.isArray(parsed.retrieval_queries) ? parsed.retrieval_queries.map((item) => String(item)).filter(Boolean) : [input.query],
+      query_plan:
+        queryPlan && typeof queryPlan === "object"
+          ? {
+              concept_queries: Array.isArray(queryPlan.concept_queries)
+                ? (queryPlan.concept_queries as unknown[]).map((item) => String(item)).filter(Boolean)
+                : [],
+              object_queries: Array.isArray(queryPlan.object_queries)
+                ? (queryPlan.object_queries as unknown[]).map((item) => String(item)).filter(Boolean)
+                : [],
+              behavior_queries: Array.isArray(queryPlan.behavior_queries)
+                ? (queryPlan.behavior_queries as unknown[]).map((item) => String(item)).filter(Boolean)
+                : []
+            }
+          : undefined
+    };
+  }
+
+  async writeSupportAnswer(
+    input: OpenClawSupportWriterInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<DraftSupportAnswer> {
+    const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
+      primaryLimit: 2,
+      supplementalLimit: 1,
+      snippetMax: 180
+    });
+    const prompt = [
+      "You are a support engineer agent for ONES.",
+      "Return ONLY valid JSON:",
+      "direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean)",
+      "Rules:",
+      "- Answer the user first. Do not output framework words like verification or evidence gap.",
+      "- Claims about APIs, parameters, scopes, permissions, limits, deployment, and versions must be grounded in evidence.",
+      "- Use grounded_inference only when multiple canonical snippets strongly imply the conclusion.",
+      "- Use operational_advice for safe next-step guidance.",
+      "- unknown is for unresolved items that still need confirmation.",
+      "- Never say 'refer to the doc' or 'follow the documentation'. State the relevant content directly.",
+      `context_type: ${input.contextType}`,
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      `case_frame: ${JSON.stringify(input.caseFrame)}`,
+      `evidence_bundle: ${JSON.stringify(compactBundle)}`,
+      ...(input.conversationHistory?.length
+        ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
+        : [])
+    ].join("\n");
+
+    const parsed = (await this.runJsonPrompt(
+      prompt,
+      `${idempotencyKey}:support-writer`,
+      runtime,
+      undefined,
+      "support-writer"
+    )) as Partial<DraftSupportAnswer>;
+    return {
+      direct_answer: typeof parsed.direct_answer === "string" ? parsed.direct_answer : "",
+      claims: Array.isArray(parsed.claims)
+        ? parsed.claims
+            .map((item) => item as unknown as Record<string, unknown>)
+            .map((item): DraftSupportAnswer["claims"][number] => ({
+              text: typeof item.text === "string" ? item.text : "",
+              kind:
+                item.kind === "grounded_inference"
+                  ? "grounded_inference"
+                  : item.kind === "operational_advice"
+                  ? "operational_advice"
+                  : item.kind === "unknown"
+                  ? "unknown"
+                  : "verified_fact",
+              evidence_ids: Array.isArray(item.evidence_ids) ? item.evidence_ids.map((value) => String(value)).filter(Boolean) : [],
+              authority: item.authority === "assistive" ? "assistive" : "canonical"
+            }))
+            .filter((item) => item.text)
+        : [],
+      next_actions: Array.isArray(parsed.next_actions) ? parsed.next_actions.map((item) => String(item)).filter(Boolean) : [],
+      unknowns: Array.isArray(parsed.unknowns) ? parsed.unknowns.map((item) => String(item)).filter(Boolean) : [],
+      escalation_needed: Boolean(parsed.escalation_needed)
+    };
+  }
+
+  async verifySupportAnswer(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult> {
+    const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
+      primaryLimit: 2,
+      supplementalLimit: 1,
+      snippetMax: 140
+    });
+    const prompt = [
+      "Verify whether the support answer is supported by the evidence.",
+      "Return ONLY valid JSON:",
+      "verdict(verified|partial|unsupported), summary, unsupported_claims(string[]), missing_info(string[]), verified_citation_ids(string[]), verified_claims(string[]), claim_to_citation_map([{text, kind, verdict(verified|supported_inference|unsupported), citation_ids(string[])}])",
+      "Rules:",
+      "- Capabilities, APIs, parameters, scopes, permissions, limits, version/deployment conclusions must be evidence-backed.",
+      "- verified: every factual claim is supported.",
+      "- partial: some guidance is supported but some factual claims go beyond evidence.",
+      "- unsupported: the core conclusion is not evidence-backed.",
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      `case_frame: ${JSON.stringify(input.caseFrame)}`,
+      `evidence_bundle: ${JSON.stringify(compactBundle)}`,
+      `draft_support_answer: ${JSON.stringify(compactDraftSupportAnswerForVerification(input.draftSupportAnswer))}`
+    ].join("\n");
+
+    return this.parseVerificationResult(
+      await this.runJsonPrompt(prompt, `${idempotencyKey}:support-verifier`, runtime, undefined, "support-verifier")
+    );
+  }
+
+  async writeTriageInsight(
+    input: OpenClawSupportWriterInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<TriageSupportInsight> {
+    const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
+      primaryLimit: 2,
+      supplementalLimit: 1,
+      snippetMax: 160
+    });
+    const prompt = [
+      "You are first-line ticket triage for ONES.",
+      "Return ONLY valid JSON with keys:",
+      "direct_answer, recommended_action(resolve|ask_user|escalate), customer_reply, customer_reply_policy(send_now|no_send), support_summary, verified_evidence(string[]), risk_flags(string[]), missing_info(string[]), verifier_verdict(verified|partial|unsupported)",
+      "Rules:",
+      "- Choose resolve only when the evidence clearly supports a self-serve resolution.",
+      "- Choose escalate for product defects, engineering investigation, platform incidents, or evidence indicating R&D ownership.",
+      "- Choose ask_user for all other cases, and ask only one high-value missing detail.",
+      "- customer_reply must be customer-facing and in English.",
+      `language: ${input.language}`,
+      `ticket_query: ${input.query}`,
+      `case_frame: ${JSON.stringify(input.caseFrame)}`,
+      `evidence_bundle: ${JSON.stringify(compactBundle)}`,
+      ...(input.ticketContext
+        ? [
+            `ticket_priority: ${input.ticketContext.priority}`,
+            `customer_meta: ${JSON.stringify(input.ticketContext.customerMeta)}`,
+            `ticket_history: ${JSON.stringify(input.ticketContext.history.slice(-6))}`
+          ]
+        : [])
+    ].join("\n");
+
+    const parsed = (await this.runJsonPrompt(
+      prompt,
+      `${idempotencyKey}:triage-writer`,
+      runtime,
+      undefined,
+      "triage-writer"
+    )) as Partial<TriageSupportInsight>;
+    return {
+      direct_answer: typeof parsed.direct_answer === "string" ? parsed.direct_answer : "",
+      recommended_action:
+        parsed.recommended_action === "resolve" || parsed.recommended_action === "escalate" ? parsed.recommended_action : "ask_user",
+      customer_reply: typeof parsed.customer_reply === "string" ? parsed.customer_reply : "",
+      customer_reply_policy: parsed.customer_reply_policy === "no_send" ? "no_send" : "send_now",
+      support_summary: typeof parsed.support_summary === "string" ? parsed.support_summary : "",
+      verified_evidence: Array.isArray(parsed.verified_evidence) ? parsed.verified_evidence.map((item) => String(item)) : [],
+      risk_flags: Array.isArray(parsed.risk_flags) ? parsed.risk_flags.map((item) => String(item)) : [],
+      missing_info: Array.isArray(parsed.missing_info) ? parsed.missing_info.map((item) => String(item)) : [],
+      verifier_verdict:
+        parsed.verifier_verdict === "verified" || parsed.verifier_verdict === "partial" ? parsed.verifier_verdict : "unsupported"
+    };
+  }
+
+  async verifyTriageInsight(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult> {
+    const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
+      primaryLimit: 2,
+      supplementalLimit: 1,
+      snippetMax: 140
+    });
+    const prompt = [
+      "You verify whether a triage recommendation is supported by the provided evidence.",
+      "Return ONLY valid JSON with keys:",
+      "verdict(verified|partial|unsupported), summary, unsupported_claims(string[]), missing_info(string[]), verified_citation_ids(string[])",
+      "Rules:",
+      "- resolve requires verified evidence for a self-serve outcome.",
+      "- escalate may be partial when there is strong incident/product-defect evidence even without a direct resolution article.",
+      "- ask_user is supported when evidence is missing and the missing detail is explicit.",
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      `case_frame: ${JSON.stringify(input.caseFrame)}`,
+      `evidence_bundle: ${JSON.stringify(compactBundle)}`,
+      `triage_insight: ${JSON.stringify(compactTriageInsightForVerification(input.triageInsight))}`
+    ].join("\n");
+
+    return this.parseVerificationResult(
+      await this.runJsonPrompt(prompt, `${idempotencyKey}:triage-verifier`, runtime, undefined, "triage-verifier")
+    );
   }
 
   async classifyIntent(
@@ -231,9 +582,10 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `user_query: ${input.query}`
     ].join("\n");
 
-    const runId = await this.startChatRun(prompt, idempotencyKey, runtime);
-    await this.waitAgentRun(runId);
-    const text = await this.fetchLatestAssistantText(runtime);
+    const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "classify");
+    const runId = await this.startChatRun(prompt, idempotencyKey, runtime, undefined, sessionKey);
+    await this.waitAgentRun(runId, sessionKey);
+    const text = await this.fetchLatestAssistantText(sessionKey);
     const parsed = this.parseFirstJson(text) as Partial<OpenClawClassifyIntentOutput>;
 
     const validIntents = ["api_operation", "feature_usage", "troubleshooting", "concept_explanation", "configuration", "general"];
@@ -267,9 +619,10 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `history: ${JSON.stringify(input.history)}`
     ].join("\n");
 
-    const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments);
-    await this.waitAgentRun(runId);
-    const text = await this.fetchLatestAssistantText(runtime);
+    const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "ticket-analyze");
+    const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments, sessionKey);
+    await this.waitAgentRun(runId, sessionKey);
+    const text = await this.fetchLatestAssistantText(sessionKey);
     const parsed = this.parseFirstJson(text) as Partial<OpenClawAnalyzeOutput>;
     const reply = typeof parsed.reply === "string" ? parsed.reply : "";
     return {
@@ -297,9 +650,10 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `index: ${input.index}`
     ].join("\n");
 
-    const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments);
-    await this.waitAgentRun(runId);
-    const text = await this.fetchLatestAssistantText(runtime);
+    const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "kb-search");
+    const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments, sessionKey);
+    await this.waitAgentRun(runId, sessionKey);
+    const text = await this.fetchLatestAssistantText(sessionKey);
     const parsed = this.parseFirstJson(text) as Record<string, unknown>;
     const rawHits = Array.isArray(parsed.hits) ? parsed.hits : [];
     const hits = rawHits.map((item, index) => {
@@ -318,21 +672,28 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  private resolveAgentRuntime(runtime?: OpenClawRuntimeContext): { agentId: string; sessionKey: string } {
+  private resolveAgentRuntime(runtime?: OpenClawRuntimeContext): { agentId: string; sessionKey: string; model?: string } {
     return {
       agentId: runtime?.agentId?.trim() || env.OPENCLAW_AGENT_ID || "main",
-      sessionKey: runtime?.sessionKey?.trim() || env.OPENCLAW_AGENT_SESSION_KEY || `agent:main:${Date.now()}`
+      sessionKey: runtime?.sessionKey?.trim() || env.OPENCLAW_AGENT_SESSION_KEY || `agent:main:${Date.now()}`,
+      model: runtime?.model?.trim() || undefined
     };
   }
 
-  private async startAgentRun(message: string, idempotencyKey: string, runtime?: OpenClawRuntimeContext): Promise<string> {
+  private async startAgentRun(
+    message: string,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext,
+    sessionKey?: string
+  ): Promise<string> {
     const agentRuntime = this.resolveAgentRuntime(runtime);
     const payload = (await this.callMethod("agent", {
       agentId: agentRuntime.agentId,
-      sessionKey: agentRuntime.sessionKey,
+      sessionKey: sessionKey ?? agentRuntime.sessionKey,
       message,
       timeout: env.OPENCLAW_AGENT_TIMEOUT_MS,
-      idempotencyKey
+      idempotencyKey,
+      ...(agentRuntime.model ? { model: agentRuntime.model } : {})
     })) as { runId?: string; status?: string; summary?: string };
 
     if (!payload?.runId) {
@@ -348,15 +709,17 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     message: string,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext,
-    attachmentUrls?: string[]
+    attachmentUrls?: string[],
+    sessionKey?: string
   ): Promise<string> {
     const agentRuntime = this.resolveAgentRuntime(runtime);
     const attachments = await this.buildChatAttachments(attachmentUrls);
     const payload = (await this.callMethod("chat.send", {
-      sessionKey: agentRuntime.sessionKey,
+      sessionKey: sessionKey ?? agentRuntime.sessionKey,
       message,
       deliver: false,
       idempotencyKey,
+      ...(agentRuntime.model ? { model: agentRuntime.model } : {}),
       ...(attachments.length ? { attachments } : {})
     })) as { runId?: string; status?: string; summary?: string };
 
@@ -388,45 +751,83 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     return results;
   }
 
-  private async waitAgentRun(runId: string): Promise<void> {
-    const payload = (await this.callMethod(
-      "agent.wait",
-      { runId, timeoutMs: env.OPENCLAW_AGENT_TIMEOUT_MS },
-      env.OPENCLAW_AGENT_TIMEOUT_MS + 2000
-    )) as { status?: string; error?: string };
-
-    if (payload?.status === "ok") {
-      return;
+  private async runJsonPrompt(
+    message: string,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext,
+    attachmentUrls?: string[],
+    stage: SessionLifecycleStage = "json-prompt"
+  ) {
+    const startedAt = performance.now();
+    const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, stage);
+    const sendStartedAt = performance.now();
+    const runId = await this.startChatRun(message, idempotencyKey, runtime, attachmentUrls, sessionKey);
+    const sendMs = roundMs(performance.now() - sendStartedAt);
+    const waitStartedAt = performance.now();
+    await this.waitAgentRun(runId, sessionKey);
+    const waitMs = roundMs(performance.now() - waitStartedAt);
+    const historyStartedAt = performance.now();
+    const text = await this.fetchLatestAssistantText(sessionKey);
+    const historyMs = roundMs(performance.now() - historyStartedAt);
+    const parseStartedAt = performance.now();
+    const parsed = this.parseFirstJson(text);
+    const parseMs = roundMs(performance.now() - parseStartedAt);
+    if (env.OPENCLAW_DEBUG_STAGE_TIMINGS) {
+      console.info(
+        `[openclaw-stage] stage=${stage} prompt_chars=${message.length} response_chars=${text.length} send_ms=${sendMs} wait_ms=${waitMs} history_ms=${historyMs} parse_ms=${parseMs} total_ms=${roundMs(performance.now() - startedAt)}`
+      );
     }
-    if (payload?.status === "error") {
-      throw new Error(payload.error || "OpenClaw agent wait failed");
-    }
-    throw new Error(`OpenClaw agent wait status: ${payload?.status ?? "unknown"}`);
+    return parsed;
   }
 
-  private async fetchLatestAssistantText(runtime?: OpenClawRuntimeContext): Promise<string> {
-    const agentRuntime = this.resolveAgentRuntime(runtime);
-    const history = (await this.callMethod("chat.history", {
-      sessionKey: agentRuntime.sessionKey,
-      limit: 12
-    })) as { messages?: Array<Record<string, unknown>> };
+  private async waitAgentRun(runId: string, sessionKey?: string): Promise<void> {
+    try {
+      const payload = (await this.callMethod(
+        "agent.wait",
+        { runId, timeoutMs: env.OPENCLAW_AGENT_TIMEOUT_MS },
+        env.OPENCLAW_AGENT_TIMEOUT_MS + 2000
+      )) as { status?: string; error?: string };
 
-    const messages = Array.isArray(history?.messages) ? history.messages : [];
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const msg = messages[i];
-      if (msg.role !== "assistant") continue;
-      const blocks = Array.isArray(msg.content) ? (msg.content as Array<Record<string, unknown>>) : [];
-      const text = blocks
-        .filter((b) => b.type === "text" && typeof b.text === "string")
-        .map((b) => String(b.text))
-        .join("\n")
-        .trim();
-      if (text) return text;
-      if (typeof msg.errorMessage === "string" && msg.errorMessage) {
-        throw new Error(msg.errorMessage);
+      if (payload?.status === "ok") {
+        return;
+      }
+      if (payload?.status === "error") {
+        throw new Error(payload.error || "OpenClaw agent wait failed");
+      }
+      throw new Error(`OpenClaw agent wait status: ${payload?.status ?? "unknown"}`);
+    } finally {
+      if (sessionKey) {
+        this.touchManagedSession(sessionKey);
       }
     }
-    throw new Error("OpenClaw agent returned no assistant text");
+  }
+
+  private async fetchLatestAssistantText(sessionKey: string): Promise<string> {
+    try {
+      const history = (await this.callMethod("chat.history", {
+        sessionKey,
+        limit: 4
+      })) as { messages?: Array<Record<string, unknown>> };
+
+      const messages = Array.isArray(history?.messages) ? history.messages : [];
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const msg = messages[i];
+        if (msg.role !== "assistant") continue;
+        const blocks = Array.isArray(msg.content) ? (msg.content as Array<Record<string, unknown>>) : [];
+        const text = blocks
+          .filter((b) => b.type === "text" && typeof b.text === "string")
+          .map((b) => String(b.text))
+          .join("\n")
+          .trim();
+        if (text) return text;
+        if (typeof msg.errorMessage === "string" && msg.errorMessage) {
+          throw new Error(msg.errorMessage);
+        }
+      }
+      throw new Error("OpenClaw agent returned no assistant text");
+    } finally {
+      this.markManagedSessionEnded(sessionKey);
+    }
   }
 
   private parseFirstJson(text: string): unknown {
@@ -453,6 +854,37 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const num = typeof value === "number" ? value : Number(value);
     if (!Number.isFinite(num)) return 0;
     return Math.max(0, Math.min(1, num));
+  }
+
+  private parseVerificationResult(input: unknown): SupportVerificationResult {
+    const parsed = (input ?? {}) as Partial<SupportVerificationResult>;
+    return {
+      verdict: parsed.verdict === "verified" || parsed.verdict === "partial" ? parsed.verdict : "unsupported",
+      summary: typeof parsed.summary === "string" ? parsed.summary : "",
+      unsupported_claims: Array.isArray(parsed.unsupported_claims) ? parsed.unsupported_claims.map((item) => String(item)) : [],
+      missing_info: Array.isArray(parsed.missing_info) ? parsed.missing_info.map((item) => String(item)) : [],
+      verified_citation_ids: Array.isArray(parsed.verified_citation_ids) ? parsed.verified_citation_ids.map((item) => String(item)) : [],
+      verified_claims: Array.isArray(parsed.verified_claims) ? parsed.verified_claims.map((item) => String(item)) : [],
+      claim_to_citation_map: Array.isArray(parsed.claim_to_citation_map)
+        ? parsed.claim_to_citation_map
+            .map((item) => item as unknown as Record<string, unknown>)
+            .map((item): SupportVerificationResult["claim_to_citation_map"][number] => ({
+              text: typeof item.text === "string" ? item.text : "",
+              kind:
+                item.kind === "grounded_inference"
+                  ? "grounded_inference"
+                  : item.kind === "operational_advice"
+                  ? "operational_advice"
+                  : item.kind === "unknown"
+                  ? "unknown"
+                  : "verified_fact",
+              verdict:
+                item.verdict === "verified" ? "verified" : item.verdict === "supported_inference" ? "supported_inference" : "unsupported",
+              citation_ids: Array.isArray(item.citation_ids) ? item.citation_ids.map((value) => String(value)) : []
+            }))
+            .filter((item) => item.text)
+        : []
+    };
   }
 
   private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
@@ -678,5 +1110,62 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         clearTimeout(timeout);
       });
     });
+  }
+
+  private createRunScopedSessionKey(
+    runtime: OpenClawRuntimeContext | undefined,
+    idempotencyKey: string,
+    stage: SessionLifecycleStage
+  ): string {
+    const baseSessionKey = this.resolveAgentRuntime(runtime).sessionKey;
+    const digest = crypto.createHash("sha1").update(`${stage}:${idempotencyKey}:${Date.now()}:${Math.random()}`).digest("hex").slice(0, 12);
+    const sessionKey = sanitizeSessionPart(`${baseSessionKey}:run:${stage}:${digest}`);
+    this.cleanupManagedSessions();
+    managedRunSessions.set(sessionKey, {
+      sessionKey,
+      baseSessionKey,
+      stage,
+      createdAt: Date.now(),
+      lastUsedAt: Date.now(),
+      endedAt: null
+    });
+    return sessionKey;
+  }
+
+  private touchManagedSession(sessionKey: string): void {
+    const existing = managedRunSessions.get(sessionKey);
+    if (!existing) return;
+    existing.lastUsedAt = Date.now();
+  }
+
+  private markManagedSessionEnded(sessionKey: string): void {
+    const existing = managedRunSessions.get(sessionKey);
+    if (!existing) return;
+    existing.lastUsedAt = Date.now();
+    existing.endedAt = Date.now();
+    this.cleanupManagedSessions();
+  }
+
+  private cleanupManagedSessions(): void {
+    const now = Date.now();
+    const ttlMs = env.OPENCLAW_RUN_SESSION_TTL_SECONDS * 1000;
+    for (const [sessionKey, session] of managedRunSessions.entries()) {
+      const referenceTime = session.endedAt ?? session.lastUsedAt;
+      if (now - referenceTime > ttlMs) {
+        managedRunSessions.delete(sessionKey);
+      }
+    }
+
+    if (managedRunSessions.size <= env.OPENCLAW_RUN_SESSION_REGISTRY_MAX) return;
+
+    const oldestFirst = [...managedRunSessions.values()].sort((a, b) => {
+      const aTime = a.endedAt ?? a.lastUsedAt;
+      const bTime = b.endedAt ?? b.lastUsedAt;
+      return aTime - bTime;
+    });
+    const overflow = managedRunSessions.size - env.OPENCLAW_RUN_SESSION_REGISTRY_MAX;
+    for (const session of oldestFirst.slice(0, overflow)) {
+      managedRunSessions.delete(session.sessionKey);
+    }
   }
 }

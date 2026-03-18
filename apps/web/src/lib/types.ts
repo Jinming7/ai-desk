@@ -29,6 +29,12 @@ export interface Ticket {
   ai_last_confidence?: number | null;
   ai_last_model?: string | null;
   ai_last_fallback_applied?: boolean;
+  triage_reasoning_summary?: string | null;
+  triage_evidence?: string[] | null;
+  triage_support_insight?: TriageSupportInsight | null;
+  triage_verification_summary?: SearchVerificationSummary | null;
+  triage_case_frame?: SearchCaseFrame | null;
+  evidence_bundle_digest?: string | null;
   customer_status_label?: string;
 }
 
@@ -67,6 +73,9 @@ export interface AgentQueueTicket {
   sla_due_at: string | null;
   triage_reasoning_summary: string | null;
   triage_evidence: string[] | null;
+  triage_support_insight?: TriageSupportInsight | null;
+  triage_verification_summary?: SearchVerificationSummary | null;
+  triage_case_frame?: SearchCaseFrame | null;
   triage_confidence: number | null;
   handoff_reason_code: string | null;
   priority?: "P1" | "P2" | "P3" | "P4";
@@ -97,16 +106,76 @@ export interface SearchReference {
   sourceUrl: string;
   repoSourceUrl?: string;
   repo?: string;
+  branch?: string;
   path?: string;
   commitSha?: string;
+  headingPath?: string;
+  supportMetadata?: Record<string, unknown>;
+  chunkMetadata?: Record<string, unknown>;
+  docMetadata?: Record<string, unknown>;
   score: number;
   retrievedAt: string;
+}
+
+export interface SearchCaseFrame {
+  goal: string;
+  symptom: string;
+  object: string;
+  action_type: string;
+  deployment_model: string;
+  product_area: string;
+  constraints: string[];
+  missing_critical_info: string[];
+  retrieval_queries: string[];
+  query_plan?: {
+    concept_queries: string[];
+    object_queries: string[];
+    behavior_queries: string[];
+  };
+}
+
+export interface SearchSupportAnswer {
+  mode: "grounded" | "partial" | "clarification" | "handoff";
+  direct_answer: string;
+  why: string[];
+  what_to_do_now: string[];
+  still_need_to_confirm: string[];
+}
+
+export interface SearchVerificationSummary {
+  verdict: "verified" | "partial" | "unsupported";
+  summary: string;
+  unsupported_claims: string[];
+  missing_info: string[];
+  verified_citation_ids: string[];
+  verified_claims: string[];
+  claim_to_citation_map: Array<{
+    text: string;
+    kind: "verified_fact" | "grounded_inference" | "operational_advice" | "unknown";
+    verdict: "verified" | "supported_inference" | "unsupported";
+    citation_ids: string[];
+  }>;
+}
+
+export interface TriageSupportInsight {
+  direct_answer: string;
+  recommended_action: "resolve" | "ask_user" | "escalate";
+  customer_reply: string;
+  customer_reply_policy: "send_now" | "no_send";
+  support_summary: string;
+  verified_evidence: string[];
+  risk_flags: string[];
+  missing_info: string[];
+  verifier_verdict: "verified" | "partial" | "unsupported";
 }
 
 export interface SearchResult {
   session_id: string;
   answer: string;
   answer_language?: "zh" | "en";
+  case_frame?: SearchCaseFrame;
+  support_answer?: SearchSupportAnswer;
+  verification?: SearchVerificationSummary;
   structured_answer?: {
     summary: string;
     assessment?: string;

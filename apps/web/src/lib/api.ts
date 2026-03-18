@@ -33,6 +33,10 @@ function asUserError(error: unknown): Error {
   return error instanceof Error ? error : new Error("Unexpected request error");
 }
 
+function asUploadError(): Error {
+  return new Error("Failed to upload attachment");
+}
+
 const inFlightRequests = new Map<string, Promise<unknown>>();
 
 function withInFlightDedup<T>(key: string, run: () => Promise<T>): Promise<T> {
@@ -65,6 +69,29 @@ export async function getTicketDetail(id: string): Promise<{ ticket: Ticket; mes
     throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to load ticket detail");
+  return res.json();
+}
+
+export async function applyAiSuggestion(ticketId: string, traceId?: string): Promise<{
+  appliedAction: "resolve" | "ask_user" | "escalate";
+  traceId?: string | null;
+  messagePosted: boolean;
+  ticket: Ticket;
+}> {
+  const res = await fetch(`${API}/api/v1/internal/tickets/${ticketId}/ai/apply`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify(traceId ? { traceId } : {})
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Failed to apply AI suggestion");
+  }
   return res.json();
 }
 
@@ -314,12 +341,11 @@ export async function uploadImageAttachment(file: File): Promise<UploadedAttachm
       dataUrl
     })
   }).catch((error) => {
-    throw asUserError(error);
+    throw error instanceof Error && error.message === "Failed to read image" ? error : asUploadError();
   });
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || "Failed to upload image");
+    throw asUploadError();
   }
 
   const data = await res.json();
@@ -350,12 +376,11 @@ export async function uploadAttachment(file: File): Promise<UploadedAttachment> 
       dataUrl
     })
   }).catch((error) => {
-    throw asUserError(error);
+    throw error instanceof Error && error.message === "Failed to read file" ? error : asUploadError();
   });
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || "Failed to upload file");
+    throw asUploadError();
   }
 
   const data = await res.json();

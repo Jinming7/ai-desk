@@ -7,6 +7,7 @@ import {
   agentQueueQuerySchema,
   fileUploadSchema,
   imageUploadSchema,
+  ticketAiApplySchema,
   ticketBulkActionSchema,
   ticketAssignSchema,
   ticketCreateSchema,
@@ -38,6 +39,7 @@ import * as onesSyncService from "./modules/ones-sync/service.js";
 import * as supportUxService from "./modules/support-ux/service.js";
 import * as githubKbService from "./modules/github-kb/service.js";
 import { getAiTopology } from "./modules/ai/agent-router.js";
+import { preloadLocalDocsIndex } from "./modules/ai/local-docs.js";
 import { getAiCapabilities } from "./modules/ai/multimodal.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
@@ -76,6 +78,8 @@ async function enrichCustomerStatus<T extends { status: string; ones_ticket_type
 }
 
 if (env.NODE_ENV !== "test") {
+  void preloadLocalDocsIndex().catch(() => undefined);
+
   setInterval(() => {
     void onesSyncService.reconcileReadModel(20).catch(() => undefined);
   }, 5 * 60 * 1000);
@@ -187,6 +191,25 @@ app.post(
         contentType: body.contentType
       }
     });
+  })
+);
+
+app.post(
+  "/api/v1/internal/tickets/:id/ai/apply",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const body = ticketAiApplySchema.parse(req.body ?? {});
+    try {
+      const result = await ticketService.applyLatestAiSuggestion(String(req.params.id), body);
+      res.json(result);
+    } catch (error) {
+      const statusCode = typeof (error as { statusCode?: unknown }).statusCode === "number" ? Number((error as { statusCode: number }).statusCode) : 500;
+      if (statusCode !== 500) {
+        res.status(statusCode).json({ error: (error as Error).message });
+        return;
+      }
+      throw error;
+    }
   })
 );
 

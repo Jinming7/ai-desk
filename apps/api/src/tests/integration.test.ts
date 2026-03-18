@@ -1,11 +1,83 @@
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
 import type { AddressInfo } from "node:net";
+import http from "node:http";
+import https from "node:https";
 import { app } from "../app.js";
 import { pool } from "../db/client.js";
 
 let baseUrl = "";
-let server: ReturnType<typeof app.listen>;
+let server: ReturnType<typeof app.listen> | null = null;
+
+async function withEphemeralServer<T>(run: (origin: string) => Promise<T>): Promise<T> {
+  const localServer = http.createServer(app);
+  await new Promise<void>((resolve) => localServer.listen(0, "127.0.0.1", () => resolve()));
+  const address = localServer.address() as AddressInfo | null;
+  if (!address) {
+    await new Promise<void>((resolve) => localServer.close(() => resolve()));
+    throw new Error("Failed to resolve ephemeral test server address");
+  }
+  const origin = `http://127.0.0.1:${address.port}`;
+  try {
+    return await run(origin);
+  } finally {
+    await new Promise<void>((resolve) => localServer.close(() => resolve()));
+  }
+}
+
+if (typeof globalThis.fetch !== "function") {
+  globalThis.fetch = (async (input: string | URL, init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  }) => {
+    const target = String(input);
+    const performRequest = async (url: URL) => {
+      const transport = url.protocol === "https:" ? https : http;
+      const response = await new Promise<{
+        status: number;
+        headers: Record<string, string | string[] | undefined>;
+        body: string;
+      }>((resolve, reject) => {
+        const req = transport.request(
+          url,
+          {
+            method: init?.method ?? "GET",
+            headers: init?.headers
+          },
+          (res) => {
+            const chunks: Buffer[] = [];
+            res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+            res.on("end", () => {
+              resolve({
+                status: res.statusCode ?? 500,
+                headers: res.headers,
+                body: Buffer.concat(chunks).toString("utf8")
+              });
+            });
+          }
+        );
+        req.on("error", reject);
+        if (init?.body) req.write(init.body);
+        req.end();
+      });
+
+      return {
+        ok: response.status >= 200 && response.status < 300,
+        status: response.status,
+        headers: response.headers,
+        text: async () => response.body,
+        json: async () => JSON.parse(response.body)
+      };
+    };
+
+    if (/^https?:\/\//i.test(target)) {
+      return performRequest(new URL(target));
+    }
+
+    return withEphemeralServer(async (origin) => performRequest(new URL(target, origin)));
+  }) as unknown as typeof fetch;
+}
 
 function assertSafeTestDatabase() {
   const url = process.env.DATABASE_URL ?? "";
@@ -43,6 +115,13 @@ async function resetDb() {
     "INSERT INTO system_settings(key, value_json, updated_by) VALUES ('ai_agent_enabled', '{\"enabled\":true}'::jsonb, 'test') ON CONFLICT (key) DO UPDATE SET value_json=EXCLUDED.value_json, updated_by=EXCLUDED.updated_by, updated_at=NOW()"
   );
   await pool.query("DELETE FROM knowledge_documents");
+  await pool.query("DELETE FROM kb_metrics_events");
+  await pool.query("DELETE FROM kb_github_webhook_events");
+  await pool.query("DELETE FROM kb_chunks");
+  await pool.query("DELETE FROM kb_documents");
+  await pool.query("DELETE FROM kb_sync_jobs");
+  await pool.query("DELETE FROM kb_sync_checkpoints");
+  await pool.query("DELETE FROM kb_repo_registrations");
 }
 
 async function waitForEscalationTerminal(escalationId: string) {
@@ -66,7 +145,7 @@ async function waitForEscalationTerminal(escalationId: string) {
 before(async () => {
   assertSafeTestDatabase();
   server = app.listen(0);
-  await new Promise<void>((resolve) => server.once("listening", () => resolve()));
+  await new Promise<void>((resolve) => server?.once("listening", () => resolve()));
   const { port } = server.address() as AddressInfo;
   baseUrl = `http://127.0.0.1:${port}`;
 });
@@ -76,7 +155,9 @@ beforeEach(async () => {
 });
 
 after(async () => {
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  if (server) {
+    await new Promise<void>((resolve) => server?.close(() => resolve()));
+  }
   await pool.end();
 });
 
@@ -91,6 +172,9 @@ test("SEARCH_MODE returns grounded result contract with references", async () =>
   const data = (await response.json()) as {
     result: {
       session_id: string;
+      case_frame: { retrieval_queries: string[]; goal: string };
+      support_answer: { mode: string; direct_answer: string; what_to_do_now: string[] };
+      verification: { verdict: string; verified_citation_ids: string[]; verified_claims: string[] };
       references: Array<{ documentId: string }>;
       citations: Array<{ id: string }>;
       suggested_next_step: "self_serve" | "submit_ticket";
@@ -98,9 +182,40 @@ test("SEARCH_MODE returns grounded result contract with references", async () =>
   };
 
   assert.equal(typeof data.result.session_id, "string");
+  assert.equal(typeof data.result.case_frame.goal, "string");
+  assert.equal(data.result.case_frame.retrieval_queries.length >= 1, true);
+  assert.equal(data.result.support_answer.mode, "grounded");
+  assert.equal(data.result.support_answer.direct_answer.length > 0, true);
+  assert.equal(data.result.support_answer.what_to_do_now.length >= 0, true);
+  assert.equal(data.result.verification.verdict, "verified");
+  assert.equal(data.result.verification.verified_citation_ids.length > 0, true);
+  assert.equal(Array.isArray(data.result.verification.verified_claims), true);
   assert.equal(data.result.references.length > 0, true);
-  assert.equal(data.result.citations.length, data.result.references.length);
+  assert.equal(data.result.citations.length > 0, true);
   assert.equal(data.result.suggested_next_step, "self_serve");
+});
+
+test("SEARCH_MODE returns partial when evidence is incomplete but usable", async () => {
+  const response = await fetch(`${baseUrl}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "billing admin role denied checkout" })
+  });
+  assert.equal(response.status, 200);
+
+  const data = (await response.json()) as {
+    result: {
+      support_answer: { mode: string; still_need_to_confirm: string[] };
+      verification: { verdict: string; summary: string };
+      citations: Array<{ id: string }>;
+    };
+  };
+
+  assert.equal(data.result.citations.length > 0, true);
+  assert.equal(data.result.support_answer.mode, "partial");
+  assert.equal(data.result.verification.verdict, "partial");
+  assert.equal(data.result.verification.summary.length > 0, true);
+  assert.equal(Array.isArray(data.result.support_answer.still_need_to_confirm), true);
 });
 
 test("SEARCH_MODE fallback exposes KB_RETRIEVAL_UNAVAILABLE when OpenClaw retrieval fails", async () => {
@@ -185,8 +300,26 @@ test("chat handoff draft and submit creates ticket", async () => {
     })
   });
   assert.equal(draftRes.status, 201);
-  const draftData = (await draftRes.json()) as { draft: { id: string; title: string; description: string } };
+  const draftData = (await draftRes.json()) as {
+    draft: {
+      id: string;
+      title: string;
+      description: string;
+      provenance: {
+        retrieval_outcome?: {
+          case_frame?: Record<string, unknown>;
+          verification_summary?: Record<string, unknown>;
+          evidence_bundle_digest?: string | null;
+        };
+      };
+    };
+  };
   assert.equal(draftData.draft.title.length > 0, true);
+  assert.equal(draftData.draft.description.includes("Direct answer summary:"), true);
+  assert.equal(draftData.draft.description.includes("Still need to confirm:"), true);
+  assert.equal(Boolean(draftData.draft.provenance.retrieval_outcome?.case_frame), true);
+  assert.equal(Boolean(draftData.draft.provenance.retrieval_outcome?.verification_summary), true);
+  assert.equal(typeof draftData.draft.provenance.retrieval_outcome?.evidence_bundle_digest === "string", true);
 
   const submitRes = await fetch(`${baseUrl}/api/v1/ai/handoff/submit`, {
     method: "POST",

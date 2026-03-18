@@ -1,3 +1,12 @@
+import type {
+  DraftSupportAnswer,
+  SearchReference,
+  SupportCaseFrame,
+  SupportEvidenceBundle,
+  SupportVerificationResult,
+  TriageSupportInsight
+} from "../../modules/ai/types.js";
+
 export type OpenClawDecisionAction = "resolve" | "ask_user" | "escalate" | "none";
 
 export interface OpenClawAnalyzeInput {
@@ -87,6 +96,7 @@ export interface OpenClawSearchAnswerOutput {
 export interface OpenClawRuntimeContext {
   agentId?: string;
   sessionKey?: string;
+  model?: string;
   intent?: "retrieval" | "clarify" | "execution";
 }
 
@@ -103,6 +113,42 @@ export interface OpenClawClassifyIntentOutput {
   reasoning: string;
 }
 
+export interface OpenClawSupportPlannerInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+  ticketContext?: {
+    priority: string;
+    customerMeta: Record<string, unknown>;
+    history: Array<{ author: string; body: string; at: string }>;
+  };
+}
+
+export interface OpenClawSupportWriterInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+  ticketContext?: {
+    priority: string;
+    customerMeta: Record<string, unknown>;
+    history: Array<{ author: string; body: string; at: string }>;
+  };
+}
+
+export interface OpenClawSupportVerifierInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  draftSupportAnswer?: DraftSupportAnswer;
+  triageInsight?: TriageSupportInsight;
+}
+
 export interface OpenClawAdapter {
   analyzeTicket(input: OpenClawAnalyzeInput, idempotencyKey: string, runtime?: OpenClawRuntimeContext): Promise<OpenClawAnalyzeOutput>;
   searchKnowledge(input: OpenClawSearchInput, idempotencyKey: string, runtime?: OpenClawRuntimeContext): Promise<OpenClawSearchOutput>;
@@ -116,5 +162,30 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawClassifyIntentOutput>;
+  planSupportCase(
+    input: OpenClawSupportPlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportCaseFrame>;
+  writeSupportAnswer(
+    input: OpenClawSupportWriterInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<DraftSupportAnswer>;
+  verifySupportAnswer(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult>;
+  writeTriageInsight(
+    input: OpenClawSupportWriterInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<TriageSupportInsight>;
+  verifyTriageInsight(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult>;
   healthCheck(): Promise<{ ok: boolean; mode: "ws" | "mock"; detail?: string }>;
 }

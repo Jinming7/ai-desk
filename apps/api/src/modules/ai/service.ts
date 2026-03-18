@@ -3,9 +3,9 @@ import type { OpenClawAdapter, OpenClawAnalyzeOutput, OpenClawDecisionAction } f
 import { env } from "../../config/env.js";
 import crypto from "node:crypto";
 import * as aiRepo from "./repository.js";
-import { SearchOrchestrator } from "./search-orchestrator.js";
 import { buildSearchRuntime, resolveExecutionRuntime } from "./agent-router.js";
 import { summarizeImageAttachments, summarizeTextAttachments } from "./multimodal.js";
+import { runSupportSearchAgent, runSupportTriageAgent } from "./support-agent.js";
 import type {
   ChatTicketDraft,
   ChatTicketDraftField,
@@ -13,7 +13,10 @@ import type {
   SearchResponseEnvelope,
   SearchReference,
   SearchDialogState,
-  StructuredSearchAnswer
+  StructuredSearchAnswer,
+  SupportCaseFrame,
+  SupportVerificationResult,
+  TriageSupportInsight
 } from "./types.js";
 import * as tickets from "../tickets/repository.js";
 import * as settings from "../settings/repository.js";
@@ -33,6 +36,19 @@ function containsCjk(text: string): boolean {
 
 function detectLanguage(text: string): "zh" | "en" {
   return containsCjk(text) ? "zh" : "en";
+}
+
+function uniqueStrings(input: Array<string | undefined | null>, limit = 8): string[] {
+  const seen = new Set<string>();
+  const values: string[] = [];
+  for (const item of input) {
+    const value = String(item ?? "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    values.push(value);
+    if (values.length >= limit) break;
+  }
+  return values;
 }
 
 function buildUserFacingDraftTitle(query: string): string {
@@ -1611,17 +1627,11 @@ export async function runSearchMode(
   const currentRound = previousDialog?.clarification_round ?? 0;
   const searchIntent = currentRound > 0 ? "clarify" : "retrieval";
   const runtime = buildSearchRuntime({ intent: searchIntent, sessionId });
-  const orchestrator = new SearchOrchestrator(adapter);
   const trimmedQuery = query.trim();
   const prevTranscript = previousDialog?.transcript;
   const resolvedQuery = trimmedQuery || (prevTranscript?.length ? prevTranscript[prevTranscript.length - 1].content : "") || "";
   const attachments = options?.attachments ?? options?.imageAttachments ?? [];
   const imageAttachments = options?.imageAttachments ?? attachments.filter((item) => item.includes("/uploads/images/"));
-  const classification = await classifyQuery({
-    query: resolvedQuery,
-    conversation: options?.conversation,
-    attachments
-  }, adapter);
   const language = options?.answerLanguage ?? detectLanguage(trimmedQuery || "image");
   const baseQuery =
     trimmedQuery ||
@@ -1656,288 +1666,339 @@ export async function runSearchMode(
     }
   }
 
-  const response = await orchestrator.search(multimodalQuery, `search:${sessionId}:${currentRound + 1}`, runtime, language, imageAttachments);
-  const filteredReferences = filterReferencesByIntent(response.query, response.references);
-  const forceScopedReferences = classification.route === "openapi_doc" || classification.intent === "api_operation";
-  let effectiveReferences = forceScopedReferences
-    ? filteredReferences
-    : filteredReferences.length
-      ? filteredReferences
-      : response.references;
-  const confidenceThreshold = Math.max(0.45, env.AI_SEARCH_ANSWER_CONFIDENCE_THRESHOLD);
-  const lowConfidence = response.confidence < confidenceThreshold;
-  // Only clear references when there are truly no results.
-  // Low-confidence references are still passed to the agent for synthesis context;
-  // citations are hidden from the user unless confidence is sufficient.
-  if (response.retrievalStatus === "no_results" && response.references.length === 0) {
-    effectiveReferences = [];
-  }
-  const showCitationsToUser = response.retrievalStatus === "grounded" && !lowConfidence;
-  const citationsValid = hasValidCitations(effectiveReferences);
-  const grounded = response.retrievalStatus === "grounded" && citationsValid && effectiveReferences.length > 0;
-  let selfServeResolved = grounded;
+  if (!env.FEATURE_KB_GROUNDED_SEARCH) {
+    const disabledAnswer =
+      language === "zh"
+        ? "知识库检索当前已关闭，建议直接创建工单，我们会自动预填你已提供的上下文。"
+        : "Knowledge grounding is currently disabled. Create a ticket now and we will prefill the context you already shared.";
+    const disabledResult: SearchModeResult = {
+      session_id: sessionId,
+      answer: disabledAnswer,
+      answer_language: language,
+      support_answer: {
+        mode: "handoff",
+        direct_answer: disabledAnswer,
+        why: [],
+        what_to_do_now:
+          language === "zh"
+            ? ["点击“Create ticket now”生成工单草稿。", "补充报错原文、复现步骤和影响范围。"]
+            : ["Create a ticket draft from this conversation.", "Add the exact error, repro steps, and impact scope."],
+        still_need_to_confirm: []
+      },
+      verification: {
+        verdict: "unsupported",
+        summary: language === "zh" ? "知识库检索被运行时开关关闭。" : "Knowledge grounding is disabled by runtime switch.",
+        unsupported_claims: [],
+        missing_info: [],
+        verified_citation_ids: [],
+        verified_claims: [],
+        claim_to_citation_map: []
+      },
+      structured_answer: {
+        summary: disabledAnswer,
+        steps:
+          language === "zh"
+            ? ["创建工单草稿。", "补充错误信息、复现步骤和影响范围。"]
+            : ["Create a ticket draft.", "Add the exact error, repro steps, and impact scope."],
+        validation: [],
+        style: "diagnosis"
+      },
+      confidence: 0,
+      suggested_next_step: "submit_ticket",
+      retrieval_status: "kb_unavailable",
+      unresolved_reason_code: "KB_RETRIEVAL_UNAVAILABLE",
+      references: [],
+      citations: [],
+      state: "TICKET_HANDOFF_RECOMMENDED",
+      clarification_round: currentRound,
+      show_create_ticket_now: true,
+      follow_up_question: null
+    };
 
-  if (!options?.sessionId || !previousDialog) {
-    await aiRepo.createSearchSession({
-      sessionId,
-      query: response.query,
-      answer: response.answer,
-      confidence: response.confidence,
-      retrievalStatus: response.retrievalStatus,
-      unresolvedReasonCode: response.unresolvedReasonCode,
-      suggestedNextStep: selfServeResolved ? "self_serve" : "submit_ticket"
-    });
-  } else {
-    await aiRepo.updateSearchSession({
-      sessionId,
-      answer: response.answer,
-      confidence: response.confidence,
-      retrievalStatus: response.retrievalStatus,
-      unresolvedReasonCode: response.unresolvedReasonCode,
-      suggestedNextStep: selfServeResolved ? "self_serve" : "submit_ticket"
-    });
-  }
-
-  await aiRepo.saveSearchReferences(sessionId, effectiveReferences);
-
-  const fallbackDecision = resolveSearchBotDecision({
-    language,
-    query: trimmedQuery || response.query,
-    classification,
-    response,
-    grounded,
-    effectiveReferences,
-    previousDialog
-  });
-  const fallbackStructuredAnswer = fallbackDecision.structuredAnswer;
-
-  let state: SearchDialogState = fallbackDecision.state;
-  let clarificationRound: number = fallbackDecision.clarificationRound;
-  let showCreateTicketNow: boolean = fallbackDecision.showCreateTicketNow;
-  let followUpQuestion: string | null = fallbackDecision.followUpQuestion;
-  let answer: string = fallbackDecision.answer;
-  let structuredAnswer: StructuredSearchAnswer | undefined = fallbackDecision.structuredAnswer;
-
-  let agentSynthesized = false;
-
-  // Build conversation history for the agent from previous dialog + current conversation
-  const agentConversationHistory: Array<{ role: "user" | "assistant"; content: string }> = [];
-  if (previousDialog?.transcript?.length) {
-    for (const turn of previousDialog.transcript.slice(-6)) {
-      agentConversationHistory.push({ role: turn.role, content: turn.content });
+    if (!options?.sessionId || !previousDialog) {
+      await aiRepo.createSearchSession({
+        sessionId,
+        query: multimodalQuery,
+        answer: disabledResult.answer,
+        confidence: disabledResult.confidence,
+        retrievalStatus: disabledResult.retrieval_status,
+        unresolvedReasonCode: disabledResult.unresolved_reason_code,
+        suggestedNextStep: disabledResult.suggested_next_step
+      });
+    } else {
+      await aiRepo.updateSearchSession({
+        sessionId,
+        answer: disabledResult.answer,
+        confidence: disabledResult.confidence,
+        retrievalStatus: disabledResult.retrieval_status,
+        unresolvedReasonCode: disabledResult.unresolved_reason_code,
+        suggestedNextStep: disabledResult.suggested_next_step
+      });
     }
-  }
-  if (options?.conversation?.length) {
-    for (const msg of options.conversation.slice(-4)) {
-      agentConversationHistory.push({ role: "user", content: msg });
-    }
+
+    await aiRepo.saveSearchReferences(sessionId, []);
+    const transcript = mergeTranscript(previousDialog?.transcript, multimodalQuery, disabledResult.answer, options?.conversation ?? []);
+    await aiRepo.upsertDialogState({
+      sessionId,
+      state: disabledResult.state,
+      clarificationRound: disabledResult.clarification_round,
+      showCreateTicketNow: disabledResult.show_create_ticket_now,
+      answerLanguage: language,
+      followUpQuestion: disabledResult.follow_up_question,
+      transcript,
+      retrievalOutcome: {
+        retrievalStatus: disabledResult.retrieval_status,
+        unresolvedReasonCode: disabledResult.unresolved_reason_code,
+        confidence: 0,
+        references: 0,
+        verification: disabledResult.verification,
+        supportAnswer: disabledResult.support_answer,
+        diagnostics: {
+          knowledge_grounding_disabled: true
+        }
+      }
+    });
+
+    return disabledResult;
   }
 
   try {
-    const agentAnswer = await adapter.answerSearchQuery(
-      {
-        query: trimmedQuery || response.query,
-        language,
-        routeHint: classification.route,
-        grounded,
-        references: effectiveReferences.map((item) => ({
-          title: item.title,
-          snippet: item.snippet,
-          sourceUrl: item.sourceUrl,
-          path: getCitationMeta(item).path
-        })),
-        // Only pass draftAnswer if it contains useful content (not a generic clarification template)
-        draftAnswer: fallbackStructuredAnswer && fallbackStructuredAnswer.style !== "clarification"
-          ? {
-              answer: fallbackDecision.answer,
-              style: fallbackStructuredAnswer.style,
-              summary: fallbackStructuredAnswer.summary,
-              assessment: fallbackStructuredAnswer.assessment,
-              steps: fallbackStructuredAnswer.steps,
-              validation: fallbackStructuredAnswer.validation,
-              required_inputs: fallbackStructuredAnswer.required_inputs
-            }
-          : undefined,
-        conversationHistory: agentConversationHistory.length ? agentConversationHistory : undefined,
-        attachments
-      },
-      `search-answer:${sessionId}:${Date.now()}`,
-      runtime
-    );
-
-    // Quality gate: agent result must have meaningful content
-    const summaryOk = agentAnswer.summary?.trim() && agentAnswer.summary.trim().length > 20;
-    const stepsOk = Array.isArray(agentAnswer.steps) && agentAnswer.steps.length >= 1;
-    const answerOk = agentAnswer.answer?.trim() && agentAnswer.answer.trim().length > 20;
-    const passesQualityGate = summaryOk || answerOk;
-
-    if (passesQualityGate) {
-      agentSynthesized = true;
-      answer = agentAnswer.answer?.trim() || agentAnswer.summary.trim();
-      structuredAnswer = {
-        summary: agentAnswer.summary.trim(),
-        assessment: agentAnswer.assessment?.trim() || undefined,
-        style: agentAnswer.style,
-        steps: agentAnswer.steps,
-        validation: agentAnswer.validation,
-        required_inputs: agentAnswer.required_inputs
-      };
-
-      if (agentAnswer.style === "kb_answer") {
-        state = "GROUNDABLE_ANSWER_READY";
-        clarificationRound = 0;
-        showCreateTicketNow = false;
-        followUpQuestion = null;
-        selfServeResolved = true;
-      } else if (agentAnswer.style === "diagnosis") {
-        const shouldTicket = agentAnswer.suggested_next_step === "submit_ticket";
-        state = shouldTicket ? "TICKET_HANDOFF_RECOMMENDED" : "GROUNDABLE_ANSWER_READY";
-        clarificationRound = 0;
-        showCreateTicketNow = shouldTicket;
-        followUpQuestion = null;
-        selfServeResolved = !shouldTicket;
-        if (shouldTicket) {
-          effectiveReferences = [];
-        }
-      } else if (agentAnswer.style === "clarification") {
-        clarificationRound = Math.max(1, fallbackDecision.clarificationRound);
-        state = clarificationRound > 1 ? "CLARIFICATION_IN_PROGRESS" : "CLARIFICATION_REQUIRED";
-        showCreateTicketNow = false;
-        followUpQuestion = answer;
-        selfServeResolved = false;
-        effectiveReferences = [];
-      } else {
-        // Default: treat unknown style as a grounded answer
-        state = "GROUNDABLE_ANSWER_READY";
-        clarificationRound = 0;
-        showCreateTicketNow = false;
-        followUpQuestion = null;
-        selfServeResolved = true;
+    const supportConversationHistory: Array<{ role: "user" | "assistant"; content: string }> = [];
+    if (previousDialog?.transcript?.length) {
+      for (const turn of previousDialog.transcript.slice(-6)) {
+        supportConversationHistory.push({ role: turn.role, content: turn.content });
       }
     }
-  } catch {
-    // Keep deterministic draft answer when search-bot final synthesis fails.
-  }
+    if (options?.conversation?.length) {
+      for (const msg of options.conversation.slice(-4)) {
+        supportConversationHistory.push({ role: "user", content: msg });
+      }
+    }
 
-  if (!agentSynthesized) {
-    state = fallbackDecision.state;
-    clarificationRound = fallbackDecision.clarificationRound;
-    showCreateTicketNow = fallbackDecision.showCreateTicketNow;
-    followUpQuestion = fallbackDecision.followUpQuestion;
-    answer = fallbackDecision.answer;
-    structuredAnswer = fallbackDecision.structuredAnswer;
-    selfServeResolved = fallbackDecision.selfServeResolved;
-    effectiveReferences = fallbackDecision.effectiveReferences;
+    const supportExecution = await runSupportSearchAgent({
+      query: multimodalQuery,
+      language,
+      currentRound,
+      conversationHistory: supportConversationHistory,
+      adapter,
+      runtime,
+      attachments,
+      idempotencyKey: `support-search:${sessionId}:${currentRound + 1}`
+    });
 
-    if (
-      env.FEATURE_AI_MULTI_TURN_HANDOFF &&
-      state === "CLARIFICATION_REQUIRED" &&
-      clarificationRound >= env.AI_SEARCH_MAX_CLARIFICATION_ROUNDS &&
-      classification.route !== "openapi_doc"
-    ) {
-      state = "TICKET_HANDOFF_RECOMMENDED";
-      showCreateTicketNow = true;
-      followUpQuestion = null;
-      answer =
-        language === "zh"
-          ? "当前还没有足够的可引用证据给出可靠结论。建议点击“Create a ticket now”，我将基于对话自动预填工单。"
-          : 'There is not enough citable evidence for a reliable final answer. Click "Create a ticket now" and I will prefill a ticket from this conversation.';
-      await aiRepo.addHandoffEvent({
+    const supportResult = {
+      ...supportExecution.result,
+      session_id: sessionId
+    };
+
+    if (!options?.sessionId || !previousDialog) {
+      await aiRepo.createSearchSession({
         sessionId,
-        eventType: "handoff_triggered",
-        payload: { clarificationRound, retrievalStatus: response.retrievalStatus }
+        query: multimodalQuery,
+        answer: supportResult.answer,
+        confidence: supportResult.confidence,
+        retrievalStatus: supportResult.retrieval_status,
+        unresolvedReasonCode: supportResult.unresolved_reason_code,
+        suggestedNextStep: supportResult.suggested_next_step
+      });
+    } else {
+      await aiRepo.updateSearchSession({
+        sessionId,
+        answer: supportResult.answer,
+        confidence: supportResult.confidence,
+        retrievalStatus: supportResult.retrieval_status,
+        unresolvedReasonCode: supportResult.unresolved_reason_code,
+        suggestedNextStep: supportResult.suggested_next_step
       });
     }
-  }
 
-  const transcript = mergeTranscript(previousDialog?.transcript, response.query, answer, options?.conversation ?? []);
-  await aiRepo.upsertDialogState({
-    sessionId,
-    state,
-    clarificationRound,
-    showCreateTicketNow,
-    answerLanguage: language,
-    followUpQuestion,
-    transcript,
-    retrievalOutcome: {
-      retrievalStatus: response.retrievalStatus,
-      unresolvedReasonCode: response.unresolvedReasonCode,
-      confidence: response.confidence,
-      references: effectiveReferences.length
-    }
-  });
+    await aiRepo.saveSearchReferences(sessionId, supportResult.references);
 
-  const metricPromises: Promise<void>[] = [
-    aiRepo.logMetric({
+    const transcript = mergeTranscript(previousDialog?.transcript, multimodalQuery, supportResult.answer, options?.conversation ?? []);
+    await aiRepo.upsertDialogState({
       sessionId,
-      name: "hit_rate",
-      value: citationsValid ? 1 : 0,
-      payload: { retrievalStatus: response.retrievalStatus }
-    }),
-    aiRepo.logMetric({
-      sessionId,
-      name: "citation_coverage",
-      value: effectiveReferences.length,
-      payload: { queryLength: response.query.length }
-    }),
-    aiRepo.logMetric({
-      sessionId,
-      name: "fallback_rate",
-      value: response.unresolvedReasonCode ? 1 : 0,
-      payload: { reasonCode: response.unresolvedReasonCode }
-    }),
-    aiRepo.logMetric({
-      sessionId,
-      name: "no_citation_rate",
-      value: citationsValid ? 0 : 1,
-      payload: { round: clarificationRound }
-    })
-  ];
-  if (grounded && previousDialog && previousDialog.clarification_round > 0) {
-    metricPromises.push(
+      state: supportResult.state,
+      clarificationRound: supportResult.clarification_round,
+      showCreateTicketNow: supportResult.show_create_ticket_now,
+      answerLanguage: language,
+      followUpQuestion: supportResult.follow_up_question,
+      transcript,
+      retrievalOutcome: {
+        retrievalStatus: supportResult.retrieval_status,
+        unresolvedReasonCode: supportResult.unresolved_reason_code,
+        confidence: supportResult.confidence,
+        references: supportResult.references.length,
+        caseFrame: supportExecution.caseFrame,
+        evidenceBundleDigest: crypto.createHash("sha256").update(JSON.stringify(supportExecution.evidenceBundle)).digest("hex"),
+        verification: supportExecution.verification,
+        supportAnswer: supportResult.support_answer,
+        diagnostics: {
+          stage_timings: supportExecution.stageTimings
+        }
+      }
+    });
+
+    await Promise.all([
       aiRepo.logMetric({
         sessionId,
-        name: "clarification_resolution_rate",
-        value: 1,
-        payload: { round: previousDialog.clarification_round }
+        name: "hit_rate",
+        value: supportResult.references.length > 0 ? 1 : 0,
+        payload: { retrievalStatus: supportResult.retrieval_status }
+      }),
+      aiRepo.logMetric({
+        sessionId,
+        name: "citation_coverage",
+        value: supportResult.citations.length,
+        payload: { queryLength: multimodalQuery.length }
+      }),
+      aiRepo.logMetric({
+        sessionId,
+        name: "fallback_rate",
+        value: supportResult.unresolved_reason_code ? 1 : 0,
+        payload: { reasonCode: supportResult.unresolved_reason_code }
+      }),
+      aiRepo.logMetric({
+        sessionId,
+        name: "no_citation_rate",
+        value: supportResult.citations.length > 0 ? 0 : 1,
+        payload: { round: supportResult.clarification_round }
       })
-    );
+    ]);
+
+    return supportResult;
+  } catch (error) {
+    console.error("[support-agent] runSearchMode infrastructure handoff:", error instanceof Error ? error.message : error);
+
+    const failureDirectAnswer =
+      language === "zh"
+        ? "当前暂时无法完成自动诊断，建议直接创建工单，我们会自动预填你已提供的上下文。"
+        : "Automatic diagnosis is temporarily unavailable. Create a ticket now and we will prefill the context you already shared.";
+    const failureResult: SearchModeResult = {
+      session_id: sessionId,
+      answer: failureDirectAnswer,
+      answer_language: language,
+      support_answer: {
+        mode: "handoff",
+        direct_answer: failureDirectAnswer,
+        why: [],
+        what_to_do_now:
+          language === "zh"
+            ? ["点击“Create ticket now”生成工单草稿。", "补充报错原文、复现步骤和影响范围。"]
+            : ["Create a ticket draft from this conversation.", "Add the exact error, repro steps, and impact scope."],
+        still_need_to_confirm: []
+      },
+      verification: {
+        verdict: "unsupported",
+        summary:
+          language === "zh"
+            ? "当前自动诊断未能完成。"
+            : "Automatic diagnosis could not be completed.",
+        unsupported_claims: [],
+        missing_info: [],
+        verified_citation_ids: [],
+        verified_claims: [],
+        claim_to_citation_map: []
+      },
+      structured_answer: {
+        summary: failureDirectAnswer,
+        steps:
+          language === "zh"
+            ? ["创建工单草稿。", "补充错误信息、复现步骤和影响范围。"]
+            : ["Create a ticket draft.", "Add the exact error, repro steps, and impact scope."],
+        validation: [],
+        style: "diagnosis"
+      },
+      confidence: 0,
+      suggested_next_step: "submit_ticket",
+      retrieval_status: "kb_unavailable",
+      unresolved_reason_code: "KB_RETRIEVAL_UNAVAILABLE",
+      references: [],
+      citations: [],
+      state: "TICKET_HANDOFF_RECOMMENDED",
+      clarification_round: currentRound,
+      show_create_ticket_now: true,
+      follow_up_question: null
+    };
+
+    if (!options?.sessionId || !previousDialog) {
+      await aiRepo.createSearchSession({
+        sessionId,
+        query: multimodalQuery,
+        answer: failureResult.answer,
+        confidence: failureResult.confidence,
+        retrievalStatus: failureResult.retrieval_status,
+        unresolvedReasonCode: failureResult.unresolved_reason_code,
+        suggestedNextStep: failureResult.suggested_next_step
+      });
+    } else {
+      await aiRepo.updateSearchSession({
+        sessionId,
+        answer: failureResult.answer,
+        confidence: failureResult.confidence,
+        retrievalStatus: failureResult.retrieval_status,
+        unresolvedReasonCode: failureResult.unresolved_reason_code,
+        suggestedNextStep: failureResult.suggested_next_step
+      });
+    }
+
+    await aiRepo.saveSearchReferences(sessionId, []);
+
+    const transcript = mergeTranscript(previousDialog?.transcript, multimodalQuery, failureResult.answer, options?.conversation ?? []);
+    await aiRepo.upsertDialogState({
+      sessionId,
+      state: failureResult.state,
+      clarificationRound: failureResult.clarification_round,
+      showCreateTicketNow: failureResult.show_create_ticket_now,
+      answerLanguage: language,
+      followUpQuestion: failureResult.follow_up_question,
+      transcript,
+      retrievalOutcome: {
+        retrievalStatus: failureResult.retrieval_status,
+        unresolvedReasonCode: failureResult.unresolved_reason_code,
+        confidence: 0,
+        references: 0,
+        verification: failureResult.verification,
+        supportAnswer: failureResult.support_answer,
+        diagnostics: {
+          infrastructure_failure: true
+        }
+      }
+    });
+
+    await Promise.all([
+      aiRepo.logMetric({
+        sessionId,
+        name: "hit_rate",
+        value: 0,
+        payload: { retrievalStatus: failureResult.retrieval_status }
+      }),
+      aiRepo.logMetric({
+        sessionId,
+        name: "citation_coverage",
+        value: 0,
+        payload: { queryLength: multimodalQuery.length }
+      }),
+      aiRepo.logMetric({
+        sessionId,
+        name: "fallback_rate",
+        value: 1,
+        payload: { reasonCode: failureResult.unresolved_reason_code }
+      }),
+      aiRepo.logMetric({
+        sessionId,
+        name: "no_citation_rate",
+        value: 1,
+        payload: { round: failureResult.clarification_round }
+      }),
+      aiRepo.addHandoffEvent({
+        sessionId,
+        eventType: "handoff_triggered",
+        payload: { reason: "support_agent_infrastructure_failure" }
+      })
+    ]);
+
+    return failureResult;
   }
-  await Promise.all(metricPromises);
-
-  // Always show references to the user — let them decide relevance.
-  // Previously we hid references when confidence was low, but that removes useful context.
-  const userFacingReferences = effectiveReferences;
-  const citations = userFacingReferences
-    .filter((ref) => Boolean(ref.sourceUrl))
-    .map((item) => ({
-      id: item.documentId,
-      title: item.title,
-      excerpt: item.snippet,
-      score: item.score,
-      source_url: item.sourceUrl,
-      retrieved_at: item.retrievedAt,
-      repo: getCitationMeta(item).repo,
-      path: getCitationMeta(item).path,
-      commit_sha: getCitationMeta(item).commitSha
-    }));
-
-  return {
-    session_id: sessionId,
-    answer,
-    answer_language: language,
-    structured_answer: structuredAnswer,
-    confidence: response.confidence,
-    suggested_next_step: selfServeResolved ? "self_serve" : "submit_ticket",
-    retrieval_status: response.retrievalStatus,
-    unresolved_reason_code: response.unresolvedReasonCode,
-    references: userFacingReferences,
-    citations,
-    state,
-    clarification_round: clarificationRound,
-    show_create_ticket_now: showCreateTicketNow,
-    follow_up_question: followUpQuestion
-  };
 }
 
 function inferServiceCategory(text: string): "technical_support" | "feature_consulting" | "account_issue" {
@@ -2013,12 +2074,51 @@ export async function buildTicketDraftFromConversation(input: {
   const transcript = dialogState?.transcript ?? [];
   const transcriptText = transcript.map((item) => `[${item.role}] ${item.content}`).join("\n");
   const query = input.question.trim() || session.query;
+  const retrievalOutcome = dialogState?.retrieval_outcome ?? {};
+  const caseFrame = (retrievalOutcome.caseFrame ?? {}) as Record<string, unknown>;
+  const verification = (retrievalOutcome.verification ?? {}) as Record<string, unknown>;
+  const supportAnswer = (retrievalOutcome.supportAnswer ?? {}) as Record<string, unknown>;
 
   const catalog = await onesSync.listCustomerTicketTypes();
   const inferred = inferTicketType(query, transcriptText, catalog);
 
-  const title = buildUserFacingDraftTitle(query);
-  const description = buildUserFacingDraftDescription({ query, transcript });
+  const title = uniqueStrings(
+    [
+      String(caseFrame.goal ?? ""),
+      String(caseFrame.object ?? ""),
+      String(caseFrame.symptom ?? "")
+    ],
+    3
+  ).join(" - ") || buildUserFacingDraftTitle(query);
+  const verifiedFacts = Array.isArray(verification.verified_citation_ids) ? verification.verified_citation_ids : [];
+  const verifiedClaims = Array.isArray(verification.verified_claims) ? verification.verified_claims.map((item) => String(item)) : [];
+  const citationSummary = session.references
+    .slice(0, 3)
+    .map((item) => `- ${item.title}${item.path ? ` (${item.path})` : ""}`)
+    .join("\n");
+  const missingInfo = Array.isArray(verification.missing_info)
+    ? verification.missing_info.map((item) => String(item))
+    : Array.isArray(caseFrame.missing_critical_info)
+    ? caseFrame.missing_critical_info.map((item) => String(item))
+    : [];
+  const description = [
+    buildUserFacingDraftDescription({ query, transcript }),
+    supportAnswer.direct_answer ? `\nDirect answer summary:\n${String(supportAnswer.direct_answer).trim()}` : "",
+    Array.isArray(supportAnswer.why) && supportAnswer.why.length
+      ? `\nVerified points:\n${supportAnswer.why.map((item: unknown) => `- ${String(item)}`).join("\n")}`
+      : verifiedClaims.length
+      ? `\nVerified points:\n${verifiedClaims.map((item) => `- ${item}`).join("\n")}`
+      : "",
+    Array.isArray(supportAnswer.still_need_to_confirm) && supportAnswer.still_need_to_confirm.length
+      ? `\nStill need to confirm:\n${supportAnswer.still_need_to_confirm.map((item: unknown) => `- ${String(item)}`).join("\n")}`
+      : "",
+    verifiedFacts.length ? `\nVerified fact references:\n${verifiedFacts.map((item) => `- ${String(item)}`).join("\n")}` : "",
+    citationSummary ? `\nKey citations:\n${citationSummary}` : "",
+    missingInfo.length ? `\nStill missing:\n${missingInfo.map((item) => `- ${item}`).join("\n")}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .trim();
 
   const onesFields: Record<string, string> = {};
   const fieldHints: ChatTicketDraftField[] = [];
@@ -2055,9 +2155,13 @@ export async function buildTicketDraftFromConversation(input: {
       transcript_digest: crypto.createHash("sha256").update(transcriptText || query).digest("hex"),
       retrieval_outcome: {
         status: session.retrieval_status,
-        unresolved_reason_code: session.unresolved_reason_code
+        unresolved_reason_code: session.unresolved_reason_code,
+        case_frame: caseFrame,
+        verification_summary: verification,
+        evidence_bundle_digest: retrievalOutcome.evidenceBundleDigest ?? null
       },
-      retrieval_traces_count: input.retrievalTraces.length
+      retrieval_traces_count: input.retrievalTraces.length,
+      support_answer: supportAnswer
     }
   });
 
@@ -2198,6 +2302,67 @@ export async function markTicketDraftSubmitted(draftId: string, ticketId: string
   });
 }
 
+function buildSupportTriageInfrastructureFailure(input: {
+  query: string;
+  error: unknown;
+}): OpenClawAnalyzeOutput & Record<string, unknown> {
+  const errorMessage = input.error instanceof Error ? input.error.message : String(input.error ?? "unknown_error");
+  const caseFrame: SupportCaseFrame = {
+    goal: input.query.trim() || "support triage",
+    symptom: "support_agent_infrastructure_failure",
+    object: "ticket",
+    action_type: "triage",
+    deployment_model: "unknown",
+    product_area: "general",
+    constraints: ["support_agent_infrastructure_failure"],
+    missing_critical_info: [],
+    retrieval_queries: [input.query.trim()].filter(Boolean),
+    query_plan: {
+      concept_queries: [input.query.trim()].filter(Boolean),
+      object_queries: [],
+      behavior_queries: []
+    }
+  };
+  const verification: SupportVerificationResult = {
+    verdict: "unsupported",
+    summary: "The AI support triage path could not verify a supported next action because evidence retrieval failed.",
+    unsupported_claims: [],
+    missing_info: [],
+    verified_citation_ids: [],
+    verified_claims: [],
+    claim_to_citation_map: []
+  };
+  const supportInsight: TriageSupportInsight = {
+    direct_answer: "The AI support triage path is unavailable, so this ticket should be escalated instead of using an unverified fallback action.",
+    recommended_action: "escalate",
+    customer_reply: "",
+    customer_reply_policy: "no_send",
+    support_summary: "Escalate because the AI support agent could not complete a verified triage run.",
+    verified_evidence: [],
+    risk_flags: ["support_agent_infrastructure_failure"],
+    missing_info: [],
+    verifier_verdict: "unsupported"
+  };
+
+  return {
+    action: "escalate",
+    confidence: 0,
+    reply: "",
+    reasoning_summary: supportInsight.support_summary,
+    evidence: [],
+    risk_flags: supportInsight.risk_flags,
+    support_insight: supportInsight,
+    verification_summary: verification,
+    case_frame: caseFrame,
+    evidence_bundle_digest: crypto
+      .createHash("sha256")
+      .update(JSON.stringify({ reason: "support_agent_infrastructure_failure", query: input.query }))
+      .digest("hex"),
+    failure_mode: "support_agent_infrastructure_failure",
+    failure_detail: errorMessage
+  };
+}
+
 export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter) {
   const ticket = await tickets.getTicketById(ticketId);
   if (!ticket) {
@@ -2265,12 +2430,40 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
 
   try {
     const runtime = resolveExecutionRuntime(`ticket-${ticketId}`);
-    const deterministicResult = buildDeterministicTicketTriage({
-      title: refreshedTicket.title,
-      description: triageDescription,
-      history
-    });
-    const rawResult = deterministicResult ?? (await adapter.analyzeTicket(input, idempotencyKey, runtime));
+    let rawResult: OpenClawAnalyzeOutput & Record<string, unknown>;
+    const legacyGuardResult = await adapter
+      .analyzeTicket(input, `${idempotencyKey}:legacy-guard`, runtime)
+      .catch(() => null);
+    if (legacyGuardResult && normalizeAction(legacyGuardResult.action) === "none") {
+      rawResult = legacyGuardResult as OpenClawAnalyzeOutput & Record<string, unknown>;
+    } else {
+    try {
+      const supportTriage = await runSupportTriageAgent({
+        query: [refreshedTicket.title, triageDescription, ...history.slice(-4).map((item) => item.body)].filter(Boolean).join("\n\n"),
+        language: "en",
+        adapter,
+        runtime,
+        idempotencyKey,
+        priority: refreshedTicket.priority,
+        customerMeta: {
+          customerId: refreshedTicket.customer_id,
+          customerName: refreshedTicket.customer_name
+        },
+        history,
+        attachments: attachmentUrls
+      });
+      rawResult = supportTriage.analyzeOutput;
+    } catch (supportError) {
+      console.error(
+        "[support-agent] triage infrastructure escalation:",
+        supportError instanceof Error ? supportError.message : supportError
+      );
+      rawResult = buildSupportTriageInfrastructureFailure({
+        query: [refreshedTicket.title, triageDescription, ...history.slice(-4).map((item) => item.body)].filter(Boolean).join("\n\n"),
+        error: supportError
+      });
+    }
+    }
     const result = normalizeAnalyzeOutput(rawResult);
     const traceId = `${ticketId}:${idempotencyKey}:${Date.now()}`;
     const promptHash = crypto
@@ -2299,6 +2492,10 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
       aiModeSnapshot: aiMode.enabled ? "AI_ON" : "AI_OFF"
     });
 
+    const supportInsight = ((result as unknown) as Record<string, unknown>).support_insight as TriageSupportInsight | undefined;
+    const customerReplyPolicy = supportInsight?.customer_reply_policy ?? (result.action === "escalate" ? "no_send" : "send_now");
+    const shouldReplyToCustomer = customerReplyPolicy === "send_now" && result.reply.trim().length > 0;
+
     if (result.action === "escalate") {
       const latest = await tickets.getTicketById(ticketId);
       if (latest && canTransition(latest.status, "ESCALATED_RND")) {
@@ -2320,7 +2517,6 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
       return result;
     }
 
-    const shouldReplyToCustomer = result.reply.trim().length > 0;
     if (shouldReplyToCustomer) {
       await tickets.addMessage({
         ticketId,
@@ -2334,6 +2530,25 @@ export async function runTicketTriage(ticketId: string, adapter: OpenClawAdapter
     }
 
     const latest = await tickets.getTicketById(ticketId);
+    if (result.action === "resolve") {
+      if (latest && canTransition(latest.status, "RESOLVED")) {
+        await tickets.transitionTicket(ticketId, latest.status, "RESOLVED");
+      }
+      await tickets.setTicketAssignee(ticketId, "SUPPORT_TEAM", "Support Team");
+      await tickets.addAuditLog(ticketId, "ai_triage_replied", null, "RESOLVED", {
+        action: result.action,
+        traceId,
+        stage: "resolved",
+        status: "RESOLVED",
+        assignee: "Support Team",
+        customer_message_policy: shouldReplyToCustomer ? "reply_from_support_team" : "none",
+        sla_effect: "continue_active_timer",
+        confidence: result.confidence,
+        evidence: result.evidence
+      });
+      return result;
+    }
+
     if (shouldReplyToCustomer && latest && canTransition(latest.status, "WAITING_CUSTOMER")) {
       await tickets.transitionTicket(ticketId, latest.status, "WAITING_CUSTOMER");
     }

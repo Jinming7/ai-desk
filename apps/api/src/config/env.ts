@@ -24,10 +24,17 @@ const envSchema = z.object({
   OPENCLAW_CLIENT_ORIGIN: z.string().default("https://47.250.122.37"),
   OPENCLAW_AGENT_ID: z.string().default("main"),
   OPENCLAW_AGENT_SESSION_KEY: z.string().default("agent:main:main"),
+  OPENCLAW_AGENT_MODEL: z.string().default(""),
   OPENCLAW_AGENT_ID_RETRIEVAL: z.string().default(""),
   OPENCLAW_AGENT_ID_CLARIFY: z.string().default(""),
   OPENCLAW_AGENT_ID_EXECUTION: z.string().default("execution"),
+  OPENCLAW_AGENT_MODEL_RETRIEVAL: z.string().default(""),
+  OPENCLAW_AGENT_MODEL_CLARIFY: z.string().default(""),
+  OPENCLAW_AGENT_MODEL_EXECUTION: z.string().default(""),
   OPENCLAW_AGENT_SESSION_PREFIX: z.string().default("nf"),
+  OPENCLAW_RUN_SESSION_TTL_SECONDS: z.coerce.number().int().min(30).max(86400).default(900),
+  OPENCLAW_RUN_SESSION_REGISTRY_MAX: z.coerce.number().int().min(100).max(10000).default(2000),
+  OPENCLAW_DEBUG_STAGE_TIMINGS: z.coerce.boolean().default(false),
   OPENCLAW_AGENT_TIMEOUT_MS: z.coerce.number().default(30000),
   OPENCLAW_ALLOW_SELF_SIGNED: z.coerce.boolean().default(false),
   OPENCLAW_SEARCH_INDEX: z.string().default("public_kb"),
@@ -66,7 +73,9 @@ const envSchema = z.object({
   GITHUB_KB_BOOTSTRAP_PUBLIC_BASE_URL: z.string().url().optional(),
   GITHUB_KB_BOOTSTRAP_BRANCH: z.string().default("main"),
   GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS: z.string().default("**/*.md"),
-  GITHUB_KB_BOOTSTRAP_EXCLUDE_PATHS: z.string().default(""),
+  GITHUB_KB_BOOTSTRAP_EXCLUDE_PATHS: z
+    .string()
+    .default(".claude/**,.github/**,.docusaurus/**,node_modules/**,build/**,dist/**"),
   GITHUB_KB_BOOTSTRAP_POLLING_INTERVAL_SECONDS: z.coerce.number().int().min(30).max(86400).default(300),
   GITHUB_KB_CHUNK_TARGET_TOKENS: z.coerce.number().int().min(100).max(3000).default(500),
   GITHUB_KB_CHUNK_OVERLAP_TOKENS: z.coerce.number().int().min(0).max(500).default(60),
@@ -75,6 +84,7 @@ const envSchema = z.object({
   GITHUB_KB_EMBEDDING_API_BASE: z.string().default("https://api.openai.com/v1"),
   GITHUB_KB_EMBEDDING_API_KEY: z.string().optional(),
   GITHUB_KB_EMBEDDING_MODEL: z.string().default("text-embedding-3-small"),
+  GITHUB_KB_EMBEDDING_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60000).default(8000),
   GITHUB_KB_EMBEDDING_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
   GITHUB_KB_PROFILE_SEARCH_TOPK: z.coerce.number().int().min(1).max(30).default(5),
   GITHUB_KB_PROFILE_AGENT_TOPK: z.coerce.number().int().min(1).max(30).default(12),
@@ -82,7 +92,10 @@ const envSchema = z.object({
   GITHUB_KB_PROFILE_AGENT_CONFIDENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.45),
   GITHUB_KB_POLL_BATCH_SIZE: z.coerce.number().int().min(1).max(200).default(5),
   GITHUB_KB_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(200).default(2),
-  GITHUB_KB_WORKER_INTERVAL_SECONDS: z.coerce.number().int().min(5).max(3600).default(30)
+  GITHUB_KB_WORKER_INTERVAL_SECONDS: z.coerce.number().int().min(5).max(3600).default(30),
+  GITHUB_KB_LOCAL_MIRROR_BATCH_SIZE: z.coerce.number().int().min(1).max(200).default(5),
+  LOCAL_DOCS_COM_PATH: z.string().default("/tmp/docs-com"),
+  LOCAL_DOCS_CACHE_TTL_SECONDS: z.coerce.number().int().min(10).max(86400).default(300)
 });
 
 export const env = envSchema.parse(process.env);

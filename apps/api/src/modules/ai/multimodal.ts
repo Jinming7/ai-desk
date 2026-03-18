@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { env } from "../../config/env.js";
+import { fetchWithNodeCompat } from "../../utils/fetch-compat.js";
 
 export type AiCapabilities = {
   imageInputEnabled: boolean;
@@ -339,7 +340,7 @@ export async function summarizeImageAttachments(input: {
     return null;
   }
 
-  const response = await fetch(`${env.OPENAI_API_BASE.replace(/\/$/, "")}/responses`, {
+  const response = await fetchWithNodeCompat(`${env.OPENAI_API_BASE.replace(/\/$/, "")}/responses`, {
     method: "POST",
     headers: {
       Authorization: auth.authHeader,

@@ -2,6 +2,7 @@ import { z } from "zod";
 import { createHash } from "node:crypto";
 import { env } from "../../config/env.js";
 import { decryptSecret, encryptSecret, maskSecret } from "../../utils/crypto.js";
+import { fetchWithNodeCompat } from "../../utils/fetch-compat.js";
 import * as repo from "./repository.js";
 import * as ticketsRepo from "../tickets/repository.js";
 
@@ -218,7 +219,7 @@ async function onesFetchWithToken(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
     try {
-      const response = await fetch(url, { ...init, headers, signal: controller.signal });
+      const response = await fetchWithNodeCompat(url, { ...init, headers, signal: controller.signal });
       clearTimeout(timer);
       if (!response.ok) {
         const body = await response.text();
@@ -895,7 +896,7 @@ export async function discoverProjects(input: unknown) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), attemptTimeout);
       try {
-        const res = await fetch(requestUrl, { headers, signal: controller.signal });
+        const res = await fetchWithNodeCompat(requestUrl, { headers, signal: controller.signal });
         clearTimeout(timer);
         if (!res.ok) {
           throw new Error(`ONES ${res.status}: ${await res.text()}`);
@@ -1265,7 +1266,7 @@ export async function testEndpoint(input: unknown) {
   const startedAt = Date.now();
   const timer = setTimeout(() => controller.abort(), parsed.timeoutMs);
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithNodeCompat(url, {
       method: parsed.method,
       headers,
       body: parsed.method === "GET" || parsed.method === "DELETE" ? undefined : JSON.stringify(parsed.body ?? {}),

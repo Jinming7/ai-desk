@@ -1,4 +1,5 @@
 import type {
+  TicketAiApplyInput,
   TicketBulkActionInput,
   TicketAssignInput,
   TicketCreateInput,
@@ -9,6 +10,7 @@ import type {
 import { canTransition } from "../../domain/state-machine.js";
 import * as repo from "./repository.js";
 import * as onesSyncService from "../ones-sync/service.js";
+import type { TriageSupportInsight } from "../ai/types.js";
 
 export async function createTicket(input: TicketCreateInput) {
   return repo.createTicket(input);
@@ -24,7 +26,26 @@ export async function getTicketDetail(id: string) {
     throw new Error("Ticket not found");
   }
   const messages = await repo.listTicketMessages(id);
-  return { ticket, messages };
+  const latestAi = await repo.getLatestCompletedAiRunResponse(id);
+  return {
+    ticket: {
+      ...ticket,
+      triage_reasoning_summary:
+        typeof latestAi?.support_insight?.support_summary === "string"
+          ? latestAi.support_insight.support_summary
+          : latestAi?.reasoning_summary ?? null,
+      triage_evidence: Array.isArray(latestAi?.support_insight?.verified_evidence)
+        ? (latestAi?.support_insight?.verified_evidence as string[])
+        : Array.isArray(latestAi?.evidence)
+        ? latestAi.evidence
+        : [],
+      triage_support_insight: latestAi?.support_insight ?? null,
+      triage_verification_summary: latestAi?.verification_summary ?? null,
+      triage_case_frame: latestAi?.case_frame ?? null,
+      evidence_bundle_digest: latestAi?.evidence_bundle_digest ?? null
+    },
+    messages
+  };
 }
 
 export async function addReply(id: string, input: TicketReplyInput) {
@@ -186,5 +207,75 @@ export async function applyBulkAction(input: TicketBulkActionInput) {
     success: results.filter((r) => r.ok).length,
     failed: results.filter((r) => !r.ok).length,
     results
+  };
+}
+
+export async function applyLatestAiSuggestion(id: string, input: TicketAiApplyInput) {
+  const ticket = await repo.getTicketById(id);
+  if (!ticket) {
+    throw new Error("Ticket not found");
+  }
+  if (input.traceId && ticket.ai_last_trace_id && input.traceId !== ticket.ai_last_trace_id) {
+    throw Object.assign(new Error("AI suggestion is stale"), { statusCode: 409 });
+  }
+
+  const latestAi = await repo.getLatestCompletedAiRunResponse(id);
+  const insight = (latestAi?.support_insight ?? null) as TriageSupportInsight | null;
+  if (!insight) {
+    throw Object.assign(new Error("AI suggestion is not available"), { statusCode: 400 });
+  }
+
+  const action = insight.recommended_action;
+  const replyPolicy = insight.customer_reply_policy ?? (action === "escalate" ? "no_send" : "send_now");
+  const reply = insight.customer_reply?.trim() ?? "";
+  let messagePosted = false;
+
+  if ((action === "ask_user" || action === "resolve") && replyPolicy === "send_now" && reply) {
+    await addReply(id, {
+      body: reply,
+      authorType: "AGENT",
+      authorName: "Support Team",
+      attachments: []
+    });
+    messagePosted = true;
+  }
+
+  if (action === "resolve") {
+    const latest = await repo.getTicketById(id);
+    if (latest && latest.status !== "RESOLVED" && canTransition(latest.status, "RESOLVED")) {
+      await transitionInternal(id, {
+        to: "RESOLVED",
+        reasonCode: "manual_resolution"
+      });
+    }
+  } else if (action === "escalate") {
+    const latest = await repo.getTicketById(id);
+    if (latest && latest.status !== "ESCALATED_RND" && canTransition(latest.status, "ESCALATED_RND")) {
+      await transitionInternal(id, {
+        to: "ESCALATED_RND",
+        reasonCode: "manual_escalation"
+      });
+    }
+    await assign(id, {
+      assigneeType: "RND_TEAM",
+      assigneeName: "R&D Team",
+      reasonCode: "manual_escalation"
+    });
+  } else if (!messagePosted) {
+    const latest = await repo.getTicketById(id);
+    if (latest && latest.status !== "WAITING_CUSTOMER" && canTransition(latest.status, "WAITING_CUSTOMER")) {
+      await transitionInternal(id, {
+        to: "WAITING_CUSTOMER",
+        reasonCode: "manual_waiting_customer"
+      });
+    }
+  }
+
+  const detail = await getTicketDetail(id);
+  return {
+    appliedAction: action,
+    traceId: ticket.ai_last_trace_id,
+    messagePosted,
+    ticket: detail.ticket
   };
 }

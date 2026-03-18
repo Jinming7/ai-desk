@@ -2,12 +2,21 @@ import type {
   OpenClawAdapter,
   OpenClawAnalyzeInput,
   OpenClawAnalyzeOutput,
+  OpenClawSupportPlannerInput,
+  OpenClawSupportVerifierInput,
+  OpenClawSupportWriterInput,
   OpenClawRuntimeContext,
   OpenClawSearchAnswerInput,
   OpenClawSearchAnswerOutput,
   OpenClawSearchInput,
   OpenClawSearchOutput
 } from "./types.js";
+import type {
+  DraftSupportAnswer,
+  SupportCaseFrame,
+  SupportVerificationResult,
+  TriageSupportInsight
+} from "../../modules/ai/types.js";
 
 const mockCorpus: Array<{ id: string; title: string; content: string; sourceUrl: string }> = [
   {
@@ -89,6 +98,9 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     if (/simulate_openclaw_failure/i.test(input.query)) {
       throw new Error("Simulated OpenClaw KB retrieval failure");
     }
+    if (/simulate_support_agent_failure/i.test(input.query)) {
+      throw new Error("Simulated support-agent retrieval failure");
+    }
 
     if (/resolve_fast/i.test(input.query)) {
       return {
@@ -154,6 +166,236 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       steps: [],
       validation: [],
       suggested_next_step: "submit_ticket"
+    };
+  }
+
+  async planSupportCase(
+    input: OpenClawSupportPlannerInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SupportCaseFrame> {
+    const query = input.query.trim();
+    const strippedQuery = query.replace(/how to|如何|怎么/gi, "").trim();
+    const isBillingCheckout = /billing admin role denied checkout/i.test(query);
+    return {
+      goal: query,
+      symptom: /failed|error|timeout|not work|问题|失败|报错/i.test(query) ? query : "needs product/support guidance",
+      object: /api|openapi|token|oauth|comment|issue/i.test(query) ? "api_or_integration" : "general_support",
+      action_type: /how|如何|怎么|create|创建|导出|export/i.test(query) ? "how_to" : "troubleshooting",
+      deployment_model: /public cloud|公有云/i.test(query) ? "public_cloud" : "shared",
+      product_area: /api|openapi/i.test(query) ? "openapi" : /oauth|login|sso|github/i.test(query) ? "integrations" : "general",
+      constraints: [],
+      missing_critical_info: [
+        /thisquerywillnotmatchkbx/i.test(query) ? "the exact object or failing step" : "",
+        isBillingCheckout ? "the exact billing role mapping and denied checkout step" : ""
+      ].filter(Boolean),
+      retrieval_queries: [query, strippedQuery].filter(Boolean),
+      query_plan: {
+        concept_queries: [query].filter(Boolean),
+        object_queries: [strippedQuery || query].filter(Boolean),
+        behavior_queries: [/why|原因|为什么/i.test(query) ? `${query} rule behavior limitation` : `${query} procedure step`]
+      }
+    };
+  }
+
+  async writeSupportAnswer(
+    input: OpenClawSupportWriterInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<DraftSupportAnswer> {
+    const primary = input.evidenceBundle.primary[0];
+    if (!primary) {
+      return {
+        direct_answer:
+          input.language === "zh"
+            ? "我还缺少一个关键信息，无法给出被证据支撑的结论。"
+            : "I still need one critical detail before I can give a verified answer.",
+        claims: [],
+        next_actions: [
+          input.language === "zh"
+            ? `请补充：${input.caseFrame.missing_critical_info[0] ?? "最关键的一条上下文"}`
+            : `Please share: ${input.caseFrame.missing_critical_info[0] ?? "the single most important missing detail"}`
+        ],
+        unknowns: input.caseFrame.missing_critical_info.slice(0, 3),
+        escalation_needed: false
+      };
+    }
+
+    return {
+      direct_answer:
+        input.language === "zh"
+          ? `${primary.snippet}`
+          : `${primary.snippet}`,
+      claims: [
+        {
+          text: primary.snippet,
+          kind: "verified_fact",
+          evidence_ids: [primary.documentId],
+          authority: "canonical"
+        }
+      ],
+      next_actions: [
+        input.language === "zh"
+          ? "如果仍未恢复，请补充准确报错、复现步骤和影响范围。"
+          : "If the issue persists, share the exact error, repro steps, and impact scope."
+      ],
+      unknowns: [],
+      escalation_needed: false
+    };
+  }
+
+  async verifySupportAnswer(
+    input: OpenClawSupportVerifierInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult> {
+    const citationIds = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].map((item) => item.documentId);
+    if (/billing admin role denied checkout/i.test(input.query)) {
+      const verifiedCitationIds = citationIds.slice(0, 2);
+      const verifiedClaims = input.draftSupportAnswer?.claims.map((item) => item.text).slice(0, 2) ?? [];
+      return {
+        verdict: "partial",
+        summary: "The available evidence supports a likely billing-permission path, but the exact role mapping is still missing.",
+        unsupported_claims: [],
+        missing_info: ["the exact billing role mapping and denied checkout step"],
+        verified_citation_ids: verifiedCitationIds,
+        verified_claims: verifiedClaims,
+        claim_to_citation_map:
+          input.draftSupportAnswer?.claims.map((item) => ({
+            text: item.text,
+            kind: item.kind,
+            verdict: item.kind === "grounded_inference" ? "supported_inference" : "verified",
+            citation_ids: item.evidence_ids.length ? item.evidence_ids.slice(0, 2) : verifiedCitationIds
+          })) ?? []
+      };
+    }
+    if (!citationIds.length) {
+      return {
+        verdict: "unsupported",
+        summary: input.language === "zh" ? "没有足够证据支撑最终结论。" : "There is not enough evidence to support a final conclusion.",
+        unsupported_claims: [input.draftSupportAnswer?.direct_answer ?? ""].filter(Boolean),
+        missing_info: input.caseFrame.missing_critical_info.slice(0, 3),
+        verified_citation_ids: [],
+        verified_claims: [],
+        claim_to_citation_map: []
+      };
+    }
+    return {
+      verdict: citationIds.length >= 3 ? "verified" : "partial",
+      summary:
+        citationIds.length >= 3
+          ? input.language === "zh"
+            ? "回答与知识库证据基本一致。"
+            : "The answer is aligned with the knowledge-base evidence."
+          : input.language === "zh"
+          ? "回答仅有部分证据支撑。"
+          : "The answer is only partially supported by evidence.",
+      unsupported_claims: [],
+      missing_info: citationIds.length > 1 ? [] : input.caseFrame.missing_critical_info.slice(0, 2),
+      verified_citation_ids: citationIds.slice(0, 3),
+      verified_claims: input.draftSupportAnswer?.claims.map((item) => item.text).slice(0, 3) ?? [],
+      claim_to_citation_map:
+        input.draftSupportAnswer?.claims.map((item) => ({
+          text: item.text,
+          kind: item.kind,
+          verdict: item.kind === "grounded_inference" ? "supported_inference" : "verified",
+          citation_ids: item.evidence_ids.length ? item.evidence_ids : citationIds.slice(0, 1)
+        })) ?? []
+    };
+  }
+
+  async writeTriageInsight(
+    input: OpenClawSupportWriterInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<TriageSupportInsight> {
+    const combined = `${input.query} ${input.ticketContext?.history.map((item) => item.body).join(" ") ?? ""}`;
+    const hasEvidence = input.evidenceBundle.primary.length > 0;
+    const recommended_action: "resolve" | "ask_user" | "escalate" =
+      /error|failed|urgent|production|bug|regression/i.test(combined) ? "escalate" : hasEvidence ? "resolve" : "ask_user";
+
+    return {
+      direct_answer:
+        recommended_action === "escalate"
+          ? "The issue is better handled by engineering with the current evidence."
+          : recommended_action === "resolve"
+          ? "The issue maps to an evidence-backed self-serve flow."
+          : "One critical detail is still missing before a reliable resolution can be suggested.",
+      recommended_action,
+      customer_reply:
+        recommended_action === "escalate"
+          ? "Thanks for your report. This issue needs deeper technical analysis, so I have escalated it to our engineering team."
+          : recommended_action === "resolve"
+          ? "Thanks for contacting support. Please try the verified steps from the knowledge base first, and reply if the issue continues."
+          : `Please share: ${input.caseFrame.missing_critical_info[0] ?? "the single most important missing detail"}.`,
+      customer_reply_policy: recommended_action === "escalate" ? "no_send" : "send_now",
+      support_summary:
+        recommended_action === "escalate"
+          ? "Escalate to R&D based on current issue signals."
+          : recommended_action === "resolve"
+          ? "A knowledge-backed support flow is available."
+          : "Ask one targeted follow-up question before suggesting resolution.",
+      verified_evidence: input.evidenceBundle.primary.slice(0, 3).map((item) => item.title),
+      risk_flags: recommended_action === "escalate" ? ["needs_rnd"] : [],
+      missing_info: input.caseFrame.missing_critical_info.slice(0, 3),
+      verifier_verdict: recommended_action === "resolve" && hasEvidence ? "verified" : hasEvidence ? "partial" : "unsupported"
+    };
+  }
+
+  async verifyTriageInsight(
+    input: OpenClawSupportVerifierInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult> {
+    const citationIds = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].map((item) => item.documentId);
+    const recommended = input.triageInsight?.recommended_action ?? "ask_user";
+    if (recommended === "resolve" && citationIds.length > 0) {
+      return {
+        verdict: "verified",
+        summary: "The triage action is supported by evidence.",
+        unsupported_claims: [],
+        missing_info: [],
+        verified_citation_ids: citationIds.slice(0, 3),
+        verified_claims: [input.triageInsight?.direct_answer ?? ""].filter(Boolean),
+        claim_to_citation_map: [
+          {
+            text: input.triageInsight?.direct_answer ?? "",
+            kind: "verified_fact" as const,
+            verdict: "verified" as const,
+            citation_ids: citationIds.slice(0, 3)
+          }
+        ].filter((item) => Boolean(item.text))
+      };
+    }
+    if (recommended === "escalate") {
+      return {
+        verdict: citationIds.length > 0 ? "partial" : "unsupported",
+        summary: citationIds.length > 0 ? "Escalation is reasonable with the current evidence." : "Escalation lacks direct KB support.",
+        unsupported_claims: [],
+        missing_info: citationIds.length > 0 ? [] : input.caseFrame.missing_critical_info.slice(0, 2),
+        verified_citation_ids: citationIds.slice(0, 3),
+        verified_claims: citationIds.length > 0 ? [input.triageInsight?.direct_answer ?? ""].filter(Boolean) : [],
+        claim_to_citation_map:
+          citationIds.length > 0
+            ? [
+                {
+                  text: input.triageInsight?.direct_answer ?? "",
+                  kind: "grounded_inference" as const,
+                  verdict: "supported_inference" as const,
+                  citation_ids: citationIds.slice(0, 3)
+                }
+              ].filter((item) => Boolean(item.text))
+            : []
+      };
+    }
+    return {
+      verdict: "unsupported",
+      summary: "More customer information is required.",
+      unsupported_claims: [],
+      missing_info: input.caseFrame.missing_critical_info.slice(0, 3),
+      verified_citation_ids: citationIds.slice(0, 2),
+      verified_claims: [],
+      claim_to_citation_map: []
     };
   }
 

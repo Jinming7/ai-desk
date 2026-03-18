@@ -110,11 +110,16 @@ export const ticketInternalTransitionSchema = z.object({
   ])
 });
 
+export const ticketAiApplySchema = z.object({
+  traceId: z.string().min(1).optional()
+});
+
 export type TicketStatus = z.infer<typeof ticketStatusSchema>;
 export type TicketCreateInput = z.infer<typeof ticketCreateSchema>;
 export type TicketReplyInput = z.infer<typeof ticketReplySchema>;
 export type TicketAssignInput = z.infer<typeof ticketAssignSchema>;
 export type TicketInternalTransitionInput = z.infer<typeof ticketInternalTransitionSchema>;
+export type TicketAiApplyInput = z.infer<typeof ticketAiApplySchema>;
 export type TicketBulkActionInput = z.infer<typeof ticketBulkActionSchema>;
 export type ImageUploadInput = z.infer<typeof imageUploadSchema>;
 export type FileUploadInput = z.infer<typeof fileUploadSchema>;
