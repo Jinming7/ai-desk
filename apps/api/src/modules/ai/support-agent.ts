@@ -54,6 +54,33 @@ function skippedStageTiming(): SupportAgentStageTiming {
   return { duration_ms: 0, status: "skipped" };
 }
 
+function remainingBudgetMs(runtime?: OpenClawRuntimeContext): number | null {
+  const startedAt = runtime?.requestStartedAtMs;
+  const overallTimeoutMs = runtime?.overallTimeoutMs;
+  if (!startedAt || !overallTimeoutMs) return null;
+  return Math.max(0, overallTimeoutMs - (Date.now() - startedAt));
+}
+
+function hasEnoughBudget(runtime: OpenClawRuntimeContext | undefined, minimumMs: number): boolean {
+  const remaining = remainingBudgetMs(runtime);
+  return remaining === null || remaining >= minimumMs;
+}
+
+function buildStageRuntime(
+  runtime: OpenClawRuntimeContext | undefined,
+  reserveMs: number,
+  minimumTimeoutMs = 3000
+): OpenClawRuntimeContext | undefined {
+  if (!runtime) return runtime;
+  const remaining = remainingBudgetMs(runtime);
+  if (remaining === null) return runtime;
+  const timeoutMs = Math.max(minimumTimeoutMs, remaining - reserveMs);
+  return {
+    ...runtime,
+    timeoutMs
+  };
+}
+
 function fallbackCaseFrame(query: string): SupportCaseFrame {
   const normalized = query.trim();
   return {
@@ -461,8 +488,11 @@ export async function runSupportSearchAgent(input: {
 }> {
   const runStartedAt = performance.now();
   const orchestrator = new SearchOrchestrator(input.adapter);
+  const allowMultiPassRetrieval = input.runtime?.allowMultiPassRetrieval !== false;
+  const allowRefinement = input.runtime?.allowRefinement !== false;
 
   const plannerStartedAt = performance.now();
+  const plannerRuntime = buildStageRuntime(input.runtime, 12000, 4000);
   const plannerPromise = input.adapter
     .planSupportCase(
       {
@@ -472,7 +502,7 @@ export async function runSupportSearchAgent(input: {
         conversationHistory: input.conversationHistory
       },
       `${input.idempotencyKey}:plan`,
-      input.runtime
+      plannerRuntime
     )
     .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(plannerStartedAt)) }))
     .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(plannerStartedAt)) }));
@@ -501,7 +531,7 @@ export async function runSupportSearchAgent(input: {
   const additionalQueries = combineRetrievalQueries(input.query, caseFrame, orchestrator);
   const additionalStartedAt = performance.now();
   const additionalEvidence =
-    additionalQueries.length > 0
+    allowMultiPassRetrieval && additionalQueries.length > 0 && hasEnoughBudget(input.runtime, 9000)
       ? await orchestrator.collectEvidence({
           queries: additionalQueries,
           idempotencyKey: `${input.idempotencyKey}:evidence:extra`,
@@ -514,7 +544,7 @@ export async function runSupportSearchAgent(input: {
     ? orchestrator.combineEvidenceCollections([baseEvidence, additionalEvidence])
     : baseEvidence;
   const refinementEvidence =
-    preRefinedEvidence.references.length > 0
+    allowRefinement && preRefinedEvidence.references.length > 0 && hasEnoughBudget(input.runtime, 7000)
       ? await orchestrator.refineEvidence({
           baseQuery: input.query,
           references: preRefinedEvidence.references,
@@ -528,7 +558,7 @@ export async function runSupportSearchAgent(input: {
     refinementEvidence && refinementEvidence.references.length > 0
       ? orchestrator.combineEvidenceCollections([preRefinedEvidence, refinementEvidence])
       : preRefinedEvidence;
-  const secondRoundQueryCount = additionalQueries.length + (refinementEvidence?.resolvedQueries.length ?? 0);
+  const secondRoundQueryCount = (additionalEvidence ? additionalQueries.length : 0) + (refinementEvidence?.resolvedQueries.length ?? 0);
   const additionalTiming =
     secondRoundQueryCount > 0
       ? stageTiming("completed", elapsedMs(additionalStartedAt), {
@@ -546,7 +576,9 @@ export async function runSupportSearchAgent(input: {
   });
 
   const writerStartedAt = performance.now();
-  const writtenResult = await input.adapter
+  const writerRuntime = buildStageRuntime(input.runtime, 4500, 3500);
+  const writtenResult = hasEnoughBudget(input.runtime, 4500)
+    ? await input.adapter
     .writeSupportAnswer(
       {
         contextType: "search",
@@ -557,10 +589,11 @@ export async function runSupportSearchAgent(input: {
         conversationHistory: input.conversationHistory
       },
       `${input.idempotencyKey}:write`,
-      input.runtime
+      writerRuntime
     )
     .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(writerStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(writerStartedAt)) }));
+    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(writerStartedAt)) }))
+    : { value: null, timing: stageTiming("skipped", elapsedMs(writerStartedAt)) };
   const draftSupportAnswer =
     writtenResult.value ??
     fallbackDraftSupportAnswer({
@@ -570,7 +603,9 @@ export async function runSupportSearchAgent(input: {
     });
 
   const verifierStartedAt = performance.now();
-  const verificationResult = await input.adapter
+  const verifierRuntime = buildStageRuntime(input.runtime, 1500, 2500);
+  const verificationResult = hasEnoughBudget(input.runtime, 2500)
+    ? await input.adapter
     .verifySupportAnswer(
       {
         contextType: "search",
@@ -581,10 +616,11 @@ export async function runSupportSearchAgent(input: {
         draftSupportAnswer
       },
       `${input.idempotencyKey}:verify`,
-      input.runtime
+      verifierRuntime
     )
     .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(verifierStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(verifierStartedAt)) }));
+    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(verifierStartedAt)) }))
+    : { value: null, timing: stageTiming("skipped", elapsedMs(verifierStartedAt)) };
   const verification =
     verificationResult.value ??
     fallbackVerification(
@@ -722,11 +758,14 @@ export async function runSupportTriageAgent(input: {
 }> {
   const runStartedAt = performance.now();
   const orchestrator = new SearchOrchestrator(input.adapter);
+  const allowMultiPassRetrieval = input.runtime?.allowMultiPassRetrieval !== false;
+  const allowRefinement = input.runtime?.allowRefinement !== false;
   const conversationHistory = input.history
     .slice(-6)
     .map((item) => ({ role: "user" as const, content: `${item.author}: ${item.body}` }));
 
   const plannerStartedAt = performance.now();
+  const plannerRuntime = buildStageRuntime(input.runtime, 12000, 4000);
   const plannerPromise = input.adapter
     .planSupportCase(
       {
@@ -741,7 +780,7 @@ export async function runSupportTriageAgent(input: {
         }
       },
       `${input.idempotencyKey}:plan`,
-      input.runtime
+      plannerRuntime
     )
     .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(plannerStartedAt)) }))
     .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(plannerStartedAt)) }));
@@ -770,7 +809,7 @@ export async function runSupportTriageAgent(input: {
   const additionalQueries = combineRetrievalQueries(input.query, caseFrame, orchestrator);
   const additionalStartedAt = performance.now();
   const additionalEvidence =
-    additionalQueries.length > 0
+    allowMultiPassRetrieval && additionalQueries.length > 0 && hasEnoughBudget(input.runtime, 9000)
       ? await orchestrator.collectEvidence({
           queries: additionalQueries,
           idempotencyKey: `${input.idempotencyKey}:evidence:extra`,
@@ -783,7 +822,7 @@ export async function runSupportTriageAgent(input: {
     ? orchestrator.combineEvidenceCollections([baseEvidence, additionalEvidence])
     : baseEvidence;
   const refinementEvidence =
-    preRefinedEvidence.references.length > 0
+    allowRefinement && preRefinedEvidence.references.length > 0 && hasEnoughBudget(input.runtime, 7000)
       ? await orchestrator.refineEvidence({
           baseQuery: input.query,
           references: preRefinedEvidence.references,
@@ -797,7 +836,7 @@ export async function runSupportTriageAgent(input: {
     refinementEvidence && refinementEvidence.references.length > 0
       ? orchestrator.combineEvidenceCollections([preRefinedEvidence, refinementEvidence])
       : preRefinedEvidence;
-  const secondRoundQueryCount = additionalQueries.length + (refinementEvidence?.resolvedQueries.length ?? 0);
+  const secondRoundQueryCount = (additionalEvidence ? additionalQueries.length : 0) + (refinementEvidence?.resolvedQueries.length ?? 0);
   const additionalTiming =
     secondRoundQueryCount > 0
       ? stageTiming("completed", elapsedMs(additionalStartedAt), {
@@ -815,7 +854,9 @@ export async function runSupportTriageAgent(input: {
   });
 
   const writerStartedAt = performance.now();
-  const writtenResult = await input.adapter
+  const writerRuntime = buildStageRuntime(input.runtime, 4500, 3500);
+  const writtenResult = hasEnoughBudget(input.runtime, 4500)
+    ? await input.adapter
     .writeTriageInsight(
       {
         contextType: "triage",
@@ -831,16 +872,19 @@ export async function runSupportTriageAgent(input: {
         }
       },
       `${input.idempotencyKey}:write`,
-      input.runtime
+      writerRuntime
     )
     .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(writerStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(writerStartedAt)) }));
+    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(writerStartedAt)) }))
+    : { value: null, timing: stageTiming("skipped", elapsedMs(writerStartedAt)) };
   const written =
     writtenResult.value ??
     fallbackTriageInsight(input.language, caseFrame, evidenceCollection.references.length ? "escalate" : "ask_user");
 
   const verifierStartedAt = performance.now();
-  const verificationResult = await input.adapter
+  const verifierRuntime = buildStageRuntime(input.runtime, 1500, 2500);
+  const verificationResult = hasEnoughBudget(input.runtime, 2500)
+    ? await input.adapter
     .verifyTriageInsight(
       {
         contextType: "triage",
@@ -851,10 +895,11 @@ export async function runSupportTriageAgent(input: {
         triageInsight: written
       },
       `${input.idempotencyKey}:verify`,
-      input.runtime
+      verifierRuntime
     )
     .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(verifierStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(verifierStartedAt)) }));
+    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(verifierStartedAt)) }))
+    : { value: null, timing: stageTiming("skipped", elapsedMs(verifierStartedAt)) };
   const verification =
     verificationResult.value ??
     fallbackVerification(input.language, written.verifier_verdict, caseFrame.missing_critical_info);

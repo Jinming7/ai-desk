@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { access, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { env } from "../../config/env.js";
+import { isServerlessRuntime } from "../../config/runtime-env.js";
 import { buildChunks } from "../github-kb/chunker.js";
 import { parseMarkdownSections } from "../github-kb/markdown.js";
 import { buildPublicSourceUrl } from "../github-kb/public-url.js";
@@ -580,6 +581,9 @@ export async function preloadLocalDocsIndex(options?: { rootDir?: string }): Pro
   headSha: string;
   branch: string;
 }> {
+  if (isServerlessRuntime()) {
+    return { entries: 0, headSha: "serverless-disabled", branch: "master" };
+  }
   const rootDir = options?.rootDir ?? env.LOCAL_DOCS_COM_PATH;
   const entries = await ensureIndex(rootDir);
   return {
@@ -595,6 +599,9 @@ export async function searchLocalDocs(
   topK = 5,
   options?: { rootDir?: string }
 ): Promise<LocalDocsHit[]> {
+  if (isServerlessRuntime()) {
+    return [];
+  }
   const rootDir = options?.rootDir ?? env.LOCAL_DOCS_COM_PATH;
   const entries = await ensureIndex(rootDir);
   if (!entries.length) return [];

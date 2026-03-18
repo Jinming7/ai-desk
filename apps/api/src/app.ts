@@ -44,6 +44,7 @@ import { getAiCapabilities } from "./modules/ai/multimodal.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
 import { env } from "./config/env.js";
+import { shouldStartBackgroundLoops } from "./config/runtime-env.js";
 import { asyncHandler } from "./utils/http.js";
 
 const app = express();
@@ -77,7 +78,7 @@ async function enrichCustomerStatus<T extends { status: string; ones_ticket_type
   return { ...ticket, customer_status_label: mapped.label };
 }
 
-if (env.NODE_ENV !== "test") {
+if (shouldStartBackgroundLoops()) {
   void preloadLocalDocsIndex().catch(() => undefined);
 
   setInterval(() => {

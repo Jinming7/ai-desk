@@ -252,7 +252,9 @@ export class SearchOrchestrator {
     answerLanguage?: "zh" | "en";
     attachments?: string[];
   }): Promise<SearchEvidenceCollection> {
-    const normalizedQueries = [...new Set(input.queries.map((item) => this.normalizeQuery(item)).filter(Boolean))].slice(0, 4);
+    const queryLimit = Math.max(1, Math.min(4, input.runtime?.queryLimit ?? 4));
+    const topK = Math.max(1, Math.min(env.GITHUB_KB_PROFILE_AGENT_TOPK, input.runtime?.kbTopK ?? env.GITHUB_KB_PROFILE_AGENT_TOPK));
+    const normalizedQueries = [...new Set(input.queries.map((item) => this.normalizeQuery(item)).filter(Boolean))].slice(0, queryLimit);
     const lang = input.answerLanguage ?? "en";
     if (!env.FEATURE_KB_GROUNDED_SEARCH) {
       return this.buildKbUnavailable(normalizedQueries[0] ?? "");
@@ -275,7 +277,8 @@ export class SearchOrchestrator {
       }
       const retrievedAt = new Date().toISOString();
       const toLocalDocsResult = async () => {
-        const localDocsHits = await searchLocalDocs(query, lang, env.GITHUB_KB_PROFILE_AGENT_TOPK).catch(() => []);
+        if (input.runtime?.disableLocalDocs) return null;
+        const localDocsHits = await searchLocalDocs(query, lang, topK).catch(() => []);
         if (!localDocsHits.length) return null;
         return {
           confidence: localDocsHits[0]?.score || 0,
@@ -313,7 +316,7 @@ export class SearchOrchestrator {
           query,
           answerLanguage: lang,
           profile: "agent",
-          topK: env.GITHUB_KB_PROFILE_AGENT_TOPK,
+          topK,
           includeFallback: true
         });
         const docsComHits = kb.hits

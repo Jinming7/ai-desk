@@ -1,4 +1,5 @@
 import { env } from "../../config/env.js";
+import { isServerlessRuntime } from "../../config/runtime-env.js";
 import type { OpenClawRuntimeContext } from "../../infrastructure/openclaw/types.js";
 
 export type AiAgentIntent = "retrieval" | "clarify" | "execution";
@@ -22,11 +23,23 @@ export function buildSearchRuntime(input: {
   const fallbackAgentId = searchAgentId || env.OPENCLAW_AGENT_ID.trim() || "main";
   const fallbackAgentModel = searchAgentModel || env.OPENCLAW_AGENT_MODEL.trim() || undefined;
   const prefix = env.OPENCLAW_AGENT_SESSION_PREFIX.trim() || "nf";
+  const serverless = isServerlessRuntime();
   return {
     intent: input.intent,
     agentId: fallbackAgentId,
     model: fallbackAgentModel,
-    sessionKey: buildAgentScopedSessionKey(fallbackAgentId, `${prefix}:${input.intent}:${input.sessionId}`)
+    sessionKey: buildAgentScopedSessionKey(fallbackAgentId, `${prefix}:${input.intent}:${input.sessionId}`),
+    ...(serverless
+      ? {
+          overallTimeoutMs: 22000,
+          requestStartedAtMs: Date.now(),
+          disableLocalDocs: true,
+          allowMultiPassRetrieval: false,
+          allowRefinement: false,
+          kbTopK: 6,
+          queryLimit: 1
+        }
+      : {})
   };
 }
 
@@ -34,11 +47,23 @@ export function resolveExecutionRuntime(sessionId: string): OpenClawRuntimeConte
   const executionAgentId = env.OPENCLAW_AGENT_ID_EXECUTION.trim() || env.OPENCLAW_AGENT_ID.trim() || "main";
   const executionAgentModel = env.OPENCLAW_AGENT_MODEL_EXECUTION.trim() || env.OPENCLAW_AGENT_MODEL.trim() || undefined;
   const prefix = env.OPENCLAW_AGENT_SESSION_PREFIX.trim() || "nf";
+  const serverless = isServerlessRuntime();
   return {
     intent: "execution",
     agentId: executionAgentId,
     model: executionAgentModel,
-    sessionKey: buildAgentScopedSessionKey(executionAgentId, `${prefix}:execution:${sessionId}`)
+    sessionKey: buildAgentScopedSessionKey(executionAgentId, `${prefix}:execution:${sessionId}`),
+    ...(serverless
+      ? {
+          overallTimeoutMs: 22000,
+          requestStartedAtMs: Date.now(),
+          disableLocalDocs: true,
+          allowMultiPassRetrieval: false,
+          allowRefinement: false,
+          kbTopK: 6,
+          queryLimit: 1
+        }
+      : {})
   };
 }
 

@@ -24,6 +24,7 @@ function createAdapter(options: {
   searchHits?: OpenClawSearchOutput["hits"];
   writerAnswer?: Partial<DraftSupportAnswer>;
   verification?: Partial<SupportVerificationResult>;
+  queryPlan?: SupportCaseFrame["query_plan"];
 }): OpenClawAdapter {
   return {
     async analyzeTicket(_input: OpenClawAnalyzeInput, _idempotencyKey: string, _runtime?: OpenClawRuntimeContext): Promise<OpenClawAnalyzeOutput> {
@@ -90,7 +91,8 @@ function createAdapter(options: {
         product_area: "openapi",
         constraints: [],
         missing_critical_info: options.missingInfo ?? [],
-        retrieval_queries: [input.query]
+        retrieval_queries: [input.query],
+        query_plan: options.queryPlan
       };
     },
     async writeSupportAnswer(
@@ -184,6 +186,45 @@ test("runSupportSearchAgent converts invalid uncited evidence into handoff when 
     assert.match(result.result.answer, /Create a ticket/i);
     assert.equal(typeof result.stageTimings.total_ms, "number");
     assert.equal(result.stageTimings.retrieval_base.status, "completed");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+  }
+});
+
+test("runSupportSearchAgent skips extra retrieval passes in fast runtime mode", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = "/tmp/__missing_local_docs__";
+  const adapter = createAdapter({
+    queryPlan: {
+      concept_queries: ["workspace role permission inheritance"],
+      object_queries: ["role permission"],
+      behavior_queries: ["why permission inherited"]
+    },
+    verification: {
+      verdict: "unsupported",
+      missing_info: ["the exact permission path"]
+    }
+  });
+  try {
+    const result = await runSupportSearchAgent({
+      query: "why is this permission inherited",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-fast-runtime",
+      runtime: {
+        intent: "retrieval",
+        sessionKey: "test-fast-runtime",
+        disableLocalDocs: true,
+        allowMultiPassRetrieval: false,
+        allowRefinement: false,
+        kbTopK: 4,
+        queryLimit: 1
+      }
+    });
+
+    assert.equal(result.stageTimings.retrieval_extra.status, "skipped");
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
   }

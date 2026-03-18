@@ -149,6 +149,14 @@ function roundMs(value: number): number {
   return Math.max(0, Math.round(value));
 }
 
+function resolveRuntimeTimeoutMs(runtime?: OpenClawRuntimeContext): number {
+  const configured = Number(runtime?.timeoutMs);
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return env.OPENCLAW_AGENT_TIMEOUT_MS;
+  }
+  return Math.max(1000, Math.min(env.OPENCLAW_AGENT_TIMEOUT_MS, Math.round(configured)));
+}
+
 export class WsOpenClawAdapter implements OpenClawAdapter {
   private consecutiveFailures = 0;
   private readonly requestedScopes = env.OPENCLAW_REQUEST_SCOPES.split(",").map((item) => item.trim()).filter(Boolean);
@@ -278,7 +286,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
       const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "search-answer");
       const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments, sessionKey);
-      await this.waitAgentRun(runId, sessionKey);
+      await this.waitAgentRun(runId, sessionKey, runtime);
       const text = await this.fetchLatestAssistantText(sessionKey);
       const parsed = this.parseFirstJson(text) as Partial<OpenClawSearchAnswerOutput>;
       return {
@@ -584,7 +592,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
     const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "classify");
     const runId = await this.startChatRun(prompt, idempotencyKey, runtime, undefined, sessionKey);
-    await this.waitAgentRun(runId, sessionKey);
+    await this.waitAgentRun(runId, sessionKey, runtime);
     const text = await this.fetchLatestAssistantText(sessionKey);
     const parsed = this.parseFirstJson(text) as Partial<OpenClawClassifyIntentOutput>;
 
@@ -621,7 +629,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
     const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "ticket-analyze");
     const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments, sessionKey);
-    await this.waitAgentRun(runId, sessionKey);
+    await this.waitAgentRun(runId, sessionKey, runtime);
     const text = await this.fetchLatestAssistantText(sessionKey);
     const parsed = this.parseFirstJson(text) as Partial<OpenClawAnalyzeOutput>;
     const reply = typeof parsed.reply === "string" ? parsed.reply : "";
@@ -652,7 +660,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
     const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "kb-search");
     const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments, sessionKey);
-    await this.waitAgentRun(runId, sessionKey);
+    await this.waitAgentRun(runId, sessionKey, runtime);
     const text = await this.fetchLatestAssistantText(sessionKey);
     const parsed = this.parseFirstJson(text) as Record<string, unknown>;
     const rawHits = Array.isArray(parsed.hits) ? parsed.hits : [];
@@ -687,11 +695,12 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     sessionKey?: string
   ): Promise<string> {
     const agentRuntime = this.resolveAgentRuntime(runtime);
+    const timeoutMs = resolveRuntimeTimeoutMs(runtime);
     const payload = (await this.callMethod("agent", {
       agentId: agentRuntime.agentId,
       sessionKey: sessionKey ?? agentRuntime.sessionKey,
       message,
-      timeout: env.OPENCLAW_AGENT_TIMEOUT_MS,
+      timeout: timeoutMs,
       idempotencyKey,
       ...(agentRuntime.model ? { model: agentRuntime.model } : {})
     })) as { runId?: string; status?: string; summary?: string };
@@ -764,7 +773,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const runId = await this.startChatRun(message, idempotencyKey, runtime, attachmentUrls, sessionKey);
     const sendMs = roundMs(performance.now() - sendStartedAt);
     const waitStartedAt = performance.now();
-    await this.waitAgentRun(runId, sessionKey);
+    await this.waitAgentRun(runId, sessionKey, runtime);
     const waitMs = roundMs(performance.now() - waitStartedAt);
     const historyStartedAt = performance.now();
     const text = await this.fetchLatestAssistantText(sessionKey);
@@ -780,12 +789,13 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     return parsed;
   }
 
-  private async waitAgentRun(runId: string, sessionKey?: string): Promise<void> {
+  private async waitAgentRun(runId: string, sessionKey?: string, runtime?: OpenClawRuntimeContext): Promise<void> {
+    const timeoutMs = resolveRuntimeTimeoutMs(runtime);
     try {
       const payload = (await this.callMethod(
         "agent.wait",
-        { runId, timeoutMs: env.OPENCLAW_AGENT_TIMEOUT_MS },
-        env.OPENCLAW_AGENT_TIMEOUT_MS + 2000
+        { runId, timeoutMs },
+        timeoutMs + 2000
       )) as { status?: string; error?: string };
 
       if (payload?.status === "ok") {

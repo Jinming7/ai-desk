@@ -98,6 +98,14 @@ export interface OpenClawRuntimeContext {
   sessionKey?: string;
   model?: string;
   intent?: "retrieval" | "clarify" | "execution";
+  timeoutMs?: number;
+  overallTimeoutMs?: number;
+  requestStartedAtMs?: number;
+  disableLocalDocs?: boolean;
+  allowMultiPassRetrieval?: boolean;
+  allowRefinement?: boolean;
+  kbTopK?: number;
+  queryLimit?: number;
 }
 
 export interface OpenClawClassifyIntentInput {
