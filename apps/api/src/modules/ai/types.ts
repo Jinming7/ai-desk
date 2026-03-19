@@ -24,6 +24,39 @@ export interface SupportQueryPlan {
   behavior_queries: string[];
 }
 
+export type SupportQuestionType =
+  | "api_endpoint_lookup"
+  | "api_field_lookup"
+  | "api_scope_auth"
+  | "how_to_product"
+  | "why_behavior"
+  | "troubleshooting"
+  | "config_setup"
+  | "capability_confirmation"
+  | "data_export_reporting";
+
+export type SupportSpecialistAgent =
+  | "api-specialist"
+  | "howto-specialist"
+  | "behavior-specialist"
+  | "troubleshooting-specialist";
+
+export type SupportRenderVariant = "api" | "how_to" | "behavior" | "troubleshooting" | "clarification" | "handoff";
+
+export interface SupportQuestionRoute {
+  question_type: SupportQuestionType;
+  user_goal: string;
+  answer_contract: string;
+  specialist_agent: SupportSpecialistAgent;
+  routing_confidence: number;
+}
+
+export interface SupportEvidencePlan {
+  query_plan: SupportQueryPlan;
+  evidence_priority: string[];
+  required_doc_kinds: string[];
+}
+
 export interface SupportCaseFrame {
   goal: string;
   symptom: string;
@@ -35,6 +68,12 @@ export interface SupportCaseFrame {
   missing_critical_info: string[];
   retrieval_queries: string[];
   query_plan?: SupportQueryPlan;
+  question_type?: SupportQuestionType;
+  specialist_agent?: SupportSpecialistAgent;
+  answer_contract?: string;
+  routing_confidence?: number;
+  evidence_priority?: string[];
+  required_doc_kinds?: string[];
 }
 
 export type SupportClaimKind = "verified_fact" | "grounded_inference" | "operational_advice" | "unknown";
@@ -54,9 +93,57 @@ export interface DraftSupportAnswer {
   escalation_needed: boolean;
 }
 
+export interface SpecialistDraftAnswer extends DraftSupportAnswer {
+  question_type: SupportQuestionType;
+  render_variant: SupportRenderVariant;
+  api_method?: string;
+  api_path?: string;
+  required_params?: string[];
+  auth_scope?: string[];
+  response_field_hint?: string;
+  important_note?: string;
+  related_variant?: string;
+  steps?: string[];
+  prerequisites?: string[];
+  limits_or_notes?: string[];
+  most_likely_explanation?: string;
+  confirmed_facts?: string[];
+  what_to_check_next?: string[];
+  most_likely_causes?: string[];
+  recommended_checks?: string[];
+  required_followup_info?: string[];
+  when_to_handoff?: string;
+}
+
+export type SupportAnswerSection =
+  | {
+      kind: "paragraph";
+      title: string;
+      body: string;
+    }
+  | {
+      kind: "bullet_list";
+      title: string;
+      items: string[];
+    }
+  | {
+      kind: "api_card";
+      title: string;
+      method: string;
+      path: string;
+      required_params: string[];
+      auth_scope: string[];
+      response_field_hint?: string;
+      important_note?: string;
+      related_variant?: string;
+    };
+
 export interface SupportAnswer {
   mode: "grounded" | "partial" | "clarification" | "handoff";
+  question_type: SupportQuestionType;
+  render_variant: SupportRenderVariant;
   direct_answer: string;
+  sections: SupportAnswerSection[];
   why: string[];
   what_to_do_now: string[];
   still_need_to_confirm: string[];

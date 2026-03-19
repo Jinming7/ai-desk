@@ -10,13 +10,16 @@ import type {
   SearchDialogState,
   SearchModeResult,
   SearchReference,
+  SpecialistDraftAnswer,
   StructuredSearchAnswer,
   SupportAnswer,
   SupportAgentStageTiming,
   SupportAgentStageTimings,
   SupportCaseFrame,
   SupportEvidenceBundle,
+  SupportEvidencePlan,
   SupportEvidenceSelection,
+  SupportQuestionRoute,
   SupportVerificationResult,
   TriageSupportInsight
 } from "./types.js";
@@ -104,6 +107,15 @@ function withStageRuntime(
   const prefix = env.OPENCLAW_AGENT_SESSION_PREFIX.trim() || "nf";
   const base = runtime ?? {};
   const useExecutionAgent =
+    stage === "router" ||
+    stage === "evidence-planner" ||
+    stage === "api-specialist" ||
+    stage === "howto-specialist" ||
+    stage === "behavior-specialist" ||
+    stage === "troubleshooting-specialist" ||
+    stage === "evidence-judge" ||
+    stage === "citation-curator" ||
+    stage === "answer-composer" ||
     stage === "planner" ||
     stage === "support-evidence-selector" ||
     stage === "support-writer" ||
@@ -152,6 +164,75 @@ function fallbackCaseFrame(query: string): SupportCaseFrame {
   };
 }
 
+function fallbackQuestionRoute(query: string): SupportQuestionRoute {
+  const lowered = query.toLowerCase();
+  const question_type: SupportQuestionRoute["question_type"] =
+    /\b(scope|oauth|token)\b/i.test(query)
+      ? "api_scope_auth"
+      : /\b(api|endpoint|method|path|openapi|接口)\b/i.test(query)
+      ? "api_endpoint_lookup"
+      : /\b(status|field|字段)\b/i.test(query) && /\b(api|接口|openapi)\b/i.test(query)
+      ? "api_field_lookup"
+      : /为什么|why|预期|行为/.test(query)
+      ? "why_behavior"
+      : /如何|怎么|步骤|setup|configure|config|导出|export/.test(query)
+      ? "how_to_product"
+      : /\b(not work|failed|failure|error|报错|异常|失败)\b/i.test(query)
+      ? "troubleshooting"
+      : "capability_confirmation";
+  const specialist_agent: SupportQuestionRoute["specialist_agent"] =
+    question_type === "api_endpoint_lookup" || question_type === "api_field_lookup" || question_type === "api_scope_auth"
+      ? "api-specialist"
+      : question_type === "how_to_product"
+      ? "howto-specialist"
+      : question_type === "why_behavior" || question_type === "capability_confirmation"
+      ? "behavior-specialist"
+      : "troubleshooting-specialist";
+  return {
+    question_type,
+    user_goal: query.trim(),
+    answer_contract:
+      specialist_agent === "api-specialist"
+        ? "Give the exact API answer first."
+        : specialist_agent === "howto-specialist"
+        ? "Give direct steps first."
+        : specialist_agent === "behavior-specialist"
+        ? "Give the most likely explanation first."
+        : "Give the most likely cause and checks first.",
+    specialist_agent,
+    routing_confidence: 0.7
+  };
+}
+
+function fallbackEvidencePlan(query: string): SupportEvidencePlan {
+  return {
+    query_plan: {
+      concept_queries: [query],
+      object_queries: [query],
+      behavior_queries: [query]
+    },
+    evidence_priority: [],
+    required_doc_kinds: []
+  };
+}
+
+function mergeRouteAndEvidencePlan(caseFrame: SupportCaseFrame, route: SupportQuestionRoute, plan: SupportEvidencePlan): SupportCaseFrame {
+  return {
+    ...caseFrame,
+    question_type: route.question_type,
+    specialist_agent: route.specialist_agent,
+    answer_contract: route.answer_contract,
+    routing_confidence: route.routing_confidence,
+    query_plan: {
+      concept_queries: uniqueStrings([...(plan.query_plan?.concept_queries ?? []), ...(caseFrame.query_plan?.concept_queries ?? []), ...caseFrame.retrieval_queries], 4),
+      object_queries: uniqueStrings([...(plan.query_plan?.object_queries ?? []), ...(caseFrame.query_plan?.object_queries ?? []), caseFrame.object], 4),
+      behavior_queries: uniqueStrings([...(plan.query_plan?.behavior_queries ?? []), ...(caseFrame.query_plan?.behavior_queries ?? []), caseFrame.action_type], 4)
+    },
+    evidence_priority: uniqueStrings([...(plan.evidence_priority ?? [])], 6),
+    required_doc_kinds: uniqueStrings([...(plan.required_doc_kinds ?? [])], 6)
+  };
+}
+
 function fallbackDraftSupportAnswer(input: {
   language: "zh" | "en";
   hasEvidence: boolean;
@@ -195,14 +276,61 @@ function fallbackDraftSupportAnswer(input: {
       };
 }
 
+function fallbackSpecialistDraftAnswer(input: {
+  language: "zh" | "en";
+  route: SupportQuestionRoute;
+  query: string;
+  evidenceBundle: SupportEvidenceBundle;
+  missingInfo: string[];
+}): SpecialistDraftAnswer {
+  const base = fallbackDraftSupportAnswer({
+    language: input.language,
+    hasEvidence: input.evidenceBundle.primary.length > 0,
+    missingInfo: input.missingInfo
+  });
+  const render_variant: SpecialistDraftAnswer["render_variant"] =
+    input.route.specialist_agent === "api-specialist"
+      ? "api"
+      : input.route.specialist_agent === "howto-specialist"
+      ? "how_to"
+      : input.route.specialist_agent === "behavior-specialist"
+      ? "behavior"
+      : "troubleshooting";
+  return {
+    question_type: input.route.question_type,
+    render_variant,
+    ...base
+  };
+}
+
 function fallbackSupportAnswer(input: {
   language: "zh" | "en";
   mode: SupportAnswer["mode"];
+  route?: SupportQuestionRoute;
   missingInfo: string[];
 }): SupportAnswer {
+  const route = input.route ?? fallbackQuestionRoute("");
+  const render_variant: SupportAnswer["render_variant"] =
+    input.mode === "handoff"
+      ? "handoff"
+      : input.mode === "clarification"
+      ? "clarification"
+      : route.specialist_agent === "api-specialist"
+      ? "api"
+      : route.specialist_agent === "howto-specialist"
+      ? "how_to"
+      : route.specialist_agent === "behavior-specialist"
+      ? "behavior"
+      : "troubleshooting";
+  const baseMeta = {
+    question_type: route.question_type,
+    render_variant,
+    sections: [] as SupportAnswer["sections"]
+  };
   if (input.language === "zh") {
     if (input.mode === "handoff") {
       return {
+        ...baseMeta,
         mode: "handoff",
         direct_answer: "抱歉，当前还没有足够的已验证证据形成可靠结论。建议直接创建工单，我会自动预填当前上下文。",
         why: [],
@@ -212,6 +340,7 @@ function fallbackSupportAnswer(input: {
     }
     if (input.mode === "clarification") {
       return {
+        ...baseMeta,
         mode: "clarification",
         direct_answer: "为了给你更可靠的结论，我还缺少一个关键信息。",
         why: [],
@@ -221,6 +350,7 @@ function fallbackSupportAnswer(input: {
     }
     if (input.mode === "partial") {
       return {
+        ...baseMeta,
         mode: "partial",
         direct_answer: "我可以先给出当前最可能的判断，但还有一部分结论尚未被文档直接确认。",
         why: [],
@@ -229,6 +359,7 @@ function fallbackSupportAnswer(input: {
       };
     }
     return {
+      ...baseMeta,
       mode: "grounded",
       direct_answer: "现有文档已经足够支撑当前结论。",
       why: [],
@@ -239,6 +370,7 @@ function fallbackSupportAnswer(input: {
 
   if (input.mode === "handoff") {
     return {
+      ...baseMeta,
       mode: "handoff",
       direct_answer: "I’m sorry, but there is still not enough verified evidence for a reliable final answer. Create a ticket now and I will prefill the current context.",
       why: [],
@@ -248,6 +380,7 @@ function fallbackSupportAnswer(input: {
   }
   if (input.mode === "clarification") {
     return {
+      ...baseMeta,
       mode: "clarification",
       direct_answer: "To give you a more reliable answer, I still need one critical detail.",
       why: [],
@@ -257,6 +390,7 @@ function fallbackSupportAnswer(input: {
   }
   if (input.mode === "partial") {
     return {
+      ...baseMeta,
       mode: "partial",
       direct_answer: "I can give the most likely answer now, but part of the conclusion is still not directly confirmed by documentation.",
       why: [],
@@ -265,6 +399,7 @@ function fallbackSupportAnswer(input: {
     };
   }
   return {
+    ...baseMeta,
     mode: "grounded",
     direct_answer: "The current conclusion is fully supported by documentation evidence.",
     why: [],
@@ -719,10 +854,62 @@ function buildFallbackDirectAnswerFromSupportedClaims(input: {
     : leadingClaims.join("; ");
 }
 
+function buildFallbackSectionsFromDraft(draft: SpecialistDraftAnswer): SupportAnswer["sections"] {
+  switch (draft.render_variant) {
+    case "api":
+      return draft.api_method || draft.api_path
+        ? [
+            {
+              kind: "api_card",
+              title: "API",
+              method: draft.api_method ?? "",
+              path: draft.api_path ?? "",
+              required_params: draft.required_params ?? [],
+              auth_scope: draft.auth_scope ?? [],
+              response_field_hint: draft.response_field_hint,
+              important_note: draft.important_note,
+              related_variant: draft.related_variant
+            }
+          ]
+        : [];
+    case "how_to":
+      return [
+        ...(draft.steps?.length ? [{ kind: "bullet_list" as const, title: "Steps", items: draft.steps }] : []),
+        ...(draft.prerequisites?.length ? [{ kind: "bullet_list" as const, title: "Prerequisites", items: draft.prerequisites }] : []),
+        ...(draft.limits_or_notes?.length ? [{ kind: "bullet_list" as const, title: "Notes", items: draft.limits_or_notes }] : [])
+      ];
+    case "behavior":
+      return [
+        ...(draft.most_likely_explanation
+          ? [{ kind: "paragraph" as const, title: "Most likely explanation", body: draft.most_likely_explanation }]
+          : []),
+        ...(draft.confirmed_facts?.length ? [{ kind: "bullet_list" as const, title: "Confirmed facts", items: draft.confirmed_facts }] : []),
+        ...(draft.what_to_check_next?.length
+          ? [{ kind: "bullet_list" as const, title: "What to check next", items: draft.what_to_check_next }]
+          : [])
+      ];
+    case "troubleshooting":
+      return [
+        ...(draft.most_likely_causes?.length
+          ? [{ kind: "bullet_list" as const, title: "Most likely causes", items: draft.most_likely_causes }]
+          : []),
+        ...(draft.recommended_checks?.length
+          ? [{ kind: "bullet_list" as const, title: "Recommended checks", items: draft.recommended_checks }]
+          : []),
+        ...(draft.required_followup_info?.length
+          ? [{ kind: "bullet_list" as const, title: "Required follow-up info", items: draft.required_followup_info }]
+          : [])
+      ];
+    default:
+      return [];
+  }
+}
+
 function buildSupportAnswerFromDraft(input: {
   language: "zh" | "en";
   mode: SupportAnswer["mode"];
-  draft: DraftSupportAnswer;
+  route: SupportQuestionRoute;
+  draft: SpecialistDraftAnswer;
   verification: SupportVerificationResult;
   missingInfo: string[];
   composed?: Omit<SupportAnswer, "mode"> | null;
@@ -749,6 +936,7 @@ function buildSupportAnswerFromDraft(input: {
   const fallback = fallbackSupportAnswer({
     language: input.language,
     mode: input.mode,
+    route: input.route,
     missingInfo: stillNeedToConfirm
   });
   const directAnswer =
@@ -762,8 +950,11 @@ function buildSupportAnswerFromDraft(input: {
         })
       : fallback.direct_answer;
   return {
+    question_type: input.composed?.question_type ?? input.draft.question_type ?? input.route.question_type,
+    render_variant: input.composed?.render_variant ?? input.draft.render_variant ?? fallback.render_variant,
     mode: input.mode,
     direct_answer: directAnswer,
+    sections: input.composed?.sections?.length ? input.composed.sections : buildFallbackSectionsFromDraft(input.draft),
     why: why.length ? why : fallback.why,
     what_to_do_now: whatToDoNow.length ? whatToDoNow : fallback.what_to_do_now,
     still_need_to_confirm:
@@ -786,6 +977,38 @@ function combineRetrievalQueries(query: string, caseFrame: SupportCaseFrame, orc
   return uniqueStrings([query, ...groupedQueries], 6).filter(
     (item) => orchestrator.normalizeQuery(item) !== orchestrator.normalizeQuery(query)
   );
+}
+
+async function writeSpecialistDraft(input: {
+  adapter: OpenClawAdapter;
+  route: SupportQuestionRoute;
+  language: "zh" | "en";
+  query: string;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  conversationHistory: Array<{ role: "user" | "assistant"; content: string }>;
+  runtime?: OpenClawRuntimeContext;
+  idempotencyKey: string;
+}): Promise<SpecialistDraftAnswer> {
+  const specialistInput = {
+    contextType: "search" as const,
+    language: input.language,
+    query: input.query,
+    route: input.route,
+    caseFrame: input.caseFrame,
+    evidenceBundle: input.evidenceBundle,
+    conversationHistory: input.conversationHistory
+  };
+  switch (input.route.specialist_agent) {
+    case "api-specialist":
+      return input.adapter.writeApiSpecialistAnswer(specialistInput, input.idempotencyKey, input.runtime);
+    case "howto-specialist":
+      return input.adapter.writeHowToSpecialistAnswer(specialistInput, input.idempotencyKey, input.runtime);
+    case "behavior-specialist":
+      return input.adapter.writeBehaviorSpecialistAnswer(specialistInput, input.idempotencyKey, input.runtime);
+    default:
+      return input.adapter.writeTroubleshootingSpecialistAnswer(specialistInput, input.idempotencyKey, input.runtime);
+  }
 }
 
 function fallbackTriageInsight(language: "zh" | "en", caseFrame: SupportCaseFrame, mode: "ask_user" | "escalate"): TriageSupportInsight {
@@ -847,7 +1070,40 @@ export async function runSupportSearchAgent(input: {
   const allowRefinement = input.runtime?.allowRefinement !== false;
 
   const plannerStartedAt = performance.now();
-  const plannerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 32000, 6000, 20000), "planner", `${input.idempotencyKey}:planner`);
+  const routerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 32000, 5000, 12000), "router", `${input.idempotencyKey}:router`);
+  const routeResult = await input.adapter
+    .routeSupportQuestion(
+      {
+        contextType: "search",
+        language: input.language,
+        query: input.query,
+        conversationHistory: input.conversationHistory
+      },
+      `${input.idempotencyKey}:route`,
+      routerRuntime
+    )
+    .then((value) => ({ route: value, timing: stageTiming("completed", elapsedMs(plannerStartedAt)) }))
+    .catch(() => ({ route: fallbackQuestionRoute(input.query), timing: stageTiming("fallback", elapsedMs(plannerStartedAt)) }));
+  const evidencePlannerRuntime = withStageRuntime(
+    buildStageRuntime(input.runtime, 26000, 4000, 10000),
+    "evidence-planner",
+    `${input.idempotencyKey}:evidence-planner`
+  );
+  const evidencePlanResult = await input.adapter
+    .planSupportEvidence(
+      {
+        contextType: "search",
+        language: input.language,
+        query: input.query,
+        route: routeResult.route,
+        conversationHistory: input.conversationHistory
+      },
+      `${input.idempotencyKey}:evidence-plan`,
+      evidencePlannerRuntime
+    )
+    .then((value) => ({ plan: value }))
+    .catch(() => ({ plan: fallbackEvidencePlan(input.query) }));
+  const plannerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 22000, 5000, 14000), "planner", `${input.idempotencyKey}:planner`);
   const plannerPromise = input.adapter
     .planSupportCase(
       {
@@ -859,8 +1115,8 @@ export async function runSupportSearchAgent(input: {
       `${input.idempotencyKey}:plan`,
       plannerRuntime
     )
-    .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(plannerStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(plannerStartedAt)) }));
+    .then((value) => ({ value }))
+    .catch(() => ({ value: null }));
 
   const baseQueries = uniqueStrings([input.query], 1);
   const baseEvidenceStartedAt = performance.now();
@@ -881,7 +1137,8 @@ export async function runSupportSearchAgent(input: {
     }));
 
   const [plannerResult, baseEvidenceResult] = await Promise.all([plannerPromise, baseEvidencePromise]);
-  const caseFrame = plannerResult.value ?? fallbackCaseFrame(input.query);
+  const route = routeResult.route;
+  const caseFrame = mergeRouteAndEvidencePlan(plannerResult.value ?? fallbackCaseFrame(input.query), route, evidencePlanResult.plan);
   const baseEvidence = baseEvidenceResult.value;
   const additionalQueries = combineRetrievalQueries(input.query, caseFrame, orchestrator);
   const additionalStartedAt = performance.now();
@@ -955,58 +1212,58 @@ export async function runSupportSearchAgent(input: {
   });
 
   const writerStartedAt = performance.now();
-  const writerRuntime = withStageRuntime(
+  const specialistRuntime = withStageRuntime(
     buildStageRuntime(input.runtime, 12000, 5000, 18000),
-    "support-writer",
-    `${input.idempotencyKey}:support-writer`
+    route.specialist_agent,
+    `${input.idempotencyKey}:${route.specialist_agent}`
   );
-  const writtenResult = hasEnoughBudget(input.runtime, 6000)
-    ? await input.adapter
-    .writeSupportAnswer(
-      {
-        contextType: "search",
+  const specialistResult = hasEnoughBudget(input.runtime, 6000)
+    ? await writeSpecialistDraft({
+        adapter: input.adapter,
+        route,
         language: input.language,
         query: input.query,
         caseFrame,
         evidenceBundle,
-        conversationHistory: input.conversationHistory
-      },
-      `${input.idempotencyKey}:write`,
-      writerRuntime
-    )
-    .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(writerStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(writerStartedAt)) }))
+        conversationHistory: input.conversationHistory,
+        runtime: specialistRuntime,
+        idempotencyKey: `${input.idempotencyKey}:specialist`
+      })
+        .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(writerStartedAt)) }))
+        .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(writerStartedAt)) }))
     : { value: null, timing: stageTiming("skipped", elapsedMs(writerStartedAt)) };
   const draftSupportAnswer =
-    writtenResult.value ??
-    fallbackDraftSupportAnswer({
+    specialistResult.value ??
+    fallbackSpecialistDraftAnswer({
       language: input.language,
-      hasEvidence: evidenceCollection.references.length > 0,
+      route,
+      query: input.query,
+      evidenceBundle,
       missingInfo: caseFrame.missing_critical_info
     });
 
   const verifierStartedAt = performance.now();
-  const verifierRuntime = withStageRuntime(
+  const judgeRuntime = withStageRuntime(
     buildStageRuntime(input.runtime, 5000, 6000, 25000),
-    "support-verifier",
-    `${input.idempotencyKey}:support-verifier`
+    "evidence-judge",
+    `${input.idempotencyKey}:evidence-judge`
   );
   const verificationResult = hasEnoughBudget(input.runtime, 7000)
     ? await input.adapter
-    .verifySupportAnswer(
-      {
-        contextType: "search",
-        language: input.language,
-        query: input.query,
-        caseFrame,
-        evidenceBundle,
-        draftSupportAnswer
-      },
-      `${input.idempotencyKey}:verify`,
-      verifierRuntime
-    )
-    .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(verifierStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(verifierStartedAt)) }))
+        .judgeSupportAnswer(
+          {
+            contextType: "search",
+            language: input.language,
+            query: input.query,
+            caseFrame,
+            evidenceBundle,
+            draftSupportAnswer
+          },
+          `${input.idempotencyKey}:judge`,
+          judgeRuntime
+        )
+        .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(verifierStartedAt)) }))
+        .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(verifierStartedAt)) }))
     : { value: null, timing: stageTiming("skipped", elapsedMs(verifierStartedAt)) };
   const verification =
     verificationResult.value ??
@@ -1021,10 +1278,11 @@ export async function runSupportSearchAgent(input: {
   });
   const supportedCoreClaims = supportedVerificationClaims(sanitizedVerification);
   const unsupportedCore = sanitizedVerification.unsupported_claims.some(
-    (claim) =>
+    (claim: string) =>
       overlapsUnsupportedClaim(draftSupportAnswer.direct_answer, [claim]) ||
       draftSupportAnswer.claims.some(
-        (draftClaim) => draftClaim.kind !== "operational_advice" && overlapsUnsupportedClaim(draftClaim.text, [claim])
+        (draftClaim: SpecialistDraftAnswer["claims"][number]) =>
+          draftClaim.kind !== "operational_advice" && overlapsUnsupportedClaim(draftClaim.text, [claim])
       )
   );
   const effectiveVerification =
@@ -1070,17 +1328,30 @@ export async function runSupportSearchAgent(input: {
     : null;
   const writerBoundVerification = sanitizeVerification({
     verification: {
-      verdict: draftSupportAnswer.claims.some((claim) => claim.evidence_ids.length > 0) ? "partial" : "unsupported",
+      verdict:
+        draftSupportAnswer.claims.some((claim: SpecialistDraftAnswer["claims"][number]) => claim.evidence_ids.length > 0)
+          ? "partial"
+          : "unsupported",
       summary:
         input.language === "zh"
           ? "已根据回答草稿中的证据引用补充文档绑定。"
           : "Documentation bindings were recovered from the draft answer evidence ids.",
-      unsupported_claims: draftSupportAnswer.claims.filter((claim) => claim.evidence_ids.length === 0).map((claim) => claim.text),
+      unsupported_claims: draftSupportAnswer.claims
+        .filter((claim: SpecialistDraftAnswer["claims"][number]) => claim.evidence_ids.length === 0)
+        .map((claim: SpecialistDraftAnswer["claims"][number]) => claim.text),
       missing_info: [],
-      verified_citation_ids: uniqueStrings(draftSupportAnswer.claims.flatMap((claim) => claim.evidence_ids), 6),
-      display_citation_ids: uniqueStrings(draftSupportAnswer.claims.flatMap((claim) => claim.evidence_ids), 3),
-      verified_claims: draftSupportAnswer.claims.filter((claim) => claim.evidence_ids.length > 0).map((claim) => claim.text),
-      claim_to_citation_map: draftSupportAnswer.claims.map((claim) => ({
+      verified_citation_ids: uniqueStrings(
+        draftSupportAnswer.claims.flatMap((claim: SpecialistDraftAnswer["claims"][number]) => claim.evidence_ids),
+        6
+      ),
+      display_citation_ids: uniqueStrings(
+        draftSupportAnswer.claims.flatMap((claim: SpecialistDraftAnswer["claims"][number]) => claim.evidence_ids),
+        3
+      ),
+      verified_claims: draftSupportAnswer.claims
+        .filter((claim: SpecialistDraftAnswer["claims"][number]) => claim.evidence_ids.length > 0)
+        .map((claim: SpecialistDraftAnswer["claims"][number]) => claim.text),
+      claim_to_citation_map: draftSupportAnswer.claims.map((claim: SpecialistDraftAnswer["claims"][number]) => ({
         text: claim.text,
         kind: claim.kind,
         verdict:
@@ -1105,13 +1376,13 @@ export async function runSupportSearchAgent(input: {
 
   const displayCitationSelectorRuntime = withStageRuntime(
     buildStageRuntime(input.runtime, 2500, 4000, 14000),
-    "support-citation-selector",
-    `${input.idempotencyKey}:support-citation-selector`
+    "citation-curator",
+    `${input.idempotencyKey}:citation-curator`
   );
   const selectedDisplayCitations =
     supportedVerificationClaims(preselectedVerification).length > 0 && hasEnoughBudget(input.runtime, 4500)
       ? await input.adapter
-          .selectDisplayCitations(
+          .curateSupportCitations(
             {
               contextType: "search",
               language: input.language,
@@ -1120,7 +1391,7 @@ export async function runSupportSearchAgent(input: {
               evidenceBundle,
               supportedClaims: supportedVerificationClaims(preselectedVerification)
             },
-            `${input.idempotencyKey}:support-citation-selector`,
+            `${input.idempotencyKey}:citation-curator`,
             displayCitationSelectorRuntime
           )
           .catch(() => null)
@@ -1145,24 +1416,26 @@ export async function runSupportSearchAgent(input: {
   });
   const answerComposerRuntime = withStageRuntime(
     buildStageRuntime(input.runtime, 1500, 4000, 14000),
-    "support-answer-composer",
-    `${input.idempotencyKey}:support-answer-composer`
+    "answer-composer",
+    `${input.idempotencyKey}:answer-composer`
   );
   const composedSupportAnswer =
     (mode === "grounded" || mode === "partial") && supportedVerificationClaims(finalVerification).length > 0 && hasEnoughBudget(input.runtime, 4500)
       ? await input.adapter
-          .composeSupportAnswer(
+          .composeCustomerAnswer(
             {
               contextType: "search",
               language: input.language,
               query: input.query,
               mode,
+              route,
               caseFrame,
+              draftSupportAnswer,
               supportedClaims: supportedVerificationClaims(finalVerification),
               nextActions: filterUnsupported(draftSupportAnswer.next_actions, finalVerification.unsupported_claims),
               unknowns: uniqueStrings([...draftSupportAnswer.unknowns, ...missingInfo], 4)
             },
-            `${input.idempotencyKey}:support-answer-composer`,
+            `${input.idempotencyKey}:answer-composer`,
             answerComposerRuntime
           )
           .catch(() => null)
@@ -1170,6 +1443,7 @@ export async function runSupportSearchAgent(input: {
   const supportAnswer = buildSupportAnswerFromDraft({
     language: input.language,
     mode,
+    route,
     draft: draftSupportAnswer,
     verification: {
       ...finalVerification,
@@ -1210,10 +1484,10 @@ export async function runSupportSearchAgent(input: {
       : "LOW_CONFIDENCE";
   const stageTimings: SupportAgentStageTimings = {
     total_ms: elapsedMs(runStartedAt),
-    planner: plannerResult.timing,
+    planner: routeResult.timing,
     retrieval_base: baseEvidenceResult.timing,
     retrieval_extra: additionalTiming,
-    writer: writtenResult.timing,
+    writer: specialistResult.timing,
     verifier: verificationResult.timing
   };
 

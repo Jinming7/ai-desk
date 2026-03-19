@@ -317,7 +317,7 @@ export function PortalPage() {
       : supportAnswer?.mode === "handoff" || supportAnswer?.mode === "partial"
       ? "diagnosis"
       : detailResult?.structured_answer?.style ?? (detailResult?.follow_up_question ? "clarification" : "kb_answer");
-  const supportWhy = supportAnswer?.why ?? [];
+  const supportSections = supportAnswer?.sections ?? [];
   const supportSteps = supportAnswer?.what_to_do_now?.length ? supportAnswer.what_to_do_now : detailResult?.structured_answer?.steps ?? [];
   const supportMissingInfo = uniqueStrings(
     [...(supportAnswer?.still_need_to_confirm ?? []), ...(detailResult?.structured_answer?.required_inputs ?? [])],
@@ -328,6 +328,10 @@ export function PortalPage() {
       ? uiLang === "zh"
         ? "当前判断"
         : "Current assessment"
+      : supportAnswer.mode === "handoff"
+      ? uiLang === "zh"
+        ? "当前结论"
+        : "Current answer"
       : uiLang === "zh"
       ? "直接回答"
       : "Direct answer"
@@ -340,7 +344,6 @@ export function PortalPage() {
       ? "当前判断"
       : "Current assessment"
     : copy.oneLineConclusion;
-  const clarificationReason = null;
   const handoffCtaText = buildHandoffCtaCopy({
     lang: uiLang,
     mode: supportAnswer?.mode,
@@ -872,17 +875,101 @@ export function PortalPage() {
 
               {supportAnswer ? (
                 <div className="mt-4 space-y-3 rounded-2xl border border-slate-200 bg-slate-50/85 p-4">
-                  {supportWhy.length > 0 && answerStyle !== "clarification" && (
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{uiLang === "zh" ? "为什么这样判断" : "Why"}</p>
-                      <div className="mt-2 space-y-2 text-sm text-slate-800">
-                        {supportWhy.slice(0, 4).map((item, idx) => (
-                          <div key={`${item}-${idx}`}>{renderReadableText(item, `support-why-${idx}`, "detail")}</div>
-                        ))}
-                      </div>
+                  {supportSections.length > 0 ? (
+                    <div className="space-y-3">
+                      {supportSections.map((section, idx) => {
+                        if (section.kind === "api_card") {
+                          return (
+                            <div key={`${section.title}-${idx}`} className="rounded-2xl border border-[#D9E4FF] bg-white p-4">
+                              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{section.title}</p>
+                              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                                <div>
+                                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Method</p>
+                                  <div className="mt-1 text-sm font-semibold text-slate-900">{renderInlineCode(`\`${section.method || "-" }\``, `api-method-${idx}`)}</div>
+                                </div>
+                                <div className="sm:col-span-2">
+                                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Path</p>
+                                  <div className="mt-1 text-sm text-slate-900">{renderInlineCode(`\`${section.path || "-" }\``, `api-path-${idx}`)}</div>
+                                </div>
+                                {section.required_params.length > 0 && (
+                                  <div>
+                                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                      {uiLang === "zh" ? "必填参数" : "Required params"}
+                                    </p>
+                                    <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-slate-800">
+                                      {section.required_params.map((item, paramIdx) => (
+                                        <li key={`${item}-${paramIdx}`}>{renderInlineCode(item, `api-param-${idx}-${paramIdx}`)}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                                {section.auth_scope.length > 0 && (
+                                  <div>
+                                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Scope</p>
+                                    <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-slate-800">
+                                      {section.auth_scope.map((item, scopeIdx) => (
+                                        <li key={`${item}-${scopeIdx}`}>{renderInlineCode(item, `api-scope-${idx}-${scopeIdx}`)}</li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                              </div>
+                              {(section.response_field_hint || section.important_note || section.related_variant) && (
+                                <div className="mt-3 space-y-2">
+                                  {section.response_field_hint && (
+                                    <div>
+                                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                        {uiLang === "zh" ? "返回字段" : "Response field"}
+                                      </p>
+                                      <div className="mt-1 text-sm text-slate-800">{renderReadableText(section.response_field_hint, `api-response-${idx}`)}</div>
+                                    </div>
+                                  )}
+                                  {section.important_note && (
+                                    <div>
+                                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                        {uiLang === "zh" ? "补充说明" : "Important note"}
+                                      </p>
+                                      <div className="mt-1 text-sm text-slate-800">{renderReadableText(section.important_note, `api-note-${idx}`)}</div>
+                                    </div>
+                                  )}
+                                  {section.related_variant && (
+                                    <div>
+                                      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                        {uiLang === "zh" ? "相关变体" : "Related variant"}
+                                      </p>
+                                      <div className="mt-1 text-sm text-slate-800">{renderReadableText(section.related_variant, `api-variant-${idx}`)}</div>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        }
+
+                        if (section.kind === "bullet_list") {
+                          return (
+                            <div key={`${section.title}-${idx}`}>
+                              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{section.title}</p>
+                              <ul className="mt-1 list-disc space-y-1.5 pl-5 text-sm leading-6 text-slate-800">
+                                {section.items.map((item, itemIdx) => (
+                                  <li key={`${item}-${itemIdx}`}>{renderInlineCode(item, `support-section-${idx}-${itemIdx}`)}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          );
+                        }
+
+                        return (
+                          <div key={`${section.title}-${idx}`}>
+                            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{section.title}</p>
+                            <div className="mt-2 space-y-2 text-sm text-slate-800">
+                              {renderReadableText(section.body, `support-section-${idx}`, "detail")}
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
-                  )}
-                  {supportSteps.length > 0 && (
+                  ) : supportSteps.length > 0 ? (
                     <div>
                       <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                         {supportAnswer?.mode === "clarification" ? copy.nextQuestion : copy.whatNow}
@@ -893,7 +980,7 @@ export function PortalPage() {
                         ))}
                       </ol>
                     </div>
-                  )}
+                  ) : null}
                   {supportMissingInfo.length > 0 && (
                     <div>
                       <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
@@ -990,14 +1077,8 @@ export function PortalPage() {
                 </div>
               )}
 
-              {(detailResult.follow_up_question || clarificationReason || supportMissingInfo.length > 0) && (
+              {(detailResult.follow_up_question || supportMissingInfo.length > 0) && (
                 <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                  {clarificationReason && (
-                    <div className="mb-3">
-                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{copy.whyNeedThis}</p>
-                      <div className="mt-2 space-y-2 text-sm text-slate-800">{renderReadableText(clarificationReason, "clarify-reason", "detail")}</div>
-                    </div>
-                  )}
                   {detailResult.follow_up_question && (
                     <div className="space-y-2 text-sm text-slate-800">{renderReadableText(detailResult.follow_up_question, "followup", "detail")}</div>
                   )}

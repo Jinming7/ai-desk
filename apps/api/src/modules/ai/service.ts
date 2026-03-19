@@ -1677,7 +1677,10 @@ export async function runSearchMode(
       answer_language: language,
       support_answer: {
         mode: "handoff",
+        question_type: "troubleshooting",
+        render_variant: "handoff",
         direct_answer: disabledAnswer,
+        sections: [],
         why: [],
         what_to_do_now:
           language === "zh"
@@ -1880,7 +1883,10 @@ export async function runSearchMode(
       answer_language: language,
       support_answer: {
         mode: "handoff",
+        question_type: "troubleshooting",
+        render_variant: "handoff",
         direct_answer: failureDirectAnswer,
+        sections: [],
         why: [],
         what_to_do_now:
           language === "zh"

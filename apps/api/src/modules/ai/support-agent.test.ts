@@ -15,13 +15,24 @@ import type {
   OpenClawSearchAnswerOutput,
   OpenClawSearchInput,
   OpenClawSearchOutput,
+  OpenClawSupportEvidencePlannerInput,
   OpenClawSupportEvidenceSelectorInput,
   OpenClawSupportPlannerInput,
+  OpenClawSupportRouterInput,
+  OpenClawSupportSpecialistInput,
   OpenClawSupportVerifierInput,
   OpenClawSupportWriterInput
 } from "../../infrastructure/openclaw/types.js";
 import { runSupportSearchAgent } from "./support-agent.js";
-import type { DraftSupportAnswer, SupportCaseFrame, SupportVerificationResult, TriageSupportInsight } from "./types.js";
+import type {
+  DraftSupportAnswer,
+  SpecialistDraftAnswer,
+  SupportCaseFrame,
+  SupportEvidencePlan,
+  SupportQuestionRoute,
+  SupportVerificationResult,
+  TriageSupportInsight
+} from "./types.js";
 
 async function createFixtureRoot(): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), "support-agent-test-"));
@@ -109,6 +120,30 @@ function createAdapter(options: {
         query_plan: options.queryPlan
       };
     },
+    async routeSupportQuestion(
+      input: OpenClawSupportRouterInput
+    ): Promise<SupportQuestionRoute> {
+      return {
+        question_type: "api_scope_auth",
+        user_goal: input.query,
+        answer_contract: "Provide the exact API answer first.",
+        specialist_agent: "api-specialist",
+        routing_confidence: 0.9
+      };
+    },
+    async planSupportEvidence(
+      input: OpenClawSupportEvidencePlannerInput
+    ): Promise<SupportEvidencePlan> {
+      return {
+        query_plan: options.queryPlan ?? {
+          concept_queries: [input.query],
+          object_queries: [input.query],
+          behavior_queries: [input.query]
+        },
+        evidence_priority: [],
+        required_doc_kinds: ["openapi/api"]
+      };
+    },
     async selectSupportEvidence(
       input: OpenClawSupportEvidenceSelectorInput,
       _idempotencyKey: string,
@@ -133,6 +168,45 @@ function createAdapter(options: {
         escalation_needed: false,
         ...options.writerAnswer
       };
+    },
+    async writeApiSpecialistAnswer(
+      _input: OpenClawSupportSpecialistInput
+    ): Promise<SpecialistDraftAnswer> {
+      return {
+        question_type: "api_scope_auth",
+        render_variant: "api",
+        direct_answer: "Use the documented API details first.",
+        claims: [],
+        next_actions: ["Please share the missing detail."],
+        unknowns: ["the exact object or scenario"],
+        escalation_needed: false,
+        ...(options.writerAnswer as Partial<SpecialistDraftAnswer>)
+      };
+    },
+    async writeHowToSpecialistAnswer(input: OpenClawSupportSpecialistInput): Promise<SpecialistDraftAnswer> {
+      return {
+        ...(await this.writeApiSpecialistAnswer(input, "", undefined)),
+        render_variant: "how_to"
+      };
+    },
+    async writeBehaviorSpecialistAnswer(input: OpenClawSupportSpecialistInput): Promise<SpecialistDraftAnswer> {
+      return {
+        ...(await this.writeApiSpecialistAnswer(input, "", undefined)),
+        render_variant: "behavior"
+      };
+    },
+    async writeTroubleshootingSpecialistAnswer(input: OpenClawSupportSpecialistInput): Promise<SpecialistDraftAnswer> {
+      return {
+        ...(await this.writeApiSpecialistAnswer(input, "", undefined)),
+        render_variant: "troubleshooting"
+      };
+    },
+    async judgeSupportAnswer(
+      input: OpenClawSupportVerifierInput,
+      _idempotencyKey: string,
+      _runtime?: OpenClawRuntimeContext
+    ): Promise<SupportVerificationResult> {
+      return this.verifySupportAnswer(input, "", _runtime);
     },
     async verifySupportAnswer(
       _input: OpenClawSupportVerifierInput,
@@ -176,6 +250,9 @@ function createAdapter(options: {
         display_citation_ids: Array.from(new Set(input.supportedClaims.flatMap((item) => item.citation_ids))).slice(0, 3)
       };
     },
+    async curateSupportCitations(input, _idempotencyKey: string, _runtime?: OpenClawRuntimeContext): Promise<{ display_citation_ids: string[] }> {
+      return this.selectDisplayCitations(input, "", _runtime);
+    },
     async composeSupportAnswer(
       input,
       _idempotencyKey: string,
@@ -183,6 +260,29 @@ function createAdapter(options: {
     ): Promise<{ direct_answer: string; why: string[]; what_to_do_now: string[]; still_need_to_confirm: string[] }> {
       return {
         direct_answer: input.supportedClaims[0]?.text ?? "",
+        why: input.supportedClaims.map((item) => item.text).slice(0, 3),
+        what_to_do_now: input.nextActions.slice(0, 4),
+        still_need_to_confirm: input.unknowns.slice(0, 4)
+      };
+    },
+    async composeCustomerAnswer(
+      input,
+      _idempotencyKey: string,
+      _runtime?: OpenClawRuntimeContext
+    ): Promise<{
+      question_type: SupportQuestionRoute["question_type"];
+      render_variant: SpecialistDraftAnswer["render_variant"];
+      direct_answer: string;
+      sections: [];
+      why: string[];
+      what_to_do_now: string[];
+      still_need_to_confirm: string[];
+    }> {
+      return {
+        question_type: input.route.question_type,
+        render_variant: input.draftSupportAnswer?.render_variant ?? "api",
+        direct_answer: input.supportedClaims[0]?.text ?? "",
+        sections: [],
         why: input.supportedClaims.map((item) => item.text).slice(0, 3),
         what_to_do_now: input.nextActions.slice(0, 4),
         still_need_to_confirm: input.unknowns.slice(0, 4)

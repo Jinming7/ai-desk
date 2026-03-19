@@ -2,10 +2,13 @@ import type {
   OpenClawAdapter,
   OpenClawAnalyzeInput,
   OpenClawAnalyzeOutput,
+  OpenClawSupportEvidencePlannerInput,
   OpenClawSupportAnswerComposerInput,
   OpenClawSupportCitationSelectorInput,
   OpenClawSupportEvidenceSelectorInput,
   OpenClawSupportPlannerInput,
+  OpenClawSupportRouterInput,
+  OpenClawSupportSpecialistInput,
   OpenClawSupportVerifierInput,
   OpenClawSupportWriterInput,
   OpenClawRuntimeContext,
@@ -16,8 +19,11 @@ import type {
 } from "./types.js";
 import type {
   DraftSupportAnswer,
+  SpecialistDraftAnswer,
   SupportCaseFrame,
+  SupportEvidencePlan,
   SupportEvidenceSelection,
+  SupportQuestionRoute,
   SupportVerificationResult,
   TriageSupportInsight
 } from "../../modules/ai/types.js";
@@ -202,6 +208,56 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
+  async routeSupportQuestion(
+    input: OpenClawSupportRouterInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SupportQuestionRoute> {
+    const query = input.query.toLowerCase();
+    const question_type: SupportQuestionRoute["question_type"] =
+      /scope|oauth|token/.test(query)
+        ? "api_scope_auth"
+        : /接口|endpoint|api|method|path/.test(input.query)
+        ? "api_endpoint_lookup"
+        : /字段|field|status/.test(query) && /api|接口|openapi/.test(query)
+        ? "api_field_lookup"
+        : /为什么|why|行为|expected|预期/.test(input.query)
+        ? "why_behavior"
+        : /如何|怎么|步骤|setup|configure|config|export|导出/.test(input.query)
+        ? "how_to_product"
+        : "troubleshooting";
+    return {
+      question_type,
+      user_goal: input.query,
+      answer_contract: question_type.startsWith("api_") ? "Provide the exact API answer first." : "Provide the most useful support answer first.",
+      specialist_agent:
+        question_type.startsWith("api_")
+          ? "api-specialist"
+          : question_type === "why_behavior"
+          ? "behavior-specialist"
+          : question_type === "how_to_product"
+          ? "howto-specialist"
+          : "troubleshooting-specialist",
+      routing_confidence: 0.82
+    };
+  }
+
+  async planSupportEvidence(
+    input: OpenClawSupportEvidencePlannerInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SupportEvidencePlan> {
+    return {
+      query_plan: {
+        concept_queries: [input.query],
+        object_queries: [input.route.user_goal],
+        behavior_queries: [input.route.question_type]
+      },
+      evidence_priority: [input.route.question_type, input.route.specialist_agent],
+      required_doc_kinds: input.route.question_type.startsWith("api_") ? ["openapi/api", "schema"] : ["product_guide", "rules"]
+    };
+  }
+
   async selectSupportEvidence(
     input: OpenClawSupportEvidenceSelectorInput,
     _idempotencyKey: string,
@@ -279,15 +335,121 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
+  async writeApiSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    const primary = input.evidenceBundle.primary[0];
+    return {
+      question_type: input.route.question_type,
+      render_variant: "api",
+      direct_answer: primary ? `Use the API documented in ${primary.title}.` : "I could not confirm the exact API yet.",
+      claims: primary
+        ? [{ text: primary.snippet, kind: "verified_fact", evidence_ids: [primary.documentId], authority: "canonical" }]
+        : [],
+      next_actions: ["Use the documented API details from the primary source first."],
+      unknowns: input.caseFrame.missing_critical_info.slice(0, 2),
+      escalation_needed: false,
+      api_method: "GET",
+      api_path: "/openapi/v2/example",
+      required_params: ["teamID", "issueID"],
+      auth_scope: ["read:project:issue"],
+      response_field_hint: "Check the response body for the target field.",
+      important_note: "If you mean the status list instead of the current status value, use the status list endpoint instead.",
+      related_variant: "Status list and current status are different lookups."
+    };
+  }
+
+  async writeHowToSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    const primary = input.evidenceBundle.primary[0];
+    return {
+      question_type: input.route.question_type,
+      render_variant: "how_to",
+      direct_answer: primary ? primary.snippet : "Follow the documented steps for this workflow.",
+      claims: primary
+        ? [{ text: primary.snippet, kind: "verified_fact", evidence_ids: [primary.documentId], authority: "canonical" }]
+        : [],
+      next_actions: ["Follow the documented steps in order.", "If the result differs, capture the exact step where it diverges."],
+      unknowns: input.caseFrame.missing_critical_info.slice(0, 2),
+      escalation_needed: false,
+      steps: ["Open the relevant configuration page.", "Apply the documented setting.", "Verify the result in the target workflow."],
+      prerequisites: ["Confirm your role and environment first."],
+      limits_or_notes: ["The exact path can vary by deployment or permissions."]
+    };
+  }
+
+  async writeBehaviorSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    const primary = input.evidenceBundle.primary[0];
+    return {
+      question_type: input.route.question_type,
+      render_variant: "behavior",
+      direct_answer: primary ? "The documentation supports a likely explanation, but not every detail is explicit." : "I could not confirm the behavior from the current evidence.",
+      claims: primary
+        ? [{ text: primary.snippet, kind: "grounded_inference", evidence_ids: [primary.documentId], authority: "canonical" }]
+        : [],
+      next_actions: ["Check whether the observed behavior matches the documented rule."],
+      unknowns: input.caseFrame.missing_critical_info.slice(0, 2),
+      escalation_needed: false,
+      most_likely_explanation: primary?.snippet,
+      confirmed_facts: primary ? [primary.snippet] : [],
+      what_to_check_next: ["Verify the exact input, object, or configuration involved."]
+    };
+  }
+
+  async writeTroubleshootingSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    const primary = input.evidenceBundle.primary[0];
+    return {
+      question_type: input.route.question_type,
+      render_variant: "troubleshooting",
+      direct_answer: primary ? "The current evidence points to a documented troubleshooting path." : "I still need one critical detail before I can suggest a reliable fix.",
+      claims: primary
+        ? [{ text: primary.snippet, kind: "verified_fact", evidence_ids: [primary.documentId], authority: "canonical" }]
+        : [],
+      next_actions: ["Start with the primary documented check.", "If the issue persists, collect the exact error and repro steps."],
+      unknowns: input.caseFrame.missing_critical_info.slice(0, 2),
+      escalation_needed: false,
+      most_likely_causes: primary ? [primary.snippet] : [],
+      recommended_checks: ["Validate the exact failing step.", "Compare the actual result with the expected behavior."],
+      required_followup_info: input.caseFrame.missing_critical_info.slice(0, 2),
+      when_to_handoff: "Escalate if the documented checks do not explain the result."
+    };
+  }
+
   async verifySupportAnswer(
     input: OpenClawSupportVerifierInput,
     _idempotencyKey: string,
     _runtime?: OpenClawRuntimeContext
   ): Promise<SupportVerificationResult> {
     const citationIds = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].map((item) => item.documentId);
+    const draftClaims = input.draftSupportAnswer?.claims ?? [];
+    if (!draftClaims.length) {
+      return {
+        verdict: "unsupported",
+        summary: "No supported claims were produced from the current evidence.",
+        unsupported_claims: [input.draftSupportAnswer?.direct_answer ?? ""].filter(Boolean),
+        missing_info: input.caseFrame.missing_critical_info.slice(0, 3),
+        verified_citation_ids: [],
+        display_citation_ids: [],
+        verified_claims: [],
+        claim_to_citation_map: []
+      };
+    }
     if (/billing admin role denied checkout/i.test(input.query)) {
       const verifiedCitationIds = citationIds.slice(0, 2);
-      const verifiedClaims = input.draftSupportAnswer?.claims.map((item) => item.text).slice(0, 2) ?? [];
+      const verifiedClaims = draftClaims.map((item) => item.text).slice(0, 2);
       return {
         verdict: "partial",
         summary: "The available evidence supports a likely billing-permission path, but the exact role mapping is still missing.",
@@ -297,7 +459,7 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
         display_citation_ids: verifiedCitationIds,
         verified_claims: verifiedClaims,
         claim_to_citation_map:
-          input.draftSupportAnswer?.claims.map((item) => ({
+          draftClaims.map((item) => ({
             text: item.text,
             kind: item.kind,
             verdict: item.kind === "grounded_inference" ? "supported_inference" : "verified",
@@ -331,9 +493,9 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       missing_info: citationIds.length > 1 ? [] : input.caseFrame.missing_critical_info.slice(0, 2),
       verified_citation_ids: citationIds.slice(0, 3),
       display_citation_ids: citationIds.slice(0, 3),
-      verified_claims: input.draftSupportAnswer?.claims.map((item) => item.text).slice(0, 3) ?? [],
+      verified_claims: draftClaims.map((item) => item.text).slice(0, 3),
       claim_to_citation_map:
-        input.draftSupportAnswer?.claims.map((item) => {
+        draftClaims.map((item) => {
           const citation_ids = item.evidence_ids.length ? item.evidence_ids : citationIds.slice(0, 1);
           return {
             text: item.text,
@@ -346,8 +508,16 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
                 : "verified",
             citation_ids
           };
-        }) ?? []
+        })
     };
+  }
+
+  async judgeSupportAnswer(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult> {
+    return this.verifySupportAnswer(input, idempotencyKey, runtime);
   }
 
   async bindSupportCitations(
@@ -396,6 +566,14 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
+  async curateSupportCitations(
+    input: OpenClawSupportCitationSelectorInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<{ display_citation_ids: string[] }> {
+    return this.selectDisplayCitations(input, idempotencyKey, runtime);
+  }
+
   async composeSupportAnswer(
     input: OpenClawSupportAnswerComposerInput,
     _idempotencyKey: string,
@@ -415,6 +593,69 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     return {
       direct_answer,
       why: facts.slice(0, 3),
+      what_to_do_now: input.nextActions.slice(0, 4),
+      still_need_to_confirm: input.unknowns.slice(0, 4)
+    };
+  }
+
+  async composeCustomerAnswer(
+    input: OpenClawSupportAnswerComposerInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<{
+    question_type: SpecialistDraftAnswer["question_type"];
+    render_variant: SpecialistDraftAnswer["render_variant"];
+    direct_answer: string;
+    sections: import("../../modules/ai/types.js").SupportAnswer["sections"];
+    why: string[];
+    what_to_do_now: string[];
+    still_need_to_confirm: string[];
+  }> {
+    const direct_answer =
+      input.supportedClaims[0]?.text ??
+      input.draftSupportAnswer?.direct_answer ??
+      (input.mode === "partial"
+        ? "I could confirm part of the answer, but some details are still unconfirmed."
+        : "The available documentation supports this answer.");
+    const sections: import("../../modules/ai/types.js").SupportAnswer["sections"] = [];
+    if (input.route.specialist_agent === "api-specialist") {
+      sections.push({
+        kind: "api_card",
+        title: "API",
+        method: input.draftSupportAnswer?.api_method ?? "",
+        path: input.draftSupportAnswer?.api_path ?? "",
+        required_params: input.draftSupportAnswer?.required_params ?? [],
+        auth_scope: input.draftSupportAnswer?.auth_scope ?? [],
+        response_field_hint: input.draftSupportAnswer?.response_field_hint,
+        important_note: input.draftSupportAnswer?.important_note,
+        related_variant: input.draftSupportAnswer?.related_variant
+      });
+    } else if (input.route.specialist_agent === "behavior-specialist") {
+      if (input.draftSupportAnswer?.most_likely_explanation) {
+        sections.push({ kind: "paragraph", title: "Most likely explanation", body: input.draftSupportAnswer.most_likely_explanation });
+      }
+      if (input.draftSupportAnswer?.what_to_check_next?.length) {
+        sections.push({ kind: "bullet_list", title: "What to check next", items: input.draftSupportAnswer.what_to_check_next });
+      }
+    } else if (input.route.specialist_agent === "howto-specialist") {
+      if (input.draftSupportAnswer?.steps?.length) sections.push({ kind: "bullet_list", title: "Steps", items: input.draftSupportAnswer.steps });
+      if (input.draftSupportAnswer?.prerequisites?.length) {
+        sections.push({ kind: "bullet_list", title: "Prerequisites", items: input.draftSupportAnswer.prerequisites });
+      }
+    } else {
+      if (input.draftSupportAnswer?.recommended_checks?.length) {
+        sections.push({ kind: "bullet_list", title: "Recommended checks", items: input.draftSupportAnswer.recommended_checks });
+      }
+      if (input.draftSupportAnswer?.required_followup_info?.length) {
+        sections.push({ kind: "bullet_list", title: "Required follow-up info", items: input.draftSupportAnswer.required_followup_info });
+      }
+    }
+    return {
+      question_type: input.route.question_type,
+      render_variant: input.draftSupportAnswer?.render_variant ?? "troubleshooting",
+      direct_answer,
+      sections,
+      why: input.supportedClaims.map((item) => item.text).slice(0, 3),
       what_to_do_now: input.nextActions.slice(0, 4),
       still_need_to_confirm: input.unknowns.slice(0, 4)
     };

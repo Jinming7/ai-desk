@@ -132,11 +132,61 @@ export interface SearchCaseFrame {
     object_queries: string[];
     behavior_queries: string[];
   };
+  question_type?:
+    | "api_endpoint_lookup"
+    | "api_field_lookup"
+    | "api_scope_auth"
+    | "how_to_product"
+    | "why_behavior"
+    | "troubleshooting"
+    | "config_setup"
+    | "capability_confirmation"
+    | "data_export_reporting";
+  specialist_agent?: "api-specialist" | "howto-specialist" | "behavior-specialist" | "troubleshooting-specialist";
+  answer_contract?: string;
+  routing_confidence?: number;
+  evidence_priority?: string[];
+  required_doc_kinds?: string[];
 }
+
+export type SearchSupportSection =
+  | {
+      kind: "paragraph";
+      title: string;
+      body: string;
+    }
+  | {
+      kind: "bullet_list";
+      title: string;
+      items: string[];
+    }
+  | {
+      kind: "api_card";
+      title: string;
+      method: string;
+      path: string;
+      required_params: string[];
+      auth_scope: string[];
+      response_field_hint?: string;
+      important_note?: string;
+      related_variant?: string;
+    };
 
 export interface SearchSupportAnswer {
   mode: "grounded" | "partial" | "clarification" | "handoff";
+  question_type:
+    | "api_endpoint_lookup"
+    | "api_field_lookup"
+    | "api_scope_auth"
+    | "how_to_product"
+    | "why_behavior"
+    | "troubleshooting"
+    | "config_setup"
+    | "capability_confirmation"
+    | "data_export_reporting";
+  render_variant: "api" | "how_to" | "behavior" | "troubleshooting" | "clarification" | "handoff";
   direct_answer: string;
+  sections: SearchSupportSection[];
   why: string[];
   what_to_do_now: string[];
   still_need_to_confirm: string[];

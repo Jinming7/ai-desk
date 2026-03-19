@@ -1,10 +1,13 @@
 import type {
   DraftSupportAnswer,
   SearchReference,
+  SpecialistDraftAnswer,
   SupportAnswer,
   SupportCaseFrame,
+  SupportEvidencePlan,
   SupportEvidenceBundle,
   SupportEvidenceSelection,
+  SupportQuestionRoute,
   SupportVerificationClaim,
   SupportVerificationResult,
   TriageSupportInsight
@@ -102,8 +105,17 @@ export interface OpenClawRuntimeContext {
   model?: string;
   intent?: "retrieval" | "clarify" | "execution";
   stage?:
-    | "planner"
+    | "router"
+    | "evidence-planner"
     | "support-evidence-selector"
+    | "api-specialist"
+    | "howto-specialist"
+    | "behavior-specialist"
+    | "troubleshooting-specialist"
+    | "evidence-judge"
+    | "citation-curator"
+    | "answer-composer"
+    | "planner"
     | "support-writer"
     | "support-verifier"
     | "support-citation-binder"
@@ -146,6 +158,21 @@ export interface OpenClawSupportPlannerInput {
   };
 }
 
+export interface OpenClawSupportRouterInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+}
+
+export interface OpenClawSupportEvidencePlannerInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  route: SupportQuestionRoute;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+}
+
 export interface OpenClawSupportWriterInput {
   contextType: "search" | "triage";
   language: "zh" | "en";
@@ -158,6 +185,16 @@ export interface OpenClawSupportWriterInput {
     customerMeta: Record<string, unknown>;
     history: Array<{ author: string; body: string; at: string }>;
   };
+}
+
+export interface OpenClawSupportSpecialistInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
 }
 
 export interface OpenClawSupportVerifierInput {
@@ -192,7 +229,9 @@ export interface OpenClawSupportAnswerComposerInput {
   language: "zh" | "en";
   query: string;
   mode: "grounded" | "partial";
+  route: SupportQuestionRoute;
   caseFrame: SupportCaseFrame;
+  draftSupportAnswer?: SpecialistDraftAnswer;
   supportedClaims: SupportVerificationClaim[];
   nextActions: string[];
   unknowns: string[];
@@ -216,21 +255,61 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportCaseFrame>;
+  routeSupportQuestion(
+    input: OpenClawSupportRouterInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportQuestionRoute>;
+  planSupportEvidence(
+    input: OpenClawSupportEvidencePlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportEvidencePlan>;
   selectSupportEvidence(
     input: OpenClawSupportEvidenceSelectorInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportEvidenceSelection>;
+  writeApiSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeHowToSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeBehaviorSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeTroubleshootingSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
   writeSupportAnswer(
     input: OpenClawSupportWriterInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<DraftSupportAnswer>;
+  judgeSupportAnswer(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult>;
   verifySupportAnswer(
     input: OpenClawSupportVerifierInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportVerificationResult>;
+  curateSupportCitations(
+    input: OpenClawSupportCitationSelectorInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<{ display_citation_ids: string[] }>;
   bindSupportCitations(
     input: OpenClawSupportVerifierInput,
     idempotencyKey: string,
@@ -242,6 +321,16 @@ export interface OpenClawAdapter {
     runtime?: OpenClawRuntimeContext
   ): Promise<{ display_citation_ids: string[] }>;
   composeSupportAnswer(
+    input: OpenClawSupportAnswerComposerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<{
+    direct_answer: string;
+    why: string[];
+    what_to_do_now: string[];
+    still_need_to_confirm: string[];
+  }>;
+  composeCustomerAnswer(
     input: OpenClawSupportAnswerComposerInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
