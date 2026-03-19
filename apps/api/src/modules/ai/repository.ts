@@ -15,7 +15,16 @@ export async function createSearchSession(input: {
   await pool.query(
     `INSERT INTO ai_search_sessions (
       id, query, answer, confidence, retrieval_status, unresolved_reason_code, suggested_next_step
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+    ON CONFLICT (id)
+    DO UPDATE SET
+      query = EXCLUDED.query,
+      answer = EXCLUDED.answer,
+      confidence = EXCLUDED.confidence,
+      retrieval_status = EXCLUDED.retrieval_status,
+      unresolved_reason_code = EXCLUDED.unresolved_reason_code,
+      suggested_next_step = EXCLUDED.suggested_next_step,
+      updated_at = NOW()`,
     [id, input.query, input.answer, input.confidence, input.retrievalStatus, input.unresolvedReasonCode, input.suggestedNextStep]
   );
   return id;
