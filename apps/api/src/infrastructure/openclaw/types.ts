@@ -1,8 +1,11 @@
 import type {
   DraftSupportAnswer,
   SearchReference,
+  SupportAnswer,
   SupportCaseFrame,
   SupportEvidenceBundle,
+  SupportEvidenceSelection,
+  SupportVerificationClaim,
   SupportVerificationResult,
   TriageSupportInsight
 } from "../../modules/ai/types.js";
@@ -98,6 +101,16 @@ export interface OpenClawRuntimeContext {
   sessionKey?: string;
   model?: string;
   intent?: "retrieval" | "clarify" | "execution";
+  stage?:
+    | "planner"
+    | "support-evidence-selector"
+    | "support-writer"
+    | "support-verifier"
+    | "support-citation-binder"
+    | "support-citation-selector"
+    | "support-answer-composer"
+    | "triage-writer"
+    | "triage-verifier";
   timeoutMs?: number;
   overallTimeoutMs?: number;
   requestStartedAtMs?: number;
@@ -157,6 +170,34 @@ export interface OpenClawSupportVerifierInput {
   triageInsight?: TriageSupportInsight;
 }
 
+export interface OpenClawSupportEvidenceSelectorInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  caseFrame: SupportCaseFrame;
+  references: SearchReference[];
+}
+
+export interface OpenClawSupportCitationSelectorInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  supportedClaims: SupportVerificationClaim[];
+}
+
+export interface OpenClawSupportAnswerComposerInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  mode: "grounded" | "partial";
+  caseFrame: SupportCaseFrame;
+  supportedClaims: SupportVerificationClaim[];
+  nextActions: string[];
+  unknowns: string[];
+}
+
 export interface OpenClawAdapter {
   analyzeTicket(input: OpenClawAnalyzeInput, idempotencyKey: string, runtime?: OpenClawRuntimeContext): Promise<OpenClawAnalyzeOutput>;
   searchKnowledge(input: OpenClawSearchInput, idempotencyKey: string, runtime?: OpenClawRuntimeContext): Promise<OpenClawSearchOutput>;
@@ -175,6 +216,11 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportCaseFrame>;
+  selectSupportEvidence(
+    input: OpenClawSupportEvidenceSelectorInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportEvidenceSelection>;
   writeSupportAnswer(
     input: OpenClawSupportWriterInput,
     idempotencyKey: string,
@@ -185,6 +231,21 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportVerificationResult>;
+  bindSupportCitations(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult>;
+  selectDisplayCitations(
+    input: OpenClawSupportCitationSelectorInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<{ display_citation_ids: string[] }>;
+  composeSupportAnswer(
+    input: OpenClawSupportAnswerComposerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<Omit<SupportAnswer, "mode">>;
   writeTriageInsight(
     input: OpenClawSupportWriterInput,
     idempotencyKey: string,

@@ -16,6 +16,7 @@ import type {
   SupportAgentStageTimings,
   SupportCaseFrame,
   SupportEvidenceBundle,
+  SupportEvidenceSelection,
   SupportVerificationResult,
   TriageSupportInsight
 } from "./types.js";
@@ -69,15 +70,61 @@ function hasEnoughBudget(runtime: OpenClawRuntimeContext | undefined, minimumMs:
 function buildStageRuntime(
   runtime: OpenClawRuntimeContext | undefined,
   reserveMs: number,
-  minimumTimeoutMs = 3000
+  minimumTimeoutMs = 3000,
+  stageTimeoutMs = 12000
 ): OpenClawRuntimeContext | undefined {
-  if (!runtime) return runtime;
+  if (!runtime) {
+    return {
+      timeoutMs: stageTimeoutMs
+    };
+  }
   const remaining = remainingBudgetMs(runtime);
-  if (remaining === null) return runtime;
-  const timeoutMs = Math.max(minimumTimeoutMs, remaining - reserveMs);
+  if (remaining === null) {
+    return {
+      ...runtime,
+      timeoutMs: stageTimeoutMs
+    };
+  }
+  const timeoutMs = Math.max(minimumTimeoutMs, Math.min(stageTimeoutMs, remaining - reserveMs));
   return {
     ...runtime,
     timeoutMs
+  };
+}
+
+function sanitizeSessionPart(input: string): string {
+  return input.replace(/[^a-zA-Z0-9:_-]/g, "_").slice(0, 120);
+}
+
+function withStageRuntime(
+  runtime: OpenClawRuntimeContext | undefined,
+  stage: NonNullable<OpenClawRuntimeContext["stage"]>,
+  sessionSeed: string
+): OpenClawRuntimeContext | undefined {
+  const prefix = env.OPENCLAW_AGENT_SESSION_PREFIX.trim() || "nf";
+  const base = runtime ?? {};
+  const useExecutionAgent =
+    stage === "planner" ||
+    stage === "support-evidence-selector" ||
+    stage === "support-writer" ||
+    stage === "support-verifier" ||
+    stage === "support-citation-binder" ||
+    stage === "support-citation-selector" ||
+    stage === "support-answer-composer" ||
+    stage === "triage-writer" ||
+    stage === "triage-verifier";
+  const agentId = useExecutionAgent
+    ? env.OPENCLAW_AGENT_ID_EXECUTION.trim() || env.OPENCLAW_AGENT_ID.trim() || "main"
+    : base.agentId?.trim() || env.OPENCLAW_AGENT_ID_RETRIEVAL.trim() || env.OPENCLAW_AGENT_ID.trim() || "main";
+  const model = useExecutionAgent
+    ? env.OPENCLAW_AGENT_MODEL_EXECUTION.trim() || env.OPENCLAW_AGENT_MODEL.trim() || undefined
+    : base.model?.trim() || env.OPENCLAW_AGENT_MODEL_RETRIEVAL.trim() || env.OPENCLAW_AGENT_MODEL.trim() || undefined;
+  return {
+    ...base,
+    stage,
+    agentId,
+    model,
+    sessionKey: `agent:${agentId}:${sanitizeSessionPart(`${prefix}:${stage}:${sessionSeed}`)}`
   };
 }
 
@@ -256,14 +303,42 @@ function buildEvidenceBundle(input: {
   fallbackUsed: boolean;
   resolvedQueries: string[];
   caseFrame: SupportCaseFrame;
+  query: string;
+  selection?: SupportEvidenceSelection | null;
 }): SupportEvidenceBundle {
+  const reranked = rerankReferencesForCaseFrame(input.references, input.query, input.caseFrame);
+  const byId = new Map(reranked.map((reference) => [reference.documentId, reference] as const));
+  const selectedPrimary =
+    input.selection?.primary_ids
+      .map((id) => byId.get(id))
+      .filter((item): item is SearchReference => Boolean(item)) ?? [];
+  const selectedSupplemental =
+    input.selection?.supplemental_ids
+      .map((id) => byId.get(id))
+      .filter(
+        (item): item is SearchReference =>
+          Boolean(item) && !selectedPrimary.some((primary) => primary.documentId === (item as SearchReference).documentId)
+      ) ?? [];
+  const primary = selectedPrimary.length ? selectedPrimary.slice(0, 3) : reranked.slice(0, 3);
+  const supplemental = selectedSupplemental.length
+    ? selectedSupplemental.slice(0, 5)
+    : reranked.filter((item) => !primary.some((primaryRef) => primaryRef.documentId === item.documentId)).slice(0, 5);
   return {
-    primary: input.references.slice(0, 3),
-    supplemental: input.references.slice(3, 8),
+    primary,
+    supplemental,
     evidence_gaps: input.caseFrame.missing_critical_info.slice(0, 3),
     confidence: input.confidence,
     fallbackUsed: input.fallbackUsed,
     resolvedQueries: input.resolvedQueries
+  };
+}
+
+function fallbackEvidenceSelection(references: SearchReference[], query: string, caseFrame: SupportCaseFrame): SupportEvidenceSelection {
+  const reranked = rerankReferencesForCaseFrame(references, query, caseFrame);
+  return {
+    primary_ids: reranked.slice(0, 3).map((item) => item.documentId),
+    supplemental_ids: reranked.slice(3, 6).map((item) => item.documentId),
+    rejected_ids: reranked.slice(6).map((item) => item.documentId)
   };
 }
 
@@ -281,6 +356,93 @@ function uniqueCitationIds(claims: SupportVerificationResult["claim_to_citation_
       .flatMap((claim) => claim.citation_ids),
     12
   );
+}
+
+function collectFocusTerms(query: string, caseFrame: SupportCaseFrame): string[] {
+  const raw = [
+    query,
+    caseFrame.goal,
+    caseFrame.object,
+    caseFrame.symptom,
+    caseFrame.product_area,
+    caseFrame.action_type,
+    ...caseFrame.retrieval_queries,
+    ...(caseFrame.query_plan?.concept_queries ?? []),
+    ...(caseFrame.query_plan?.object_queries ?? []),
+    ...(caseFrame.query_plan?.behavior_queries ?? [])
+  ]
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  const ascii = [...raw.matchAll(/[a-z0-9:_./-]{3,}/g)].map((match) => match[0]);
+  const cjk = [...raw.matchAll(/[\u4e00-\u9fff]{2,}/g)].map((match) => match[0]);
+  return uniqueStrings([...ascii, ...cjk], 24);
+}
+
+function buildCompactFocusQuery(query: string, caseFrame: SupportCaseFrame): string | null {
+  const stopwords = new Set([
+    "does",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+    "that",
+    "this",
+    "have",
+    "from",
+    "into",
+    "such",
+    "used",
+    "commonly",
+    "noticed",
+    "support",
+    "supports",
+    "query",
+    "queries",
+    "function",
+    "seems",
+    "translate",
+    "changing",
+    "exact",
+    "object",
+    "scenario",
+    "working"
+  ]);
+  const focusTerms = collectFocusTerms(query, caseFrame).filter((term) => {
+    const normalized = term.toLowerCase();
+    return normalized.length > 2 && !stopwords.has(normalized);
+  });
+  const compact = uniqueStrings(focusTerms, 8).join(" ").trim();
+  if (!compact) return null;
+  return compact.toLowerCase() === query.trim().toLowerCase() ? null : compact;
+}
+
+function rerankReferencesForCaseFrame(references: SearchReference[], query: string, caseFrame: SupportCaseFrame): SearchReference[] {
+  const focusTerms = collectFocusTerms(query, caseFrame);
+  return [...references].sort((a, b) => {
+    const scoreRef = (reference: SearchReference) => {
+      const title = String(reference.title ?? "").toLowerCase();
+      const heading = String(reference.headingPath ?? "").toLowerCase();
+      const refPath = String(reference.path ?? "").toLowerCase();
+      const snippet = String(reference.snippet ?? "").toLowerCase();
+      let topicScore = 0;
+      for (const term of focusTerms) {
+        if (title.includes(term)) topicScore += 8;
+        else if (heading.includes(term)) topicScore += 5;
+        else if (refPath.includes(term)) topicScore += 4;
+        else if (snippet.includes(term)) topicScore += 1;
+      }
+      if (reference.sourceType === "local_docs" || reference.sourceType === "github_kb") {
+        topicScore += 2;
+      }
+      return topicScore;
+    };
+    const topicDiff = scoreRef(b) - scoreRef(a);
+    if (topicDiff !== 0) return topicDiff;
+    return b.score - a.score;
+  });
 }
 
 function sanitizeVerification(input: {
@@ -337,7 +499,7 @@ function sanitizeVerification(input: {
     unsupported_claims: unsupportedClaims,
     missing_info: input.verification.missing_info,
     verified_citation_ids: claimLinkedCitationIds,
-    display_citation_ids: (displayCitationIds.length ? displayCitationIds : claimLinkedCitationIds).slice(0, 3),
+    display_citation_ids: displayCitationIds.slice(0, 3),
     verified_claims: supportedClaims.map((claim) => claim.text),
     claim_to_citation_map: sanitizedClaims
   };
@@ -458,25 +620,130 @@ function resolveSupportMode(input: {
   return "handoff";
 }
 
+function supportedVerificationClaims(verification: SupportVerificationResult) {
+  return verification.claim_to_citation_map.filter(
+    (claim) => (claim.verdict === "verified" || claim.verdict === "supported_inference") && claim.citation_ids.length > 0
+  );
+}
+
+function scoreReferenceTopicMatch(reference: SearchReference, focusTerms: string[]): number {
+  const title = String(reference.title ?? "").toLowerCase();
+  const heading = String(reference.headingPath ?? "").toLowerCase();
+  const refPath = canonicalDocsPath(reference.path).toLowerCase();
+  const snippet = String(reference.snippet ?? "").toLowerCase();
+  let topicScore = 0;
+  for (const term of focusTerms) {
+    if (title.includes(term)) topicScore += 10;
+    else if (heading.includes(term)) topicScore += 7;
+    else if (refPath.includes(term)) topicScore += 5;
+    else if (snippet.includes(term)) topicScore += 2;
+  }
+  return topicScore;
+}
+
+function scoreVerificationCandidate(
+  verification: SupportVerificationResult,
+  evidenceBundle: SupportEvidenceBundle,
+  query: string,
+  caseFrame: SupportCaseFrame
+): number {
+  const supportedClaims = supportedVerificationClaims(verification);
+  const evidenceById = new Map(
+    [...evidenceBundle.primary, ...evidenceBundle.supplemental]
+      .filter((item) => item.authority === "canonical_visible")
+      .map((item) => [item.documentId, item] as const)
+  );
+  const focusTerms = collectFocusTerms(query, caseFrame);
+  let score = 0;
+  score += supportedClaims.length * 40;
+  score += verification.display_citation_ids.length * 18;
+  score -= verification.unsupported_claims.length * 8;
+  for (const citationId of verification.display_citation_ids) {
+    const reference = evidenceById.get(citationId);
+    if (!reference) continue;
+    score += scoreReferenceTopicMatch(reference, focusTerms);
+    score += Math.round(reference.score * 10);
+  }
+  return score;
+}
+
+function pickBestVerificationCandidate(input: {
+  query: string;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  primary: SupportVerificationResult;
+  rebound: SupportVerificationResult | null;
+  writerBound: SupportVerificationResult;
+}): SupportVerificationResult {
+  const candidates = [input.primary, input.rebound].filter(
+    (candidate): candidate is SupportVerificationResult => Boolean(candidate)
+  );
+  const supportedCandidates = candidates.filter((candidate) => supportedVerificationClaims(candidate).length > 0);
+  if (supportedCandidates.length > 0) {
+    return [...supportedCandidates].sort(
+      (a, b) =>
+        scoreVerificationCandidate(b, input.evidenceBundle, input.query, input.caseFrame) -
+        scoreVerificationCandidate(a, input.evidenceBundle, input.query, input.caseFrame)
+    )[0];
+  }
+  return supportedVerificationClaims(input.writerBound).length > 0 ? input.writerBound : input.primary;
+}
+
+function buildFallbackDirectAnswerFromSupportedClaims(input: {
+  language: "zh" | "en";
+  mode: SupportAnswer["mode"];
+  supportedClaims: SupportVerificationResult["claim_to_citation_map"];
+  fallback: SupportAnswer;
+}): string {
+  const leadingClaims = uniqueStrings(
+    input.supportedClaims
+      .filter((claim) => claim.kind === "verified_fact" || claim.kind === "grounded_inference")
+      .map((claim) => claim.text),
+    2
+  );
+  const explicitVerdict = leadingClaims.find((claim) => /could not confirm|does not explicitly|not explicitly|未明确|无法确认|没有明确/i.test(claim));
+  if (!leadingClaims.length || (input.mode !== "grounded" && input.mode !== "partial")) {
+    return input.fallback.direct_answer;
+  }
+  if (input.language === "zh") {
+    return input.mode === "partial"
+      ? explicitVerdict
+        ? `${explicitVerdict}${leadingClaims.length > 1 ? ` 另外，${leadingClaims.filter((item) => item !== explicitVerdict).join("；")}` : ""}`
+        : `基于当前文档，我可以先确认：${leadingClaims.join("；")}。其余部分还需要进一步确认。`
+      : leadingClaims.join("；");
+  }
+  return input.mode === "partial"
+    ? explicitVerdict
+      ? `${explicitVerdict}${leadingClaims.length > 1 ? ` ${leadingClaims.filter((item) => item !== explicitVerdict).join(" ")}` : ""}`
+      : `Based on the current documentation, I can confirm this much: ${leadingClaims.join("; ")}. The remaining part is still not fully confirmed.`
+    : leadingClaims.join("; ");
+}
+
 function buildSupportAnswerFromDraft(input: {
   language: "zh" | "en";
   mode: SupportAnswer["mode"];
   draft: DraftSupportAnswer;
   verification: SupportVerificationResult;
   missingInfo: string[];
+  composed?: Omit<SupportAnswer, "mode"> | null;
 }): SupportAnswer {
-  const supportedClaims = input.verification.claim_to_citation_map.filter(
-    (claim) => (claim.verdict === "verified" || claim.verdict === "supported_inference") && claim.citation_ids.length > 0
-  );
+  const supportedClaims = supportedVerificationClaims(input.verification);
   const why = uniqueStrings(
-    supportedClaims
-      .filter((claim) => claim.kind === "verified_fact" || claim.kind === "grounded_inference")
-      .map((claim) => claim.text),
+    [
+      ...(input.composed?.why ?? []),
+      ...supportedClaims.filter((claim) => claim.kind === "verified_fact" || claim.kind === "grounded_inference").map((claim) => claim.text)
+    ],
     4
   );
-  const whatToDoNow = uniqueStrings(filterUnsupported(input.draft.next_actions, input.verification.unsupported_claims), 4);
+  const whatToDoNow = uniqueStrings(
+    [
+      ...(input.composed?.what_to_do_now ?? []),
+      ...filterUnsupported(input.draft.next_actions, input.verification.unsupported_claims)
+    ],
+    4
+  );
   const stillNeedToConfirm = uniqueStrings(
-    [...input.draft.unknowns, ...input.verification.missing_info, ...input.missingInfo],
+    [...(input.composed?.still_need_to_confirm ?? []), ...input.draft.unknowns, ...input.verification.missing_info, ...input.missingInfo],
     4
   );
   const fallback = fallbackSupportAnswer({
@@ -486,7 +753,13 @@ function buildSupportAnswerFromDraft(input: {
   });
   const directAnswer =
     input.mode === "grounded" || input.mode === "partial"
-      ? input.draft.direct_answer.trim() || fallback.direct_answer
+      ? input.composed?.direct_answer?.trim() ||
+        buildFallbackDirectAnswerFromSupportedClaims({
+          language: input.language,
+          mode: input.mode,
+          supportedClaims,
+          fallback
+        })
       : fallback.direct_answer;
   return {
     mode: input.mode,
@@ -507,7 +780,8 @@ function combineRetrievalQueries(query: string, caseFrame: SupportCaseFrame, orc
     ...(caseFrame.query_plan?.concept_queries ?? []),
     ...(caseFrame.query_plan?.object_queries ?? []),
     ...(caseFrame.query_plan?.behavior_queries ?? []),
-    ...caseFrame.retrieval_queries
+    ...caseFrame.retrieval_queries,
+    buildCompactFocusQuery(query, caseFrame)
   ];
   return uniqueStrings([query, ...groupedQueries], 6).filter(
     (item) => orchestrator.normalizeQuery(item) !== orchestrator.normalizeQuery(query)
@@ -573,7 +847,7 @@ export async function runSupportSearchAgent(input: {
   const allowRefinement = input.runtime?.allowRefinement !== false;
 
   const plannerStartedAt = performance.now();
-  const plannerRuntime = buildStageRuntime(input.runtime, 12000, 4000);
+  const plannerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 32000, 6000, 20000), "planner", `${input.idempotencyKey}:planner`);
   const plannerPromise = input.adapter
     .planSupportCase(
       {
@@ -648,17 +922,45 @@ export async function runSupportSearchAgent(input: {
         })
       : skippedStageTiming();
 
+  const selectionRuntime = withStageRuntime(
+    buildStageRuntime(input.runtime, 22000, 4000, 12000),
+    "support-evidence-selector",
+    `${input.idempotencyKey}:evidence-selector`
+  );
+  const evidenceSelection =
+    evidenceCollection.references.length > 0 && hasEnoughBudget(input.runtime, 5000)
+      ? await input.adapter
+          .selectSupportEvidence(
+            {
+              contextType: "search",
+              language: input.language,
+              query: input.query,
+              caseFrame,
+              references: evidenceCollection.references
+            },
+            `${input.idempotencyKey}:evidence-selector`,
+            selectionRuntime
+          )
+          .catch(() => fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame))
+      : fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame);
+
   const evidenceBundle = buildEvidenceBundle({
     references: evidenceCollection.references,
     confidence: evidenceCollection.confidence,
     fallbackUsed: evidenceCollection.fallbackUsed,
     resolvedQueries: evidenceCollection.resolvedQueries,
-    caseFrame
+    caseFrame,
+    query: input.query,
+    selection: evidenceSelection
   });
 
   const writerStartedAt = performance.now();
-  const writerRuntime = buildStageRuntime(input.runtime, 4500, 3500);
-  const writtenResult = hasEnoughBudget(input.runtime, 4500)
+  const writerRuntime = withStageRuntime(
+    buildStageRuntime(input.runtime, 12000, 5000, 18000),
+    "support-writer",
+    `${input.idempotencyKey}:support-writer`
+  );
+  const writtenResult = hasEnoughBudget(input.runtime, 6000)
     ? await input.adapter
     .writeSupportAnswer(
       {
@@ -684,8 +986,12 @@ export async function runSupportSearchAgent(input: {
     });
 
   const verifierStartedAt = performance.now();
-  const verifierRuntime = buildStageRuntime(input.runtime, 1500, 2500);
-  const verificationResult = hasEnoughBudget(input.runtime, 2500)
+  const verifierRuntime = withStageRuntime(
+    buildStageRuntime(input.runtime, 5000, 6000, 25000),
+    "support-verifier",
+    `${input.idempotencyKey}:support-verifier`
+  );
+  const verificationResult = hasEnoughBudget(input.runtime, 7000)
     ? await input.adapter
     .verifySupportAnswer(
       {
@@ -713,9 +1019,7 @@ export async function runSupportSearchAgent(input: {
     verification,
     evidenceBundle
   });
-  const supportedCoreClaims = sanitizedVerification.claim_to_citation_map.filter(
-    (claim) => (claim.verdict === "verified" || claim.verdict === "supported_inference") && claim.citation_ids.length > 0
-  );
+  const supportedCoreClaims = supportedVerificationClaims(sanitizedVerification);
   const unsupportedCore = sanitizedVerification.unsupported_claims.some(
     (claim) =>
       overlapsUnsupportedClaim(draftSupportAnswer.direct_answer, [claim]) ||
@@ -736,27 +1040,148 @@ export async function runSupportSearchAgent(input: {
         }
       : sanitizedVerification;
 
-  const missingInfo = uniqueStrings([...effectiveVerification.missing_info, ...caseFrame.missing_critical_info], 3);
+  const citationBinderRuntime = withStageRuntime(
+    buildStageRuntime(input.runtime, 3000, 5000, 16000),
+    "support-citation-binder",
+    `${input.idempotencyKey}:support-citation-binder`
+  );
+  const reboundVerification =
+    !draftSupportAnswer.claims.length || !evidenceBundle.primary.length || !hasEnoughBudget(input.runtime, 5000)
+      ? null
+      : await input.adapter
+          .bindSupportCitations(
+            {
+              contextType: "search",
+              language: input.language,
+              query: input.query,
+              caseFrame,
+              evidenceBundle,
+              draftSupportAnswer
+            },
+            `${input.idempotencyKey}:support-citation-binder`,
+            citationBinderRuntime
+          )
+          .catch(() => null);
+  const reboundSanitized = reboundVerification
+    ? sanitizeVerification({
+        verification: reboundVerification,
+        evidenceBundle
+      })
+    : null;
+  const writerBoundVerification = sanitizeVerification({
+    verification: {
+      verdict: draftSupportAnswer.claims.some((claim) => claim.evidence_ids.length > 0) ? "partial" : "unsupported",
+      summary:
+        input.language === "zh"
+          ? "已根据回答草稿中的证据引用补充文档绑定。"
+          : "Documentation bindings were recovered from the draft answer evidence ids.",
+      unsupported_claims: draftSupportAnswer.claims.filter((claim) => claim.evidence_ids.length === 0).map((claim) => claim.text),
+      missing_info: [],
+      verified_citation_ids: uniqueStrings(draftSupportAnswer.claims.flatMap((claim) => claim.evidence_ids), 6),
+      display_citation_ids: uniqueStrings(draftSupportAnswer.claims.flatMap((claim) => claim.evidence_ids), 3),
+      verified_claims: draftSupportAnswer.claims.filter((claim) => claim.evidence_ids.length > 0).map((claim) => claim.text),
+      claim_to_citation_map: draftSupportAnswer.claims.map((claim) => ({
+        text: claim.text,
+        kind: claim.kind,
+        verdict:
+          claim.evidence_ids.length === 0
+            ? ("unsupported" as const)
+            : claim.kind === "grounded_inference"
+            ? ("supported_inference" as const)
+            : ("verified" as const),
+        citation_ids: claim.evidence_ids
+      }))
+    },
+    evidenceBundle
+  });
+  const preselectedVerification = pickBestVerificationCandidate({
+    query: input.query,
+    caseFrame,
+    evidenceBundle,
+    primary: effectiveVerification,
+    rebound: reboundSanitized,
+    writerBound: writerBoundVerification
+  });
+
+  const displayCitationSelectorRuntime = withStageRuntime(
+    buildStageRuntime(input.runtime, 2500, 4000, 14000),
+    "support-citation-selector",
+    `${input.idempotencyKey}:support-citation-selector`
+  );
+  const selectedDisplayCitations =
+    supportedVerificationClaims(preselectedVerification).length > 0 && hasEnoughBudget(input.runtime, 4500)
+      ? await input.adapter
+          .selectDisplayCitations(
+            {
+              contextType: "search",
+              language: input.language,
+              query: input.query,
+              caseFrame,
+              evidenceBundle,
+              supportedClaims: supportedVerificationClaims(preselectedVerification)
+            },
+            `${input.idempotencyKey}:support-citation-selector`,
+            displayCitationSelectorRuntime
+          )
+          .catch(() => null)
+      : null;
+
+  const finalVerification = sanitizeVerification({
+    verification: selectedDisplayCitations
+      ? {
+          ...preselectedVerification,
+          display_citation_ids: selectedDisplayCitations.display_citation_ids
+        }
+      : preselectedVerification,
+    evidenceBundle
+  });
+
+  const missingInfo = uniqueStrings([...finalVerification.missing_info, ...caseFrame.missing_critical_info], 3);
   const mode = resolveSupportMode({
-    verification: effectiveVerification,
+    verification: finalVerification,
     references: evidenceCollection.references,
     currentRound: input.currentRound + 1,
     missingInfo
   });
+  const answerComposerRuntime = withStageRuntime(
+    buildStageRuntime(input.runtime, 1500, 4000, 14000),
+    "support-answer-composer",
+    `${input.idempotencyKey}:support-answer-composer`
+  );
+  const composedSupportAnswer =
+    (mode === "grounded" || mode === "partial") && supportedVerificationClaims(finalVerification).length > 0 && hasEnoughBudget(input.runtime, 4500)
+      ? await input.adapter
+          .composeSupportAnswer(
+            {
+              contextType: "search",
+              language: input.language,
+              query: input.query,
+              mode,
+              caseFrame,
+              supportedClaims: supportedVerificationClaims(finalVerification),
+              nextActions: filterUnsupported(draftSupportAnswer.next_actions, finalVerification.unsupported_claims),
+              unknowns: uniqueStrings([...draftSupportAnswer.unknowns, ...missingInfo], 4)
+            },
+            `${input.idempotencyKey}:support-answer-composer`,
+            answerComposerRuntime
+          )
+          .catch(() => null)
+      : null;
   const supportAnswer = buildSupportAnswerFromDraft({
     language: input.language,
     mode,
     draft: draftSupportAnswer,
     verification: {
-      ...effectiveVerification,
-      unsupported_claims: sanitizedVerification.unsupported_claims
+      ...finalVerification,
+      unsupported_claims: finalVerification.unsupported_claims
     },
-    missingInfo
+    missingInfo,
+    composed: composedSupportAnswer
   });
-  const structuredAnswer = buildStructuredAnswer(supportAnswer, effectiveVerification);
+  const structuredAnswer = buildStructuredAnswer(supportAnswer, finalVerification);
   const citations = buildCitations({
     references: [...evidenceBundle.primary, ...evidenceBundle.supplemental],
-    verification: effectiveVerification
+    verification: finalVerification
   });
 
   const handoffAfterClarificationExhausted =
@@ -780,7 +1205,7 @@ export async function runSupportSearchAgent(input: {
       ? "KB_RETRIEVAL_UNAVAILABLE"
       : !evidenceCollection.references.length
       ? "NO_MATCHING_KB"
-      : effectiveVerification.verdict === "verified"
+      : finalVerification.verdict === "verified"
       ? null
       : "LOW_CONFIDENCE";
   const stageTimings: SupportAgentStageTimings = {
@@ -795,7 +1220,7 @@ export async function runSupportSearchAgent(input: {
   return {
     caseFrame,
     evidenceBundle,
-    verification: effectiveVerification,
+    verification: finalVerification,
     stageTimings,
     result: {
       session_id: "",
@@ -803,7 +1228,7 @@ export async function runSupportSearchAgent(input: {
       answer_language: input.language,
       case_frame: caseFrame,
       support_answer: supportAnswer,
-      verification: effectiveVerification,
+      verification: finalVerification,
       structured_answer: structuredAnswer,
       confidence: evidenceCollection.confidence,
       suggested_next_step: mode === "grounded" ? "self_serve" : "submit_ticket",
@@ -850,7 +1275,7 @@ export async function runSupportTriageAgent(input: {
     .map((item) => ({ role: "user" as const, content: `${item.author}: ${item.body}` }));
 
   const plannerStartedAt = performance.now();
-  const plannerRuntime = buildStageRuntime(input.runtime, 12000, 4000);
+  const plannerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 22000, 5000, 14000), "planner", `${input.idempotencyKey}:planner`);
   const plannerPromise = input.adapter
     .planSupportCase(
       {
@@ -930,17 +1355,45 @@ export async function runSupportTriageAgent(input: {
         })
       : skippedStageTiming();
 
+  const selectionRuntime = withStageRuntime(
+    buildStageRuntime(input.runtime, 14000, 3500, 9000),
+    "support-evidence-selector",
+    `${input.idempotencyKey}:evidence-selector`
+  );
+  const evidenceSelection =
+    evidenceCollection.references.length > 0 && hasEnoughBudget(input.runtime, 4000)
+      ? await input.adapter
+          .selectSupportEvidence(
+            {
+              contextType: "triage",
+              language: input.language,
+              query: input.query,
+              caseFrame,
+              references: evidenceCollection.references
+            },
+            `${input.idempotencyKey}:evidence-selector`,
+            selectionRuntime
+          )
+          .catch(() => fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame))
+      : fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame);
+
   const evidenceBundle = buildEvidenceBundle({
     references: evidenceCollection.references,
     confidence: evidenceCollection.confidence,
     fallbackUsed: evidenceCollection.fallbackUsed,
     resolvedQueries: evidenceCollection.resolvedQueries,
-    caseFrame
+    caseFrame,
+    query: input.query,
+    selection: evidenceSelection
   });
 
   const writerStartedAt = performance.now();
-  const writerRuntime = buildStageRuntime(input.runtime, 4500, 3500);
-  const writtenResult = hasEnoughBudget(input.runtime, 4500)
+  const writerRuntime = withStageRuntime(
+    buildStageRuntime(input.runtime, 7000, 4000, 12000),
+    "triage-writer",
+    `${input.idempotencyKey}:triage-writer`
+  );
+  const writtenResult = hasEnoughBudget(input.runtime, 5000)
     ? await input.adapter
     .writeTriageInsight(
       {
@@ -967,8 +1420,12 @@ export async function runSupportTriageAgent(input: {
     fallbackTriageInsight(input.language, caseFrame, evidenceCollection.references.length ? "escalate" : "ask_user");
 
   const verifierStartedAt = performance.now();
-  const verifierRuntime = buildStageRuntime(input.runtime, 1500, 2500);
-  const verificationResult = hasEnoughBudget(input.runtime, 2500)
+  const verifierRuntime = withStageRuntime(
+    buildStageRuntime(input.runtime, 2500, 3500, 9000),
+    "triage-verifier",
+    `${input.idempotencyKey}:triage-verifier`
+  );
+  const verificationResult = hasEnoughBudget(input.runtime, 3500)
     ? await input.adapter
     .verifyTriageInsight(
       {

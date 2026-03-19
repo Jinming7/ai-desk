@@ -2,6 +2,9 @@ import type {
   OpenClawAdapter,
   OpenClawAnalyzeInput,
   OpenClawAnalyzeOutput,
+  OpenClawSupportAnswerComposerInput,
+  OpenClawSupportCitationSelectorInput,
+  OpenClawSupportEvidenceSelectorInput,
   OpenClawSupportPlannerInput,
   OpenClawSupportVerifierInput,
   OpenClawSupportWriterInput,
@@ -14,6 +17,7 @@ import type {
 import type {
   DraftSupportAnswer,
   SupportCaseFrame,
+  SupportEvidenceSelection,
   SupportVerificationResult,
   TriageSupportInsight
 } from "../../modules/ai/types.js";
@@ -198,6 +202,37 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
+  async selectSupportEvidence(
+    input: OpenClawSupportEvidenceSelectorInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SupportEvidenceSelection> {
+    const terms = Array.from(
+      new Set(
+        input.query
+          .toLowerCase()
+          .match(/[a-z0-9:_./-]{3,}/g)?.filter(Boolean) ?? []
+      )
+    );
+    const scored = input.references
+      .map((reference) => {
+        const text = `${reference.title} ${reference.headingPath ?? ""} ${reference.path ?? ""} ${reference.snippet}`.toLowerCase();
+        const lexical = terms.reduce((sum, term) => sum + (text.includes(term) ? 1 : 0), 0);
+        return { reference, lexical };
+      })
+      .sort((a, b) => b.lexical - a.lexical || b.reference.score - a.reference.score);
+
+    const primary = scored.slice(0, 3).map((item) => item.reference.documentId);
+    const supplemental = scored.slice(3, 5).map((item) => item.reference.documentId);
+    const selected = new Set([...primary, ...supplemental]);
+
+    return {
+      primary_ids: primary,
+      supplemental_ids: supplemental,
+      rejected_ids: input.references.map((item) => item.documentId).filter((id) => !selected.has(id))
+    };
+  }
+
   async writeSupportAnswer(
     input: OpenClawSupportWriterInput,
     _idempotencyKey: string,
@@ -312,6 +347,76 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
             citation_ids
           };
         }) ?? []
+    };
+  }
+
+  async bindSupportCitations(
+    input: OpenClawSupportVerifierInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult> {
+    const citationIds = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].map((item) => item.documentId);
+    const claimMap =
+      input.draftSupportAnswer?.claims.map((item) => {
+        const boundIds = item.evidence_ids.length ? item.evidence_ids.slice(0, 2) : citationIds.slice(0, 2);
+        return {
+          text: item.text,
+          kind: item.kind,
+          verdict:
+            boundIds.length === 0
+              ? ("unsupported" as const)
+              : item.kind === "grounded_inference"
+              ? ("supported_inference" as const)
+              : ("verified" as const),
+          citation_ids: boundIds
+        };
+      }) ?? [];
+    const displayCitationIds = Array.from(new Set(claimMap.flatMap((item) => item.citation_ids))).slice(0, 3);
+    return {
+      verdict: displayCitationIds.length ? "partial" : "unsupported",
+      summary: displayCitationIds.length
+        ? "Claims were rebound to the strongest available evidence."
+        : "No claim could be rebound to the available evidence.",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: displayCitationIds,
+      display_citation_ids: displayCitationIds,
+      verified_claims: claimMap.filter((item) => item.citation_ids.length > 0).map((item) => item.text),
+      claim_to_citation_map: claimMap
+    };
+  }
+
+  async selectDisplayCitations(
+    input: OpenClawSupportCitationSelectorInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<{ display_citation_ids: string[] }> {
+    return {
+      display_citation_ids: Array.from(new Set(input.supportedClaims.flatMap((item) => item.citation_ids))).slice(0, 3)
+    };
+  }
+
+  async composeSupportAnswer(
+    input: OpenClawSupportAnswerComposerInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<{
+    direct_answer: string;
+    why: string[];
+    what_to_do_now: string[];
+    still_need_to_confirm: string[];
+  }> {
+    const facts = input.supportedClaims.map((item) => item.text);
+    const direct_answer =
+      facts[0] ??
+      (input.mode === "partial"
+        ? "I can confirm part of the answer, but some details are still unconfirmed."
+        : "The available documentation supports this answer.");
+    return {
+      direct_answer,
+      why: facts.slice(0, 3),
+      what_to_do_now: input.nextActions.slice(0, 4),
+      still_need_to_confirm: input.unknowns.slice(0, 4)
     };
   }
 

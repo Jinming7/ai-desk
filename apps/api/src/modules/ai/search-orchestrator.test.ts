@@ -15,6 +15,7 @@ import type {
   OpenClawSearchAnswerOutput,
   OpenClawSearchInput,
   OpenClawSearchOutput,
+  OpenClawSupportEvidenceSelectorInput,
   OpenClawSupportPlannerInput,
   OpenClawSupportVerifierInput,
   OpenClawSupportWriterInput
@@ -102,6 +103,17 @@ function createAdapter(searchKnowledgeCalls: { count: number }): OpenClawAdapter
         escalation_needed: false
       };
     },
+    async selectSupportEvidence(
+      input: OpenClawSupportEvidenceSelectorInput,
+      _idempotencyKey: string,
+      _runtime?: OpenClawRuntimeContext
+    ) {
+      return {
+        primary_ids: input.references.slice(0, 3).map((item) => item.documentId),
+        supplemental_ids: input.references.slice(3, 5).map((item) => item.documentId),
+        rejected_ids: input.references.slice(5).map((item) => item.documentId)
+      };
+    },
     async verifySupportAnswer(
       _input: OpenClawSupportVerifierInput,
       _idempotencyKey: string,
@@ -116,6 +128,43 @@ function createAdapter(searchKnowledgeCalls: { count: number }): OpenClawAdapter
         display_citation_ids: [],
         verified_claims: [],
         claim_to_citation_map: []
+      };
+    },
+    async bindSupportCitations(
+      _input: OpenClawSupportVerifierInput,
+      _idempotencyKey: string,
+      _runtime?: OpenClawRuntimeContext
+    ): Promise<SupportVerificationResult> {
+      return {
+        verdict: "unsupported",
+        summary: "",
+        unsupported_claims: [],
+        missing_info: [],
+        verified_citation_ids: [],
+        display_citation_ids: [],
+        verified_claims: [],
+        claim_to_citation_map: []
+      };
+    },
+    async selectDisplayCitations(
+      input,
+      _idempotencyKey: string,
+      _runtime?: OpenClawRuntimeContext
+    ): Promise<{ display_citation_ids: string[] }> {
+      return {
+        display_citation_ids: Array.from(new Set(input.supportedClaims.flatMap((item) => item.citation_ids))).slice(0, 3)
+      };
+    },
+    async composeSupportAnswer(
+      input,
+      _idempotencyKey: string,
+      _runtime?: OpenClawRuntimeContext
+    ): Promise<{ direct_answer: string; why: string[]; what_to_do_now: string[]; still_need_to_confirm: string[] }> {
+      return {
+        direct_answer: input.supportedClaims[0]?.text ?? "",
+        why: input.supportedClaims.map((item) => item.text).slice(0, 3),
+        what_to_do_now: input.nextActions.slice(0, 4),
+        still_need_to_confirm: input.unknowns.slice(0, 4)
       };
     },
     async writeTriageInsight(

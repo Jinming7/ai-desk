@@ -39,7 +39,14 @@ export function buildSearchRuntime(input: {
           kbTopK: 6,
           queryLimit: 1
         }
-      : {})
+      : {
+          overallTimeoutMs: 90000,
+          requestStartedAtMs: Date.now(),
+          allowMultiPassRetrieval: true,
+          allowRefinement: false,
+          kbTopK: 8,
+          queryLimit: 3
+        })
   };
 }
 

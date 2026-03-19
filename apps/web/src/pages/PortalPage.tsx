@@ -323,6 +323,23 @@ export function PortalPage() {
     [...(supportAnswer?.still_need_to_confirm ?? []), ...(detailResult?.structured_answer?.required_inputs ?? [])],
     3
   );
+  const summaryHeading = supportAnswer
+    ? supportAnswer.mode === "clarification"
+      ? uiLang === "zh"
+        ? "当前判断"
+        : "Current assessment"
+      : uiLang === "zh"
+      ? "直接回答"
+      : "Direct answer"
+    : answerStyle === "diagnosis"
+    ? uiLang === "zh"
+      ? "诊断结论"
+      : "Diagnosis"
+    : answerStyle === "clarification"
+    ? uiLang === "zh"
+      ? "当前判断"
+      : "Current assessment"
+    : copy.oneLineConclusion;
   const clarificationReason = null;
   const handoffCtaText = buildHandoffCtaCopy({
     lang: uiLang,
@@ -848,15 +865,7 @@ export function PortalPage() {
             <div className={`chat-no-x-scroll mt-6 w-full max-w-[1080px] rounded-2xl border border-[#D1D5DB] bg-white/92 p-5 text-left ${inChatMode ? "" : "md:w-[70%]"}`}>
               <div className="min-w-0 rounded-2xl border border-slate-200 bg-[linear-gradient(180deg,#FFFFFF_0%,#F8FAFF_100%)] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.75)]">
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                  {answerStyle === "diagnosis"
-                    ? uiLang === "zh"
-                      ? "诊断结论"
-                      : "Diagnosis"
-                    : answerStyle === "clarification"
-                      ? uiLang === "zh"
-                        ? "当前判断"
-                        : "Current assessment"
-                      : copy.oneLineConclusion}
+                  {summaryHeading}
                 </p>
                 <div className="mt-3 space-y-2 text-[17px] font-semibold text-[#111827]">{renderReadableText(summaryTextResolved, "summary", "summary")}</div>
               </div>
@@ -876,7 +885,7 @@ export function PortalPage() {
                   {supportSteps.length > 0 && (
                     <div>
                       <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                        {answerStyle === "clarification" ? copy.nextQuestion : copy.whatNow}
+                        {supportAnswer?.mode === "clarification" ? copy.nextQuestion : copy.whatNow}
                       </p>
                       <ol className="mt-1 list-decimal space-y-1.5 pl-5 text-sm leading-6 text-slate-800">
                         {supportSteps.slice(0, 4).map((step, idx) => (

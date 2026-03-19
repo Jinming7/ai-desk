@@ -89,6 +89,12 @@ export interface SupportEvidenceBundle {
   resolvedQueries: string[];
 }
 
+export interface SupportEvidenceSelection {
+  primary_ids: string[];
+  supplemental_ids: string[];
+  rejected_ids: string[];
+}
+
 export interface SupportAgentStageTiming {
   duration_ms: number;
   status: "completed" | "fallback" | "skipped";

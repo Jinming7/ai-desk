@@ -10,6 +10,7 @@ import type {
   OpenClawClassifyIntentInput,
   OpenClawClassifyIntentOutput,
   OpenClawRuntimeContext,
+  OpenClawSupportEvidenceSelectorInput,
   OpenClawSupportPlannerInput,
   OpenClawSupportVerifierInput,
   OpenClawSupportWriterInput,
@@ -22,6 +23,7 @@ import type {
   DraftSupportAnswer,
   SupportCaseFrame,
   SupportEvidenceBundle,
+  SupportEvidenceSelection,
   SupportVerificationResult,
   TriageSupportInsight
 } from "../../modules/ai/types.js";
@@ -51,8 +53,12 @@ type OpenClawChatAttachment = {
 type SessionLifecycleStage =
   | "search-answer"
   | "planner"
+  | "support-evidence-selector"
   | "support-writer"
   | "support-verifier"
+  | "support-citation-binder"
+  | "support-citation-selector"
+  | "support-answer-composer"
   | "triage-writer"
   | "triage-verifier"
   | "classify"
@@ -332,6 +338,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "goal, symptom, object, action_type, deployment_model, product_area, constraints(string[]), missing_critical_info(string[]), retrieval_queries(string[]), query_plan({concept_queries:string[], object_queries:string[], behavior_queries:string[]})",
       "Rules:",
       "- Summarize the user goal and symptom crisply.",
+      "- Extract the main product object or syntax subject explicitly when the query names one, for example ONESQL, JQL, OpenAPI, comment, issue, scope, or OAuth.",
+      "- Prefer a specific object and product_area over generic values like unspecified or general whenever the query makes them clear.",
       "- Propose 2 to 4 retrieval queries optimized for a documentation knowledge base.",
       "- Only put genuinely blocking items into missing_critical_info.",
       "- Keep deployment_model to one of: public_cloud, private_deployment, shared, unknown.",
@@ -376,7 +384,63 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
                 ? (queryPlan.behavior_queries as unknown[]).map((item) => String(item)).filter(Boolean)
                 : []
             }
-          : undefined
+      : undefined
+    };
+  }
+
+  async selectSupportEvidence(
+    input: OpenClawSupportEvidenceSelectorInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportEvidenceSelection> {
+    const candidates = input.references.slice(0, 8).map((reference) => ({
+      documentId: reference.documentId,
+      title: reference.title,
+      headingPath: reference.headingPath,
+      path: reference.path,
+      snippet: reference.snippet.slice(0, 220),
+      score: reference.score,
+      sourceType: reference.sourceType,
+      supportMetadata: compactSupportMetadata(reference.supportMetadata)
+    }));
+    const prompt = [
+      "You are an evidence selector for a support engineer agent.",
+      "Return ONLY valid JSON with keys: primary_ids(string[]), supplemental_ids(string[]), rejected_ids(string[])",
+      "Rules:",
+      "- Select only documentation chunks that directly help answer the user's question.",
+      "- Prioritize sources that explicitly discuss the queried object, rule, syntax, API, scope, or behavior.",
+      "- Reject tangential sources even if they are from the same product area.",
+      "- primary_ids should contain the strongest 1 to 3 evidence ids.",
+      "- supplemental_ids may contain up to 2 additional evidence ids that add useful context.",
+      "- Do not include the same id in multiple arrays.",
+      `context_type: ${input.contextType}`,
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      `query_focus_terms: ${JSON.stringify(extractQueryFocusTerms({ query: input.query, caseFrame: input.caseFrame }))}`,
+      `case_frame: ${JSON.stringify(input.caseFrame)}`,
+      `candidate_evidence: ${JSON.stringify(candidates)}`
+    ].join("\n");
+
+    const parsed = (await this.runJsonPrompt(
+      prompt,
+      `${idempotencyKey}:support-evidence-selector`,
+      runtime,
+      undefined,
+      "support-evidence-selector"
+    )) as Partial<SupportEvidenceSelection>;
+    const primaryIds = Array.isArray(parsed.primary_ids) ? parsed.primary_ids.map((item) => String(item)).filter(Boolean) : [];
+    const supplementalIds = Array.isArray(parsed.supplemental_ids)
+      ? parsed.supplemental_ids.map((item) => String(item)).filter(Boolean)
+      : [];
+    const selected = new Set(primaryIds);
+    const dedupedSupplemental = supplementalIds.filter((item) => !selected.has(item));
+    const accepted = new Set([...primaryIds, ...dedupedSupplemental]);
+    return {
+      primary_ids: primaryIds.slice(0, 3),
+      supplemental_ids: dedupedSupplemental.slice(0, 2),
+      rejected_ids: Array.isArray(parsed.rejected_ids)
+        ? parsed.rejected_ids.map((item) => String(item)).filter((item) => !accepted.has(item))
+        : candidates.map((item) => item.documentId).filter((item) => !accepted.has(item))
     };
   }
 
@@ -386,9 +450,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     runtime?: OpenClawRuntimeContext
   ): Promise<DraftSupportAnswer> {
     const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
-      primaryLimit: 2,
-      supplementalLimit: 1,
-      snippetMax: 180
+      primaryLimit: 3,
+      supplementalLimit: 2,
+      snippetMax: 260
     });
     const prompt = [
       "You are a support engineer agent for ONES.",
@@ -401,6 +465,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Be helpful and respectful. Do not sound abrupt, dismissive, or overly certain.",
       "- Do not output framework words like verification or evidence gap.",
       "- Claims about APIs, parameters, scopes, permissions, limits, deployment, and versions must be grounded in evidence.",
+      "- Every verified_fact or grounded_inference claim MUST include evidence_ids from the evidence bundle.",
+      "- If you conclude that a syntax clause, API capability, or query behavior is supported or documented, attach the exact evidence_ids that mention it.",
+      "- If you cannot attach evidence_ids for a factual capability claim, do not state that claim as fact.",
       "- Use grounded_inference only when multiple canonical snippets strongly imply the conclusion.",
       "- Use operational_advice for safe next-step guidance.",
       "- unknown is for unresolved items that still need confirmation.",
@@ -455,9 +522,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportVerificationResult> {
     const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
-      primaryLimit: 2,
-      supplementalLimit: 1,
-      snippetMax: 140
+      primaryLimit: 3,
+      supplementalLimit: 2,
+      snippetMax: 220
     });
     const prompt = [
       "Verify whether the support answer is supported by the evidence.",
@@ -467,6 +534,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Capabilities, APIs, parameters, scopes, permissions, limits, version/deployment conclusions must be evidence-backed.",
       "- A verified or supported_inference claim MUST include at least one directly relevant citation id from the evidence bundle.",
       "- Tangential or merely same-domain documents must not be used as citations.",
+      "- For claims about what the retrieved documentation does or does not show, cite the relevant syntax/reference document ids directly. If a syntax reference enumerates supported operators or clauses and does not mention ORDER BY / GROUP BY, that syntax reference can support a narrowly phrased claim like 'the retrieved syntax reference does not show ORDER BY / GROUP BY'.",
+      "- When the evidence supports a limited conclusion, keep the claim narrow and still attach the best matching citation ids. Do not drop citation ids just because the claim is conservative.",
+      "- unsupported_claims should contain only claims that truly cannot be supported from the evidence bundle.",
       "- display_citation_ids must contain only the 1 to 3 canonical citation ids that should be shown to the user.",
       "- Every display_citation_id must directly support at least one surviving verified or supported_inference claim.",
       "- verified: every factual claim is supported.",
@@ -485,15 +555,152 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     );
   }
 
+  async bindSupportCitations(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult> {
+    const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
+      primaryLimit: 3,
+      supplementalLimit: 2,
+      snippetMax: 220
+    });
+    const prompt = [
+      "You are a citation binder for a support engineer agent.",
+      "Return ONLY valid JSON:",
+      "verdict(verified|partial|unsupported), summary, unsupported_claims(string[]), missing_info(string[]), verified_citation_ids(string[]), display_citation_ids(string[]), verified_claims(string[]), claim_to_citation_map([{text, kind, verdict(verified|supported_inference|unsupported), citation_ids(string[])}])",
+      "Rules:",
+      "- Focus on binding the draft claims to the strongest evidence ids from the evidence bundle.",
+      "- Prefer narrow, documentation-backed claims over broad unsupported claims.",
+      "- If a syntax/reference document enumerates supported syntax and does not mention ORDER BY / GROUP BY, you may cite it for a narrow claim such as 'the retrieved syntax reference does not show ORDER BY / GROUP BY'.",
+      "- Any verified or supported_inference claim MUST include at least one citation id from the evidence bundle.",
+      "- unsupported_claims should only list claims that cannot be supported even after narrowing them.",
+      "- display_citation_ids must contain only the 1 to 3 canonical citation ids that should be shown to the user.",
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      `query_focus_terms: ${JSON.stringify(extractQueryFocusTerms({ query: input.query, caseFrame: input.caseFrame }))}`,
+      `case_frame: ${JSON.stringify(input.caseFrame)}`,
+      `evidence_bundle: ${JSON.stringify(compactBundle)}`,
+      `draft_support_answer: ${JSON.stringify(compactDraftSupportAnswerForVerification(input.draftSupportAnswer))}`
+    ].join("\n");
+
+    return this.parseVerificationResult(
+      await this.runJsonPrompt(prompt, `${idempotencyKey}:support-citation-binder`, runtime, undefined, "support-citation-binder")
+    );
+  }
+
+  async selectDisplayCitations(
+    input: import("./types.js").OpenClawSupportCitationSelectorInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<{ display_citation_ids: string[] }> {
+    const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
+      primaryLimit: 3,
+      supplementalLimit: 2,
+      snippetMax: 220
+    });
+    const supportedClaims = input.supportedClaims.map((claim) => ({
+      text: claim.text,
+      kind: claim.kind,
+      citation_ids: claim.citation_ids
+    }));
+    const prompt = [
+      "You are a display-citation selector for a support engineer agent.",
+      "Return ONLY valid JSON with key: display_citation_ids(string[])",
+      "Rules:",
+      "- Select only 1 to 3 canonical citation ids that most directly support the final user-visible answer.",
+      "- Prefer citations that directly discuss the same object, syntax, API, scope, or behavior as the user query.",
+      "- Reject tangential same-domain documents.",
+      "- Every selected citation id must support at least one supported claim.",
+      "- Prefer citations that best support the direct answer first, then the why section.",
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      `query_focus_terms: ${JSON.stringify(extractQueryFocusTerms({ query: input.query, caseFrame: input.caseFrame }))}`,
+      `case_frame: ${JSON.stringify(input.caseFrame)}`,
+      `supported_claims: ${JSON.stringify(supportedClaims)}`,
+      `evidence_bundle: ${JSON.stringify(compactBundle)}`
+    ].join("\n");
+
+    const parsed = (await this.runJsonPrompt(
+      prompt,
+      `${idempotencyKey}:support-citation-selector`,
+      runtime,
+      undefined,
+      "support-citation-selector"
+    )) as { display_citation_ids?: unknown };
+    return {
+      display_citation_ids: Array.isArray(parsed.display_citation_ids)
+        ? parsed.display_citation_ids.map((item) => String(item)).filter(Boolean).slice(0, 3)
+        : []
+    };
+  }
+
+  async composeSupportAnswer(
+    input: import("./types.js").OpenClawSupportAnswerComposerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<{
+    direct_answer: string;
+    why: string[];
+    what_to_do_now: string[];
+    still_need_to_confirm: string[];
+  }> {
+    const prompt = [
+      "You are a polite support engineer for ONES.",
+      "Return ONLY valid JSON with keys: direct_answer, why(string[]), what_to_do_now(string[]), still_need_to_confirm(string[])",
+      "Rules:",
+      "- Use only the supported claims and approved next actions below. Do not restate unsupported conclusions.",
+      "- Be polite, professional, and measured.",
+      "- Answer the user's question first.",
+      "- If the user asks whether something is supported, documented, or expected, start with a direct verdict such as 'Yes', 'No', or 'I could not confirm from the current documentation', then explain briefly.",
+      "- For partial mode, clearly state what you could confirm and what is still unconfirmed.",
+      "- For partial mode, do not start with generic wording like 'I can confirm part of the answer'. State the actual supported or unsupported conclusion directly.",
+      "- why should explain the answer briefly using the supported claims.",
+      "- what_to_do_now should contain practical next steps only.",
+      "- still_need_to_confirm should include only unresolved items.",
+      "- Do not mention verification, unsupported claims, or internal system language.",
+      `language: ${input.language}`,
+      `mode: ${input.mode}`,
+      `user_query: ${input.query}`,
+      `case_frame: ${JSON.stringify(input.caseFrame)}`,
+      `supported_claims: ${JSON.stringify(
+        input.supportedClaims.map((claim) => ({
+          text: claim.text,
+          kind: claim.kind
+        }))
+      )}`,
+      `next_actions: ${JSON.stringify(input.nextActions)}`,
+      `unknowns: ${JSON.stringify(input.unknowns)}`
+    ].join("\n");
+
+    const parsed = (await this.runJsonPrompt(
+      prompt,
+      `${idempotencyKey}:support-answer-composer`,
+      runtime,
+      undefined,
+      "support-answer-composer"
+    )) as Record<string, unknown>;
+    return {
+      direct_answer: typeof parsed.direct_answer === "string" ? parsed.direct_answer : "",
+      why: Array.isArray(parsed.why) ? parsed.why.map((item) => String(item)).filter(Boolean) : [],
+      what_to_do_now: Array.isArray(parsed.what_to_do_now)
+        ? parsed.what_to_do_now.map((item) => String(item)).filter(Boolean)
+        : [],
+      still_need_to_confirm: Array.isArray(parsed.still_need_to_confirm)
+        ? parsed.still_need_to_confirm.map((item) => String(item)).filter(Boolean)
+        : []
+    };
+  }
+
   async writeTriageInsight(
     input: OpenClawSupportWriterInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<TriageSupportInsight> {
     const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
-      primaryLimit: 2,
-      supplementalLimit: 1,
-      snippetMax: 160
+      primaryLimit: 3,
+      supplementalLimit: 2,
+      snippetMax: 240
     });
     const prompt = [
       "You are first-line ticket triage for ONES.",
@@ -545,9 +752,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportVerificationResult> {
     const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
-      primaryLimit: 2,
-      supplementalLimit: 1,
-      snippetMax: 140
+      primaryLimit: 3,
+      supplementalLimit: 2,
+      snippetMax: 220
     });
     const prompt = [
       "You verify whether a triage recommendation is supported by the provided evidence.",
@@ -710,10 +917,28 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   }
 
   private resolveAgentRuntime(runtime?: OpenClawRuntimeContext): { agentId: string; sessionKey: string; model?: string } {
+    const stage = runtime?.stage;
+    const useExecutionAgent =
+      stage === "support-writer" ||
+      stage === "support-verifier" ||
+      stage === "support-citation-binder" ||
+      stage === "triage-writer" ||
+      stage === "triage-verifier";
+    const preferredAgentId = useExecutionAgent
+      ? env.OPENCLAW_AGENT_ID_EXECUTION?.trim() || env.OPENCLAW_AGENT_ID?.trim() || "main"
+      : runtime?.agentId?.trim() || env.OPENCLAW_AGENT_ID?.trim() || "main";
+    const preferredModel = useExecutionAgent
+      ? env.OPENCLAW_AGENT_MODEL_EXECUTION?.trim() || env.OPENCLAW_AGENT_MODEL?.trim() || undefined
+      : runtime?.model?.trim() || undefined;
+    const preferredSessionKey =
+      runtime?.sessionKey?.trim() ||
+      `${env.OPENCLAW_AGENT_SESSION_PREFIX?.trim() || "nf"}:${stage ?? "session"}:${Date.now()}`;
     return {
-      agentId: runtime?.agentId?.trim() || env.OPENCLAW_AGENT_ID || "main",
-      sessionKey: runtime?.sessionKey?.trim() || env.OPENCLAW_AGENT_SESSION_KEY || `agent:main:${Date.now()}`,
-      model: runtime?.model?.trim() || undefined
+      agentId: preferredAgentId,
+      sessionKey: preferredSessionKey.startsWith("agent:")
+        ? preferredSessionKey
+        : `agent:${preferredAgentId}:${sanitizeSessionPart(preferredSessionKey)}`,
+      model: preferredModel
     };
   }
 
