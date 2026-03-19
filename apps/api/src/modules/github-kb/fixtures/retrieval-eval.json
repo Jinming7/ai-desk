@@ -1,0 +1,10 @@
+[
+  {
+    "query": "how to rotate token for api access",
+    "expectedPaths": ["docs/auth.md", "docs/api.md"]
+  },
+  {
+    "query": "incident escalation timeline",
+    "expectedPaths": ["docs/runbook.md"]
+  }
+]

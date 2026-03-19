@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: nexusflow-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: nexusflow
+      POSTGRES_USER: nexusflow
+      POSTGRES_PASSWORD: nexusflow
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+  api:
+    image: node:20-alpine
+    container_name: nexusflow-api
+    working_dir: /workspace
+    command: sh -c "npm ci && npm run db:migrate -w apps/api && npm run dev -w apps/api"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://nexusflow:nexusflow@postgres:5432/nexusflow
+    volumes:
+      - .:/workspace
+    ports:
+      - "4000:4000"
+    depends_on:
+      - postgres
+  kb-worker:
+    image: node:20-alpine
+    container_name: nexusflow-kb-worker
+    working_dir: /workspace
+    command: sh -c "npm ci && npm run db:migrate -w apps/api && npm run kb:worker -w apps/api"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://nexusflow:nexusflow@postgres:5432/nexusflow
+    volumes:
+      - .:/workspace
+    depends_on:
+      - postgres
+      - api
+volumes:
+  pgdata:
