@@ -24,6 +24,7 @@ import type {
   TriageSupportInsight
 } from "./types.js";
 import { SearchOrchestrator } from "./search-orchestrator.js";
+import { resolveStageSpecificAgent } from "./agent-router.js";
 
 function uniqueStrings(input: Array<string | undefined | null>, limit = 6): string[] {
   const seen = new Set<string>();
@@ -106,31 +107,14 @@ function withStageRuntime(
 ): OpenClawRuntimeContext | undefined {
   const prefix = env.OPENCLAW_AGENT_SESSION_PREFIX.trim() || "nf";
   const base = runtime ?? {};
-  const useExecutionAgent =
-    stage === "router" ||
-    stage === "evidence-planner" ||
-    stage === "api-specialist" ||
-    stage === "howto-specialist" ||
-    stage === "behavior-specialist" ||
-    stage === "troubleshooting-specialist" ||
-    stage === "evidence-judge" ||
-    stage === "citation-curator" ||
-    stage === "answer-composer" ||
-    stage === "planner" ||
+  const { agentId, model } =
     stage === "support-evidence-selector" ||
-    stage === "support-writer" ||
-    stage === "support-verifier" ||
-    stage === "support-citation-binder" ||
-    stage === "support-citation-selector" ||
-    stage === "support-answer-composer" ||
-    stage === "triage-writer" ||
-    stage === "triage-verifier";
-  const agentId = useExecutionAgent
-    ? env.OPENCLAW_AGENT_ID_EXECUTION.trim() || env.OPENCLAW_AGENT_ID.trim() || "main"
-    : base.agentId?.trim() || env.OPENCLAW_AGENT_ID_RETRIEVAL.trim() || env.OPENCLAW_AGENT_ID.trim() || "main";
-  const model = useExecutionAgent
-    ? env.OPENCLAW_AGENT_MODEL_EXECUTION.trim() || env.OPENCLAW_AGENT_MODEL.trim() || undefined
-    : base.model?.trim() || env.OPENCLAW_AGENT_MODEL_RETRIEVAL.trim() || env.OPENCLAW_AGENT_MODEL.trim() || undefined;
+    stage === "support-citation-selector"
+      ? {
+          agentId: base.agentId?.trim() || env.OPENCLAW_AGENT_ID_RETRIEVAL.trim() || env.OPENCLAW_AGENT_ID.trim() || "main",
+          model: base.model?.trim() || env.OPENCLAW_AGENT_MODEL_RETRIEVAL.trim() || env.OPENCLAW_AGENT_MODEL.trim() || undefined
+        }
+      : resolveStageSpecificAgent(stage, base);
   return {
     ...base,
     stage,
@@ -454,10 +438,28 @@ function buildEvidenceBundle(input: {
         (item): item is SearchReference =>
           Boolean(item) && !selectedPrimary.some((primary) => primary.documentId === (item as SearchReference).documentId)
       ) ?? [];
-  const primary = selectedPrimary.length ? selectedPrimary.slice(0, 3) : reranked.slice(0, 3);
-  const supplemental = selectedSupplemental.length
-    ? selectedSupplemental.slice(0, 5)
-    : reranked.filter((item) => !primary.some((primaryRef) => primaryRef.documentId === item.documentId)).slice(0, 5);
+  const primary = uniqueStrings(
+    [
+      ...reranked.slice(0, 3).map((item) => item.documentId),
+      ...selectedPrimary.map((item) => item.documentId)
+    ],
+    3
+  )
+    .map((id) => byId.get(id))
+    .filter((item): item is SearchReference => Boolean(item));
+  const supplemental = uniqueStrings(
+    [
+      ...selectedSupplemental.map((item) => item.documentId),
+      ...collectApiCompanionChunkIds(reranked, primary, input.caseFrame),
+      ...reranked
+        .filter((item) => !primary.some((primaryRef) => primaryRef.documentId === item.documentId))
+        .slice(0, 5)
+        .map((item) => item.documentId)
+    ],
+    5
+  )
+    .map((id) => byId.get(id))
+    .filter((item): item is SearchReference => Boolean(item));
   return {
     primary,
     supplemental,
@@ -466,6 +468,28 @@ function buildEvidenceBundle(input: {
     fallbackUsed: input.fallbackUsed,
     resolvedQueries: input.resolvedQueries
   };
+}
+
+function collectApiCompanionChunkIds(
+  references: SearchReference[],
+  primary: SearchReference[],
+  caseFrame: SupportCaseFrame
+): string[] {
+  if (!String(caseFrame.question_type ?? "").startsWith("api_")) return [];
+  const ids: string[] = [];
+  for (const item of primary) {
+    const canonicalPath = canonicalDocsPath(item.path);
+    if (!canonicalPath.includes("open-docs/docs/openapi/api/")) continue;
+    if (String(item.headingPath ?? "").toUpperCase() !== "ROOT") continue;
+    const companion = references.find(
+      (candidate) =>
+        candidate.documentId !== item.documentId &&
+        canonicalDocsPath(candidate.path) === canonicalPath &&
+        String(candidate.headingPath ?? "").toUpperCase() !== "ROOT"
+    );
+    if (companion) ids.push(companion.documentId);
+  }
+  return uniqueStrings(ids, 3);
 }
 
 function fallbackEvidenceSelection(references: SearchReference[], query: string, caseFrame: SupportCaseFrame): SupportEvidenceSelection {
@@ -555,7 +579,11 @@ function buildCompactFocusQuery(query: string, caseFrame: SupportCaseFrame): str
 }
 
 function rerankReferencesForCaseFrame(references: SearchReference[], query: string, caseFrame: SupportCaseFrame): SearchReference[] {
+  const requiredDocKinds = caseFrame.required_doc_kinds ?? [];
   const focusTerms = collectFocusTerms(query, caseFrame);
+  const normalizedQuery = query.toLowerCase();
+  const wantsListVariant =
+    /列表|枚举|可选|全部|有哪些/.test(query) || /\b(list|enum|options|all statuses?)\b/.test(normalizedQuery);
   return [...references].sort((a, b) => {
     const scoreRef = (reference: SearchReference) => {
       const title = String(reference.title ?? "").toLowerCase();
@@ -571,6 +599,55 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
       }
       if (reference.sourceType === "local_docs" || reference.sourceType === "github_kb") {
         topicScore += 2;
+      }
+      for (const kind of requiredDocKinds.map((item) => item.toLowerCase())) {
+        if (kind === "openapi/api" && refPath.includes("openapi/api/")) topicScore += 22;
+        else if ((kind === "schema" || kind === "field") && (refPath.includes("issue-field") || refPath.includes("field"))) {
+          topicScore += 14;
+        } else if (kind === "syntax_reference" && (refPath.includes("onesql") || title.includes("onesql") || heading.includes("onesql"))) {
+          topicScore += 18;
+        } else if (kind === "permissions" && (refPath.includes("scope") || title.includes("scope") || title.includes("permission"))) {
+          topicScore += 16;
+        } else if (kind === "rules" && (title.includes("workflow") || heading.includes("workflow") || title.includes("rule"))) {
+          topicScore += 12;
+        } else if (kind === "product_guide" && refPath.includes("/docs/") && !refPath.includes("openapi/api/")) {
+          topicScore += 10;
+        }
+      }
+      if (
+        caseFrame.question_type &&
+        caseFrame.question_type.startsWith("api_") &&
+        refPath.includes("openapi/api/")
+      ) {
+        topicScore += 8;
+      }
+      if (caseFrame.question_type === "api_field_lookup") {
+        const isIssueDetailsOperation =
+          /03-get-a-issue-details|\/project\/issues\/\{issueid\}/.test(refPath + " " + snippet) ||
+          title.includes("issue details") ||
+          title.includes("工作项详细信息");
+        const isStatusListOperation =
+          /get-a-list-of-issue-status|\/project\/issuestatuses/.test(refPath + " " + snippet) ||
+          title.includes("issue status") ||
+          title.includes("工作项状态列表");
+        const hasFieldSignal =
+          /status object|"status"|name=\{"status"\}|状态|字段|responseexample/.test(snippet) ||
+          heading.includes("schema") ||
+          heading.includes("responses");
+        if (isIssueDetailsOperation) {
+          topicScore += wantsListVariant ? 6 : 20;
+          if (hasFieldSignal) topicScore += 14;
+        }
+        if (isStatusListOperation) {
+          topicScore += wantsListVariant ? 18 : -8;
+        }
+      }
+      if (
+        /sidebar label|hide title|custom edit url|import apitabs|import methodendpoint|^---\s*id:/.test(snippet) ||
+        (String(reference.headingPath ?? "").toUpperCase() === "ROOT" &&
+          /sidebar label|hide title|custom edit url|import apitabs|import methodendpoint/.test(snippet))
+      ) {
+        topicScore -= 20;
       }
       return topicScore;
     };
@@ -939,9 +1016,14 @@ function buildSupportAnswerFromDraft(input: {
     route: input.route,
     missingInfo: stillNeedToConfirm
   });
+  const safeDraftDirectAnswer =
+    input.draft.direct_answer?.trim() && !overlapsUnsupportedClaim(input.draft.direct_answer, input.verification.unsupported_claims)
+      ? input.draft.direct_answer.trim()
+      : "";
   const directAnswer =
     input.mode === "grounded" || input.mode === "partial"
       ? input.composed?.direct_answer?.trim() ||
+        safeDraftDirectAnswer ||
         buildFallbackDirectAnswerFromSupportedClaims({
           language: input.language,
           mode: input.mode,
@@ -968,10 +1050,10 @@ function buildSupportAnswerFromDraft(input: {
 
 function combineRetrievalQueries(query: string, caseFrame: SupportCaseFrame, orchestrator: SearchOrchestrator): string[] {
   const groupedQueries = [
-    ...(caseFrame.query_plan?.concept_queries ?? []),
-    ...(caseFrame.query_plan?.object_queries ?? []),
-    ...(caseFrame.query_plan?.behavior_queries ?? []),
     ...caseFrame.retrieval_queries,
+    ...(caseFrame.query_plan?.object_queries ?? []),
+    ...(caseFrame.query_plan?.concept_queries ?? []),
+    ...(caseFrame.query_plan?.behavior_queries ?? []),
     buildCompactFocusQuery(query, caseFrame)
   ];
   return uniqueStrings([query, ...groupedQueries], 6).filter(

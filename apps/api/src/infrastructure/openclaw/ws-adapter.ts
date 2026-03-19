@@ -34,6 +34,7 @@ import type {
   SupportVerificationResult,
   TriageSupportInsight
 } from "../../modules/ai/types.js";
+import { resolveStageSpecificAgent } from "../../modules/ai/agent-router.js";
 
 interface RpcReq {
   type: "req";
@@ -441,8 +442,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Summarize the user goal and symptom crisply.",
       "- Extract the main product object or syntax subject explicitly when the query names one, for example ONESQL, JQL, OpenAPI, comment, issue, scope, or OAuth.",
       "- Prefer a specific object and product_area over generic values like unspecified or general whenever the query makes them clear.",
+      "- Translate business-facing nouns into the documentation nouns when useful for retrieval, for example defect or bug may map to issue, and current status may map to issue details plus status field.",
       "- Propose 2 to 4 retrieval queries optimized for a documentation knowledge base.",
-      "- Only put genuinely blocking items into missing_critical_info.",
+      "- Only put genuinely blocking items into missing_critical_info. If a useful best-effort answer can still be given from the current docs, do not block on extra clarification.",
       "- Keep deployment_model to one of: public_cloud, private_deployment, shared, unknown.",
       "- Keep product_area concise.",
       `context_type: ${input.contextType}`,
@@ -552,7 +554,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Prefer object-specific and documentation-specific queries over generic restatements.",
       "- required_doc_kinds should be short labels such as openapi/api, syntax_reference, product_guide, permissions, rules, troubleshooting.",
       "- For API questions, prioritize openapi/api and schema/field documentation.",
+      "- For API questions with nearby variants, include both the likely primary operation query and the nearby variant query. Example: current status versus status list.",
       "- For why/behavior questions, prioritize rules, limitations, and product-guide documents.",
+      "- For syntax or capability questions, include the exact product syntax term in the queries and prioritize syntax/reference docs before UI behavior docs.",
       "- For how-to questions, prioritize product-guide and step-by-step docs.",
       `context_type: ${input.contextType}`,
       `language: ${input.language}`,
@@ -605,8 +609,11 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         "question_type, render_variant, direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean), api_method, api_path, required_params(string[]), auth_scope(string[]), response_field_hint, important_note, related_variant",
         "Rules:",
         "- Answer the user's API question directly first.",
+        "- If the evidence contains a likely exact operation doc, answer with that operation first instead of asking for clarification.",
         "- For endpoint lookup, field lookup, and scope questions, provide the exact endpoint details when evidence supports them.",
-        "- If there is a nearby ambiguity, such as current status versus status list, distinguish both variants clearly.",
+        "- If there is a nearby ambiguity, such as current status versus status list, keep the most likely primary answer in direct_answer and put the nearby variant in related_variant or important_note.",
+        "- For field lookup questions, prefer the operation whose response schema returns the current object details when the user asks for a current value.",
+        "- Use claims with evidence_ids for the primary route and for any nearby variant that is also evidenced.",
         "- Keep wording polite, direct, and useful.",
         "- Do not output internal reasoning labels."
       ],
@@ -651,6 +658,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         "question_type, render_variant, direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean), most_likely_explanation, confirmed_facts(string[]), what_to_check_next(string[])",
         "Rules:",
         "- Answer the user's why/behavior question directly.",
+        "- If the retrieved docs support a narrow conclusion, state that narrow conclusion directly instead of escalating immediately.",
+        "- When the question is about supported syntax or documented capability, prefer syntax/reference docs over UI guidance, and keep the claim narrow.",
         "- It is acceptable to use grounded_inference for the most likely explanation, but never present an inference as documented fact.",
         "- Keep the tone polite, measured, and useful."
       ],
@@ -703,6 +712,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "Rules:",
       "- Select only documentation chunks that directly help answer the user's question.",
       "- Prioritize sources that explicitly discuss the queried object, rule, syntax, API, scope, or behavior.",
+      "- Follow case_frame.required_doc_kinds strictly when strong matches exist.",
+      "- For api_field_lookup, prefer the operation that returns the current object details; list or enum endpoints should be supplemental unless the question explicitly asks for the list.",
+      "- For capability_confirmation and why_behavior about syntax or operators, prefer syntax/reference docs before general product guides.",
       "- Reject tangential sources even if they are from the same product area.",
       "- primary_ids should contain the strongest 1 to 3 evidence ids.",
       "- supplemental_ids may contain up to 2 additional evidence ids that add useful context.",
@@ -829,6 +841,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- verified_fact and grounded_inference claims require directly relevant citation ids.",
       "- operational_advice may survive only if it does not depend on unsupported facts.",
       "- Do not preserve broad claims when only a narrower claim is supported; narrow them instead and keep citation ids.",
+      "- If an API operation doc clearly answers the main question, preserve that supported claim even if a nearby variant remains unresolved.",
+      "- If the docs support a useful partial answer, keep the useful supported claim and move the unresolved part into missing_info instead of rejecting the whole answer.",
       "- display_citation_ids may be empty here; they will be curated later.",
       `language: ${input.language}`,
       `user_query: ${input.query}`,
@@ -1074,8 +1088,10 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Do not output internal reasoning labels like verification, unsupported claims, evidence gap, or why this is still needed.",
       "- Use polite, professional, and measured wording.",
       "- The content must adapt to the routed question type.",
-      "- API answers should prioritize the exact endpoint details first.",
+      "- API answers should prioritize the exact endpoint details first, and they should answer the likely primary route before mentioning nearby variants.",
+      "- For API answers, do not start with generic uncertainty if there is at least one supported operation or field answer. State that supported answer directly and then note the nearby variant or remaining uncertainty.",
       "- Why answers should prioritize the most likely explanation first.",
+      "- For behavior/capability answers, do not start with generic partial wording like 'I can confirm part of the answer'. State the narrow supported conclusion directly.",
       "- How-to answers should prioritize steps and prerequisites.",
       "- Troubleshooting answers should prioritize recommended checks and follow-up info.",
       `language: ${input.language}`,
@@ -1463,27 +1479,15 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
   private resolveAgentRuntime(runtime?: OpenClawRuntimeContext): { agentId: string; sessionKey: string; model?: string } {
     const stage = runtime?.stage;
-    const useExecutionAgent =
-      stage === "router" ||
-      stage === "evidence-planner" ||
-      stage === "api-specialist" ||
-      stage === "howto-specialist" ||
-      stage === "behavior-specialist" ||
-      stage === "troubleshooting-specialist" ||
-      stage === "evidence-judge" ||
-      stage === "citation-curator" ||
-      stage === "answer-composer" ||
-      stage === "support-writer" ||
-      stage === "support-verifier" ||
-      stage === "support-citation-binder" ||
-      stage === "triage-writer" ||
-      stage === "triage-verifier";
-    const preferredAgentId = useExecutionAgent
-      ? env.OPENCLAW_AGENT_ID_EXECUTION?.trim() || env.OPENCLAW_AGENT_ID?.trim() || "main"
-      : runtime?.agentId?.trim() || env.OPENCLAW_AGENT_ID?.trim() || "main";
-    const preferredModel = useExecutionAgent
-      ? env.OPENCLAW_AGENT_MODEL_EXECUTION?.trim() || env.OPENCLAW_AGENT_MODEL?.trim() || undefined
-      : runtime?.model?.trim() || undefined;
+    const stageSpecific =
+      stage
+        ? resolveStageSpecificAgent(stage, runtime)
+        : {
+            agentId: runtime?.agentId?.trim() || env.OPENCLAW_AGENT_ID?.trim() || "main",
+            model: runtime?.model?.trim() || undefined
+          };
+    const preferredAgentId = stageSpecific.agentId;
+    const preferredModel = stageSpecific.model;
     const preferredSessionKey =
       runtime?.sessionKey?.trim() ||
       `${env.OPENCLAW_AGENT_SESSION_PREFIX?.trim() || "nf"}:${stage ?? "session"}:${Date.now()}`;

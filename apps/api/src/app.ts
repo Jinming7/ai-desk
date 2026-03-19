@@ -63,8 +63,12 @@ const aiAdapter =
 
 const aiTopology = getAiTopology();
 if (env.NODE_ENV !== "test") {
+  const dedicatedStageSummary = aiTopology.supportStages.stages
+    .filter((stage) => stage.dedicated)
+    .map((stage) => `${stage.stage}:${stage.agentId}`)
+    .join(",");
   console.info(
-    `[ai-topology] searchBot=${aiTopology.searchBot.orchestration} openclawAgentBound=${String(aiTopology.searchBot.openclawAgentBound)} ticketAgent=${aiTopology.ticketAgent.agentId}`
+    `[ai-topology] searchBot=${aiTopology.searchBot.orchestration} openclawAgentBound=${String(aiTopology.searchBot.openclawAgentBound)} ticketAgent=${aiTopology.ticketAgent.agentId} dedicatedSupportStages=${aiTopology.supportStages.dedicatedCount}${dedicatedStageSummary ? ` [${dedicatedStageSummary}]` : ""}`
   );
 }
 

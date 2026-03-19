@@ -147,7 +147,7 @@ function stripMarkup(content: string): string {
       .replace(/^import\s+.+$/gm, " ")
       .replace(/```[\s\S]*?```/g, " ")
       .replace(/<[^>]+>/g, " ")
-      .replace(/\{[^}]{0,160}\}/g, " ")
+      .replace(/\{[^}]{0,160}\}/g, (matched) => (/["':]/.test(matched) ? matched : " "))
       .replace(/`{1,3}/g, "")
       .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
       .replace(/^\s*[-*+]\s+/gm, " ")
@@ -252,6 +252,14 @@ function buildQueryVariants(query: string): string[] {
     [/open\s*api/gi, "openapi"],
     [/开放平台/gi, "openapi open platform"],
     [/接口/gi, "api endpoint"],
+    [/缺陷/gi, "缺陷 defect bug issue 工作项"],
+    [/工作项/gi, "工作项 issue work item"],
+    [/状态列表|状态枚举/gi, "status list statuses enum issueStatuses"],
+    [/状态/gi, "状态 status state workflow_status issue status"],
+    [/详情|详细信息/gi, "详情 details detail get by id current value"],
+    [/字段/gi, "字段 field response schema property"],
+    [/列表/gi, "列表 list collection enum"],
+    [/获取|查询/gi, "get query retrieve fetch"],
     [/评论/gi, "comment issue comment"],
     [/权限/gi, "permission scope access"],
     [/scope/gi, "scope permission"],
@@ -298,6 +306,10 @@ function scoreEntry(entry: LocalDocsIndexEntry, phrases: string[], tokens: strin
   const needsCommentEvidence = /comment|issue-comment/.test(joinedTokens);
   const needsIntegrationEvidence = /github|gitlab|integration|callback|redirect|webhook|oauth/.test(joinedTokens);
   const needsTokenLifecycleEvidence = /token|credential|revoke|reset|refresh/.test(joinedTokens);
+  const needsIssueEntity = /issue|defect|bug|工作项|缺陷/.test(joinedTokens);
+  const needsStatusEntity = /status|state|workflow_status|状态/.test(joinedTokens);
+  const needsDetailOperation = /detail|details|get by id|current value|详细信息|详情|当前/.test(joinedTokens);
+  const needsListOperation = /statuses|list|enum|collection|列表|枚举/.test(joinedTokens);
   const normalizedPhrases = phrases.map((phrase) => phrase.toLowerCase()).filter((phrase) => phrase.length >= 2);
   for (const phrase of normalizedPhrases) {
     if (entry.searchableTitle.includes(phrase)) score += 7;
@@ -340,6 +352,20 @@ function scoreEntry(entry: LocalDocsIndexEntry, phrases: string[], tokens: strin
   if (/token|credential|revoke|reset/.test(joinedTokens) && prerequisites.some((item) => item.includes("scope:"))) {
     score += 2;
   }
+  if (needsIssueEntity && needsStatusEntity && /open-docs\/docs\/openapi\/api\//i.test(entry.path)) {
+    if (/03-get-a-issue-details|\/project\/issues\/\{issueid\}/i.test(entry.searchablePath + " " + entry.searchableContent)) {
+      score += needsDetailOperation || !needsListOperation ? 18 : 6;
+    }
+    if (/get-a-list-of-issue-status|\/project\/issuestatuses/i.test(entry.searchablePath + " " + entry.searchableContent)) {
+      score += needsListOperation ? 18 : 8;
+    }
+    if (entry.searchableTitle.includes("获取工作项详细信息") || entry.searchableHeading.includes("获取工作项详细信息")) {
+      score += needsDetailOperation || !needsListOperation ? 10 : 3;
+    }
+    if (entry.searchableTitle.includes("获取工作项状态列表") || entry.searchableHeading.includes("获取工作项状态列表")) {
+      score += needsListOperation ? 10 : 4;
+    }
+  }
   if (needsIntegrationEvidence) {
     const signals = ["github", "gitlab", "integration", "oauth", "callback", "redirect", "webhook"];
     const matchedSignals = signals.filter(
@@ -369,15 +395,28 @@ function scoreEntry(entry: LocalDocsIndexEntry, phrases: string[], tokens: strin
 }
 
 function buildSnippet(content: string, terms: string[]): string {
-  const cleaned = normalizeSpaces(content);
+  const cleaned = stripMarkup(content);
   if (!cleaned) return "";
   const lower = cleaned.toLowerCase();
-  const match = terms.find((term) => term.length >= 2 && lower.includes(term.toLowerCase()));
+  const rankedTerms = [...terms]
+    .filter((term) => term.length >= 2)
+    .sort((a, b) => scoreSnippetTerm(b) - scoreSnippetTerm(a));
+  const match = rankedTerms.find((term) => lower.includes(term.toLowerCase()));
   if (!match) return cleaned.slice(0, 320);
   const index = lower.indexOf(match.toLowerCase());
   const start = Math.max(0, index - 140);
   const end = Math.min(cleaned.length, index + 220);
   return cleaned.slice(start, end).trim();
+}
+
+function scoreSnippetTerm(term: string): number {
+  const normalized = term.toLowerCase();
+  let score = Math.min(normalized.length, 24);
+  if (/[/{}`:]/.test(normalized)) score += 18;
+  if (/status|state|scope|permission|field|schema|response|param|path|issueid|workflow/.test(normalized)) score += 40;
+  if (/状态|字段|权限|参数|路径|返回|工作流|接口/.test(term)) score += 40;
+  if (/detail|details|current|get by id|详细信息|详情|当前/.test(normalized + term)) score += 12;
+  return score;
 }
 
 function countAnchorMatches(entry: LocalDocsIndexEntry, anchorTokens: string[]): number {

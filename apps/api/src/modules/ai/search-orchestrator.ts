@@ -148,6 +148,60 @@ export class SearchOrchestrator {
     return limited;
   }
 
+  private scoreDocKindMatch(reference: SearchReference, requiredDocKinds: string[]): number {
+    if (!requiredDocKinds.length) return 0;
+    const path = this.canonicalDocsPath(reference.path).toLowerCase();
+    const title = String(reference.title ?? "").toLowerCase();
+    const heading = String(reference.headingPath ?? "").toLowerCase();
+    const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
+    const evidenceKind = String(metadata.evidence_kind ?? "").toLowerCase();
+    const productArea = String(metadata.product_area ?? "").toLowerCase();
+
+    let score = 0;
+    for (const kind of requiredDocKinds.map((item) => item.toLowerCase())) {
+      if (kind === "openapi/api" && path.includes("openapi/api/")) score += 24;
+      else if (kind === "schema" || kind === "field") {
+        if (path.includes("issue-field") || path.includes("field") || evidenceKind.includes("schema")) score += 16;
+      } else if (kind === "syntax_reference") {
+        if (path.includes("onesql") || title.includes("onesql") || heading.includes("onesql")) score += 20;
+      } else if (kind === "permissions") {
+        if (path.includes("scope") || title.includes("scope") || title.includes("permission")) score += 18;
+      } else if (kind === "rules") {
+        if (title.includes("rule") || title.includes("workflow") || heading.includes("workflow")) score += 14;
+      } else if (kind === "troubleshooting") {
+        if (title.includes("troubleshooting") || heading.includes("why") || heading.includes("faq")) score += 12;
+      } else if (kind === "product_guide") {
+        if (path.startsWith("docs/") && !path.includes("openapi/api/")) score += 12;
+      }
+    }
+
+    if (productArea === "openapi" && requiredDocKinds.some((item) => item.toLowerCase() === "openapi/api")) {
+      score += 4;
+    }
+
+    return score;
+  }
+
+  rerankReferencesForRoute(references: SearchReference[], options?: {
+    requiredDocKinds?: string[];
+    questionType?: string;
+  }): SearchReference[] {
+    const requiredDocKinds = options?.requiredDocKinds ?? [];
+    const questionType = String(options?.questionType ?? "");
+    return [...references].sort((a, b) => {
+      const docKindDiff = this.scoreDocKindMatch(b, requiredDocKinds) - this.scoreDocKindMatch(a, requiredDocKinds);
+      if (docKindDiff !== 0) return docKindDiff;
+
+      if (questionType.startsWith("api_")) {
+        const aApi = this.canonicalDocsPath(a.path).includes("openapi/api/");
+        const bApi = this.canonicalDocsPath(b.path).includes("openapi/api/");
+        if (aApi !== bApi) return bApi ? 1 : -1;
+      }
+
+      return b.score - a.score;
+    });
+  }
+
   combineEvidenceCollections(collections: SearchEvidenceCollection[]): SearchEvidenceCollection {
     const validCollections = collections.filter(Boolean);
     const mergedReferences = this.mergeReferences(validCollections.flatMap((item) => item.references)).slice(
@@ -306,47 +360,67 @@ export class SearchOrchestrator {
         };
       };
 
-      const localDocsResult = await toLocalDocsResult();
-      if (localDocsResult) {
-        return localDocsResult;
-      }
+      const [localDocsResult, kbResult] = await Promise.all([
+        toLocalDocsResult().catch(() => null),
+        githubKbService
+          .retrieveKnowledgeWithRetry({
+            query,
+            answerLanguage: lang,
+            profile: "agent",
+            topK,
+            includeFallback: true
+          })
+          .then((kb) => {
+            const docsComHits = kb.hits
+              .map((hit) =>
+                this.toReference(
+                  {
+                    ...hit,
+                    supportMetadata: { ...(hit.supportMetadata ?? {}), authority: "canonical_visible", source_type: "github_kb" }
+                  },
+                  retrievedAt
+                )
+              )
+              .filter((hit) => this.isDocsComVisibleReference(hit));
+            return {
+              confidence: docsComHits.length ? kb.confidence : 0,
+              fallbackUsed: false,
+              resolvedQueries: kb.resolvedQueries ?? [query],
+              references: docsComHits
+            };
+          })
+          .catch(() => null)
+      ]);
 
-      try {
-        const kb = await githubKbService.retrieveKnowledgeWithRetry({
-          query,
-          answerLanguage: lang,
-          profile: "agent",
-          topK,
-          includeFallback: true
-        });
-        const docsComHits = kb.hits
-          .map((hit) =>
-            this.toReference(
-              {
-                ...hit,
-                supportMetadata: { ...(hit.supportMetadata ?? {}), authority: "canonical_visible", source_type: "github_kb" }
-              },
-              retrievedAt
-            )
-          )
-          .filter((hit) => this.isDocsComVisibleReference(hit));
-        if (!docsComHits.length) {
-          return {
-            confidence: 0,
-            fallbackUsed: false,
-            resolvedQueries: kb.resolvedQueries ?? [query],
-            references: []
-          };
+      const mergedReferences = this.mergeReferences([
+        ...(localDocsResult?.references ?? []),
+        ...(kbResult?.references ?? [])
+      ]);
+
+      if (!mergedReferences.length) {
+        if (!localDocsResult && !kbResult) {
+          throw new Error(`KB retrieval unavailable for query: ${query}`);
         }
         return {
-          confidence: kb.confidence,
+          confidence: 0,
           fallbackUsed: false,
-          resolvedQueries: kb.resolvedQueries ?? [query],
-          references: docsComHits
+          resolvedQueries: [
+            ...(localDocsResult?.resolvedQueries ?? []),
+            ...(kbResult?.resolvedQueries ?? [query])
+          ],
+          references: []
         };
-      } catch {
-        throw new Error(`KB retrieval unavailable for query: ${query}`);
       }
+
+      return {
+        confidence: Math.max(localDocsResult?.confidence ?? 0, kbResult?.confidence ?? 0),
+        fallbackUsed: false,
+        resolvedQueries: [
+          ...(localDocsResult?.resolvedQueries ?? []),
+          ...(kbResult?.resolvedQueries ?? [query])
+        ],
+        references: mergedReferences
+      };
     };
 
     const firstRound = await Promise.all(normalizedQueries.map((query) => retrieveOnce(query)));
