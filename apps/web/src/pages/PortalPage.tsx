@@ -297,7 +297,8 @@ export function PortalPage() {
   );
   const showCreateTicketNow = Boolean(latestResult?.show_create_ticket_now);
   const detailResult = latestResult;
-  const primaryReference = latestResult?.references?.[0] ?? null;
+  const primaryCitation = latestResult?.citations?.[0] ?? null;
+  const moreCitations = latestResult?.citations?.slice(1, 3) ?? [];
   const latestUserQuestion = chatMessages.filter((item) => item.role === "user").at(-1)?.content ?? query;
   const uiLang: "zh" | "en" = detailResult?.answer_language ?? detectLang(latestUserQuestion || query || "");
   const copy = t(uiLang);
@@ -950,20 +951,33 @@ export function PortalPage() {
                 </div>
               ) : null}
 
-              {primaryReference && (
+              {primaryCitation && (
                 <div className="mt-3 rounded-xl border border-emerald-100 bg-emerald-50 p-3">
                   <div className="flex items-center justify-between gap-3">
                     <p className="text-xs font-semibold uppercase tracking-wide text-emerald-700">{copy.primary}</p>
-                    <a className="text-xs text-brand-500 hover:underline" href={primaryReference.sourceUrl} target="_blank" rel="noreferrer">
+                    <a className="text-xs text-brand-500 hover:underline" href={primaryCitation.source_url} target="_blank" rel="noreferrer">
                       {copy.open}
                     </a>
                   </div>
-                  <p className="mt-1 text-sm font-semibold text-slate-800">{primaryReference.title}</p>
-                  {(primaryReference.path || primaryReference.commitSha) && (
-                    <p className="chat-text-safe mt-1 text-[11px] text-slate-500">
-                      {primaryReference.path ?? "unknown path"} {primaryReference.commitSha ? `@ ${primaryReference.commitSha.slice(0, 8)}` : ""}
-                    </p>
-                  )}
+                  <p className="mt-1 text-sm font-semibold text-slate-800">{primaryCitation.title}</p>
+                </div>
+              )}
+
+              {moreCitations.length > 0 && (
+                <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{copy.more}</p>
+                  <div className="mt-2 space-y-2">
+                    {moreCitations.map((citation) => (
+                      <div key={citation.id} className="rounded-lg border border-slate-100 bg-slate-50 p-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="text-sm font-semibold text-slate-800">{citation.title}</p>
+                          <a className="text-xs text-brand-500 hover:underline" href={citation.source_url} target="_blank" rel="noreferrer">
+                            {copy.open}
+                          </a>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 

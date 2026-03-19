@@ -75,6 +75,7 @@ export interface SupportVerificationResult {
   unsupported_claims: string[];
   missing_info: string[];
   verified_citation_ids: string[];
+  display_citation_ids: string[];
   verified_claims: string[];
   claim_to_citation_map: SupportVerificationClaim[];
 }

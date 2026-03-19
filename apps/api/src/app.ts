@@ -59,9 +59,7 @@ app.use("/uploads", express.static(uploadsRoot));
 const aiAdapter =
   env.NODE_ENV === "test"
     ? new MockOpenClawAdapter()
-    : env.OPENCLAW_GATEWAY_TOKEN
-      ? new WsOpenClawAdapter()
-      : new MockOpenClawAdapter();
+    : new WsOpenClawAdapter();
 
 const aiTopology = getAiTopology();
 if (env.NODE_ENV !== "test") {
@@ -110,7 +108,7 @@ app.get("/api/v1/health", (_req, res) => {
   res.json({
     ok: true,
     service: "nexusflow-api",
-    openclaw: env.OPENCLAW_GATEWAY_TOKEN ? "ws" : "mock",
+    openclaw: env.OPENCLAW_GATEWAY_TOKEN ? "ws" : "unconfigured",
     aiTopology
   });
 });
@@ -226,6 +224,10 @@ app.post(
 app.post(
   "/api/v1/ai/search",
   asyncHandler(async (req, res) => {
+    if (env.NODE_ENV !== "test" && !env.OPENCLAW_GATEWAY_TOKEN) {
+      res.status(503).json({ error: "OPENCLAW_GATEWAY_TOKEN is not configured" });
+      return;
+    }
     const body = aiSearchRequestSchema.parse(req.body);
     const result = await aiService.runSearchMode(body.query, aiAdapter, {
       sessionId: body.sessionId,

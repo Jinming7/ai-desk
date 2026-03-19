@@ -259,6 +259,7 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
         unsupported_claims: [],
         missing_info: ["the exact billing role mapping and denied checkout step"],
         verified_citation_ids: verifiedCitationIds,
+        display_citation_ids: verifiedCitationIds,
         verified_claims: verifiedClaims,
         claim_to_citation_map:
           input.draftSupportAnswer?.claims.map((item) => ({
@@ -276,6 +277,7 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
         unsupported_claims: [input.draftSupportAnswer?.direct_answer ?? ""].filter(Boolean),
         missing_info: input.caseFrame.missing_critical_info.slice(0, 3),
         verified_citation_ids: [],
+        display_citation_ids: [],
         verified_claims: [],
         claim_to_citation_map: []
       };
@@ -293,14 +295,23 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       unsupported_claims: [],
       missing_info: citationIds.length > 1 ? [] : input.caseFrame.missing_critical_info.slice(0, 2),
       verified_citation_ids: citationIds.slice(0, 3),
+      display_citation_ids: citationIds.slice(0, 3),
       verified_claims: input.draftSupportAnswer?.claims.map((item) => item.text).slice(0, 3) ?? [],
       claim_to_citation_map:
-        input.draftSupportAnswer?.claims.map((item) => ({
-          text: item.text,
-          kind: item.kind,
-          verdict: item.kind === "grounded_inference" ? "supported_inference" : "verified",
-          citation_ids: item.evidence_ids.length ? item.evidence_ids : citationIds.slice(0, 1)
-        })) ?? []
+        input.draftSupportAnswer?.claims.map((item) => {
+          const citation_ids = item.evidence_ids.length ? item.evidence_ids : citationIds.slice(0, 1);
+          return {
+            text: item.text,
+            kind: item.kind,
+            verdict:
+              citation_ids.length === 0
+                ? "unsupported"
+                : item.kind === "grounded_inference"
+                ? "supported_inference"
+                : "verified",
+            citation_ids
+          };
+        }) ?? []
     };
   }
 
@@ -356,6 +367,7 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
         unsupported_claims: [],
         missing_info: [],
         verified_citation_ids: citationIds.slice(0, 3),
+        display_citation_ids: citationIds.slice(0, 3),
         verified_claims: [input.triageInsight?.direct_answer ?? ""].filter(Boolean),
         claim_to_citation_map: [
           {
@@ -374,6 +386,7 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
         unsupported_claims: [],
         missing_info: citationIds.length > 0 ? [] : input.caseFrame.missing_critical_info.slice(0, 2),
         verified_citation_ids: citationIds.slice(0, 3),
+        display_citation_ids: citationIds.slice(0, 3),
         verified_claims: citationIds.length > 0 ? [input.triageInsight?.direct_answer ?? ""].filter(Boolean) : [],
         claim_to_citation_map:
           citationIds.length > 0
@@ -394,6 +407,7 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       unsupported_claims: [],
       missing_info: input.caseFrame.missing_critical_info.slice(0, 3),
       verified_citation_ids: citationIds.slice(0, 2),
+      display_citation_ids: [],
       verified_claims: [],
       claim_to_citation_map: []
     };

@@ -113,6 +113,7 @@ function createAdapter(searchKnowledgeCalls: { count: number }): OpenClawAdapter
         unsupported_claims: [],
         missing_info: [],
         verified_citation_ids: [],
+        display_citation_ids: [],
         verified_claims: [],
         claim_to_citation_map: []
       };
@@ -145,6 +146,7 @@ function createAdapter(searchKnowledgeCalls: { count: number }): OpenClawAdapter
         unsupported_claims: [],
         missing_info: [],
         verified_citation_ids: [],
+        display_citation_ids: [],
         verified_claims: [],
         claim_to_citation_map: []
       };

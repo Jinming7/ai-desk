@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { test } from "node:test";
 import { env } from "../../config/env.js";
 import type {
@@ -18,6 +21,16 @@ import type {
 } from "../../infrastructure/openclaw/types.js";
 import { runSupportSearchAgent } from "./support-agent.js";
 import type { DraftSupportAnswer, SupportCaseFrame, SupportVerificationResult, TriageSupportInsight } from "./types.js";
+
+async function createFixtureRoot(): Promise<string> {
+  return mkdtemp(path.join(os.tmpdir(), "support-agent-test-"));
+}
+
+async function writeFixture(rootDir: string, relativePath: string, content: string): Promise<void> {
+  const filePath = path.join(rootDir, relativePath);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, content, "utf8");
+}
 
 function createAdapter(options: {
   missingInfo?: string[];
@@ -120,6 +133,7 @@ function createAdapter(options: {
         unsupported_claims: [],
         missing_info: [],
         verified_citation_ids: [],
+        display_citation_ids: [],
         verified_claims: [],
         claim_to_citation_map: [],
         ...options.verification
@@ -153,6 +167,7 @@ function createAdapter(options: {
         unsupported_claims: [],
         missing_info: [],
         verified_citation_ids: [],
+        display_citation_ids: [],
         verified_claims: [],
         claim_to_citation_map: []
       };
@@ -263,23 +278,30 @@ test("runSupportSearchAgent keeps clarification only when blocking missing info 
 });
 
 test("runSupportSearchAgent removes unsupported auxiliary claims without downgrading a supported core answer", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/issue-comment.info.mdx",
+    `---
+title: "Issue Comment"
+---
+
+# Issue Comment
+
+write:project:issue-comment: Add, edit, delete issue comments
+`
+  );
+
   const adapter = createAdapter({
-    searchHits: [
-      {
-        id: "issue-comment-scope",
-        title: "Issue Comment",
-        snippet: "write:project:issue-comment: Add, edit, delete issue comments",
-        score: 0.99,
-        sourceUrl: "https://docs.ones.com/developer/openapi/api/issue-comment"
-      }
-    ],
     writerAnswer: {
       direct_answer: "The required OAuth scope is `write:project:issue-comment`.",
       claims: [
         {
           text: "The required OAuth scope is `write:project:issue-comment`.",
           kind: "verified_fact",
-          evidence_ids: ["issue-comment-scope"],
+          evidence_ids: [],
           authority: "canonical"
         }
       ],
@@ -287,35 +309,201 @@ test("runSupportSearchAgent removes unsupported auxiliary claims without downgra
         "Request an OAuth token with the `write:project:issue-comment` scope.",
         "Call the API with that token in the Authorization header."
       ]
-    },
-    verification: {
+    }
+  });
+  const originalVerify = adapter.verifySupportAnswer;
+  adapter.verifySupportAnswer = async (input, idempotencyKey, runtime) => {
+    const cited = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental][0];
+    const verifiedId = cited?.documentId ? [cited.documentId] : [];
+    return {
+      ...(await originalVerify(input, idempotencyKey, runtime)),
       verdict: "partial",
       summary: "The core answer is supported, but the Authorization header detail is not explicitly shown.",
       unsupported_claims: ["Call the API with that token in the Authorization header."],
-      verified_citation_ids: ["issue-comment-scope"],
+      verified_citation_ids: verifiedId,
+      display_citation_ids: verifiedId,
       verified_claims: ["The required OAuth scope is `write:project:issue-comment`."],
       claim_to_citation_map: [
         {
           text: "The required OAuth scope is `write:project:issue-comment`.",
           kind: "verified_fact",
           verdict: "verified",
-          citation_ids: ["issue-comment-scope"]
+          citation_ids: verifiedId
+        }
+      ]
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "What scope is required to create an issue comment via OpenAPI?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-remove-unsupported-aux-claims"
+    });
+
+    assert.equal(result.result.support_answer?.mode, "grounded");
+    assert.equal(result.result.verification?.verdict, "verified");
+    assert.deepEqual(result.result.support_answer?.what_to_do_now, ["Request an OAuth token with the `write:project:issue-comment` scope."]);
+    assert.equal(result.result.unresolved_reason_code, null);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent only displays claim-linked citations even when unrelated references are retrieved", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/execute-onesql.api.mdx",
+    `---
+title: "Execute ONESQL query"
+---
+
+# Execute ONESQL query
+
+ONESQL supports ORDER BY and GROUP BY clauses in POST /onesql/query.
+`
+  );
+  await writeFixture(
+    rootDir,
+    "docs/admin/set-up-your-team/advanced-settings/notes-for-modifying-the-baseurl.mdx",
+    `---
+title: "Notes for modifying the baseURL"
+---
+
+# Notes for modifying the baseURL
+
+This note mentions ONESQL ORDER BY GROUP BY only as unrelated glossary text.
+`
+  );
+
+  const adapter = createAdapter({
+    writerAnswer: {
+      direct_answer: "ONESQL supports ORDER BY and GROUP BY in the query syntax.",
+      claims: [
+        {
+          text: "ONESQL supports ORDER BY and GROUP BY in the query syntax.",
+          kind: "verified_fact",
+          evidence_ids: [],
+          authority: "canonical"
+        }
+      ]
+    }
+  });
+  const originalVerify = adapter.verifySupportAnswer;
+  adapter.verifySupportAnswer = async (input, idempotencyKey, runtime) => {
+    const cited = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].find((item) =>
+      /execute onesql query/i.test(item.title)
+    );
+    const verifiedId = cited?.documentId ? [cited.documentId] : [];
+    return {
+      ...(await originalVerify(input, idempotencyKey, runtime)),
+      verdict: "verified",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: verifiedId,
+      display_citation_ids: verifiedId,
+      verified_claims: ["ONESQL supports ORDER BY and GROUP BY in the query syntax."],
+      claim_to_citation_map: [
+        {
+          text: "ONESQL supports ORDER BY and GROUP BY in the query syntax.",
+          kind: "verified_fact",
+          verdict: "verified",
+          citation_ids: verifiedId
+        }
+      ]
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "does ONESQL support ORDER BY and GROUP BY?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-claim-linked-citations"
+    });
+
+    assert.equal(result.result.references.length >= 1, true);
+    assert.equal(result.result.citations.length, 1);
+    assert.match(result.result.citations[0].title, /Execute ONESQL query/i);
+    assert.doesNotMatch(result.result.citations[0].title, /baseURL/i);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent drops supported claims that are missing citation ids", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/execute-onesql.api.mdx",
+    `---
+title: "Execute ONESQL query"
+---
+
+# Execute ONESQL query
+
+ONESQL supports ORDER BY and GROUP BY clauses in POST /onesql/query.
+`
+  );
+
+  const adapter = createAdapter({
+    writerAnswer: {
+      direct_answer: "ONESQL supports ORDER BY and GROUP BY in the query syntax.",
+      claims: [
+        {
+          text: "ONESQL supports ORDER BY and GROUP BY in the query syntax.",
+          kind: "verified_fact",
+          evidence_ids: [],
+          authority: "canonical"
+        }
+      ]
+    },
+    verification: {
+      verdict: "verified",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: [],
+      display_citation_ids: [],
+      verified_claims: ["ONESQL supports ORDER BY and GROUP BY in the query syntax."],
+      claim_to_citation_map: [
+        {
+          text: "ONESQL supports ORDER BY and GROUP BY in the query syntax.",
+          kind: "verified_fact",
+          verdict: "verified",
+          citation_ids: []
         }
       ]
     }
   });
 
-  const result = await runSupportSearchAgent({
-    query: "What scope is required to create an issue comment via OpenAPI?",
-    language: "en",
-    currentRound: 0,
-    conversationHistory: [],
-    adapter,
-    idempotencyKey: "support-agent-remove-unsupported-aux-claims"
-  });
+  try {
+    const result = await runSupportSearchAgent({
+      query: "does ONESQL support ORDER BY and GROUP BY?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-no-citation-no-grounded"
+    });
 
-  assert.equal(result.result.support_answer?.mode, "grounded");
-  assert.equal(result.result.verification?.verdict, "verified");
-  assert.deepEqual(result.result.support_answer?.what_to_do_now, ["Request an OAuth token with the `write:project:issue-comment` scope."]);
-  assert.equal(result.result.unresolved_reason_code, null);
+    assert.equal(result.result.citations.length, 0);
+    assert.notEqual(result.result.support_answer?.mode, "grounded");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
 });

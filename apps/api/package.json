@@ -11,6 +11,8 @@
     "db:seed:mock": "tsx src/db/seed-mock.ts",
     "test:ai-support-agent:smoke": "NODE_ENV=test tsx src/tests/ai-support-agent.smoke.ts",
     "test:ai-support-agent:business": "tsx src/tests/ai-support-agent.business-eval.ts",
+    "test:ai-support-agent:business:real": "tsx src/tests/ai-support-agent.business-eval.ts",
+    "test:ai-support-agent:business:mock": "NODE_ENV=test tsx src/tests/ai-support-agent.business-eval.ts",
     "test:integration": "NODE_ENV=test tsx --test src/tests/integration.test.ts",
     "test:github-kb": "NODE_ENV=test tsx --test src/tests/github-kb.integration.test.ts",
     "kb:worker": "tsx src/modules/github-kb/worker.ts",

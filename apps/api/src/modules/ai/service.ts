@@ -1691,6 +1691,7 @@ export async function runSearchMode(
         unsupported_claims: [],
         missing_info: [],
         verified_citation_ids: [],
+        display_citation_ids: [],
         verified_claims: [],
         claim_to_citation_map: []
       },
@@ -1896,6 +1897,7 @@ export async function runSearchMode(
         unsupported_claims: [],
         missing_info: [],
         verified_citation_ids: [],
+        display_citation_ids: [],
         verified_claims: [],
         claim_to_citation_map: []
       },
@@ -2329,6 +2331,7 @@ function buildSupportTriageInfrastructureFailure(input: {
     unsupported_claims: [],
     missing_info: [],
     verified_citation_ids: [],
+    display_citation_ids: [],
     verified_claims: [],
     claim_to_citation_map: []
   };

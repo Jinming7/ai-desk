@@ -47,8 +47,21 @@ const scenarios = [
     query: "What scope is required to create an issue comment via OpenAPI?",
     expectDocsEvidence: true,
     expectedBehavior: "如果找得到精确 scope，应返回精确 scope；找不到也应说明证据缺口，不要伪造。"
+  },
+  {
+    id: "en_onesql_order_by",
+    language: "en" as const,
+    query: "Does ONESQL support ORDER BY and GROUP BY?",
+    expectDocsEvidence: true,
+    expectedBehavior: "应先直接回答 ONESQL 是否支持这些子句，并且引用必须是 ONESQL 相关文档，而不是无关配置页。"
   }
 ];
+
+function extractFocusTerms(input: string): string[] {
+  const ascii = [...input.toLowerCase().matchAll(/[a-z0-9:_./-]{3,}/g)].map((match) => match[0]);
+  const cjk = [...input.matchAll(/[\u4e00-\u9fff]{2,}/g)].map((match) => match[0]);
+  return [...new Set([...ascii, ...cjk])].slice(0, 12);
+}
 
 function summarizeEvaluation(input: {
   language: "zh" | "en";
@@ -57,6 +70,7 @@ function summarizeEvaluation(input: {
   payload: SearchResult["result"];
 }) {
   const notes: string[] = [];
+  const answerText = input.payload.support_answer?.direct_answer ?? input.payload.answer;
   if (input.payload.answer_language !== input.language) {
     notes.push("语言与用户提问不一致");
   }
@@ -66,6 +80,30 @@ function summarizeEvaluation(input: {
   if (input.payload.support_answer?.mode === "handoff" && !input.payload.follow_up_question) {
     notes.push("直接 handoff，没有给出 targeted clarification");
   }
+  const focusTerms = extractFocusTerms(input.scenario.query);
+  const irrelevantCitation = input.payload.citations.find((citation) => {
+    const haystack = `${citation.title} ${citation.source_url}`.toLowerCase();
+    return focusTerms.length > 0 && !focusTerms.some((term) => haystack.includes(term));
+  });
+  if (irrelevantCitation) {
+    notes.push(`存在弱相关 citation: ${irrelevantCitation.title}`);
+  }
+  if (/verification|evidence gap|unsupported claims|why this is still needed/i.test(answerText)) {
+    notes.push("泄露了内部框架语言");
+  }
+  if (/onesql/i.test(input.scenario.query) && !/onesql|order by|group by/i.test(answerText)) {
+    notes.push("没有直接回答 ONESQL / ORDER BY / GROUP BY 问题");
+  }
+  if (/scope|oauth|comment/i.test(input.scenario.query) && !/scope|oauth|comment|issue comment/i.test(answerText)) {
+    notes.push("没有直接回答 scope / OAuth 问题");
+  }
+  if (
+    input.language === "en" &&
+    input.payload.support_answer?.mode !== "grounded" &&
+    !/\b(sorry|recommend|please|currently|could|would)\b/i.test(answerText)
+  ) {
+    notes.push("support tone is not polite enough");
+  }
   if (input.payload.clarification_round > 0 && input.payload.support_answer?.mode !== "clarification") {
     notes.push("clarification_round 与最终 mode 不一致");
   }
@@ -73,7 +111,14 @@ function summarizeEvaluation(input: {
     notes.push(`耗时过长 (${input.durationMs}ms)`);
   }
 
-  const verdict = notes.length === 0 ? "pass" : notes.some((note) => /没有返回任何 docs 证据|耗时过长/.test(note)) ? "fail" : "warn";
+  const verdict =
+    notes.length === 0
+      ? "pass"
+      : notes.some((note) =>
+          /没有返回任何 docs 证据|耗时过长|存在弱相关 citation|没有直接回答|泄露了内部框架语言/.test(note)
+        )
+      ? "fail"
+      : "warn";
   return { verdict, notes };
 }
 

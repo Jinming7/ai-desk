@@ -106,6 +106,7 @@ function compactEvidenceBundle(
     path: reference.path,
     snippet: reference.snippet.slice(0, snippetMax),
     score: reference.score,
+    sourceType: reference.sourceType,
     supportMetadata: compactSupportMetadata(reference.supportMetadata)
   });
 
@@ -117,6 +118,24 @@ function compactEvidenceBundle(
     fallbackUsed: bundle.fallbackUsed,
     resolvedQueries: bundle.resolvedQueries.slice(0, 4)
   };
+}
+
+function extractQueryFocusTerms(input: { query: string; caseFrame?: SupportCaseFrame }) {
+  const candidates = [
+    input.query,
+    input.caseFrame?.object,
+    input.caseFrame?.product_area,
+    input.caseFrame?.action_type,
+    ...(input.caseFrame?.query_plan?.concept_queries ?? []),
+    ...(input.caseFrame?.query_plan?.object_queries ?? [])
+  ]
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean)
+    .join(" ");
+
+  const ascii = [...candidates.matchAll(/[A-Za-z0-9:_./-]{3,}/g)].map((match) => match[0]);
+  const cjk = [...candidates.matchAll(/[\u4e00-\u9fff]{2,}/g)].map((match) => match[0]);
+  return [...new Set([...ascii, ...cjk])].slice(0, 12);
 }
 
 function compactDraftSupportAnswerForVerification(answer?: DraftSupportAnswer) {
@@ -376,7 +395,11 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "Return ONLY valid JSON:",
       "direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean)",
       "Rules:",
-      "- Answer the user first. Do not output framework words like verification or evidence gap.",
+      "- Answer the user's actual question first in a support engineer style.",
+      "- Organize your answer as: direct answer, why you think so, what to do now, and what is still unconfirmed.",
+      "- Use polite, professional, and measured wording.",
+      "- Be helpful and respectful. Do not sound abrupt, dismissive, or overly certain.",
+      "- Do not output framework words like verification or evidence gap.",
       "- Claims about APIs, parameters, scopes, permissions, limits, deployment, and versions must be grounded in evidence.",
       "- Use grounded_inference only when multiple canonical snippets strongly imply the conclusion.",
       "- Use operational_advice for safe next-step guidance.",
@@ -385,6 +408,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `context_type: ${input.contextType}`,
       `language: ${input.language}`,
       `user_query: ${input.query}`,
+      `query_focus_terms: ${JSON.stringify(extractQueryFocusTerms({ query: input.query, caseFrame: input.caseFrame }))}`,
       `case_frame: ${JSON.stringify(input.caseFrame)}`,
       `evidence_bundle: ${JSON.stringify(compactBundle)}`,
       ...(input.conversationHistory?.length
@@ -438,14 +462,19 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const prompt = [
       "Verify whether the support answer is supported by the evidence.",
       "Return ONLY valid JSON:",
-      "verdict(verified|partial|unsupported), summary, unsupported_claims(string[]), missing_info(string[]), verified_citation_ids(string[]), verified_claims(string[]), claim_to_citation_map([{text, kind, verdict(verified|supported_inference|unsupported), citation_ids(string[])}])",
+      "verdict(verified|partial|unsupported), summary, unsupported_claims(string[]), missing_info(string[]), verified_citation_ids(string[]), display_citation_ids(string[]), verified_claims(string[]), claim_to_citation_map([{text, kind, verdict(verified|supported_inference|unsupported), citation_ids(string[])}])",
       "Rules:",
       "- Capabilities, APIs, parameters, scopes, permissions, limits, version/deployment conclusions must be evidence-backed.",
+      "- A verified or supported_inference claim MUST include at least one directly relevant citation id from the evidence bundle.",
+      "- Tangential or merely same-domain documents must not be used as citations.",
+      "- display_citation_ids must contain only the 1 to 3 canonical citation ids that should be shown to the user.",
+      "- Every display_citation_id must directly support at least one surviving verified or supported_inference claim.",
       "- verified: every factual claim is supported.",
       "- partial: some guidance is supported but some factual claims go beyond evidence.",
       "- unsupported: the core conclusion is not evidence-backed.",
       `language: ${input.language}`,
       `user_query: ${input.query}`,
+      `query_focus_terms: ${JSON.stringify(extractQueryFocusTerms({ query: input.query, caseFrame: input.caseFrame }))}`,
       `case_frame: ${JSON.stringify(input.caseFrame)}`,
       `evidence_bundle: ${JSON.stringify(compactBundle)}`,
       `draft_support_answer: ${JSON.stringify(compactDraftSupportAnswerForVerification(input.draftSupportAnswer))}`
@@ -874,6 +903,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       unsupported_claims: Array.isArray(parsed.unsupported_claims) ? parsed.unsupported_claims.map((item) => String(item)) : [],
       missing_info: Array.isArray(parsed.missing_info) ? parsed.missing_info.map((item) => String(item)) : [],
       verified_citation_ids: Array.isArray(parsed.verified_citation_ids) ? parsed.verified_citation_ids.map((item) => String(item)) : [],
+      display_citation_ids: Array.isArray((parsed as Record<string, unknown>).display_citation_ids)
+        ? ((parsed as Record<string, unknown>).display_citation_ids as unknown[]).map((item) => String(item))
+        : [],
       verified_claims: Array.isArray(parsed.verified_claims) ? parsed.verified_claims.map((item) => String(item)) : [],
       claim_to_citation_map: Array.isArray(parsed.claim_to_citation_map)
         ? parsed.claim_to_citation_map

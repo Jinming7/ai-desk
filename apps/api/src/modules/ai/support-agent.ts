@@ -120,7 +120,7 @@ function fallbackDraftSupportAnswer(input: {
           escalation_needed: false
         }
       : {
-          direct_answer: "我还不能给出可靠结论，因为当前缺少能支撑核心判断的文档证据。",
+          direct_answer: "抱歉，我暂时还不能给出可靠结论，因为当前缺少能支撑核心判断的文档证据。",
           claims: [],
           next_actions: input.missingInfo.length ? [`请先补充：${input.missingInfo[0]}`] : ["建议直接创建工单并附上完整上下文。"],
           unknowns: input.missingInfo,
@@ -140,7 +140,7 @@ function fallbackDraftSupportAnswer(input: {
         escalation_needed: false
       }
     : {
-        direct_answer: "I cannot give a reliable conclusion yet because the core answer is not supported by documentation evidence.",
+        direct_answer: "I’m sorry, but I cannot give a reliable conclusion yet because the core answer is not supported by documentation evidence.",
         claims: [],
         next_actions: input.missingInfo.length ? [`Please share: ${input.missingInfo[0]}`] : ["Create a ticket with the current context."],
         unknowns: input.missingInfo,
@@ -157,7 +157,7 @@ function fallbackSupportAnswer(input: {
     if (input.mode === "handoff") {
       return {
         mode: "handoff",
-        direct_answer: "当前还没有足够的已验证证据形成可靠结论，建议直接创建工单并自动预填上下文。",
+        direct_answer: "抱歉，当前还没有足够的已验证证据形成可靠结论。建议直接创建工单，我会自动预填当前上下文。",
         why: [],
         what_to_do_now: ["点击“Create ticket now”生成工单草稿。", "补充报错原文、复现步骤和影响范围。"],
         still_need_to_confirm: []
@@ -166,7 +166,7 @@ function fallbackSupportAnswer(input: {
     if (input.mode === "clarification") {
       return {
         mode: "clarification",
-        direct_answer: "我还缺少一个关键信息，才能给出被证据支撑的结论。",
+        direct_answer: "为了给你更可靠的结论，我还缺少一个关键信息。",
         why: [],
         what_to_do_now: [input.missingInfo[0] ? `请先补充：${input.missingInfo[0]}` : "请先补充最关键的一条上下文。"],
         still_need_to_confirm: input.missingInfo.slice(0, 3)
@@ -193,7 +193,7 @@ function fallbackSupportAnswer(input: {
   if (input.mode === "handoff") {
     return {
       mode: "handoff",
-      direct_answer: "There is still not enough verified evidence for a reliable final answer. Create a ticket now and I will prefill the context.",
+      direct_answer: "I’m sorry, but there is still not enough verified evidence for a reliable final answer. Create a ticket now and I will prefill the current context.",
       why: [],
       what_to_do_now: ["Create a ticket draft from this conversation.", "Add the exact error, repro steps, and impact scope."],
       still_need_to_confirm: []
@@ -202,7 +202,7 @@ function fallbackSupportAnswer(input: {
   if (input.mode === "clarification") {
     return {
       mode: "clarification",
-      direct_answer: "I still need one critical detail before I can give a verified answer.",
+      direct_answer: "To give you a more reliable answer, I still need one critical detail.",
       why: [],
       what_to_do_now: [input.missingInfo[0] ? `Please share: ${input.missingInfo[0]}` : "Provide the single most important missing detail."],
       still_need_to_confirm: input.missingInfo.slice(0, 3)
@@ -244,6 +244,7 @@ function fallbackVerification(language: "zh" | "en", verdict: SupportVerificatio
     unsupported_claims: [],
     missing_info: missingInfo,
     verified_citation_ids: [],
+    display_citation_ids: [],
     verified_claims: [],
     claim_to_citation_map: []
   };
@@ -273,20 +274,100 @@ function canonicalDocsPath(input?: string): string {
     .replace(/^i18n\/[^/]+\/docusaurus-plugin-content-docs\/current\//i, "docs/");
 }
 
-function buildCitations(references: SearchReference[], verifiedCitationIds: string[]) {
-  const deduped = new Map<string, SearchReference>();
-  const allowAll = verifiedCitationIds.length === 0;
-  const verified = new Set(verifiedCitationIds);
-  for (const item of references) {
-    if (!item.sourceUrl || item.authority !== "canonical_visible") continue;
-    if (!allowAll && !verified.has(item.documentId)) continue;
-    const key = [canonicalDocsPath(item.path) || item.sourceUrl || item.documentId, item.headingPath || "ROOT"].join("::");
-    const previous = deduped.get(key);
-    if (!previous || item.score > previous.score) {
-      deduped.set(key, item);
+function uniqueCitationIds(claims: SupportVerificationResult["claim_to_citation_map"]): string[] {
+  return uniqueStrings(
+    claims
+      .filter((claim) => (claim.verdict === "verified" || claim.verdict === "supported_inference") && claim.citation_ids.length > 0)
+      .flatMap((claim) => claim.citation_ids),
+    12
+  );
+}
+
+function sanitizeVerification(input: {
+  verification: SupportVerificationResult;
+  evidenceBundle: SupportEvidenceBundle;
+}): SupportVerificationResult {
+  const evidenceById = new Map(
+    [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental]
+      .filter((item) => item.authority === "canonical_visible")
+      .map((item) => [item.documentId, item] as const)
+  );
+  const sanitizedClaims = input.verification.claim_to_citation_map.map((claim) => {
+    const validCitationIds = uniqueStrings(
+      claim.citation_ids.filter((citationId) => evidenceById.has(citationId)),
+      6
+    );
+    if ((claim.verdict === "verified" || claim.verdict === "supported_inference") && validCitationIds.length === 0) {
+      return {
+        ...claim,
+        verdict: "unsupported" as const,
+        citation_ids: []
+      };
     }
+    return {
+      ...claim,
+      citation_ids: validCitationIds
+    };
+  });
+  const supportedClaims = sanitizedClaims.filter(
+    (claim) => (claim.verdict === "verified" || claim.verdict === "supported_inference") && claim.citation_ids.length > 0
+  );
+  const claimLinkedCitationIds = uniqueCitationIds(sanitizedClaims);
+  const claimLinkedCitationSet = new Set(claimLinkedCitationIds);
+  const displayCitationIds = uniqueStrings(input.verification.display_citation_ids, 6).filter(
+    (citationId) => evidenceById.has(citationId) && claimLinkedCitationSet.has(citationId)
+  );
+  const unsupportedClaims = uniqueStrings(
+    [
+      ...input.verification.unsupported_claims,
+      ...sanitizedClaims
+        .filter((claim) => claim.verdict === "unsupported")
+        .map((claim) => claim.text)
+    ],
+    12
+  );
+  return {
+    verdict:
+      supportedClaims.length === 0
+        ? "unsupported"
+        : unsupportedClaims.length === 0 && input.verification.verdict === "verified"
+        ? "verified"
+        : "partial",
+    summary: input.verification.summary,
+    unsupported_claims: unsupportedClaims,
+    missing_info: input.verification.missing_info,
+    verified_citation_ids: claimLinkedCitationIds,
+    display_citation_ids: (displayCitationIds.length ? displayCitationIds : claimLinkedCitationIds).slice(0, 3),
+    verified_claims: supportedClaims.map((claim) => claim.text),
+    claim_to_citation_map: sanitizedClaims
+  };
+}
+
+function buildCitations(input: {
+  references: SearchReference[];
+  verification: SupportVerificationResult;
+}) {
+  if (!input.verification.display_citation_ids.length) {
+    return [];
   }
-  return [...deduped.values()].slice(0, 3).map((item) => ({
+  const bestById = new Map<string, SearchReference>();
+  for (const item of input.references) {
+    if (!item.sourceUrl || item.authority !== "canonical_visible") continue;
+    const previous = bestById.get(item.documentId);
+    if (!previous || item.score > previous.score) bestById.set(item.documentId, item);
+  }
+  const selected: SearchReference[] = [];
+  const seenCanonicalKeys = new Set<string>();
+  for (const citationId of input.verification.display_citation_ids) {
+    const item = bestById.get(citationId);
+    if (!item) continue;
+    const key = [canonicalDocsPath(item.path) || item.sourceUrl || item.documentId, item.headingPath || "ROOT"].join("::");
+    if (seenCanonicalKeys.has(key)) continue;
+    seenCanonicalKeys.add(key);
+    selected.push(item);
+    if (selected.length >= 3) break;
+  }
+  return selected.map((item) => ({
     id: item.documentId,
     title: item.title,
     excerpt: item.snippet,
@@ -360,7 +441,7 @@ function resolveSupportMode(input: {
   missingInfo: string[];
 }): SupportAnswer["mode"] {
   const supportedCoreClaims = input.verification.claim_to_citation_map.filter(
-    (claim) => claim.verdict === "verified" || claim.verdict === "supported_inference"
+    (claim) => (claim.verdict === "verified" || claim.verdict === "supported_inference") && claim.citation_ids.length > 0
   );
   if (supportedCoreClaims.length > 0 && input.verification.verdict === "verified" && input.missingInfo.length === 0) {
     return "grounded";
@@ -385,7 +466,7 @@ function buildSupportAnswerFromDraft(input: {
   missingInfo: string[];
 }): SupportAnswer {
   const supportedClaims = input.verification.claim_to_citation_map.filter(
-    (claim) => claim.verdict === "verified" || claim.verdict === "supported_inference"
+    (claim) => (claim.verdict === "verified" || claim.verdict === "supported_inference") && claim.citation_ids.length > 0
   );
   const why = uniqueStrings(
     supportedClaims
@@ -628,10 +709,14 @@ export async function runSupportSearchAgent(input: {
       evidenceCollection.references.length ? "partial" : "unsupported",
       caseFrame.missing_critical_info
     );
-  const supportedCoreClaims = verification.claim_to_citation_map.filter(
-    (claim) => claim.verdict === "verified" || claim.verdict === "supported_inference"
+  const sanitizedVerification = sanitizeVerification({
+    verification,
+    evidenceBundle
+  });
+  const supportedCoreClaims = sanitizedVerification.claim_to_citation_map.filter(
+    (claim) => (claim.verdict === "verified" || claim.verdict === "supported_inference") && claim.citation_ids.length > 0
   );
-  const unsupportedCore = verification.unsupported_claims.some(
+  const unsupportedCore = sanitizedVerification.unsupported_claims.some(
     (claim) =>
       overlapsUnsupportedClaim(draftSupportAnswer.direct_answer, [claim]) ||
       draftSupportAnswer.claims.some(
@@ -639,17 +724,17 @@ export async function runSupportSearchAgent(input: {
       )
   );
   const effectiveVerification =
-    verification.verdict === "partial" &&
+    sanitizedVerification.verdict === "partial" &&
     supportedCoreClaims.length > 0 &&
-    verification.unsupported_claims.length > 0 &&
+    sanitizedVerification.unsupported_claims.length > 0 &&
     !unsupportedCore
       ? {
-          ...verification,
+          ...sanitizedVerification,
           verdict: "verified" as const,
           unsupported_claims: [],
           missing_info: []
         }
-      : verification;
+      : sanitizedVerification;
 
   const missingInfo = uniqueStrings([...effectiveVerification.missing_info, ...caseFrame.missing_critical_info], 3);
   const mode = resolveSupportMode({
@@ -664,15 +749,15 @@ export async function runSupportSearchAgent(input: {
     draft: draftSupportAnswer,
     verification: {
       ...effectiveVerification,
-      unsupported_claims: verification.unsupported_claims
+      unsupported_claims: sanitizedVerification.unsupported_claims
     },
     missingInfo
   });
   const structuredAnswer = buildStructuredAnswer(supportAnswer, effectiveVerification);
-  const citations = buildCitations(
-    [...evidenceBundle.primary, ...evidenceBundle.supplemental],
-    effectiveVerification.verified_citation_ids
-  );
+  const citations = buildCitations({
+    references: [...evidenceBundle.primary, ...evidenceBundle.supplemental],
+    verification: effectiveVerification
+  });
 
   const handoffAfterClarificationExhausted =
     mode === "handoff" && missingInfo.length > 0 && input.currentRound + 1 >= env.AI_SEARCH_MAX_CLARIFICATION_ROUNDS;
