@@ -18,6 +18,12 @@ export interface SearchReference {
   retrievedAt: string;
 }
 
+export interface SupportConversationTurn {
+  role: "user" | "assistant";
+  content: string;
+  at?: string;
+}
+
 export interface SupportQueryPlan {
   concept_queries: string[];
   object_queries: string[];
@@ -144,6 +150,7 @@ export interface SearchResponseEnvelope {
 
 export interface SearchModeResult {
   session_id: string;
+  case_id: string;
   answer: string;
   answer_language: "zh" | "en";
   case_frame?: SupportCaseFrame;
@@ -170,6 +177,18 @@ export interface SearchModeResult {
   clarification_round: number;
   show_create_ticket_now: boolean;
   follow_up_question: string | null;
+  orchestration_trace?: {
+    route?: string;
+    case_type?: string;
+    mode?: SupportAnswer["mode"];
+    agent_ids: string[];
+    session_keys: string[];
+    stages: Array<{ name: string; agent_id?: string; status: "completed" | "fallback" | "skipped"; duration_ms?: number }>;
+  };
+  specialists_used?: string[];
+  confirmed_facts?: string[];
+  evidence_sources?: string[];
+  internal_diagnostics?: Record<string, unknown>;
 }
 
 export interface ChatTicketDraftField {

@@ -1,11 +1,17 @@
 import { z } from "zod";
 
+const conversationTurnSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  content: z.string().min(1),
+  at: z.string().optional()
+});
+
 export const aiSearchRequestSchema = z.object({
   query: z.string().default(""),
   imageAttachments: z.array(z.string()).default([]),
   attachments: z.array(z.string()).default([]),
   sessionId: z.string().uuid().optional(),
-  conversation: z.array(z.string()).default([]),
+  conversation: z.array(z.union([z.string(), conversationTurnSchema])).default([]),
   answerLanguage: z.enum(["zh", "en"]).optional()
 }).refine((input) => input.query.trim().length >= 2 || input.imageAttachments.length > 0 || input.attachments.length > 0, {
   message: "query or attachments is required"

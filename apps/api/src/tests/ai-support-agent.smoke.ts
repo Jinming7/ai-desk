@@ -79,6 +79,13 @@ async function main() {
     assert.equal(partial.json.result.support_answer.mode, "partial");
     assert.equal(partial.json.result.verification.verdict, "partial");
 
+    const updateIssue = await request("POST", "/api/v1/ai/search", { query: "怎么通过接口更新工作项" });
+    assert.equal(updateIssue.status, 200);
+    assert.equal(updateIssue.json.result.support_answer.mode, "grounded");
+    assert.equal(updateIssue.json.result.verification.verdict, "verified");
+    assert.equal(updateIssue.json.result.suggested_next_step, "self_serve");
+    assert.match(updateIssue.json.result.answer, /PUT `?\/project\/issues\/\{issueID\}`?/);
+
     const round1 = await request("POST", "/api/v1/ai/search", { query: "thisquerywillnotmatchkbx" });
     const round2 = await request("POST", "/api/v1/ai/search", {
       query: "thisquerywillnotmatchkbx",

@@ -100,6 +100,12 @@ export interface OpenClawRuntimeContext {
   intent?: "retrieval" | "clarify" | "execution";
 }
 
+export interface OpenClawAgentProbeInput {
+  agentId: string;
+  sessionKey: string;
+  model?: string;
+}
+
 export interface OpenClawClassifyIntentInput {
   query: string;
   language: "zh" | "en";
@@ -187,5 +193,16 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportVerificationResult>;
+  runAgentJson?(
+    input: {
+      prompt: string;
+      attachments?: string[];
+      runtime: OpenClawRuntimeContext;
+      stage: string;
+      preferAgentRpc?: boolean;
+    },
+    idempotencyKey: string
+  ): Promise<unknown>;
+  probeAgents?(inputs: OpenClawAgentProbeInput[]): Promise<Array<{ agentId: string; ok: boolean; detail?: string }>>;
   healthCheck(): Promise<{ ok: boolean; mode: "ws" | "mock"; detail?: string }>;
 }

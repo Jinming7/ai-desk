@@ -10,6 +10,7 @@ import type {
   OnesProjectIssueTypeConfig,
   OnesSyncConfig,
   OnesTicketType,
+  SearchConversationTurn,
   SearchResult,
   Ticket,
   TicketMessage,
@@ -144,7 +145,7 @@ export async function searchKnowledge(input: {
   imageAttachments?: string[];
   attachments?: string[];
   sessionId?: string;
-  conversation?: string[];
+  conversation?: SearchConversationTurn[];
   answerLanguage?: "zh" | "en";
 }): Promise<SearchResult> {
   for (let attempt = 0; attempt < 2; attempt += 1) {

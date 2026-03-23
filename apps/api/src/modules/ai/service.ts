@@ -6,6 +6,7 @@ import * as aiRepo from "./repository.js";
 import { buildSearchRuntime, resolveExecutionRuntime } from "./agent-router.js";
 import { summarizeImageAttachments, summarizeTextAttachments } from "./multimodal.js";
 import { runSupportSearchAgent, runSupportTriageAgent } from "./support-agent.js";
+import { runMultiAgentSupportSearch } from "./support-orchestrator.js";
 import type {
   ChatTicketDraft,
   ChatTicketDraftField,
@@ -13,6 +14,7 @@ import type {
   SearchResponseEnvelope,
   SearchReference,
   SearchDialogState,
+  SupportConversationTurn,
   StructuredSearchAnswer,
   SupportCaseFrame,
   SupportVerificationResult,
@@ -886,6 +888,60 @@ function buildOpenApiRequestFallback(query: string, language: "zh" | "en"): Stru
   };
 }
 
+function buildOpenApiIssueUpdateFallback(query: string, language: "zh" | "en"): StructuredSearchAnswer | null {
+  const q = query.toLowerCase();
+  const mentionsIssueUpdate =
+    /更新.*工作项|修改.*工作项|编辑.*工作项|update.*work.?item|update.*issue|modify.*issue|edit.*issue/i.test(query) ||
+    (/工作项|issue/i.test(query) && /接口|openapi|open api|api/i.test(query) && /更新|修改|编辑|update|modify|edit/i.test(query)) ||
+    (/\/project\/issues\/\{issueid\}/i.test(q) && /\b(put|update|edit|modify)\b/i.test(query));
+
+  if (!mentionsIssueUpdate) {
+    return null;
+  }
+
+  if (language === "zh") {
+    return {
+      summary: "可以。按当前 ONES OpenAPI 文档，更新工作项应调用 `PUT /project/issues/{issueID}`。",
+      assessment:
+        "这不是需要先追问产品线的问题。OpenAPI 里已经明确给出更新工作项接口：`PUT /project/issues/{issueID}`，必带 `teamID` 与 `issueID`，scope 是 `write:project:issue`。请求体 `UpdateIssueRequest` 当前可见字段至少有 `assignee`、`title`、`fieldValues`。如果你要改状态，不应混在这个请求里，而要走同一路径上的 workflow 执行接口。",
+      style: "kb_answer",
+      steps: [
+        "调用 `PUT /project/issues/{issueID}?teamID=TEAM_ID`。",
+        "请求头带 `Authorization: Bearer ACCESS_TOKEN`，并确保 token 包含 `write:project:issue`。",
+        "请求体按 `UpdateIssueRequest` 传需要更新的字段，例如 `title`、`assignee`、`fieldValues`。",
+        "如果要更新自定义字段，先确认 `fieldValues` 里的 `fieldID/type/value`；必要时先查 `GET /project/issueFields`。",
+        "如果你实际想改的是状态/流转，不要用这个 `PUT`，而是走 `POST /project/issues/{issueID}?action=executeWorkflow`。"
+      ],
+      validation: [
+        "401 优先看 token/鉴权是否缺失或失效。",
+        "403 优先看 scope 是否缺少 `write:project:issue`。",
+        "404 先确认 `issueID` 是否属于当前 `teamID`。",
+        "如果只改标题或负责人，先用最小请求体验证，再逐步加回 `fieldValues`。"
+      ]
+    };
+  }
+
+  return {
+    summary: "Yes. According to the current ONES OpenAPI spec, updating a work item uses `PUT /project/issues/{issueID}`.",
+    assessment:
+      "This should not be blocked by a generic clarification step. The spec already documents the update-issue endpoint: `PUT /project/issues/{issueID}` with required `teamID`, `issueID`, and scope `write:project:issue`. The `UpdateIssueRequest` schema currently exposes at least `assignee`, `title`, and `fieldValues`. If you need to change workflow status, use the workflow execution endpoint instead of this `PUT`.",
+    style: "kb_answer",
+    steps: [
+      "Call `PUT /project/issues/{issueID}?teamID=TEAM_ID`.",
+      "Send `Authorization: Bearer ACCESS_TOKEN` and make sure the token has `write:project:issue`.",
+      "Pass the fields to update in `UpdateIssueRequest`, such as `title`, `assignee`, and `fieldValues`.",
+      "For custom fields, validate each `fieldID/type/value` first; if needed, query `GET /project/issueFields` beforehand.",
+      "If you actually want to change status/workflow, do not use this `PUT`; use `POST /project/issues/{issueID}?action=executeWorkflow`."
+    ],
+    validation: [
+      "Treat 401 as missing/invalid auth credentials.",
+      "Treat 403 as missing `write:project:issue` scope.",
+      "Treat 404 as a likely `issueID` vs `teamID` mismatch.",
+      "If you are only updating title or assignee, start with a minimal payload before adding `fieldValues`."
+    ]
+  };
+}
+
 function buildOpenApiLookupFallback(query: string, language: "zh" | "en"): StructuredSearchAnswer | null {
   const q = query.toLowerCase();
 
@@ -1072,6 +1128,16 @@ function buildOpenApiLookupFallback(query: string, language: "zh" | "en"): Struc
   return null;
 }
 
+export function buildDeterministicOpenApiAnswer(query: string, language: "zh" | "en", authProblem = false): StructuredSearchAnswer | null {
+  return (
+    buildOpenApiIssueUpdateFallback(query, language) ??
+    buildOpenApiRequestFallback(query, language) ??
+    buildOpenApiLookupFallback(query, language) ??
+    (authProblem ? buildOpenApiAuthFallback(language) : null) ??
+    null
+  );
+}
+
 function buildOpenApiClarificationFallback(language: "zh" | "en"): StructuredSearchAnswer {
   if (language === "zh") {
     return {
@@ -1207,11 +1273,7 @@ function resolveSearchBotDecision(input: {
         effectiveReferences: input.effectiveReferences
       };
     }
-    const structuredAnswer =
-      buildOpenApiRequestFallback(query || response.query, language) ??
-      buildOpenApiLookupFallback(query || response.query, language) ??
-      (classification.authProblem ? buildOpenApiAuthFallback(language) : null) ??
-      buildOpenApiClarificationFallback(language);
+    const structuredAnswer = buildDeterministicOpenApiAnswer(query || response.query, language, classification.authProblem) ?? buildOpenApiClarificationFallback(language);
     const isClarification = structuredAnswer.style === "clarification";
     return {
       answer: structuredAnswer.summary,
@@ -1588,15 +1650,24 @@ function inferEvidenceDiagnosis(query: string, language: "zh" | "en"): Structure
       };
 }
 
-function normalizeTranscript(input: string[]): Array<{ role: "user" | "assistant"; content: string; at: string }> {
+function normalizeConversationTurns(
+  input: Array<string | SupportConversationTurn>
+): Array<{ role: "user" | "assistant"; content: string; at: string }> {
   const now = new Date().toISOString();
   return input
-    .map((text, idx) => {
-      const role: "user" | "assistant" = idx % 2 === 0 ? "user" : "assistant";
+    .map((item, idx) => {
+      if (typeof item === "string") {
+        const role: "user" | "assistant" = idx % 2 === 0 ? "user" : "assistant";
+        return {
+          role,
+          content: item.trim(),
+          at: now
+        };
+      }
       return {
-        role,
-        content: text.trim(),
-        at: now
+        role: item.role,
+        content: item.content.trim(),
+        at: item.at ?? now
       };
     })
     .filter((item) => item.content.length > 0);
@@ -1606,10 +1677,18 @@ function mergeTranscript(
   previous: Array<{ role: "user" | "assistant"; content: string; at: string }> | undefined,
   latestQuery: string,
   latestAnswer: string,
-  conversation: string[]
+  conversation: Array<string | SupportConversationTurn>
 ): Array<{ role: "user" | "assistant"; content: string; at: string }> {
   const merged = [...(previous ?? [])];
-  merged.push(...normalizeTranscript(conversation));
+  const normalizedConversation = normalizeConversationTurns(conversation);
+  const previousDigest = new Set(merged.map((item) => `${item.role}:${item.content}`));
+  for (const turn of normalizedConversation) {
+    const digest = `${turn.role}:${turn.content}`;
+    if (!previousDigest.has(digest)) {
+      merged.push(turn);
+      previousDigest.add(digest);
+    }
+  }
   merged.push({ role: "user", content: latestQuery.trim(), at: new Date().toISOString() });
   if (latestAnswer.trim()) {
     merged.push({ role: "assistant", content: latestAnswer.trim(), at: new Date().toISOString() });
@@ -1620,19 +1699,24 @@ function mergeTranscript(
 export async function runSearchMode(
   query: string,
   adapter: OpenClawAdapter,
-  options?: { sessionId?: string; conversation?: string[]; answerLanguage?: "zh" | "en"; imageAttachments?: string[]; attachments?: string[] }
+  options?: {
+    sessionId?: string;
+    conversation?: Array<string | SupportConversationTurn>;
+    answerLanguage?: "zh" | "en";
+    imageAttachments?: string[];
+    attachments?: string[];
+  }
 ): Promise<SearchModeResult> {
   const sessionId = options?.sessionId ?? crypto.randomUUID();
   const previousDialog = await aiRepo.getDialogState(sessionId);
   const currentRound = previousDialog?.clarification_round ?? 0;
-  const searchIntent = currentRound > 0 ? "clarify" : "retrieval";
-  const runtime = buildSearchRuntime({ intent: searchIntent, sessionId });
   const trimmedQuery = query.trim();
   const prevTranscript = previousDialog?.transcript;
   const resolvedQuery = trimmedQuery || (prevTranscript?.length ? prevTranscript[prevTranscript.length - 1].content : "") || "";
   const attachments = options?.attachments ?? options?.imageAttachments ?? [];
   const imageAttachments = options?.imageAttachments ?? attachments.filter((item) => item.includes("/uploads/images/"));
   const language = options?.answerLanguage ?? detectLanguage(trimmedQuery || "image");
+  const normalizedConversation = normalizeConversationTurns(options?.conversation ?? []);
   const baseQuery =
     trimmedQuery ||
     (language === "zh"
@@ -1666,6 +1750,15 @@ export async function runSearchMode(
     }
   }
 
+  const classification = await classifyQuery(
+    {
+      query: multimodalQuery,
+      conversation: normalizedConversation.map((item) => item.content),
+      attachments
+    },
+    adapter
+  );
+
   if (!env.FEATURE_KB_GROUNDED_SEARCH) {
     const disabledAnswer =
       language === "zh"
@@ -1673,6 +1766,7 @@ export async function runSearchMode(
         : "Knowledge grounding is currently disabled. Create a ticket now and we will prefill the context you already shared.";
     const disabledResult: SearchModeResult = {
       session_id: sessionId,
+      case_id: sessionId,
       answer: disabledAnswer,
       answer_language: language,
       support_answer: {
@@ -1762,6 +1856,103 @@ export async function runSearchMode(
     return disabledResult;
   }
 
+  if (classification.route === "openapi_doc") {
+    const deterministicOpenApi = buildDeterministicOpenApiAnswer(multimodalQuery, language, classification.authProblem);
+    if (deterministicOpenApi) {
+      const answer = renderStructuredAnswerAsAgentReply(language, deterministicOpenApi);
+      const deterministicResult: SearchModeResult = {
+        session_id: sessionId,
+        case_id: sessionId,
+        answer,
+        answer_language: language,
+        support_answer: {
+          mode: "grounded",
+          direct_answer: answer,
+          why: deterministicOpenApi.assessment ? [deterministicOpenApi.assessment] : [],
+          what_to_do_now: deterministicOpenApi.steps,
+          still_need_to_confirm: deterministicOpenApi.required_inputs ?? []
+        },
+        verification: {
+          verdict: "verified",
+          summary: language === "zh" ? "命中 ONES OpenAPI 确定性规则，已按本地规范返回接口说明。" : "Matched ONES OpenAPI deterministic rule and returned spec-grounded guidance.",
+          unsupported_claims: [],
+          missing_info: deterministicOpenApi.required_inputs ?? [],
+          verified_citation_ids: [],
+          verified_claims: [deterministicOpenApi.summary],
+          claim_to_citation_map: [
+            {
+              text: deterministicOpenApi.summary,
+              kind: "verified_fact",
+              verdict: "verified",
+              citation_ids: []
+            }
+          ]
+        },
+        structured_answer: deterministicOpenApi,
+        confidence: 0.92,
+        suggested_next_step: "self_serve",
+        retrieval_status: "grounded",
+        unresolved_reason_code: null,
+        references: [],
+        citations: [],
+        state: "GROUNDABLE_ANSWER_READY",
+        clarification_round: 0,
+        show_create_ticket_now: false,
+        follow_up_question: null,
+        specialists_used: ["openapi_spec_first"],
+        confirmed_facts: [deterministicOpenApi.summary],
+        evidence_sources: ["local_openapi_spec"]
+      };
+
+      if (!options?.sessionId || !previousDialog) {
+        await aiRepo.createSearchSession({
+          sessionId,
+          query: multimodalQuery,
+          answer: deterministicResult.answer,
+          confidence: deterministicResult.confidence,
+          retrievalStatus: deterministicResult.retrieval_status,
+          unresolvedReasonCode: deterministicResult.unresolved_reason_code,
+          suggestedNextStep: deterministicResult.suggested_next_step
+        });
+      } else {
+        await aiRepo.updateSearchSession({
+          sessionId,
+          answer: deterministicResult.answer,
+          confidence: deterministicResult.confidence,
+          retrievalStatus: deterministicResult.retrieval_status,
+          unresolvedReasonCode: deterministicResult.unresolved_reason_code,
+          suggestedNextStep: deterministicResult.suggested_next_step
+        });
+      }
+
+      await aiRepo.saveSearchReferences(sessionId, []);
+      const transcript = mergeTranscript(previousDialog?.transcript, multimodalQuery, deterministicResult.answer, options?.conversation ?? []);
+      await aiRepo.upsertDialogState({
+        sessionId,
+        state: deterministicResult.state,
+        clarificationRound: deterministicResult.clarification_round,
+        showCreateTicketNow: deterministicResult.show_create_ticket_now,
+        answerLanguage: language,
+        followUpQuestion: deterministicResult.follow_up_question,
+        transcript,
+        retrievalOutcome: {
+          retrievalStatus: deterministicResult.retrieval_status,
+          unresolvedReasonCode: deterministicResult.unresolved_reason_code,
+          confidence: deterministicResult.confidence,
+          references: 0,
+          verification: deterministicResult.verification,
+          supportAnswer: deterministicResult.support_answer,
+          diagnostics: {
+            deterministic_openapi: true,
+            route: classification.route
+          }
+        }
+      });
+
+      return deterministicResult;
+    }
+  }
+
   try {
     const supportConversationHistory: Array<{ role: "user" | "assistant"; content: string }> = [];
     if (previousDialog?.transcript?.length) {
@@ -1769,19 +1960,19 @@ export async function runSearchMode(
         supportConversationHistory.push({ role: turn.role, content: turn.content });
       }
     }
-    if (options?.conversation?.length) {
-      for (const msg of options.conversation.slice(-4)) {
-        supportConversationHistory.push({ role: "user", content: msg });
+    if (normalizedConversation.length) {
+      for (const turn of normalizedConversation.slice(-6)) {
+        supportConversationHistory.push({ role: turn.role, content: turn.content });
       }
     }
 
-    const supportExecution = await runSupportSearchAgent({
+    const supportExecution = await runMultiAgentSupportSearch({
+      caseId: sessionId,
       query: multimodalQuery,
       language,
       currentRound,
       conversationHistory: supportConversationHistory,
       adapter,
-      runtime,
       attachments,
       idempotencyKey: `support-search:${sessionId}:${currentRound + 1}`
     });
@@ -1833,7 +2024,10 @@ export async function runSearchMode(
         verification: supportExecution.verification,
         supportAnswer: supportResult.support_answer,
         diagnostics: {
-          stage_timings: supportExecution.stageTimings
+          orchestration_trace: supportResult.orchestration_trace,
+          specialists_used: supportResult.specialists_used,
+          evidence_sources: supportResult.evidence_sources,
+          internal_diagnostics: supportResult.internal_diagnostics
         }
       }
     });
@@ -1875,6 +2069,7 @@ export async function runSearchMode(
         : "Automatic diagnosis is temporarily unavailable. Create a ticket now and we will prefill the context you already shared.";
     const failureResult: SearchModeResult = {
       session_id: sessionId,
+      case_id: sessionId,
       answer: failureDirectAnswer,
       answer_language: language,
       support_answer: {

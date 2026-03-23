@@ -171,6 +171,7 @@ export interface TriageSupportInsight {
 
 export interface SearchResult {
   session_id: string;
+  case_id?: string;
   answer: string;
   answer_language?: "zh" | "en";
   case_frame?: SearchCaseFrame;
@@ -198,6 +199,18 @@ export interface SearchResult {
   clarification_round?: number;
   show_create_ticket_now?: boolean;
   follow_up_question?: string | null;
+  orchestration_trace?: {
+    route?: string;
+    case_type?: string;
+    mode?: "grounded" | "partial" | "clarification" | "handoff";
+    agent_ids: string[];
+    session_keys: string[];
+    stages: Array<{ name: string; agent_id?: string; status: "completed" | "fallback" | "skipped"; duration_ms?: number }>;
+  };
+  specialists_used?: string[];
+  confirmed_facts?: string[];
+  evidence_sources?: string[];
+  internal_diagnostics?: Record<string, unknown>;
   references: SearchReference[];
   citations: Array<{
     id: string;
@@ -246,6 +259,12 @@ export interface AiEscalation {
   resolution: { answer?: string; confidence?: number; references?: SearchReference[] } | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface SearchConversationTurn {
+  role: "user" | "assistant";
+  content: string;
+  at?: string;
 }
 
 export interface AiAgentMode {

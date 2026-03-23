@@ -376,10 +376,7 @@ function buildSupportAnswerFromDraft(input: {
     mode: input.mode,
     missingInfo: stillNeedToConfirm
   });
-  const directAnswer =
-    input.mode === "grounded" || input.mode === "partial"
-      ? input.draft.direct_answer.trim() || fallback.direct_answer
-      : fallback.direct_answer;
+  const directAnswer = input.draft.direct_answer.trim() || fallback.direct_answer;
   return {
     mode: input.mode,
     direct_answer: directAnswer,
@@ -678,6 +675,7 @@ export async function runSupportSearchAgent(input: {
     stageTimings,
     result: {
       session_id: "",
+      case_id: "",
       answer: supportAnswer.direct_answer,
       answer_language: input.language,
       case_frame: caseFrame,
@@ -685,7 +683,7 @@ export async function runSupportSearchAgent(input: {
       verification: effectiveVerification,
       structured_answer: structuredAnswer,
       confidence: evidenceCollection.confidence,
-      suggested_next_step: mode === "grounded" ? "self_serve" : "submit_ticket",
+      suggested_next_step: mode === "handoff" ? "submit_ticket" : "self_serve",
       retrieval_status:
         evidenceCollection.retrievalStatus === "kb_unavailable"
           ? "kb_unavailable"

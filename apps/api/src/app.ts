@@ -39,10 +39,12 @@ import * as onesSyncService from "./modules/ones-sync/service.js";
 import * as supportUxService from "./modules/support-ux/service.js";
 import * as githubKbService from "./modules/github-kb/service.js";
 import { getAiTopology } from "./modules/ai/agent-router.js";
+import { buildSupportAgentRuntime, getSupportAgentRegistry } from "./modules/ai/agent-registry.js";
 import { preloadLocalDocsIndex } from "./modules/ai/local-docs.js";
 import { getAiCapabilities } from "./modules/ai/multimodal.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
+import type { OpenClawAdapter } from "./infrastructure/openclaw/types.js";
 import { env } from "./config/env.js";
 import { asyncHandler } from "./utils/http.js";
 
@@ -55,17 +57,17 @@ const imagesUploadRoot = path.join(uploadsRoot, "images");
 const filesUploadRoot = path.join(uploadsRoot, "files");
 app.use("/uploads", express.static(uploadsRoot));
 
-const aiAdapter =
-  env.NODE_ENV === "test"
-    ? new MockOpenClawAdapter()
-    : env.OPENCLAW_GATEWAY_TOKEN
-      ? new WsOpenClawAdapter()
-      : new MockOpenClawAdapter();
+const aiAdapter: OpenClawAdapter =
+  env.NODE_ENV === "test" ? new MockOpenClawAdapter() : new WsOpenClawAdapter();
+
+if (env.NODE_ENV !== "test" && !env.OPENCLAW_GATEWAY_TOKEN?.trim()) {
+  throw new Error("OPENCLAW_GATEWAY_TOKEN must be configured outside test mode");
+}
 
 const aiTopology = getAiTopology();
 if (env.NODE_ENV !== "test") {
   console.info(
-    `[ai-topology] searchBot=${aiTopology.searchBot.orchestration} openclawAgentBound=${String(aiTopology.searchBot.openclawAgentBound)} ticketAgent=${aiTopology.ticketAgent.agentId}`
+    `[ai-topology] orchestration=${aiTopology.orchestration} router=${aiTopology.agents.router?.agentId ?? "n/a"} answerComposer=${aiTopology.agents.answerComposer?.agentId ?? "n/a"} ticketAgent=${aiTopology.agents.ticketAgent?.agentId ?? "n/a"}`
   );
 }
 
@@ -109,7 +111,7 @@ app.get("/api/v1/health", (_req, res) => {
   res.json({
     ok: true,
     service: "nexusflow-api",
-    openclaw: env.OPENCLAW_GATEWAY_TOKEN ? "ws" : "mock",
+    openclaw: env.NODE_ENV === "test" ? "mock" : "ws",
     aiTopology
   });
 });
@@ -122,7 +124,44 @@ app.get(
   "/api/v1/integrations/openclaw/health",
   asyncHandler(async (_req, res) => {
     const health = await aiAdapter.healthCheck();
-    res.status(health.ok ? 200 : 503).json(health);
+    const registry = getSupportAgentRegistry();
+    const topology = getAiTopology();
+    const configuredAgents = Object.values(registry.agents).map((item) => ({
+      role: item.role,
+      agentId: item.agentId,
+      configured: item.configured,
+      usingFallback: item.usingFallback
+    }));
+    let agentStatus: { reachable: string[]; invalid: string[]; details: Array<{ agentId: string; ok: boolean; detail?: string }> } = {
+      reachable: [],
+      invalid: [],
+      details: []
+    };
+    if (health.ok && typeof aiAdapter.probeAgents === "function") {
+      const probeInputs = Object.values(registry.agents).map((item) => {
+        const runtime = buildSupportAgentRuntime({ registry, role: item.role, caseId: "healthcheck" });
+        return {
+          agentId: runtime.agentId ?? item.agentId,
+          sessionKey: runtime.sessionKey ?? `agent:${item.agentId}:healthcheck`,
+          model: runtime.model
+        };
+      });
+      const details = await aiAdapter.probeAgents(probeInputs);
+      agentStatus = {
+        reachable: details.filter((item: { ok: boolean }) => item.ok).map((item: { agentId: string }) => item.agentId),
+        invalid: details.filter((item: { ok: boolean }) => !item.ok).map((item: { agentId: string }) => item.agentId),
+        details
+      };
+    }
+    const payload = {
+      ...health,
+      configured_agents: configuredAgents,
+      reachable_agents: agentStatus.reachable,
+      invalid_agents: agentStatus.invalid,
+      agent_probe_details: agentStatus.details,
+      active_topology_hash: topology.topologyHash
+    };
+    res.status(health.ok ? 200 : 503).json(payload);
   })
 );
 

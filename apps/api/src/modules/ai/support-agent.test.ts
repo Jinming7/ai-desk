@@ -181,7 +181,9 @@ test("runSupportSearchAgent converts invalid uncited evidence into handoff when 
     assert.equal(result.result.retrieval_status, "no_results");
     assert.equal(result.result.clarification_round, 0);
     assert.equal(result.result.follow_up_question, null);
-    assert.match(result.result.answer, /Create a ticket/i);
+    assert.equal(result.result.suggested_next_step, "submit_ticket");
+    assert.equal(result.result.show_create_ticket_now, true);
+    assert.match(result.result.answer, /critical detail|verified answer/i);
     assert.equal(typeof result.stageTimings.total_ms, "number");
     assert.equal(result.stageTimings.retrieval_base.status, "completed");
   } finally {

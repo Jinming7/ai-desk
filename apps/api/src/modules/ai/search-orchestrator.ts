@@ -60,6 +60,10 @@ export class SearchOrchestrator {
     return Boolean(reference.documentId && reference.title && reference.snippet && this.hasUsableSourceUrl(reference.sourceUrl));
   }
 
+  private isUserVisibleReference(reference: SearchReference): boolean {
+    return reference.authority === "canonical_visible" && this.hasUsableEvidence(reference);
+  }
+
   private toReference(
     hit: {
       documentId: string;
@@ -108,7 +112,7 @@ export class SearchOrchestrator {
     const sourceUrl = String(reference.sourceUrl ?? "").toLowerCase();
     const path = this.canonicalDocsPath(reference.path).toLowerCase();
     return (
-      reference.authority === "canonical_visible" &&
+      this.isUserVisibleReference(reference) &&
       (repo === "bangwork/docs-com" ||
         sourceUrl.startsWith("https://docs.ones.com/") ||
         path.startsWith("docs/") ||
@@ -274,38 +278,64 @@ export class SearchOrchestrator {
         };
       }
       const retrievedAt = new Date().toISOString();
-      const toLocalDocsResult = async () => {
-        const localDocsHits = await searchLocalDocs(query, lang, env.GITHUB_KB_PROFILE_AGENT_TOPK).catch(() => []);
-        if (!localDocsHits.length) return null;
-        return {
-          confidence: localDocsHits[0]?.score || 0,
-          fallbackUsed: false,
-          resolvedQueries: [query],
-          references: localDocsHits.map((hit) =>
-            this.toReference(
-              {
-                documentId: hit.documentId,
-                title: hit.title,
-                snippet: hit.snippet,
-                sourceUrl: hit.sourceUrl,
-                repoSourceUrl: hit.repoSourceUrl,
-                repo: hit.repo,
-                branch: hit.branch,
-                path: hit.path,
-                commitSha: hit.commitSha,
-                headingPath: hit.headingPath,
-                supportMetadata: { ...(hit.supportMetadata ?? {}), authority: "canonical_visible", source_type: "local_docs" },
-                score: hit.score
-              },
-              retrievedAt
-            )
-          )
-        };
-      };
+      const localDocsHits = await searchLocalDocs(query, lang, env.GITHUB_KB_PROFILE_AGENT_TOPK).catch(() => []);
+      const localDocsReferences = localDocsHits.map((hit) =>
+        this.toReference(
+          {
+            documentId: hit.documentId,
+            title: hit.title,
+            snippet: hit.snippet,
+            sourceUrl: hit.sourceUrl,
+            repoSourceUrl: hit.repoSourceUrl,
+            repo: hit.repo,
+            branch: hit.branch,
+            path: hit.path,
+            commitSha: hit.commitSha,
+            headingPath: hit.headingPath,
+            supportMetadata: { ...(hit.supportMetadata ?? {}), authority: "canonical_visible", source_type: "local_docs" },
+            score: hit.score
+          },
+          retrievedAt
+        )
+      );
 
-      const localDocsResult = await toLocalDocsResult();
-      if (localDocsResult) {
-        return localDocsResult;
+      let openClawConfidence = 0;
+      let openClawReferences: SearchReference[] = [];
+      if (!localDocsReferences.length) {
+        try {
+          const openClawResult = await this.adapter.searchKnowledge(
+            {
+              query,
+              topK: env.GITHUB_KB_PROFILE_AGENT_TOPK,
+              index: env.OPENCLAW_SEARCH_INDEX,
+              attachments: input.attachments
+            },
+            `${input.idempotencyKey}:openclaw:${normalizedQueries.indexOf(query) + 1}`,
+            input.runtime
+          );
+          openClawConfidence = openClawResult.confidence;
+          openClawReferences = openClawResult.hits
+            .map((hit) =>
+              this.toReference(
+                {
+                  documentId: hit.id,
+                  title: hit.title,
+                  snippet: hit.snippet,
+                  sourceUrl: hit.sourceUrl,
+                  supportMetadata: {
+                    authority: "canonical_visible",
+                    source_type: "openclaw_search"
+                  },
+                  score: hit.score
+                },
+                retrievedAt
+              )
+            )
+            .filter((hit) => this.isUserVisibleReference(hit));
+        } catch {
+          openClawConfidence = 0;
+          openClawReferences = [];
+        }
       }
 
       try {
@@ -327,21 +357,23 @@ export class SearchOrchestrator {
             )
           )
           .filter((hit) => this.isDocsComVisibleReference(hit));
-        if (!docsComHits.length) {
-          return {
-            confidence: 0,
-            fallbackUsed: false,
-            resolvedQueries: kb.resolvedQueries ?? [query],
-            references: []
-          };
-        }
+        const mergedReferences = this.mergeReferences([...localDocsReferences, ...openClawReferences, ...docsComHits]);
         return {
-          confidence: kb.confidence,
+          confidence: Math.max(localDocsHits[0]?.score || 0, openClawConfidence, kb.confidence),
           fallbackUsed: false,
           resolvedQueries: kb.resolvedQueries ?? [query],
-          references: docsComHits
+          references: mergedReferences
         };
       } catch {
+        const mergedReferences = this.mergeReferences([...localDocsReferences, ...openClawReferences]);
+        if (mergedReferences.length > 0) {
+          return {
+            confidence: Math.max(localDocsHits[0]?.score || 0, openClawConfidence),
+            fallbackUsed: false,
+            resolvedQueries: [query],
+            references: mergedReferences
+          };
+        }
         throw new Error(`KB retrieval unavailable for query: ${query}`);
       }
     };

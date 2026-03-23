@@ -5,6 +5,7 @@ import { env } from "../../config/env.js";
 import { detectMimeType, resolveAttachmentPath } from "../../modules/ai/multimodal.js";
 import type {
   OpenClawAdapter,
+  OpenClawAgentProbeInput,
   OpenClawAnalyzeInput,
   OpenClawAnalyzeOutput,
   OpenClawClassifyIntentInput,
@@ -599,6 +600,62 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
+  async runAgentJson(
+    input: {
+      prompt: string;
+      attachments?: string[];
+      runtime: OpenClawRuntimeContext;
+      stage: string;
+      preferAgentRpc?: boolean;
+    },
+    idempotencyKey: string
+  ): Promise<unknown> {
+    const sessionKey = input.runtime.sessionKey ?? this.createRunScopedSessionKey(input.runtime, idempotencyKey, "json-prompt");
+    const text = await this.executeJsonRun({
+      message: input.prompt,
+      idempotencyKey,
+      runtime: input.runtime,
+      attachmentUrls: input.attachments,
+      stage: input.stage,
+      sessionKey,
+      preferAgentRpc: input.preferAgentRpc ?? true
+    });
+    return this.parseFirstJson(text);
+  }
+
+  async probeAgents(inputs: OpenClawAgentProbeInput[]): Promise<Array<{ agentId: string; ok: boolean; detail?: string }>> {
+    const seen = new Set<string>();
+    const results: Array<{ agentId: string; ok: boolean; detail?: string }> = [];
+    for (const input of inputs) {
+      const agentId = input.agentId.trim();
+      if (!agentId || seen.has(agentId)) continue;
+      seen.add(agentId);
+      try {
+        await this.runAgentJson(
+          {
+            prompt: 'Return ONLY valid JSON: {"ok":true}',
+            runtime: {
+              agentId,
+              sessionKey: input.sessionKey,
+              model: input.model
+            },
+            stage: "probe",
+            preferAgentRpc: true
+          },
+          `probe:${agentId}:${Date.now()}`
+        );
+        results.push({ agentId, ok: true });
+      } catch (error) {
+        results.push({
+          agentId,
+          ok: false,
+          detail: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+    return results;
+  }
+
   private async analyzeViaChat(
     input: OpenClawAnalyzeInput,
     idempotencyKey: string,
@@ -732,6 +789,38 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     return payload.runId;
   }
 
+  private async executeJsonRun(input: {
+    message: string;
+    idempotencyKey: string;
+    runtime?: OpenClawRuntimeContext;
+    attachmentUrls?: string[];
+    stage: string;
+    sessionKey: string;
+    preferAgentRpc: boolean;
+  }): Promise<string> {
+    const supportsAgentRpc = input.preferAgentRpc && (!input.attachmentUrls || input.attachmentUrls.length === 0);
+    if (supportsAgentRpc) {
+      try {
+        const runId = await this.startAgentRun(input.message, input.idempotencyKey, { ...input.runtime, sessionKey: input.sessionKey }, input.sessionKey);
+        await this.waitAgentRun(runId, input.sessionKey);
+        return await this.fetchLatestAssistantText(input.sessionKey);
+      } catch (error) {
+        const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+        const shouldFallback =
+          message.includes("unknown method") ||
+          message.includes("returned no assistant text") ||
+          message.includes("did not return runid");
+        if (!shouldFallback) {
+          throw error;
+        }
+      }
+    }
+
+    const runId = await this.startChatRun(input.message, input.idempotencyKey, input.runtime, input.attachmentUrls, input.sessionKey);
+    await this.waitAgentRun(runId, input.sessionKey);
+    return await this.fetchLatestAssistantText(input.sessionKey);
+  }
+
   private async buildChatAttachments(attachmentUrls?: string[]): Promise<OpenClawChatAttachment[]> {
     const results: OpenClawChatAttachment[] = [];
 
@@ -761,13 +850,19 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const startedAt = performance.now();
     const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, stage);
     const sendStartedAt = performance.now();
-    const runId = await this.startChatRun(message, idempotencyKey, runtime, attachmentUrls, sessionKey);
+    const text = await this.executeJsonRun({
+      message,
+      idempotencyKey,
+      runtime,
+      attachmentUrls,
+      stage,
+      sessionKey,
+      preferAgentRpc: true
+    });
     const sendMs = roundMs(performance.now() - sendStartedAt);
     const waitStartedAt = performance.now();
-    await this.waitAgentRun(runId, sessionKey);
     const waitMs = roundMs(performance.now() - waitStartedAt);
     const historyStartedAt = performance.now();
-    const text = await this.fetchLatestAssistantText(sessionKey);
     const historyMs = roundMs(performance.now() - historyStartedAt);
     const parseStartedAt = performance.now();
     const parsed = this.parseFirstJson(text);

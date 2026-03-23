@@ -12,7 +12,7 @@ import {
   submitChatTicketDraft,
   uploadAttachment
 } from "../lib/api";
-import type { AiCapabilities, ChatTicketDraft, OnesTicketType, SearchResult, UploadedAttachment } from "../lib/types";
+import type { AiCapabilities, ChatTicketDraft, OnesTicketType, SearchConversationTurn, SearchResult, UploadedAttachment } from "../lib/types";
 
 const services = [
   {
@@ -550,7 +550,10 @@ export function PortalPage() {
 
   const executeSearch = async (userInput: string, appendUserBubble = true) => {
     if (userInput.trim().length < 2 && composerAttachments.length === 0) return;
-    const priorConversation = chatMessages.map((item) => item.content);
+    const priorConversation: SearchConversationTurn[] = chatMessages.map((item) => ({
+      role: item.role,
+      content: item.content
+    }));
     const pendingAttachments = composerAttachments;
     if (appendUserBubble) {
       setChatMessages((prev) => [
