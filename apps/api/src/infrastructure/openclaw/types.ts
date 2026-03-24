@@ -133,6 +133,22 @@ export interface OpenClawRuntimeContext {
   queryLimit?: number;
 }
 
+export interface OpenClawHealthCheckInput {
+  agentIds?: string[];
+}
+
+export interface OpenClawHealthCheckResult {
+  ok: boolean;
+  mode: "ws" | "mock";
+  detail?: string;
+  configuredAgents?: string[];
+  reachableAgents?: string[];
+  unreachableAgents?: Array<{
+    agentId: string;
+    detail: string;
+  }>;
+}
+
 export interface OpenClawClassifyIntentInput {
   query: string;
   language: "zh" | "en";
@@ -228,7 +244,7 @@ export interface OpenClawSupportAnswerComposerInput {
   contextType: "search" | "triage";
   language: "zh" | "en";
   query: string;
-  mode: "grounded" | "partial";
+  mode: SupportAnswer["mode"];
   route: SupportQuestionRoute;
   caseFrame: SupportCaseFrame;
   draftSupportAnswer?: SpecialistDraftAnswer;
@@ -345,5 +361,5 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportVerificationResult>;
-  healthCheck(): Promise<{ ok: boolean; mode: "ws" | "mock"; detail?: string }>;
+  healthCheck(input?: OpenClawHealthCheckInput): Promise<OpenClawHealthCheckResult>;
 }
