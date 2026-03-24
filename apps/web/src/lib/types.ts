@@ -54,6 +54,12 @@ export interface UploadedAttachment {
   contentType: string;
 }
 
+export interface ConversationTurn {
+  role: "user" | "assistant";
+  content: string;
+  at?: string;
+}
+
 export interface AiCapabilities {
   imageInputEnabled: boolean;
   provider: "openai" | "disabled";
@@ -161,6 +167,12 @@ export type SearchSupportSection =
       items: string[];
     }
   | {
+      kind: "code_block";
+      title: string;
+      code: string;
+      language?: string;
+    }
+  | {
       kind: "api_card";
       title: string;
       method: string;
@@ -223,12 +235,12 @@ export interface SearchResult {
   session_id: string;
   answer: string;
   answer_language?: "zh" | "en";
+  delivery_mode?: "agent_orchestrated" | "kb_direct";
   case_frame?: SearchCaseFrame;
   support_answer?: SearchSupportAnswer;
   verification?: SearchVerificationSummary;
   structured_answer?: {
     summary: string;
-    assessment?: string;
     steps: string[];
     validation: string[];
     required_inputs?: string[];
