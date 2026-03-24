@@ -1069,6 +1069,15 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
         refPath.includes("openapi/api/")
       ) {
         topicScore += 8;
+        topicScore += scoreApiIntentAlignment(
+          collectApiOperationIntents(query, caseFrame),
+          classifyApiOperationCandidate({
+            method: extractApiOperationSignature(reference).method,
+            path: extractApiOperationSignature(reference).path,
+            title: reference.title,
+            snippet
+          })
+        );
       }
       if (caseFrame.question_type === "api_scope_auth") {
         if (refPath.includes("openapi/auth/") || title.includes("scope") || title.includes("permission")) {
@@ -1988,6 +1997,8 @@ type ApiEvidenceCandidate = {
   path?: string;
 };
 
+type ApiOperationIntent = "create" | "read" | "list" | "update" | "delete" | "execute";
+
 function expandApiSemanticFocusTerms(query: string, caseFrame: SupportCaseFrame): string[] {
   const raw = `${query} ${caseFrame.goal} ${caseFrame.object} ${caseFrame.symptom}`.toLowerCase();
   const expanded = new Set<string>(collectFocusTerms(query, caseFrame));
@@ -2004,16 +2015,45 @@ function expandApiSemanticFocusTerms(query: string, caseFrame: SupportCaseFrame)
   return uniqueStrings([...expanded], 32);
 }
 
+function collectApiOperationIntents(query: string, caseFrame: SupportCaseFrame): Set<ApiOperationIntent> {
+  const raw = `${query} ${caseFrame.goal} ${caseFrame.object} ${caseFrame.symptom} ${caseFrame.action_type}`.toLowerCase();
+  const intents = new Set<ApiOperationIntent>();
+
+  if (/(创建|新增|新建|添加|create|add|new )/i.test(raw)) intents.add("create");
+  if (/(更新|修改|变更|设置|edit|update|modify|change|set )/i.test(raw)) intents.add("update");
+  if (/(删除|移除|remove|delete)/i.test(raw)) intents.add("delete");
+  if (/(执行|触发|run |execute|trigger)/i.test(raw)) intents.add("execute");
+  if (/(列表|列出|枚举|清单|list |all statuses)/i.test(raw)) intents.add("list");
+  if (/(获取|查询|查看|详情|get |fetch|read|detail)/i.test(raw)) intents.add("read");
+
+  if (!intents.size) {
+    if (caseFrame.action_type === "update") intents.add("update");
+    else if (caseFrame.question_type === "api_field_lookup" || caseFrame.question_type === "api_scope_auth") intents.add("read");
+  }
+
+  return intents;
+}
+
 function extractApiOperationSignature(reference: SearchReference): { method?: string; path?: string } {
-  const snippet = String(reference.snippet ?? "");
-  const jsxMatch = snippet.match(/method=\{"([a-z]+)"\}\s+path=\{"([^"]+)"\}/i);
+  const source = (() => {
+    const snippet = String(reference.snippet ?? "");
+    const resolvedPath = resolveLocalDocsMirrorPath(reference);
+    if (!resolvedPath) return snippet;
+    try {
+      const raw = fs.readFileSync(resolvedPath, "utf8");
+      return `${snippet}\n${raw}`;
+    } catch {
+      return snippet;
+    }
+  })();
+  const jsxMatch = source.match(/method=\{"([a-z]+)"\}\s+path=\{"([^"]+)"\}/i);
   if (jsxMatch) {
     return {
       method: jsxMatch[1].toUpperCase(),
       path: jsxMatch[2]
     };
   }
-  const plainMatch = snippet.match(/\b(GET|POST|PUT|PATCH|DELETE)\s+([/A-Za-z0-9._:-]+)/);
+  const plainMatch = source.match(/\b(GET|POST|PUT|PATCH|DELETE)\s+([/A-Za-z0-9._:{}?=&-]+)/);
   if (plainMatch) {
     return {
       method: plainMatch[1].toUpperCase(),
@@ -2093,7 +2133,67 @@ function extractApiRequestParamNames(reference: SearchReference): string[] {
   );
 }
 
-function scoreApiEvidenceCandidate(candidate: ApiEvidenceCandidate, focusTerms: string[], reference: SearchReference, primaryBoost: number): number {
+function classifyApiOperationCandidate(input: { method?: string; path?: string; title?: string; snippet?: string }): Set<ApiOperationIntent> {
+  const intents = new Set<ApiOperationIntent>();
+  const method = String(input.method ?? "").toUpperCase();
+  const path = String(input.path ?? "").toLowerCase();
+  const title = String(input.title ?? "").toLowerCase();
+  const snippet = String(input.snippet ?? "").toLowerCase();
+  const haystack = `${path} ${title} ${snippet}`;
+
+  if (method === "PUT" || method === "PATCH" || /update|更新|修改|变更|edit|patch/.test(haystack)) intents.add("update");
+  if (method === "DELETE" || /delete|remove|删除|移除/.test(haystack)) intents.add("delete");
+  if (method === "POST" && /create|创建|新增|新建|add /.test(haystack)) intents.add("create");
+  if ((method === "POST" && /execute|执行|触发|trigger|run /.test(haystack)) || /action=executeworkflow/.test(haystack)) intents.add("execute");
+  if (method === "GET") {
+    if (/list|列表|issuestatuses|\/workflows\b|\/fields\b/.test(haystack) && !/\{[^}]+\}/.test(path)) intents.add("list");
+    if (!intents.has("list")) intents.add("read");
+  }
+  if ((/\{[^}]+\}/.test(path) || /detail|details|详情|详细信息/.test(haystack)) && method === "GET") intents.add("read");
+
+  return intents;
+}
+
+function scoreApiIntentAlignment(targetIntents: Set<ApiOperationIntent>, candidateIntents: Set<ApiOperationIntent>): number {
+  if (!targetIntents.size || !candidateIntents.size) return 0;
+
+  let score = 0;
+  if (targetIntents.has("update")) {
+    if (candidateIntents.has("update")) score += 52;
+    if (candidateIntents.has("read")) score -= 12;
+    if (candidateIntents.has("list")) score -= 30;
+  }
+  if (targetIntents.has("create")) {
+    if (candidateIntents.has("create")) score += 30;
+    if (candidateIntents.has("read") || candidateIntents.has("list")) score -= 10;
+  }
+  if (targetIntents.has("delete")) {
+    if (candidateIntents.has("delete")) score += 30;
+    if (candidateIntents.has("read") || candidateIntents.has("list")) score -= 10;
+  }
+  if (targetIntents.has("execute")) {
+    if (candidateIntents.has("execute")) score += 28;
+    if (candidateIntents.has("read") || candidateIntents.has("list")) score -= 8;
+  }
+  if (targetIntents.has("list")) {
+    if (candidateIntents.has("list")) score += 24;
+    if (candidateIntents.has("update") || candidateIntents.has("delete")) score -= 8;
+  }
+  if (targetIntents.has("read") && !targetIntents.has("update") && !targetIntents.has("create") && !targetIntents.has("delete")) {
+    if (candidateIntents.has("read")) score += 16;
+    if (candidateIntents.has("list")) score += 8;
+  }
+
+  return score;
+}
+
+function scoreApiEvidenceCandidate(
+  candidate: ApiEvidenceCandidate,
+  focusTerms: string[],
+  reference: SearchReference,
+  primaryBoost: number,
+  targetIntents: Set<ApiOperationIntent>
+): number {
   const haystack = `${candidate.text} ${candidate.fieldName ?? ""} ${candidate.method ?? ""} ${candidate.path ?? ""} ${reference.title} ${reference.headingPath ?? ""} ${reference.path ?? ""}`.toLowerCase();
   let score = primaryBoost + Math.round(reference.score * 10);
   const wantsIdentifier = focusTerms.some((term) => /标识|id|uuid|identifier/i.test(term));
@@ -2113,6 +2213,15 @@ function scoreApiEvidenceCandidate(candidate: ApiEvidenceCandidate, focusTerms: 
   if (wantsMember && /项目|project/i.test(candidate.text) && !/成员|member|user|owner|assignee/i.test(candidate.text)) score -= 6;
   if (/(返回包含|returns?)/i.test(candidate.text)) score += 4;
   if (candidate.method && candidate.path) score += 6;
+  score += scoreApiIntentAlignment(
+    targetIntents,
+    classifyApiOperationCandidate({
+      method: candidate.method,
+      path: candidate.path,
+      title: reference.title,
+      snippet: candidate.text
+    })
+  );
   return score;
 }
 
@@ -2133,6 +2242,7 @@ function recoverEvidenceAnchoredApiDraft(input: {
   if (!ranked.length) return null;
 
   const focusTerms = expandApiSemanticFocusTerms(input.query, input.caseFrame);
+  const targetIntents = collectApiOperationIntents(input.query, input.caseFrame);
   const wantsIdentifier = focusTerms.some((term) => /标识|id|uuid|identifier/i.test(term));
   const scoredClaims: ApiEvidenceCandidate[] = [];
   let topOperationMethod = "";
@@ -2147,8 +2257,8 @@ function recoverEvidenceAnchoredApiDraft(input: {
       const operationCandidate: ApiEvidenceCandidate = {
         text:
           input.language === "zh"
-            ? `《${reference.title}》文档给出的接口是 ${operation.method} ${operation.path}。`
-            : `The documented operation in "${reference.title}" is ${operation.method} ${operation.path}.`,
+            ? `当前应优先调用 ${operation.method} ${operation.path}。`
+            : `The primary operation to use here is ${operation.method} ${operation.path}.`,
         evidenceId: reference.documentId,
         kind: "verified_fact",
         authority: "canonical",
@@ -2156,7 +2266,7 @@ function recoverEvidenceAnchoredApiDraft(input: {
         method: operation.method,
         path: operation.path
       };
-      operationCandidate.score = scoreApiEvidenceCandidate(operationCandidate, focusTerms, reference, primaryBoost);
+      operationCandidate.score = scoreApiEvidenceCandidate(operationCandidate, focusTerms, reference, primaryBoost, targetIntents);
       scoredClaims.push(operationCandidate);
       if (operationCandidate.score > topOperationScore) {
         topOperationMethod = operation.method;
@@ -2167,11 +2277,11 @@ function recoverEvidenceAnchoredApiDraft(input: {
     }
 
     extractApiFieldCandidates(reference, input.language).forEach((candidate) => {
-      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost);
+      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost, targetIntents);
       scoredClaims.push(candidate);
     });
     extractApiNarrativeCandidates(reference, input.language).forEach((candidate) => {
-      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost);
+      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost, targetIntents);
       scoredClaims.push(candidate);
     });
   });

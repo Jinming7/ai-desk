@@ -1055,6 +1055,81 @@ sidebarposition: 2
   }
 });
 
+test("runSupportSearchAgent prioritizes update operations over status-list variants for composite API queries", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/04-update-a-issue.api.mdx",
+    `---
+id: 04-update-a-issue
+title: "Update a issue"
+---
+
+# Update a issue
+
+通过 PUT /project/issues/{issueID} 更新工作项。
+可更新工作项标题、字段等信息。
+`
+  );
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/get-a-list-of-issue-status.api.mdx",
+    `---
+id: get-a-list-of-issue-status
+title: "获取工作项状态列表"
+---
+
+# 获取工作项状态列表
+
+通过 GET /project/issueStatuses 获取工作项状态列表。
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "api_endpoint_lookup",
+      specialist_agent: "api-specialist",
+      answer_contract: "Provide the exact API answer first."
+    },
+    writerAnswer: {
+      question_type: "api_endpoint_lookup",
+      render_variant: "api",
+      direct_answer: "",
+      claims: [],
+      next_actions: [],
+      unknowns: [],
+      escalation_needed: false
+    } as Partial<SpecialistDraftAnswer>
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "如何通过接口更新工作项属性/状态？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-api-update-over-status-list"
+    });
+
+    assert.match(result.result.answer, /PUT \/project\/issues\/\{issueID\}/);
+    assert.equal(result.result.support_answer?.render_variant, "api");
+    assert.equal(result.result.support_answer?.sections[0]?.kind, "api_card");
+    if (result.result.support_answer?.sections[0]?.kind === "api_card") {
+      assert.equal(result.result.support_answer.sections[0].method, "PUT");
+      assert.equal(result.result.support_answer.sections[0].path, "/project/issues/{issueID}");
+    }
+    assert.ok(result.result.references.some((reference) => /04-update-a-issue\.api\.mdx/.test(reference.path ?? "")));
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("runSupportSearchAgent uses AI stage budget to skip specialist and emit a claim graph", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
