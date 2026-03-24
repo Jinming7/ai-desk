@@ -890,6 +890,87 @@ bash reset-password.sh
   }
 });
 
+test("runSupportSearchAgent stabilizes API update questions onto OpenAPI evidence instead of generic docs", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/04-update-a-issue.api.mdx",
+    `---
+id: 04-update-a-issue
+title: "Update a issue"
+description: "Update a issue."
+sidebar_label: "Update a issue"
+---
+
+# Update a issue
+
+通过 PUT /project/issues/{issueID} 更新工作项。
+
+可更新工作项标题、字段等信息。
+`
+  );
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/get-a-list-of-issue-status.api.mdx",
+    `---
+id: get-a-list-of-issue-status
+title: "获取工作项状态列表"
+---
+
+# 获取工作项状态列表
+
+通过 GET /project/issueStatuses 获取工作项状态列表。
+`
+  );
+
+  await writeFixture(
+    rootDir,
+    "docs/account-settings/account-binding.mdx",
+    `---
+title: "绑定账号"
+slug: /admin/account-integration/start-to-account-integration/account-binding-or-unbinding
+sidebarposition: 2
+---
+
+# 绑定账号
+
+在添加 CAS 页面选择账号绑定方式时，需要选择“自动绑定具有相同唯一标识符的同步源账号”。
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "how_to_product",
+      specialist_agent: "howto-specialist",
+      answer_contract: "Give direct steps first."
+    }
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "如何通过接口更新工作项及工作项状态？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-api-route-stabilization"
+    });
+
+    assert.equal(result.caseFrame.specialist_agent, "api-specialist");
+    assert.match(String(result.caseFrame.question_type ?? ""), /^api_/);
+    assert.equal(result.result.references.length > 0, true);
+    assert.match(result.result.references[0]?.path ?? "", /open-docs\/docs\/openapi\/api\//);
+    assert.doesNotMatch(result.result.answer, /sidebarposition|slug:\s*\/admin\/account-integration/i);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("runSupportSearchAgent uses AI stage budget to skip specialist and emit a claim graph", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;

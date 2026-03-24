@@ -176,6 +176,7 @@ function fallbackCaseFrame(query: string): SupportCaseFrame {
 }
 
 type SupportQuerySignals = {
+  apiContext: boolean;
   privateDeploymentContext: boolean;
   infrastructureContext: boolean;
   accountRecoveryContext: boolean;
@@ -191,6 +192,7 @@ function analyzeSupportQuerySignals(query: string): SupportQuerySignals {
   const normalized = query.trim();
   const lowered = normalized.toLowerCase();
   return {
+    apiContext: isApiShapedQuery(normalized),
     privateDeploymentContext:
       /私有部署|本地部署|闭网|闭域网|内网|离线|受限环境/.test(normalized) ||
       /\b(private deployment|on[- ]?prem|onprem|air[- ]?gapped|closed network|offline|restricted environment)\b/i.test(lowered),
@@ -217,6 +219,16 @@ function isApiShapedQuery(query: string): boolean {
   return /\b(api|openapi|endpoint|path|method|scope|oauth|token)\b/i.test(query) || /接口|开放平台|鉴权|授权/.test(query);
 }
 
+function inferApiQuestionType(query: string): SupportQuestionRoute["question_type"] {
+  if (/\b(scope|oauth|token)\b/i.test(query) || /权限|鉴权|授权/.test(query)) {
+    return "api_scope_auth";
+  }
+  if ((/\b(status|field)\b/i.test(query) || /状态|字段|属性/.test(query)) && isApiShapedQuery(query)) {
+    return "api_field_lookup";
+  }
+  return "api_endpoint_lookup";
+}
+
 function stabilizeSupportRouteAndCaseFrame(input: {
   query: string;
   route: SupportQuestionRoute;
@@ -240,6 +252,11 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   const shouldTreatAsHowTo =
     (signals.accountRecoveryContext && (signals.privateDeploymentContext || signals.infrastructureContext)) ||
     (signals.wantsProcedure && deploymentModel === "private_deployment");
+  const shouldForceApiRoute =
+    signals.apiContext &&
+    (input.caseFrame.product_area === "openapi" ||
+      input.route.specialist_agent !== "api-specialist" ||
+      !String(input.route.question_type ?? "").startsWith("api_"));
   const object =
     input.caseFrame.object === "unspecified" && signals.accountRecoveryContext
       ? localizedSupportLabel(input.query, "管理员密码重置", "administrator password reset")
@@ -268,13 +285,30 @@ function stabilizeSupportRouteAndCaseFrame(input: {
       object_queries: uniqueStrings([...(input.caseFrame.query_plan?.object_queries ?? []), object, ...retrievalSeeds], 4),
       behavior_queries: uniqueStrings([...(input.caseFrame.query_plan?.behavior_queries ?? []), actionType], 4)
     },
-    required_doc_kinds: shouldTreatAsHowTo
+    required_doc_kinds: shouldForceApiRoute
+      ? uniqueStrings(
+          [
+            ...(input.caseFrame.required_doc_kinds ?? []),
+            "openapi/api",
+            /\b(scope|oauth|token)\b/i.test(input.query) || /权限|鉴权|授权/.test(input.query) ? "permissions" : undefined
+          ],
+          6
+        )
+      : shouldTreatAsHowTo
       ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "deployment_runbook", "troubleshooting"], 6)
       : input.caseFrame.required_doc_kinds
   };
 
   const route: SupportQuestionRoute =
-    shouldTreatAsHowTo && (input.route.question_type === "capability_confirmation" || input.route.specialist_agent === "behavior-specialist")
+    shouldForceApiRoute
+      ? {
+          ...input.route,
+          question_type: inferApiQuestionType(input.query),
+          specialist_agent: "api-specialist",
+          answer_contract: "Give the exact API answer first.",
+          routing_confidence: Math.max(input.route.routing_confidence, 0.84)
+        }
+      : shouldTreatAsHowTo && (input.route.question_type === "capability_confirmation" || input.route.specialist_agent === "behavior-specialist")
       ? {
           ...input.route,
           question_type: "how_to_product",

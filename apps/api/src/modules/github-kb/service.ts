@@ -217,9 +217,22 @@ function isPathIncluded(path: string, includePaths: string[], excludePaths: stri
 }
 
 function pickTitle(path: string, content: string): string {
+  const frontmatterTitle = /^---\s*\n[\s\S]*?^\s*title:\s*["']?(.+?)["']?\s*$[\s\S]*?\n---\s*(?:\n|$)/im.exec(content);
+  if (frontmatterTitle?.[1]) return frontmatterTitle[1].trim();
   const heading = /^(#{1,6})\s+(.+)$/m.exec(content);
   if (heading?.[2]) return heading[2].trim();
   return path.split("/").pop() ?? path;
+}
+
+function stripFrontmatter(content: string): string {
+  return content.replace(/^---\s*\n[\s\S]*?\n---\s*(?:\n|$)/, "");
+}
+
+function stripIndexNoise(content: string): string {
+  return stripFrontmatter(content)
+    .replace(/^import\s+.+$/gm, " ")
+    .replace(/^\s*(slug|sidebarposition|sidebar_position|sidebar_label|hide_title|hide_table_of_contents|custom_edit_url|info_path)\s*:\s*.+$/gim, " ")
+    .trim();
 }
 
 function decodeBase64Url(input: string): Buffer {
@@ -516,13 +529,14 @@ function extractSupportEvidenceMetadata(input: {
 }
 
 function enrichIndexableContent(path: string, rawContent: string): string {
+  const cleanedContent = stripIndexNoise(rawContent);
   if (!/open-docs\/docs\/openapi\/api\/.+\.api\.mdx$/i.test(path)) {
-    return rawContent;
+    return cleanedContent;
   }
   const apiDoc = decodeOpenApiBlob(rawContent);
-  if (!apiDoc) return rawContent;
+  if (!apiDoc) return cleanedContent;
   const apiText = toSearchableApiText(apiDoc);
-  return `${rawContent}\n\n${apiText}`;
+  return `${cleanedContent}\n\n${apiText}`;
 }
 
 function getProfileConfig(profile: RetrievalProfile): {
@@ -585,6 +599,9 @@ function tokenizeRetrievalQuery(query: string): string[] {
 
 function cleanSnippet(raw: string): string {
   return raw
+    .replace(/^---\s*\n[\s\S]*?\n---\s*(?:\n|$)/, " ")
+    .replace(/^import\s+.+$/gm, " ")
+    .replace(/^\s*(slug|sidebarposition|sidebar_position|sidebar_label|hide_title|hide_table_of_contents|custom_edit_url|info_path|title|description)\s*:\s*.+$/gim, " ")
     .replace(/<JsonSchemaViewer[^>]*\/>/gi, " ")
     .replace(/<SchemaItem[^>]*\/>/gi, " ")
     .replace(/api\s*:\s*eJ[0-9A-Za-z+/_=-]{16,}/g, " ")
@@ -674,14 +691,37 @@ async function enrichOpenApiHits(hits: RetrievalHit[], answerLanguage: "zh" | "e
 function buildQueryVariants(query: string): string[] {
   const normalized = normalizeSpaces(query);
   const lowered = normalized.toLowerCase();
-  const compactTokenVariant = tokenizeRetrievalQuery(normalized).join(" ").trim();
+  const replacements: Array<[RegExp, string]> = [
+    [/open\s*api/gi, "openapi"],
+    [/开放平台/gi, "openapi open platform"],
+    [/接口/gi, "api endpoint openapi"],
+    [/工作项/gi, "工作项 issue work item"],
+    [/状态列表|状态枚举/gi, "状态列表 status list statuses enum issueStatuses"],
+    [/状态/gi, "状态 status state issue status"],
+    [/字段|属性/gi, "字段 field property schema"],
+    [/更新|修改/gi, "update modify edit"],
+    [/获取|查询/gi, "get query retrieve fetch"],
+    [/创建/gi, "create add new"],
+    [/删除/gi, "delete remove"],
+    [/评论/gi, "comment issue comment"],
+    [/权限/gi, "permission scope access"],
+    [/授权/gi, "authorization oauth"],
+    [/令牌|token/gi, "token credential access token"]
+  ];
+  let expanded = lowered;
+  for (const [pattern, replacement] of replacements) {
+    expanded = expanded.replace(pattern, ` ${replacement} `);
+  }
+  expanded = normalizeSpaces(expanded);
+  const compactTokenVariant = tokenizeRetrievalQuery(expanded || normalized).join(" ").trim();
   return uniqueStrings(
     [
       normalized,
       lowered !== normalized ? lowered : "",
+      expanded && expanded !== lowered ? expanded : "",
       compactTokenVariant && compactTokenVariant !== lowered ? compactTokenVariant : ""
     ],
-    3
+    4
   );
 }
 
@@ -1557,6 +1597,9 @@ function mergeHybridCandidates(
   const integrationIntent = /\b(integrate|integration|teams|slack|webhook|zapier|oauth)\b/i.test(normalizedQuery);
   const merged = [...byChunk.values()].map((hit) => {
     let boosted = hit.score;
+    const metadata = (hit.supportMetadata ?? {}) as Record<string, unknown>;
+    const productArea = String(metadata.product_area ?? "").toLowerCase();
+    const evidenceKind = String(metadata.evidence_kind ?? "").toLowerCase();
     if (hit.path.toLowerCase().includes(normalizedQuery)) boosted += 0.03;
     if (hit.title.toLowerCase().includes(normalizedQuery)) boosted += 0.05;
 
@@ -1569,7 +1612,10 @@ function mergeHybridCandidates(
 
     // For API-like questions, prefer OpenAPI endpoint docs over webhook/event docs.
     if (apiIntent) {
-      if (/\/openapi\/api\/.+\.api\.mdx$/i.test(hit.path)) boosted += 0.08;
+      if (/\/openapi\/api\/.+\.api\.mdx$/i.test(hit.path)) boosted += 0.24;
+      else if (/\/openapi\//i.test(hit.path) || productArea === "openapi") boosted += 0.1;
+      else boosted -= 0.18;
+      if (evidenceKind === "api_operation") boosted += 0.12;
       if (/\/abilities\/events\//i.test(hit.path)) boosted -= 0.04;
       if (/create-a-new-issue\.api\.mdx$/i.test(hit.path) && /\b(create|new)\b/i.test(normalizedQuery) && /\bissue\b/i.test(normalizedQuery)) {
         boosted += 0.2;
@@ -1595,6 +1641,34 @@ function mergeHybridCandidates(
 
   merged.sort((a, b) => b.score - a.score);
   return merged;
+}
+
+function rerankHitsForIntent(query: string, hits: RetrievalHit[]): RetrievalHit[] {
+  if (!hits.length) return hits;
+  const apiIntent = isApiIntent(query) || /接口|开放平台|鉴权|授权/.test(query);
+  if (!apiIntent) return hits;
+
+  const tokens = tokenizeRetrievalQuery(buildQueryVariants(query).join(" ")).slice(0, 12);
+  return [...hits]
+    .map((hit) => {
+      const metadata = (hit.supportMetadata ?? {}) as Record<string, unknown>;
+      const productArea = String(metadata.product_area ?? "").toLowerCase();
+      const evidenceKind = String(metadata.evidence_kind ?? "").toLowerCase();
+      const haystack = `${hit.path} ${hit.title}`.toLowerCase();
+      let boosted = hit.score;
+      if (/\/openapi\/api\/.+\.api\.mdx$/i.test(hit.path)) boosted += 0.4;
+      else if (/\/openapi\//i.test(hit.path) || productArea === "openapi") boosted += 0.14;
+      else boosted -= 0.24;
+      if (evidenceKind === "api_operation") boosted += 0.12;
+      if (/\/abilities\/events\//i.test(hit.path)) boosted -= 0.08;
+      for (const token of tokens) {
+        if (token.length < 2) continue;
+        if (haystack.includes(token.toLowerCase())) boosted += 0.018;
+      }
+      if (/^(root|fallback)$/i.test(hit.headingPath ?? "") && cleanSnippet(hit.snippet).length < 40) boosted -= 0.06;
+      return { ...hit, score: boosted };
+    })
+    .sort((a, b) => b.score - a.score);
 }
 
 function estimateConfidence(hit: RetrievalHit | undefined): number {
@@ -1630,12 +1704,20 @@ function buildLocalizedAnswer(language: "zh" | "en", hits: RetrievalHit[], confi
   return `Retrieved ${hits.length} relevant documents. Start with \"${top.title}\" (path: ${top.path}). Confidence: ${confidence.toFixed(2)}.`;
 }
 
-async function buildGroundedAnswerFromTopHit(language: "zh" | "en", hits: RetrievalHit[], confidence: number): Promise<string> {
+async function buildGroundedAnswerFromTopHit(
+  language: "zh" | "en",
+  hits: RetrievalHit[],
+  confidence: number,
+  query: string
+): Promise<string> {
   if (!hits.length) {
     return buildLocalizedAnswer(language, hits, confidence);
   }
 
-  const top = hits[0];
+  const top =
+    (isApiIntent(query) || /接口|开放平台|鉴权|授权/.test(query)
+      ? hits.find((item) => /\/openapi\/api\/.+\.api\.mdx$/i.test(item.path))
+      : null) ?? hits[0];
   if (/\/openapi\/api\/.+\.api\.mdx$/i.test(top.path)) {
     const registration = await repo.getRepoRegistrationById(top.repoId).catch(() => null);
     if (registration) {
@@ -1789,6 +1871,7 @@ export async function retrieveKnowledge(input: {
 
   hits = await enrichOpenApiHits(hits, answerLanguage).catch(() => hits);
   hits = await hydratePublicSourceUrls(hits).catch(() => hits);
+  hits = rerankHitsForIntent(input.query, hits);
   // Guardrail: fallback-only retrieval must not be treated as grounded-high-confidence.
   if (hits.length > 0 && hits.every((item) => item.rankSignals?.fallback)) {
     confidence = Math.min(confidence, Math.max(0, cfg.threshold - 0.12));
@@ -1815,7 +1898,7 @@ export async function retrieveKnowledge(input: {
     })
   ]);
 
-  const groundedAnswer = await buildGroundedAnswerFromTopHit(answerLanguage, hits, confidence).catch(() =>
+  const groundedAnswer = await buildGroundedAnswerFromTopHit(answerLanguage, hits, confidence, input.query).catch(() =>
     buildLocalizedAnswer(answerLanguage, hits, confidence)
   );
 

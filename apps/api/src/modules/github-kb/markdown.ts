@@ -16,7 +16,8 @@ function extractHeading(line: string): { level: number; text: string } | null {
 }
 
 export function parseMarkdownSections(input: string): ParsedSection[] {
-  const lines = input.split(/\r?\n/);
+  const normalizedInput = input.replace(/^---\s*\n[\s\S]*?\n---\s*(?:\n|$)/, "");
+  const lines = normalizedInput.split(/\r?\n/);
   const sections: ParsedSection[] = [];
   let headingStack: HeadingState[] = [];
   let currentBuffer: string[] = [];
