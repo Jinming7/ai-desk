@@ -819,6 +819,77 @@ bash reset-password.sh
   }
 });
 
+test("runSupportSearchAgent realigns private deployment password recovery questions from behavior to how-to", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/configure/ops/admin-password.cn.md",
+    `---
+title: "修改用户密码"
+---
+
+# 修改用户密码
+
+适用于私有部署环境。
+
+## 操作步骤
+
+#### 进入 ONES pod
+
+\`\`\`shell
+ones-ai-k8s.sh
+\`\`\`
+
+### 使用脚本更新密码
+
+执行以下命令
+
+\`\`\`bash
+bash reset-password.sh
+\`\`\`
+
+根据提示输入邮箱账号，然后脚本会自动重置密码并输出新密码。
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract: "Give the most likely explanation first."
+    },
+    queryPlan: {
+      concept_queries: ["闭网 邮件不可用"],
+      object_queries: ["管理员访问恢复"],
+      behavior_queries: ["是否支持"]
+    }
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "私有部署环境闭网且邮件不可用时，是否可以通过服务器或 OS 层直接重置管理员密码来恢复访问？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-private-deployment-route-realign"
+    });
+
+    assert.equal(result.caseFrame.deployment_model, "private_deployment");
+    assert.equal(result.caseFrame.product_area, "deployment");
+    assert.equal(result.caseFrame.question_type, "how_to_product");
+    assert.equal(result.caseFrame.specialist_agent, "howto-specialist");
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.match(result.result.answer, /重置管理员密码|reset-password\.sh|ones-ai-k8s\.sh/);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("runSupportSearchAgent uses AI stage budget to skip specialist and emit a claim graph", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;

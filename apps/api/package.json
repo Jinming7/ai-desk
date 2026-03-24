@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
+    "start": "../../scripts/restart-api-safe.sh",
+    "start:raw": "node dist/index.js",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed:mock": "tsx src/db/seed-mock.ts",
     "test:ai-support-agent:smoke": "NODE_ENV=test tsx src/tests/ai-support-agent.smoke.ts",

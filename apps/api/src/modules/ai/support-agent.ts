@@ -175,6 +175,126 @@ function fallbackCaseFrame(query: string): SupportCaseFrame {
   };
 }
 
+type SupportQuerySignals = {
+  privateDeploymentContext: boolean;
+  infrastructureContext: boolean;
+  accountRecoveryContext: boolean;
+  mailDependencyContext: boolean;
+  wantsProcedure: boolean;
+};
+
+function hasCjkText(input: string): boolean {
+  return /[\u3400-\u9FBF]/.test(input);
+}
+
+function analyzeSupportQuerySignals(query: string): SupportQuerySignals {
+  const normalized = query.trim();
+  const lowered = normalized.toLowerCase();
+  return {
+    privateDeploymentContext:
+      /私有部署|本地部署|闭网|闭域网|内网|离线|受限环境/.test(normalized) ||
+      /\b(private deployment|on[- ]?prem|onprem|air[- ]?gapped|closed network|offline|restricted environment)\b/i.test(lowered),
+    infrastructureContext:
+      /服务器|os层|操作系统|pod|集群|k8s|k3s|容器|运维/.test(normalized) ||
+      /\b(server|os[- ]?level|operating system|pod|cluster|k8s|k3s|container|ops|operation toolkit)\b/i.test(lowered),
+    accountRecoveryContext:
+      /管理员密码|重置密码|恢复管理员|登录访问权限|邮件重置/.test(normalized) ||
+      /\b(admin(?:istrator)? password|password reset|reset password|restore admin(?:istrator)? access|mail reset|email reset)\b/i.test(lowered),
+    mailDependencyContext:
+      /邮件服务|邮箱|邮件重置|外部无法直接连接|无法远程/.test(normalized) ||
+      /\b(email|mail|smtp|remote access|remote operation|external connection)\b/i.test(lowered),
+    wantsProcedure:
+      /如何|怎么|步骤|方式|能否|是否存在|可以通过/.test(normalized) ||
+      /\b(how|how to|steps?|procedure|workflow|can we|is there|via server|via os)\b/i.test(lowered)
+  };
+}
+
+function localizedSupportLabel(query: string, zh: string, en: string): string {
+  return hasCjkText(query) ? zh : en;
+}
+
+function isApiShapedQuery(query: string): boolean {
+  return /\b(api|openapi|endpoint|path|method|scope|oauth|token)\b/i.test(query) || /接口|开放平台|鉴权|授权/.test(query);
+}
+
+function stabilizeSupportRouteAndCaseFrame(input: {
+  query: string;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+}): { route: SupportQuestionRoute; caseFrame: SupportCaseFrame } {
+  const signals = analyzeSupportQuerySignals(input.query);
+  const deploymentModel =
+    input.caseFrame.deployment_model === "unknown" || input.caseFrame.deployment_model === "shared"
+      ? signals.privateDeploymentContext || (signals.infrastructureContext && signals.mailDependencyContext)
+        ? "private_deployment"
+        : input.caseFrame.deployment_model
+      : input.caseFrame.deployment_model;
+  const productArea =
+    (input.caseFrame.product_area === "general" ||
+      (input.caseFrame.product_area === "openapi" &&
+        !isApiShapedQuery(input.query) &&
+        (signals.accountRecoveryContext || signals.infrastructureContext))) &&
+    (deploymentModel === "private_deployment" || signals.infrastructureContext)
+      ? "deployment"
+      : input.caseFrame.product_area;
+  const shouldTreatAsHowTo =
+    (signals.accountRecoveryContext && (signals.privateDeploymentContext || signals.infrastructureContext)) ||
+    (signals.wantsProcedure && deploymentModel === "private_deployment");
+  const object =
+    input.caseFrame.object === "unspecified" && signals.accountRecoveryContext
+      ? localizedSupportLabel(input.query, "管理员密码重置", "administrator password reset")
+      : input.caseFrame.object;
+  const actionType = shouldTreatAsHowTo ? "how_to" : input.caseFrame.action_type;
+  const retrievalSeeds = shouldTreatAsHowTo
+    ? uniqueStrings(
+        [
+          localizedSupportLabel(input.query, "私有部署 管理员密码重置", "private deployment administrator password reset"),
+          localizedSupportLabel(input.query, "服务器 OS 层 重置 管理员 密码", "server os level reset administrator password"),
+          localizedSupportLabel(input.query, "邮件不可用 管理员 密码 恢复", "email unavailable administrator access recovery")
+        ],
+        3
+      )
+    : [];
+
+  let caseFrame: SupportCaseFrame = {
+    ...input.caseFrame,
+    deployment_model: deploymentModel,
+    product_area: productArea,
+    object,
+    action_type: actionType,
+    retrieval_queries: uniqueStrings([...input.caseFrame.retrieval_queries, ...retrievalSeeds], 6),
+    query_plan: {
+      concept_queries: uniqueStrings([...(input.caseFrame.query_plan?.concept_queries ?? []), ...retrievalSeeds], 4),
+      object_queries: uniqueStrings([...(input.caseFrame.query_plan?.object_queries ?? []), object, ...retrievalSeeds], 4),
+      behavior_queries: uniqueStrings([...(input.caseFrame.query_plan?.behavior_queries ?? []), actionType], 4)
+    },
+    required_doc_kinds: shouldTreatAsHowTo
+      ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "deployment_runbook", "troubleshooting"], 6)
+      : input.caseFrame.required_doc_kinds
+  };
+
+  const route: SupportQuestionRoute =
+    shouldTreatAsHowTo && (input.route.question_type === "capability_confirmation" || input.route.specialist_agent === "behavior-specialist")
+      ? {
+          ...input.route,
+          question_type: "how_to_product",
+          specialist_agent: "howto-specialist",
+          answer_contract: "Provide the direct recovery steps and prerequisites first.",
+          routing_confidence: Math.max(input.route.routing_confidence, 0.82)
+        }
+      : input.route;
+
+  caseFrame = {
+    ...caseFrame,
+    question_type: route.question_type,
+    specialist_agent: route.specialist_agent,
+    answer_contract: route.answer_contract,
+    routing_confidence: route.routing_confidence
+  };
+
+  return { route, caseFrame };
+}
+
 function fallbackQuestionRoute(query: string): SupportQuestionRoute {
   const lowered = query.toLowerCase();
   const question_type: SupportQuestionRoute["question_type"] =
@@ -760,6 +880,10 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
       const heading = String(reference.headingPath ?? "").toLowerCase();
       const refPath = String(reference.path ?? "").toLowerCase();
       const snippet = String(reference.snippet ?? "").toLowerCase();
+      const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
+      const evidenceKind = String(metadata.evidence_kind ?? "").toLowerCase();
+      const productArea = String(metadata.product_area ?? "").toLowerCase();
+      const deploymentModel = String(metadata.deployment_model ?? "").toLowerCase();
       let topicScore = 0;
       for (const term of focusTerms) {
         if (title.includes(term)) topicScore += 8;
@@ -786,7 +910,20 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
           !refPath.includes("openapi/api/")
         ) {
           topicScore += 10;
+        } else if (kind === "deployment_runbook") {
+          if (refPath.startsWith("deploy-docs/") || productArea === "deployment" || deploymentModel === "private_deployment") {
+            topicScore += 22;
+          }
         }
+      }
+      if (caseFrame.deployment_model === "private_deployment") {
+        if (deploymentModel === "private_deployment") topicScore += 18;
+        if (refPath.startsWith("deploy-docs/")) topicScore += 14;
+      }
+      if (caseFrame.product_area === "deployment") {
+        if (productArea === "deployment") topicScore += 16;
+        if (evidenceKind === "procedure") topicScore += 12;
+        else if (evidenceKind === "troubleshooting") topicScore += 6;
       }
       if (
         caseFrame.question_type &&
@@ -794,6 +931,10 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
         refPath.includes("openapi/api/")
       ) {
         topicScore += 8;
+      }
+      if (caseFrame.question_type === "how_to_product" || caseFrame.question_type === "config_setup") {
+        if (evidenceKind === "procedure") topicScore += 14;
+        if (deploymentModel === "private_deployment" && refPath.startsWith("deploy-docs/")) topicScore += 10;
       }
       if (caseFrame.question_type === "api_field_lookup") {
         const isIssueDetailsOperation =
@@ -822,6 +963,9 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
           /sidebar label|hide title|custom edit url|import apitabs|import methodendpoint/.test(snippet))
       ) {
         topicScore -= 20;
+      }
+      if (caseFrame.deployment_model === "private_deployment" && deploymentModel && deploymentModel !== "private_deployment") {
+        topicScore -= 8;
       }
       return topicScore;
     };
@@ -2087,8 +2231,14 @@ export async function runSupportSearchAgent(input: {
     }));
 
   const [plannerResult, baseEvidenceResult] = await Promise.all([plannerPromise, baseEvidencePromise]);
-  const route = routeResult.route;
-  const caseFrame = mergeRouteAndEvidencePlan(plannerResult.value ?? fallbackCaseFrame(input.query), route, evidencePlanResult.plan);
+  const mergedCaseFrame = mergeRouteAndEvidencePlan(plannerResult.value ?? fallbackCaseFrame(input.query), routeResult.route, evidencePlanResult.plan);
+  const stabilized = stabilizeSupportRouteAndCaseFrame({
+    query: input.query,
+    route: routeResult.route,
+    caseFrame: mergedCaseFrame
+  });
+  const route = stabilized.route;
+  const caseFrame = stabilized.caseFrame;
   const stageBudget = normalizeStageBudget({
     route,
     plan: evidencePlanResult.plan

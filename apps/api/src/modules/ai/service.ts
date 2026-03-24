@@ -7,6 +7,7 @@ import { buildSearchRuntime, resolveExecutionRuntime } from "./agent-router.js";
 import { summarizeImageAttachments, summarizeTextAttachments } from "./multimodal.js";
 import { runSupportSearchAgent, runSupportTriageAgent } from "./support-agent.js";
 import type {
+  ConversationTurn,
   ChatTicketDraft,
   ChatTicketDraftField,
   SearchModeResult,
@@ -21,6 +22,7 @@ import type {
 import * as tickets from "../tickets/repository.js";
 import * as settings from "../settings/repository.js";
 import * as onesSync from "../ones-sync/service.js";
+import * as githubKbService from "../github-kb/service.js";
 
 function normalizeAction(action: string): OpenClawDecisionAction {
   if (action === "ask_info") return "ask_user";
@@ -242,6 +244,103 @@ function looksLikeProductBug(query: string): boolean {
     searchFailure ||
     /\b(bug|regression|unexpected|incorrect|wrong result|blank|空白|缺失|异常|回归|不生效|未生效)\b/i.test(query)
   );
+}
+
+async function buildKbFallbackSearchResult(input: {
+  sessionId: string;
+  query: string;
+  language: "zh" | "en";
+  currentRound: number;
+}): Promise<SearchModeResult | null> {
+  try {
+    const retrieval = await githubKbService.retrieveKnowledgeWithRetry({
+      query: input.query,
+      answerLanguage: input.language,
+      profile: "agent",
+      includeFallback: true
+    });
+    const references: SearchReference[] = retrieval.hits.map((hit) => ({
+      documentId: hit.documentId,
+      title: hit.title,
+      snippet: hit.snippet,
+      sourceUrl: hit.sourceUrl,
+      repoSourceUrl: hit.repoSourceUrl,
+      repo: hit.repo,
+      branch: hit.branch,
+      path: hit.path,
+      commitSha: hit.commitSha,
+      headingPath: hit.headingPath,
+      supportMetadata: hit.supportMetadata,
+      chunkMetadata: hit.chunkMetadata,
+      docMetadata: hit.docMetadata,
+      sourceType: "github_kb",
+      score: hit.score,
+      retrievedAt: new Date().toISOString()
+    }));
+    const citations = references.slice(0, 6).map((ref, index) => ({
+      id: `kb-${index + 1}`,
+      title: ref.title,
+      excerpt: ref.snippet,
+      score: ref.score,
+      source_url: ref.sourceUrl,
+      retrieved_at: ref.retrievedAt,
+      repo: ref.repo,
+      path: ref.path,
+      commit_sha: ref.commitSha
+    }));
+    const answer =
+      retrieval.answer?.trim() ||
+      (input.language === "zh"
+        ? "已从知识库检索到相关文档，请参考下方引用。"
+        : "Relevant documentation was found in the knowledge base. Please review the references below.");
+    return {
+      session_id: input.sessionId,
+      answer,
+      answer_language: input.language,
+      delivery_mode: "kb_direct",
+      support_answer: {
+        mode: references.length > 0 ? "partial" : "handoff",
+        question_type: "troubleshooting",
+        render_variant: references.length > 0 ? "troubleshooting" : "handoff",
+        direct_answer: answer,
+        sections: [],
+        why: [],
+        what_to_do_now: [],
+        still_need_to_confirm: []
+      },
+      verification: {
+        verdict: references.length > 0 ? "partial" : "unsupported",
+        summary:
+          input.language === "zh"
+            ? "已回退为知识库直检索结果。"
+            : "Fell back to direct knowledge-base retrieval.",
+        unsupported_claims: [],
+        missing_info: [],
+        verified_citation_ids: citations.map((item) => item.id),
+        display_citation_ids: citations.map((item) => item.id),
+        verified_claims: [],
+        claim_to_citation_map: []
+      },
+      structured_answer: {
+        summary: answer,
+        steps: [],
+        validation: [],
+        style: "diagnosis"
+      },
+      confidence: retrieval.confidence,
+      suggested_next_step: references.length > 0 ? "self_serve" : "submit_ticket",
+      retrieval_status: references.length > 0 ? "grounded" : "no_results",
+      unresolved_reason_code: references.length > 0 ? null : "KB_RETRIEVAL_UNAVAILABLE",
+      references,
+      citations,
+      state: references.length > 0 ? "GROUNDABLE_ANSWER_READY" : "TICKET_HANDOFF_RECOMMENDED",
+      clarification_round: input.currentRound,
+      show_create_ticket_now: references.length === 0,
+      follow_up_question: null
+    };
+  } catch {
+    return null;
+  }
 }
 
 function isIntegrationDiagnosisQuery(query: string): boolean {
@@ -1144,173 +1243,6 @@ function buildKBGuidanceFallback(query: string, language: "zh" | "en", refs?: Se
   };
 }
 
-type SearchRouteDecision = {
-  answer: string;
-  structuredAnswer?: StructuredSearchAnswer;
-  state: SearchDialogState;
-  clarificationRound: number;
-  showCreateTicketNow: boolean;
-  followUpQuestion: string | null;
-  selfServeResolved: boolean;
-  effectiveReferences: SearchReference[];
-};
-
-function resolveSearchBotDecision(input: {
-  language: "zh" | "en";
-  query: string;
-  classification: Awaited<ReturnType<typeof classifyQuery>>;
-  response: SearchResponseEnvelope;
-  grounded: boolean;
-  effectiveReferences: SearchReference[];
-  previousDialog: Awaited<ReturnType<typeof aiRepo.getDialogState>>;
-}): SearchRouteDecision {
-  const { language, query, classification, response, grounded, previousDialog } = input;
-  const groundedAnswer = buildQueryAwareStructuredAnswer(language, response.query, input.effectiveReferences) ?? undefined;
-
-  if (grounded) {
-    const structuredAnswer = groundedAnswer;
-    const answer =
-      response.answer.trim() && shouldUseRawGroundedAnswer(query || response.query, input.effectiveReferences)
-        ? response.answer.trim()
-        : structuredAnswer?.summary ?? response.answer;
-    return {
-      answer,
-      structuredAnswer: structuredAnswer
-        ? {
-            ...structuredAnswer,
-            summary: response.answer.trim() && shouldUseRawGroundedAnswer(query || response.query, input.effectiveReferences)
-              ? response.answer.trim()
-              : structuredAnswer.summary
-          }
-        : undefined,
-      state: "GROUNDABLE_ANSWER_READY",
-      clarificationRound: 0,
-      showCreateTicketNow: false,
-      followUpQuestion: null,
-      selfServeResolved: true,
-      effectiveReferences: input.effectiveReferences
-    };
-  }
-
-  if (classification.route === "openapi_doc") {
-    // When we have effective references, prefer building answer from them
-    if (input.effectiveReferences.length > 0) {
-      const structuredAnswer = groundedAnswer ?? buildKBGuidanceFallback(query || response.query, language, input.effectiveReferences);
-      return {
-        answer: structuredAnswer.summary,
-        structuredAnswer,
-        state: "GROUNDABLE_ANSWER_READY",
-        clarificationRound: 0,
-        showCreateTicketNow: false,
-        followUpQuestion: null,
-        selfServeResolved: true,
-        effectiveReferences: input.effectiveReferences
-      };
-    }
-    const structuredAnswer =
-      buildOpenApiRequestFallback(query || response.query, language) ??
-      buildOpenApiLookupFallback(query || response.query, language) ??
-      (classification.authProblem ? buildOpenApiAuthFallback(language) : null) ??
-      buildOpenApiClarificationFallback(language);
-    const isClarification = structuredAnswer.style === "clarification";
-    return {
-      answer: structuredAnswer.summary,
-      structuredAnswer,
-      state: isClarification ? "CLARIFICATION_REQUIRED" : "GROUNDABLE_ANSWER_READY",
-      clarificationRound: isClarification ? 1 : 0,
-      showCreateTicketNow: false,
-      followUpQuestion: isClarification ? structuredAnswer.summary : null,
-      selfServeResolved: !isClarification,
-      effectiveReferences: []
-    };
-  }
-
-  if (classification.route === "infra_runbook") {
-    const structuredAnswer = buildInfraRunbookFallback(query || response.query, language)!;
-    return {
-      answer: structuredAnswer.summary,
-      structuredAnswer,
-      state: "GROUNDABLE_ANSWER_READY",
-      clarificationRound: 0,
-      showCreateTicketNow: false,
-      followUpQuestion: null,
-      selfServeResolved: true,
-      effectiveReferences: []
-    };
-  }
-
-  if (classification.route === "integration_diagnosis") {
-    const structuredAnswer = buildIntegrationDiagnosisFallback(query || response.query, language)!;
-    return {
-      answer: structuredAnswer.summary,
-      structuredAnswer,
-      state: "GROUNDABLE_ANSWER_READY",
-      clarificationRound: 0,
-      showCreateTicketNow: false,
-      followUpQuestion: null,
-      selfServeResolved: true,
-      effectiveReferences: []
-    };
-  }
-
-  if (classification.route === "product_diagnosis") {
-    const structuredAnswer = inferEvidenceDiagnosis(query || response.query, language);
-    return {
-      answer: structuredAnswer.summary,
-      structuredAnswer,
-      state: "TICKET_HANDOFF_RECOMMENDED",
-      clarificationRound: 0,
-      showCreateTicketNow: true,
-      followUpQuestion: null,
-      selfServeResolved: false,
-      effectiveReferences: []
-    };
-  }
-
-  if (classification.route === "kb_guidance") {
-    const structuredAnswer = groundedAnswer ?? buildKBGuidanceFallback(query || response.query, language, input.effectiveReferences);
-    const isClarification = structuredAnswer.style === "clarification";
-    return {
-      answer: structuredAnswer.summary,
-      structuredAnswer,
-      state: isClarification ? "CLARIFICATION_REQUIRED" : "GROUNDABLE_ANSWER_READY",
-      clarificationRound: isClarification ? 1 : 0,
-      showCreateTicketNow: false,
-      followUpQuestion: isClarification ? structuredAnswer.summary : null,
-      selfServeResolved: !isClarification,
-      effectiveReferences: isClarification ? [] : input.effectiveReferences
-    };
-  }
-
-  const trulyVague = isTrulyVagueQuery(query || response.query);
-  if (!trulyVague) {
-    const structuredAnswer = buildKBGuidanceFallback(query || response.query, language, input.effectiveReferences);
-    const isClarification = structuredAnswer.style === "clarification";
-    return {
-      answer: structuredAnswer.summary,
-      structuredAnswer,
-      state: isClarification ? "CLARIFICATION_REQUIRED" : "GROUNDABLE_ANSWER_READY",
-      clarificationRound: isClarification ? 1 : 0,
-      showCreateTicketNow: false,
-      followUpQuestion: isClarification ? structuredAnswer.summary : null,
-      selfServeResolved: !isClarification,
-      effectiveReferences: isClarification ? [] : input.effectiveReferences
-    };
-  }
-
-  const structuredAnswer = buildClarificationStructuredAnswer(language, response.query);
-  return {
-    answer: structuredAnswer.summary,
-    structuredAnswer,
-    state: "CLARIFICATION_REQUIRED",
-    clarificationRound: (previousDialog?.clarification_round ?? 0) + 1,
-    showCreateTicketNow: false,
-    followUpQuestion: structuredAnswer.summary,
-    selfServeResolved: false,
-    effectiveReferences: []
-  };
-}
-
 function buildInfraRunbookFallback(query: string, language: "zh" | "en"): StructuredSearchAnswer | null {
   if (!isInfraTroubleshooting(query)) return null;
 
@@ -1460,145 +1392,13 @@ function buildIntegrationDiagnosisFallback(query: string, language: "zh" | "en")
   };
 }
 
-function renderStructuredAnswerAsAgentReply(language: "zh" | "en", answer: StructuredSearchAnswer): string {
-  const lines: string[] = [answer.summary.trim()];
-  if (answer.assessment?.trim()) {
-    lines.push("", language === "zh" ? "判断依据：" : "Assessment:");
-    lines.push(answer.assessment.trim());
-  }
-  if (answer.steps.length) {
-    lines.push("", language === "zh" ? "建议动作：" : "Recommended actions:");
-    answer.steps.forEach((step, idx) => {
-      lines.push(`${idx + 1}. ${step}`);
-    });
-  }
-  if (answer.validation.length) {
-    lines.push("", language === "zh" ? "验证点：" : "Validation:");
-    answer.validation.forEach((item) => {
-      lines.push(`- ${item}`);
-    });
-  }
-  return lines.join("\n").trim();
-}
-
-function buildDeterministicTicketTriage(input: {
-  title: string;
-  description: string;
-  history: Array<{ author: string; body: string }>;
-}): OpenClawAnalyzeOutput | null {
-  const combined = [
-    input.title.trim(),
-    input.description.trim(),
-    ...input.history.slice(-6).map((item) => `${item.author}: ${item.body}`)
-  ]
-    .filter(Boolean)
-    .join("\n");
-  const language = detectLanguage(combined);
-  const classification = classifyQuerySync({ query: combined });
-
-  let structured: StructuredSearchAnswer | null = null;
-  if (classification.route === "openapi_doc") {
-    structured = buildOpenApiRequestFallback(combined, language) ?? buildOpenApiLookupFallback(combined, language) ?? buildOpenApiAuthFallback(language);
-  } else if (classification.route === "infra_runbook") {
-    structured = buildInfraRunbookFallback(combined, language);
-  } else if (classification.route === "integration_diagnosis") {
-    structured = buildIntegrationDiagnosisFallback(combined, language);
-  } else if (classification.route === "product_diagnosis") {
-    return {
-      action: "escalate",
-      confidence: 0.86,
-      reply: "",
-      reasoning_summary: "Deterministic orchestration classified the ticket as product defect / ticket handoff.",
-      evidence: ["orchestrator:product_diagnosis"],
-      risk_flags: ["needs_rnd"]
-    };
-  }
-
-  if (!structured) return null;
-  return {
-    action: "ask_user",
-    confidence: 0.82,
-    reply: renderStructuredAnswerAsAgentReply(language, structured),
-    reasoning_summary: `Deterministic orchestration matched route ${classification.route}.`,
-    evidence: [`orchestrator:${classification.route}`],
-    risk_flags: []
-  };
-}
-
-function inferEvidenceDiagnosis(query: string, language: "zh" | "en"): StructuredSearchAnswer {
-  const q = query.toLowerCase();
-  const looksLikeSearchBug =
-    /\b(search|filter|find|lookup)\b/.test(q) &&
-    /\b(no results|cannot|can't|not work|not working|missing)\b/.test(q);
-
-  const looksLikeProductBug =
-    looksLikeSearchBug ||
-    /\b(bug|regression|unexpected|incorrect|wrong result|empty result|blank)\b/.test(q);
-
-  if (language === "zh") {
-    return looksLikeProductBug
-      ? {
-          summary: "已结合现有复现步骤与附件证据判断，这更像产品本身的问题，不属于知识库可直接解决的使用类问题。",
-          assessment: looksLikeSearchBug
-            ? "现象符合搜索/筛选缺陷：对象存在，但输入标题后结果变为空。"
-            : "现有证据更符合产品缺陷或回归，而不是配置/操作问题。",
-          style: "diagnosis",
-          steps: [
-            "建议立即提交工单，并附上截图、HAR、实际输入值和期望结果。",
-            "在工单中明确写出：数据实际存在，但输入同名标题后返回空结果。",
-            "如有条件，请补充一次成功场景与失败场景的请求对比。"
-          ],
-          validation: [
-            "研发应先比对“无搜索词”和“有搜索词”两次请求的查询条件差异。",
-            "重点检查后端搜索/分词/精确匹配逻辑是否对特殊字符、版本号或标题字段处理异常。"
-          ]
-        }
-      : {
-          summary: "已结合现有证据判断，这更像产品问题或内部逻辑缺陷，知识库暂时无法直接给出修复方案。",
-          assessment: "用户已提供了足够上下文，当前更适合转工单定位根因。",
-          style: "diagnosis",
-          steps: ["建议提交工单并附上全部证据。", "在工单中明确复现步骤、期望结果、实际结果。", "保留附件原件供研发排查。"],
-          validation: ["后续应由研发基于请求链路和数据状态继续定位。"]
-        };
-  }
-
-  return looksLikeProductBug
-    ? {
-        summary: "Based on the provided repro steps and attachments, this looks like a product issue rather than a KB-solvable usage question.",
-        assessment: looksLikeSearchBug
-          ? "The symptom matches a search/filter defect: the object exists, but searching by its title returns no results."
-          : "The evidence fits a product bug or regression more than a configuration or usage mistake.",
-        style: "diagnosis",
-        steps: [
-          "Submit a ticket now and attach the screenshots, HAR, exact input value, and expected result.",
-          "State clearly that the record exists in the unfiltered list but disappears when the same title is searched.",
-          "If available, include one success-vs-failure request comparison."
-        ],
-        validation: [
-          "Engineering should compare the query conditions between the unfiltered and filtered requests.",
-          "Check backend search/tokenization/exact-match handling for special characters, version strings, or title fields."
-        ]
-      }
-    : {
-        summary: "Based on the current evidence, this looks more like a product issue or internal logic defect than a KB-solvable question.",
-        assessment: "The user has already provided enough context, so the next step should be ticket handoff rather than generic clarification.",
-        style: "diagnosis",
-        steps: ["Submit a ticket with the collected evidence.", "State repro steps, expected result, and actual result.", "Keep the original attachments for engineering analysis."],
-        validation: ["Engineering should continue from request traces and data state."]
-      };
-}
-
-function normalizeTranscript(input: string[]): Array<{ role: "user" | "assistant"; content: string; at: string }> {
-  const now = new Date().toISOString();
+function normalizeTranscript(input: ConversationTurn[]): Array<{ role: "user" | "assistant"; content: string; at: string }> {
   return input
-    .map((text, idx) => {
-      const role: "user" | "assistant" = idx % 2 === 0 ? "user" : "assistant";
-      return {
-        role,
-        content: text.trim(),
-        at: now
-      };
-    })
+    .map((turn) => ({
+      role: turn.role,
+      content: turn.content.trim(),
+      at: turn.at ?? new Date().toISOString()
+    }))
     .filter((item) => item.content.length > 0);
 }
 
@@ -1606,7 +1406,7 @@ function mergeTranscript(
   previous: Array<{ role: "user" | "assistant"; content: string; at: string }> | undefined,
   latestQuery: string,
   latestAnswer: string,
-  conversation: string[]
+  conversation: ConversationTurn[]
 ): Array<{ role: "user" | "assistant"; content: string; at: string }> {
   const merged = [...(previous ?? [])];
   merged.push(...normalizeTranscript(conversation));
@@ -1620,12 +1420,18 @@ function mergeTranscript(
 export async function runSearchMode(
   query: string,
   adapter: OpenClawAdapter,
-  options?: { sessionId?: string; conversation?: string[]; answerLanguage?: "zh" | "en"; imageAttachments?: string[]; attachments?: string[] }
+  options?: {
+    sessionId?: string;
+    conversation?: ConversationTurn[];
+    answerLanguage?: "zh" | "en";
+    imageAttachments?: string[];
+    attachments?: string[];
+  }
 ): Promise<SearchModeResult> {
   const sessionId = options?.sessionId ?? crypto.randomUUID();
   const previousDialog = await aiRepo.getDialogState(sessionId);
   const currentRound = previousDialog?.clarification_round ?? 0;
-  const searchIntent = currentRound > 0 ? "clarify" : "retrieval";
+  const searchIntent: "clarify" | "retrieval" = currentRound > 0 ? "clarify" : "retrieval";
   const runtime = buildSearchRuntime({ intent: searchIntent, sessionId });
   const trimmedQuery = query.trim();
   const prevTranscript = previousDialog?.transcript;
@@ -1774,8 +1580,9 @@ export async function runSearchMode(
       }
     }
     if (options?.conversation?.length) {
-      for (const msg of options.conversation.slice(-4)) {
-        supportConversationHistory.push({ role: "user", content: msg });
+      for (const turn of options.conversation.slice(-6)) {
+        if (!turn.content.trim()) continue;
+        supportConversationHistory.push({ role: turn.role, content: turn.content.trim() });
       }
     }
 
@@ -1792,7 +1599,29 @@ export async function runSearchMode(
 
     const supportResult = {
       ...supportExecution.result,
-      session_id: sessionId
+      session_id: sessionId,
+      delivery_mode: "agent_orchestrated" as const,
+      internal_diagnostics: supportExecution.result.internal_diagnostics
+        ? {
+            ...supportExecution.result.internal_diagnostics,
+            case_id: sessionId,
+            search_agents_used: [
+              {
+                stage: searchIntent,
+                agent_id: runtime.agentId ?? "",
+                session_key: runtime.sessionKey ?? ""
+              }
+            ],
+            orchestration_trace: [
+              {
+                stage: searchIntent,
+                agent_id: runtime.agentId ?? "",
+                model: runtime.model ?? null
+              },
+              ...(supportExecution.result.internal_diagnostics.orchestration_trace ?? [])
+            ]
+          }
+        : undefined
     };
 
     if (!options?.sessionId || !previousDialog) {
@@ -1837,7 +1666,8 @@ export async function runSearchMode(
         verification: supportExecution.verification,
         supportAnswer: supportResult.support_answer,
         diagnostics: {
-          stage_timings: supportExecution.stageTimings
+          stage_timings: supportExecution.stageTimings,
+          ...(supportResult.internal_diagnostics ? { support_internal_diagnostics: supportResult.internal_diagnostics } : {})
         }
       }
     });
@@ -1873,6 +1703,60 @@ export async function runSearchMode(
   } catch (error) {
     console.error("[support-agent] runSearchMode infrastructure handoff:", error instanceof Error ? error.message : error);
 
+    const kbFallback = await buildKbFallbackSearchResult({
+      sessionId,
+      query: multimodalQuery,
+      language,
+      currentRound
+    });
+    if (kbFallback) {
+      if (!options?.sessionId || !previousDialog) {
+        await aiRepo.createSearchSession({
+          sessionId,
+          query: multimodalQuery,
+          answer: kbFallback.answer,
+          confidence: kbFallback.confidence,
+          retrievalStatus: kbFallback.retrieval_status,
+          unresolvedReasonCode: kbFallback.unresolved_reason_code,
+          suggestedNextStep: kbFallback.suggested_next_step
+        });
+      } else {
+        await aiRepo.updateSearchSession({
+          sessionId,
+          answer: kbFallback.answer,
+          confidence: kbFallback.confidence,
+          retrievalStatus: kbFallback.retrieval_status,
+          unresolvedReasonCode: kbFallback.unresolved_reason_code,
+          suggestedNextStep: kbFallback.suggested_next_step
+        });
+      }
+
+      await aiRepo.saveSearchReferences(sessionId, kbFallback.references);
+      const transcript = mergeTranscript(previousDialog?.transcript, multimodalQuery, kbFallback.answer, options?.conversation ?? []);
+      await aiRepo.upsertDialogState({
+        sessionId,
+        state: kbFallback.state,
+        clarificationRound: kbFallback.clarification_round,
+        showCreateTicketNow: kbFallback.show_create_ticket_now,
+        answerLanguage: language,
+        followUpQuestion: kbFallback.follow_up_question,
+        transcript,
+        retrievalOutcome: {
+          retrievalStatus: kbFallback.retrieval_status,
+          unresolvedReasonCode: kbFallback.unresolved_reason_code,
+          confidence: kbFallback.confidence,
+          references: kbFallback.references.length,
+          verification: kbFallback.verification,
+          supportAnswer: kbFallback.support_answer,
+          diagnostics: {
+            infrastructure_failure: true,
+            fallback_mode: "kb_direct"
+          }
+        }
+      });
+      return kbFallback;
+    }
+
     const failureDirectAnswer =
       language === "zh"
         ? "当前暂时无法完成自动诊断，建议直接创建工单，我们会自动预填你已提供的上下文。"
@@ -1881,6 +1765,7 @@ export async function runSearchMode(
       session_id: sessionId,
       answer: failureDirectAnswer,
       answer_language: language,
+      delivery_mode: "agent_orchestrated",
       support_answer: {
         mode: "handoff",
         question_type: "troubleshooting",
@@ -2070,7 +1955,7 @@ function fieldValueFromContext(key: string, label: string, title: string, descri
 export async function buildTicketDraftFromConversation(input: {
   sessionId: string;
   question: string;
-  conversation: string[];
+  conversation: ConversationTurn[];
   retrievalTraces: unknown[];
 }): Promise<ChatTicketDraft> {
   const session = await aiRepo.getSearchSessionWithReferences(input.sessionId);

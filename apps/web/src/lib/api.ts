@@ -149,13 +149,17 @@ export async function searchKnowledge(input: {
   answerLanguage?: "zh" | "en";
 }): Promise<SearchResult> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const res = await fetch(`${API}/api/v1/ai/search`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input)
-    }).catch((error) => {
-      throw asUserError(error);
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${API}/api/v1/ai/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input)
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message.trim() : "";
+      throw new Error(message || "Local API is unavailable. Start the backend service and retry.");
+    }
 
     if (res.ok) {
       const data = await res.json();

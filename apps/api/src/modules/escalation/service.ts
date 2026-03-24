@@ -5,7 +5,7 @@ import type { OpenClawAdapter } from "../../infrastructure/openclaw/types.js";
 import * as aiRepo from "../ai/repository.js";
 import { buildSearchRuntime } from "../ai/agent-router.js";
 import { SearchOrchestrator } from "../ai/search-orchestrator.js";
-import type { SearchReference } from "../ai/types.js";
+import type { ConversationTurn, SearchReference } from "../ai/types.js";
 import * as ticketService from "../tickets/service.js";
 
 type EscalationStatus = "ESCALATED" | "DEEP_RETRIEVING" | "RESOLVED_BY_AI" | "TICKET_CREATED";
@@ -56,7 +56,7 @@ async function getEscalationBySession(sessionId: string): Promise<EscalationReco
 export async function createOrGetEscalation(input: {
   sessionId: string;
   question: string;
-  conversation: string[];
+  conversation: ConversationTurn[];
   reasonCode: "NO_MATCHING_KB" | "LOW_CONFIDENCE" | "KB_RETRIEVAL_UNAVAILABLE";
   adapter: OpenClawAdapter;
 }) {

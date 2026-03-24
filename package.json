@@ -13,6 +13,7 @@
     "dev:web": "npm run dev -w apps/web",
     "dev:support-plugin": "bash ./scripts/dev-support-plugin.sh",
     "dev:support-plugin:clear": "bash ./scripts/dev-support-plugin.sh --clear",
+    "start:api": "npm run start -w apps/api",
     "build": "npm run build -w apps/api && npm run build -w apps/web",
     "db:migrate": "npm run db:migrate -w apps/api",
     "test:api-integration": "NODE_ENV=test npm run test:integration -w apps/api"

@@ -1,11 +1,31 @@
 import { z } from "zod";
 
+const conversationTurnSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  content: z.string(),
+  at: z.string().optional()
+});
+
+const conversationSchema = z
+  .union([z.array(z.string()), z.array(conversationTurnSchema)])
+  .default([])
+  .transform((items) =>
+    items.map((item) =>
+      typeof item === "string"
+        ? {
+            role: "user" as const,
+            content: item
+          }
+        : item
+    )
+  );
+
 export const aiSearchRequestSchema = z.object({
   query: z.string().default(""),
   imageAttachments: z.array(z.string()).default([]),
   attachments: z.array(z.string()).default([]),
   sessionId: z.string().uuid().optional(),
-  conversation: z.array(z.string()).default([]),
+  conversation: conversationSchema,
   answerLanguage: z.enum(["zh", "en"]).optional()
 }).refine((input) => input.query.trim().length >= 2 || input.imageAttachments.length > 0 || input.attachments.length > 0, {
   message: "query or attachments is required"
@@ -14,14 +34,14 @@ export const aiSearchRequestSchema = z.object({
 export const aiEscalateRequestSchema = z.object({
   sessionId: z.string().uuid(),
   question: z.string().min(2),
-  conversation: z.array(z.string()).default([]),
+  conversation: conversationSchema,
   reasonCode: z.enum(["NO_MATCHING_KB", "LOW_CONFIDENCE", "KB_RETRIEVAL_UNAVAILABLE"])
 });
 
 export const aiTicketDraftRequestSchema = z.object({
   sessionId: z.string().uuid(),
   question: z.string().min(2),
-  conversation: z.array(z.string()).default([]),
+  conversation: conversationSchema,
   retrievalTraces: z.array(z.any()).default([])
 });
 
