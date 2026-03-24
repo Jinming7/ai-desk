@@ -50,6 +50,8 @@ function createAdapter(options: {
   writerAnswer?: Partial<DraftSupportAnswer>;
   verification?: Partial<SupportVerificationResult>;
   queryPlan?: SupportCaseFrame["query_plan"];
+  routeOverride?: Partial<SupportQuestionRoute>;
+  evidencePlanOverride?: Partial<SupportEvidencePlan>;
 }): OpenClawAdapter {
   return {
     async analyzeTicket(_input: OpenClawAnalyzeInput, _idempotencyKey: string, _runtime?: OpenClawRuntimeContext): Promise<OpenClawAnalyzeOutput> {
@@ -128,7 +130,8 @@ function createAdapter(options: {
         user_goal: input.query,
         answer_contract: "Provide the exact API answer first.",
         specialist_agent: "api-specialist",
-        routing_confidence: 0.9
+        routing_confidence: 0.9,
+        ...options.routeOverride
       };
     },
     async planSupportEvidence(
@@ -141,7 +144,8 @@ function createAdapter(options: {
           behavior_queries: [input.query]
         },
         evidence_priority: [],
-        required_doc_kinds: ["openapi/api"]
+        required_doc_kinds: ["openapi/api"],
+        ...options.evidencePlanOverride
       };
     },
     async selectSupportEvidence(
@@ -426,6 +430,140 @@ test("runSupportSearchAgent keeps clarification only when blocking missing info 
   }
 });
 
+test("runSupportSearchAgent uses customer answer composer for clarification replies", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = "/tmp/__missing_local_docs__";
+  const adapter = createAdapter({
+    missingInfo: ["the workspace where the token is being used"],
+    verification: {
+      verdict: "unsupported",
+      missing_info: ["the workspace where the token is being used"]
+    }
+  });
+  let composeCalled = false;
+  adapter.composeCustomerAnswer = async (input) => {
+    composeCalled = true;
+    return {
+      question_type: input.route.question_type,
+      render_variant: "clarification",
+      direct_answer: "Please confirm which workspace the token belongs to before I continue.",
+      sections: [],
+      why: [],
+      what_to_do_now: ["Share the workspace name or URL."],
+      still_need_to_confirm: ["the workspace where the token is being used"]
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "reset api token access",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-clarification-composer"
+    });
+
+    assert.equal(composeCalled, true);
+    assert.equal(result.result.support_answer?.mode, "clarification");
+    assert.equal(result.result.answer, "Please confirm which workspace the token belongs to before I continue.");
+    assert.deepEqual(result.result.support_answer?.what_to_do_now, ["Share the workspace name or URL."]);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+  }
+});
+
+test("runSupportSearchAgent uses customer answer composer for handoff replies", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = "/tmp/__missing_local_docs__";
+  const adapter = createAdapter({});
+  let composeCalled = false;
+  adapter.composeCustomerAnswer = async (input) => {
+    composeCalled = true;
+    return {
+      question_type: input.route.question_type,
+      render_variant: "handoff",
+      direct_answer: "I cannot verify this from documentation, so the next step is to create a ticket with the current evidence.",
+      sections: [],
+      why: [],
+      what_to_do_now: ["Create the ticket draft now."],
+      still_need_to_confirm: []
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "reset api token access",
+      language: "en",
+      currentRound: env.AI_SEARCH_MAX_CLARIFICATION_ROUNDS,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-handoff-composer"
+    });
+
+    assert.equal(composeCalled, true);
+    assert.equal(result.result.support_answer?.mode, "handoff");
+    assert.equal(
+      result.result.answer,
+      "I cannot verify this from documentation, so the next step is to create a ticket with the current evidence."
+    );
+    assert.deepEqual(result.result.support_answer?.what_to_do_now, ["Create the ticket draft now."]);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+  }
+});
+
+test("runSupportSearchAgent records planner-driven retrieval queries in internal diagnostics", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = "/tmp/__missing_local_docs__";
+  const adapter = createAdapter({
+    queryPlan: {
+      concept_queries: ["workspace role permission inheritance"],
+      object_queries: ["role permission path"],
+      behavior_queries: ["why permission inherited after role change"]
+    },
+    evidencePlanOverride: {
+      retrieval_rounds: 2,
+      allow_refinement: false
+    },
+    verification: {
+      verdict: "unsupported",
+      missing_info: ["the exact permission path"]
+    }
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "why is this permission inherited",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-retrieval-query-graph"
+    });
+
+    const diagnostics = result.result.internal_diagnostics;
+    assert.ok(diagnostics);
+    assert.deepEqual(diagnostics.stage_budget, {
+      retrieval_rounds: 2,
+      allow_refinement: false,
+      stop_after_grounded_evidence: false,
+      specialist_budget: 1
+    });
+    assert.equal(
+      diagnostics.retrieval_queries_used.includes("workspace role permission inheritance"),
+      true
+    );
+    assert.equal(diagnostics.retrieval_queries_used.includes("role permission path"), true);
+    assert.equal(
+      diagnostics.retrieval_queries_used.includes("why permission inherited after role change"),
+      true
+    );
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+  }
+});
+
 test("runSupportSearchAgent removes unsupported auxiliary claims without downgrading a supported core answer", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
@@ -501,6 +639,229 @@ write:project:issue-comment: Add, edit, delete issue comments
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });
   }
+});
+
+test("runSupportSearchAgent uses fast multi-agent path for grounded how-to answers", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+  await writeFixture(
+    rootDir,
+    "docs/import-data-into-ones/rebuild-indexes-after-migration.mdx",
+    `---
+title: "Rebuild indexes after migration"
+---
+
+# Rebuild indexes after migration
+
+1. Open the migration tool.
+2. Run the rebuild indexes task.
+3. Verify the latest indexing job completed successfully.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "how_to_product",
+      specialist_agent: "howto-specialist"
+    },
+    writerAnswer: {
+      direct_answer: "要重建索引，可以直接执行迁移工具里的 rebuild indexes 任务。",
+      claims: [
+        {
+          text: "可以通过迁移工具执行 rebuild indexes 任务来重建索引。",
+          kind: "verified_fact",
+          evidence_ids: ["local:docs/import-data-into-ones/rebuild-indexes-after-migration.mdx:root"],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["执行 rebuild indexes。", "确认最新索引任务执行完成。"],
+      unknowns: [],
+      escalation_needed: false
+    }
+  });
+  adapter.writeHowToSpecialistAnswer = async () => ({
+    question_type: "how_to_product",
+    render_variant: "how_to",
+    direct_answer: "要重建索引，可以直接执行迁移工具里的 rebuild indexes 任务。",
+    claims: [
+      {
+        text: "可以通过迁移工具执行 rebuild indexes 任务来重建索引。",
+        kind: "verified_fact",
+        evidence_ids: ["local:docs/import-data-into-ones/rebuild-indexes-after-migration.mdx:root"],
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["执行 rebuild indexes。", "确认最新索引任务执行完成。"],
+    steps: ["打开迁移工具。", "执行 rebuild indexes 任务。", "确认最新索引任务执行完成。"],
+    unknowns: [],
+    escalation_needed: false
+  });
+  let judgeCalled = false;
+  let composeCalled = false;
+  let curateCalled = false;
+  let displaySelectorCalled = false;
+  adapter.judgeSupportAnswer = async () => {
+    judgeCalled = true;
+    throw new Error("judge should be skipped in fast path");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    composeCalled = true;
+    throw new Error("composer should be skipped in fast path");
+  };
+  adapter.curateSupportCitations = async () => {
+    curateCalled = true;
+    throw new Error("citation curator should be skipped in fast path");
+  };
+  adapter.selectDisplayCitations = async (input) => {
+    displaySelectorCalled = true;
+    return {
+      display_citation_ids: Array.from(new Set(input.supportedClaims.flatMap((item) => item.citation_ids))).slice(0, 3)
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "怎么重建索引",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-fast-howto"
+    });
+
+    assert.equal(judgeCalled, false);
+    assert.equal(composeCalled, false);
+    assert.equal(curateCalled, false);
+    assert.equal(displaySelectorCalled, true);
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.equal(result.result.internal_diagnostics?.fast_path_used, true);
+    assert.ok(result.result.answer.includes("重建索引"));
+    assert.equal(result.result.references.length > 0, true);
+    assert.equal(result.result.citations.length > 0, true);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent uses AI stage budget to skip specialist and emit a claim graph", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/execute-onesql.api.mdx",
+    `---
+title: "Execute ONESQL query"
+---
+
+# Execute ONESQL query
+
+The ONESQL syntax reference explicitly supports ORDER BY and GROUP BY clauses.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      specialist_budget: 0
+    },
+    evidencePlanOverride: {
+      retrieval_rounds: 1,
+      allow_refinement: false,
+      stop_after_grounded_evidence: true
+    },
+    verification: {
+      verdict: "verified",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: [],
+      display_citation_ids: [],
+      verified_claims: ["The ONESQL syntax reference explicitly supports ORDER BY and GROUP BY clauses."],
+      claim_to_citation_map: []
+    }
+  });
+  adapter.verifySupportAnswer = async (input) => {
+    const cited = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].find((item) =>
+      /execute onesql query/i.test(item.title)
+    );
+    const verifiedId = cited?.documentId ? [cited.documentId] : [];
+    return {
+      verdict: "verified",
+      summary: "The cited ONESQL syntax page directly supports the answer.",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: verifiedId,
+      display_citation_ids: verifiedId,
+      verified_claims: ["The ONESQL syntax reference explicitly supports ORDER BY and GROUP BY clauses."],
+      claim_to_citation_map: [
+        {
+          text: "The ONESQL syntax reference explicitly supports ORDER BY and GROUP BY clauses.",
+          kind: "verified_fact",
+          verdict: "verified",
+          citation_ids: verifiedId
+        }
+      ]
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "does ONESQL support ORDER BY and GROUP BY?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-stage-budget-claim-graph"
+    });
+
+    const diagnostics = result.result.internal_diagnostics;
+    assert.ok(diagnostics);
+    assert.equal(result.stageTimings.writer.status, "skipped");
+    assert.equal(diagnostics.specialist_skipped, true);
+    assert.deepEqual(diagnostics.stage_budget, {
+      retrieval_rounds: 1,
+      allow_refinement: false,
+      stop_after_grounded_evidence: true,
+      specialist_budget: 0
+    });
+    assert.deepEqual(diagnostics.claim_graph, [
+      {
+        text: "The ONESQL syntax reference explicitly supports ORDER BY and GROUP BY clauses.",
+        kind: "verified_fact",
+        verdict: "verified",
+        citation_ids: result.result.citations.map((item) => item.id),
+        has_citation: true
+      }
+    ]);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent reports dedicated selector stages in orchestration trace instead of main fallback", async () => {
+  const adapter = createAdapter({
+    verification: {
+      verdict: "unsupported",
+      missing_info: ["the exact object or scenario"]
+    }
+  });
+
+  const result = await runSupportSearchAgent({
+    query: "which scope is needed to create an issue comment",
+    language: "en",
+    currentRound: 0,
+    conversationHistory: [],
+    adapter,
+    idempotencyKey: "support-agent-selector-stage-trace"
+  });
+
+  const trace = result.result.internal_diagnostics?.orchestration_trace ?? [];
+  const evidenceSelector = trace.find((item) => item.stage === "support-evidence-selector");
+  assert.ok(evidenceSelector);
+  assert.equal(evidenceSelector?.agent_id, "support-evidence-selector");
 });
 
 test("runSupportSearchAgent only displays claim-linked citations even when unrelated references are retrieved", async () => {

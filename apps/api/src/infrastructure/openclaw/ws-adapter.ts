@@ -288,12 +288,43 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   private consecutiveFailures = 0;
   private readonly requestedScopes = env.OPENCLAW_REQUEST_SCOPES.split(",").map((item) => item.trim()).filter(Boolean);
 
-  async healthCheck() {
+  async healthCheck(input?: { agentIds?: string[] }) {
+    const configuredAgents = [...new Set((input?.agentIds ?? []).map((item) => String(item).trim()).filter(Boolean))];
     try {
       await this.connectOnly();
-      return { ok: true, mode: "ws" as const, detail: "Connected to OpenClaw gateway" };
+      const registry = (await this.callMethod("agents.list", {}, Math.min(env.OPENCLAW_METHOD_TIMEOUT_MS, 10000))) as {
+        agents?: Array<{ id?: string }>;
+      } | null;
+      const liveAgents = new Set(
+        Array.isArray(registry?.agents) ? registry.agents.map((item) => String(item?.id ?? "").trim()).filter(Boolean) : []
+      );
+      const reachableAgents = configuredAgents.filter((agentId) => liveAgents.has(agentId));
+      const unreachableAgents = configuredAgents
+        .filter((agentId) => !liveAgents.has(agentId))
+        .map((agentId) => ({ agentId, detail: "Agent is not present in live OpenClaw registry" }));
+      return {
+        ok: unreachableAgents.length === 0,
+        mode: "ws" as const,
+        detail:
+          unreachableAgents.length === 0
+            ? "Connected to OpenClaw gateway and all configured agents are reachable"
+            : "Connected to OpenClaw gateway but some configured agents are unreachable",
+        configuredAgents,
+        reachableAgents,
+        unreachableAgents
+      };
     } catch (error) {
-      return { ok: false, mode: "ws" as const, detail: (error as Error).message };
+      return {
+        ok: false,
+        mode: "ws" as const,
+        detail: (error as Error).message,
+        configuredAgents,
+        reachableAgents: [],
+        unreachableAgents: configuredAgents.map((agentId) => ({
+          agentId,
+          detail: (error as Error).message
+        }))
+      };
     }
   }
 
@@ -713,6 +744,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Select only documentation chunks that directly help answer the user's question.",
       "- Prioritize sources that explicitly discuss the queried object, rule, syntax, API, scope, or behavior.",
       "- Follow case_frame.required_doc_kinds strictly when strong matches exist.",
+      "- For how_to_product, config_setup, and data_export_reporting: if both product guides and deployment runbooks are present, choose the document that gives the most direct executable procedure for the user’s stated task as primary.",
+      "- For how_to_product, config_setup, and data_export_reporting: keep deployment/private_deployment troubleshooting docs as primary only when the user question itself is clearly infra/deployment-oriented or the candidate directly matches the reported symptom; otherwise keep them supplemental.",
+      "- Use supportMetadata.deployment_model, product_area, evidence_kind, prerequisites, and limitations when deciding which evidence is the best fit.",
       "- For api_field_lookup, prefer the operation that returns the current object details; list or enum endpoints should be supplemental unless the question explicitly asks for the list.",
       "- For capability_confirmation and why_behavior about syntax or operators, prefer syntax/reference docs before general product guides.",
       "- Reject tangential sources even if they are from the same product area.",

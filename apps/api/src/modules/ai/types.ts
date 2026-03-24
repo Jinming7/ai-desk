@@ -18,6 +18,12 @@ export interface SearchReference {
   retrievedAt: string;
 }
 
+export interface ConversationTurn {
+  role: "user" | "assistant";
+  content: string;
+  at?: string;
+}
+
 export interface SupportQueryPlan {
   concept_queries: string[];
   object_queries: string[];
@@ -49,12 +55,16 @@ export interface SupportQuestionRoute {
   answer_contract: string;
   specialist_agent: SupportSpecialistAgent;
   routing_confidence: number;
+  specialist_budget?: number;
 }
 
 export interface SupportEvidencePlan {
   query_plan: SupportQueryPlan;
   evidence_priority: string[];
   required_doc_kinds: string[];
+  retrieval_rounds?: number;
+  allow_refinement?: boolean;
+  stop_after_grounded_evidence?: boolean;
 }
 
 export interface SupportCaseFrame {
@@ -125,6 +135,12 @@ export type SupportAnswerSection =
       kind: "bullet_list";
       title: string;
       items: string[];
+    }
+  | {
+      kind: "code_block";
+      title: string;
+      code: string;
+      language?: string;
     }
   | {
       kind: "api_card";
@@ -240,6 +256,7 @@ export interface SearchModeResult {
   session_id: string;
   answer: string;
   answer_language: "zh" | "en";
+  delivery_mode?: "agent_orchestrated" | "kb_direct";
   case_frame?: SupportCaseFrame;
   support_answer?: SupportAnswer;
   verification?: SupportVerificationResult;
@@ -264,6 +281,41 @@ export interface SearchModeResult {
   clarification_round: number;
   show_create_ticket_now: boolean;
   follow_up_question: string | null;
+  internal_diagnostics?: {
+    case_id?: string;
+    route: SupportQuestionRoute;
+    evidence_plan: SupportEvidencePlan;
+    stage_budget: {
+      retrieval_rounds: number;
+      allow_refinement: boolean;
+      stop_after_grounded_evidence: boolean;
+      specialist_budget: number;
+    };
+    retrieval_queries_used: string[];
+    retrieval_queries_refined: string[];
+    claim_graph: Array<{
+      text: string;
+      kind: SupportClaimKind;
+      verdict: "verified" | "supported_inference" | "unsupported";
+      citation_ids: string[];
+      has_citation: boolean;
+    }>;
+    specialist_skipped: boolean;
+    specialists_used?: string[];
+    evidence_sources?: string[];
+    fast_path_used?: boolean;
+    confirmed_facts?: string[];
+    search_agents_used?: Array<{
+      stage: "retrieval" | "clarify" | "execution";
+      agent_id: string;
+      session_key: string;
+    }>;
+    orchestration_trace?: Array<{
+      stage: string;
+      agent_id: string;
+      model?: string | null;
+    }>;
+  };
 }
 
 export interface ChatTicketDraftField {
