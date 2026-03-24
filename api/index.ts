@@ -8,7 +8,7 @@ let runtimeReadyPromise: Promise<void> | null = null;
 
 async function loadAppModule(): Promise<LoadedApp> {
   if (!loadedAppPromise) {
-    loadedAppPromise = import("../apps/api/src/app.ts").then((mod) => ({
+    loadedAppPromise = import("../apps/api/dist/app.js").then((mod) => ({
       app: mod.app,
       ensureAiRuntimeReady: mod.ensureAiRuntimeReady
     }));
