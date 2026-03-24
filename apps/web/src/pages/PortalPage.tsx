@@ -12,7 +12,7 @@ import {
   submitChatTicketDraft,
   uploadAttachment
 } from "../lib/api";
-import type { AiCapabilities, ChatTicketDraft, OnesTicketType, SearchResult, UploadedAttachment } from "../lib/types";
+import type { AiCapabilities, ChatTicketDraft, ConversationTurn, OnesTicketType, SearchResult, UploadedAttachment } from "../lib/types";
 
 const services = [
   {
@@ -297,6 +297,7 @@ export function PortalPage() {
   );
   const showCreateTicketNow = Boolean(latestResult?.show_create_ticket_now);
   const detailResult = latestResult;
+  const isKbDirectFallback = detailResult?.delivery_mode === "kb_direct";
   const primaryCitation = latestResult?.citations?.[0] ?? null;
   const moreCitations = latestResult?.citations?.slice(1, 3) ?? [];
   const latestUserQuestion = chatMessages.filter((item) => item.role === "user").at(-1)?.content ?? query;
@@ -326,8 +327,8 @@ export function PortalPage() {
   const summaryHeading = supportAnswer
     ? supportAnswer.mode === "clarification"
       ? uiLang === "zh"
-        ? "当前判断"
-        : "Current assessment"
+        ? "当前结论"
+        : "Current answer"
       : supportAnswer.mode === "handoff"
       ? uiLang === "zh"
         ? "当前结论"
@@ -341,8 +342,8 @@ export function PortalPage() {
       : "Diagnosis"
     : answerStyle === "clarification"
     ? uiLang === "zh"
-      ? "当前判断"
-      : "Current assessment"
+      ? "当前结论"
+      : "Current answer"
     : copy.oneLineConclusion;
   const handoffCtaText = buildHandoffCtaCopy({
     lang: uiLang,
@@ -571,7 +572,10 @@ export function PortalPage() {
 
   const executeSearch = async (userInput: string, appendUserBubble = true) => {
     if (userInput.trim().length < 2 && composerAttachments.length === 0) return;
-    const priorConversation = chatMessages.map((item) => item.content);
+    const priorConversation: ConversationTurn[] = chatMessages.map((item) => ({
+      role: item.role,
+      content: item.content
+    }));
     const pendingAttachments = composerAttachments;
     if (appendUserBubble) {
       setChatMessages((prev) => [
@@ -659,7 +663,10 @@ export function PortalPage() {
       const draft = await createChatTicketDraft({
         sessionId: latestResult.session_id,
         question: chatMessages.filter((item) => item.role === "user").at(-1)?.content ?? "",
-        conversation: chatMessages.map((item) => item.content),
+        conversation: chatMessages.map((item): ConversationTurn => ({
+          role: item.role,
+          content: item.content
+        })),
         retrievalTraces: latestResult.citations
       });
       setChatDraft(draft);
@@ -866,6 +873,11 @@ export function PortalPage() {
           {!inChatMode && searchError && <p className="mt-3 text-sm text-rose-600">{searchError}</p>}
           {detailResult && (
             <div className={`chat-no-x-scroll mt-6 w-full max-w-[1080px] rounded-2xl border border-[#D1D5DB] bg-white/92 p-5 text-left ${inChatMode ? "" : "md:w-[70%]"}`}>
+              {isKbDirectFallback && (
+                <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+                  {uiLang === "zh" ? "直接从 KB 检索" : "Directly retrieve from KB"}
+                </div>
+              )}
               <div className="min-w-0 rounded-2xl border border-slate-200 bg-[linear-gradient(180deg,#FFFFFF_0%,#F8FAFF_100%)] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.75)]">
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                   {summaryHeading}
@@ -959,14 +971,43 @@ export function PortalPage() {
                           );
                         }
 
-                        return (
-                          <div key={`${section.title}-${idx}`}>
-                            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{section.title}</p>
-                            <div className="mt-2 space-y-2 text-sm text-slate-800">
-                              {renderReadableText(section.body, `support-section-${idx}`, "detail")}
+                        if (section.kind === "code_block") {
+                          const copyId = `support-code-${idx}`;
+                          return (
+                            <div key={`${section.title}-${idx}`}>
+                              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{section.title}</p>
+                              <div className="mt-2 overflow-hidden rounded-2xl border border-slate-200 bg-slate-950">
+                                <div className="flex items-center justify-between border-b border-slate-800 px-3 py-2 text-[11px] uppercase tracking-wide text-slate-300">
+                                  <span>{section.language || "text"}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => void copyCodeText(section.code, copyId)}
+                                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-slate-300 hover:bg-slate-800 hover:text-white"
+                                  >
+                                    {copiedCodeId === copyId ? <Check size={12} /> : <Copy size={12} />}
+                                    <span>{uiLang === "zh" ? "复制" : "Copy"}</span>
+                                  </button>
+                                </div>
+                                <pre className="overflow-x-auto p-3 text-sm leading-6 text-slate-100">
+                                  <code>{section.code}</code>
+                                </pre>
+                              </div>
                             </div>
-                          </div>
-                        );
+                          );
+                        }
+
+                        if (section.kind === "paragraph") {
+                          return (
+                            <div key={`${section.title}-${idx}`}>
+                              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{section.title}</p>
+                              <div className="mt-2 space-y-2 text-sm text-slate-800">
+                                {renderReadableText(section.body, `support-section-${idx}`, "detail")}
+                              </div>
+                            </div>
+                          );
+                        }
+
+                        return null;
                       })}
                     </div>
                   ) : supportSteps.length > 0 ? (
@@ -996,16 +1037,8 @@ export function PortalPage() {
                 </div>
               ) : detailResult.structured_answer ? (
                 <div className="mt-4 space-y-3 rounded-2xl border border-slate-200 bg-slate-50/85 p-4">
-                  {detailResult.structured_answer.assessment && answerStyle === "diagnosis" && (
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{uiLang === "zh" ? "判断依据" : "Assessment"}</p>
-                      <div className="mt-2 space-y-2 text-sm text-slate-800">
-                        {renderReadableText(detailResult.structured_answer.assessment, "assessment", "detail")}
-                      </div>
-                    </div>
-                  )}
                   {(detailResult.structured_answer.steps?.length ?? 0) > 0 && (
-                    <div className={detailResult.structured_answer.assessment ? "mt-3" : "mt-2"}>
+                    <div className="mt-2">
                       <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                         {answerStyle === "diagnosis"
                           ? uiLang === "zh"

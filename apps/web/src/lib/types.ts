@@ -241,6 +241,7 @@ export interface SearchResult {
   verification?: SearchVerificationSummary;
   structured_answer?: {
     summary: string;
+    assessment?: string;
     steps: string[];
     validation: string[];
     required_inputs?: string[];
