@@ -4,6 +4,7 @@ import type {
   AiAgentMode,
   AiEscalation,
   OnesCatalogStatus,
+  ConversationTurn,
   OnesConfigHistoryItem,
   ChatTicketDraft,
   OnesProjectIssueType,
@@ -144,7 +145,7 @@ export async function searchKnowledge(input: {
   imageAttachments?: string[];
   attachments?: string[];
   sessionId?: string;
-  conversation?: string[];
+  conversation?: ConversationTurn[];
   answerLanguage?: "zh" | "en";
 }): Promise<SearchResult> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -174,9 +175,15 @@ export async function searchKnowledge(input: {
     if (retryable) {
       throw new Error("Knowledge base is temporarily busy. Please retry in a few seconds.");
     }
-    throw new Error("Failed to search knowledge base");
+    try {
+      const parsed = JSON.parse(errorText) as { error?: unknown };
+      const message = typeof parsed.error === "string" ? parsed.error.trim() : "";
+      throw new Error(message || "AI support request failed");
+    } catch {
+      throw new Error(errorText.trim() || "AI support request failed");
+    }
   }
-  throw new Error("Failed to search knowledge base");
+  throw new Error("AI support request failed");
 }
 
 export async function getAiCapabilities(): Promise<AiCapabilities> {
@@ -191,7 +198,7 @@ export async function getAiCapabilities(): Promise<AiCapabilities> {
 export async function createChatTicketDraft(input: {
   sessionId: string;
   question: string;
-  conversation: string[];
+  conversation: ConversationTurn[];
   retrievalTraces?: unknown[];
 }): Promise<ChatTicketDraft> {
   const res = await fetch(`${API}/api/v1/ai/handoff/draft`, {
@@ -250,7 +257,7 @@ export async function submitChatTicketDraft(input: {
 export async function createQuickEscalation(input: {
   sessionId: string;
   question: string;
-  conversation: string[];
+  conversation: ConversationTurn[];
   reasonCode: "NO_MATCHING_KB" | "LOW_CONFIDENCE" | "KB_RETRIEVAL_UNAVAILABLE";
 }): Promise<AiEscalation> {
   const res = await fetch(`${API}/api/v1/ai/escalations`, {

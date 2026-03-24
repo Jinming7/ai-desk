@@ -1,13 +1,24 @@
-let appPromise: Promise<(req: any, res: any) => unknown> | null = null;
+import { app, ensureAiRuntimeReady } from "../apps/api/src/app.js";
 
-async function loadApp() {
-  if (!appPromise) {
-    appPromise = import("../apps/api/src/app.js").then((mod) => mod.app);
+let runtimeReadyPromise: Promise<void> | null = null;
+
+async function ensureRuntimeReadyOnce() {
+  if (!runtimeReadyPromise) {
+    runtimeReadyPromise = ensureAiRuntimeReady().catch((error) => {
+      runtimeReadyPromise = null;
+      throw error;
+    });
   }
-  return appPromise;
+  return runtimeReadyPromise;
 }
 
 export default async function handler(req: any, res: any) {
-  const app = await loadApp();
-  return app(req, res);
+  try {
+    await ensureRuntimeReadyOnce();
+    return app(req, res);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Vercel API bootstrap failed";
+    console.error("[vercel-api] bootstrap failure:", message);
+    res.status(503).json({ error: message });
+  }
 }
