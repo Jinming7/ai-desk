@@ -1147,22 +1147,36 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   ): Promise<Omit<SupportAnswer, "mode">> {
     const prompt = [
       "You are the Answer Composer Agent for a customer-facing support engineer system.",
-      "Return ONLY valid JSON with keys: question_type, render_variant, direct_answer, sections([{kind,title,body?,items?,method?,path?,required_params?,auth_scope?,response_field_hint?,important_note?,related_variant?}]), why(string[]), what_to_do_now(string[]), still_need_to_confirm(string[])",
+      "Return ONLY valid JSON with keys: question_type, render_variant, direct_answer, sections([{kind,title,body?,items?,code?,language?,method?,path?,required_params?,auth_scope?,response_field_hint?,important_note?,related_variant?}]), why(string[]), what_to_do_now(string[]), still_need_to_confirm(string[])",
       "Rules:",
-      "- The answer must be customer-facing and useful.",
+      "- The answer must be customer-facing, directly useful, and structurally organized.",
       "- Do not output internal reasoning labels like verification, unsupported claims, evidence gap, or why this is still needed.",
       "- Use polite, professional, and measured wording.",
-      "- The content must adapt to the routed question type.",
-      "- API answers should prioritize the exact endpoint details first, and they should answer the likely primary route before mentioning nearby variants.",
-      "- For API answers, do not start with generic uncertainty if there is at least one supported operation or field answer. State that supported answer directly and then note the nearby variant or remaining uncertainty.",
-      "- Why answers should prioritize the most likely explanation first.",
-      "- For behavior/capability answers, do not start with generic partial wording like 'I can confirm part of the answer'. State the narrow supported conclusion directly.",
-      "- How-to answers should prioritize steps and prerequisites.",
+      "- The first sentence must answer the user's actual question, not describe your process.",
+      "- Use the same language as the user.",
+      "- Do not end with invitation filler such as 'let me know' or 'I can also continue'.",
       "- If the draft or supported claims already contain concrete documented actions, restate them directly. Do not send the user to a document section as the main answer.",
       "- Avoid doc-navigation wording such as 'go read section', 'refer to chapter', 'open the documentation', or '按《xxx》执行' unless no actionable content is available.",
-      "- Troubleshooting answers should prioritize recommended checks and follow-up info.",
+      "- The content must adapt to the routed question type and render_variant.",
+      "- `why` must be short grounded support points, not a second answer body.",
+      "- `what_to_do_now` must be short executable actions, not document-reading suggestions.",
+      "- `still_need_to_confirm` must contain only the minimum unresolved items.",
+      "- Section titles must also be in the user's language.",
+      "- Prefer 2 to 3 sections. Do not repeat the same sentence across direct_answer, sections, and what_to_do_now.",
+      "- If a code snippet or shell command is genuinely useful, use a `code_block` section instead of burying it inside prose.",
+      "- For render_variant=api, structure the answer as: 1) `接口信息` / `API information` using an `api_card`; 2) `必填参数及获取方式` / `Required parameters and how to get them`; 3) `关键说明` / `Key notes`.",
+      "- For render_variant=how_to, structure the answer as: 1) `操作步骤` / `Steps`; 2) `前提条件` / `Prerequisites` if present; 3) `关键说明` / `Notes` if present.",
+      "- For render_variant=behavior, structure the answer as: 1) `结论说明` / `Conclusion`; 2) `已确认事实` / `Confirmed facts`; 3) `需要注意` / `What to watch` if useful.",
+      "- For render_variant=troubleshooting, structure the answer as: 1) `高概率原因` / `Most likely causes`; 2) `直接排查动作` / `Checks to run now`; 3) `还需要补充` / `Still needed` only when truly blocking.",
+      "- For mode=clarification, keep the direct answer brief and add a single section like `还需要你补充` / `Need from you` with only the minimum missing items.",
+      "- For mode=handoff, keep the direct answer brief and add a section like `建议你现在做什么` / `What to do now` with the minimum ticket-ready actions.",
+      "- API answers should prioritize the exact endpoint details first, and they should answer the likely primary route before mentioning nearby variants.",
+      "- For API answers, do not start with generic uncertainty if there is at least one supported operation or field answer. State that supported answer directly and then note the nearby variant or remaining uncertainty.",
+      "- For behavior/capability answers, do not start with generic partial wording like 'I can confirm part of the answer'. State the narrow supported conclusion directly.",
+      "- Troubleshooting answers should prioritize the most likely causes and immediate checks instead of abstract explanations.",
       `language: ${input.language}`,
       `mode: ${input.mode}`,
+      `user_query: ${input.query}`,
       `route: ${JSON.stringify(input.route)}`,
       `case_frame: ${JSON.stringify(input.caseFrame)}`,
       `draft_support_answer: ${JSON.stringify(compactSpecialistDraftAnswer(input.draftSupportAnswer))}`,
@@ -1198,6 +1212,14 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         ? parsed.sections
             .map((item) => item as Record<string, unknown>)
             .map((item) => {
+              if (item.kind === "code_block") {
+                return {
+                  kind: "code_block" as const,
+                  title: typeof item.title === "string" ? item.title : "",
+                  code: typeof item.code === "string" ? item.code : "",
+                  language: typeof item.language === "string" ? item.language : undefined
+                };
+              }
               if (item.kind === "api_card") {
                 return {
                   kind: "api_card" as const,
@@ -1224,7 +1246,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
                 body: typeof item.body === "string" ? item.body : ""
               };
             })
-            .filter((item) => item.title && (item.kind !== "paragraph" || item.body))
+            .filter((item) => item.title && (item.kind !== "paragraph" || item.body) && (item.kind !== "code_block" || item.code))
         : [],
       why: Array.isArray(parsed.why) ? parsed.why.map((item) => String(item)).filter(Boolean) : [],
       what_to_do_now: Array.isArray(parsed.what_to_do_now) ? parsed.what_to_do_now.map((item) => String(item)).filter(Boolean) : [],

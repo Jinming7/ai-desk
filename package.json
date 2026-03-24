@@ -2,6 +2,9 @@
   "name": "nexusflow",
   "private": true,
   "version": "0.1.0",
+  "engines": {
+    "node": ">=20.20.1 <21"
+  },
   "workspaces": [
     "apps/api",
     "apps/web"

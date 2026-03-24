@@ -468,6 +468,13 @@ test("runSupportSearchAgent uses customer answer composer for clarification repl
     assert.equal(result.result.support_answer?.mode, "clarification");
     assert.equal(result.result.answer, "Please confirm which workspace the token belongs to before I continue.");
     assert.deepEqual(result.result.support_answer?.what_to_do_now, ["Share the workspace name or URL."]);
+    assert.deepEqual(result.result.support_answer?.sections, [
+      {
+        kind: "bullet_list",
+        title: "Need from you",
+        items: ["the workspace where the token is being used"]
+      }
+    ]);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
   }
@@ -508,6 +515,13 @@ test("runSupportSearchAgent uses customer answer composer for handoff replies", 
       "I cannot verify this from documentation, so the next step is to create a ticket with the current evidence."
     );
     assert.deepEqual(result.result.support_answer?.what_to_do_now, ["Create the ticket draft now."]);
+    assert.deepEqual(result.result.support_answer?.sections, [
+      {
+        kind: "bullet_list",
+        title: "What to do now",
+        items: ["Create the ticket draft now."]
+      }
+    ]);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
   }
@@ -735,10 +749,78 @@ title: "Rebuild indexes after migration"
     assert.equal(curateCalled, false);
     assert.equal(displaySelectorCalled, true);
     assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.deepEqual(
+      result.result.support_answer?.sections.map((section) => section.title),
+      ["操作步骤"]
+    );
     assert.equal(result.result.internal_diagnostics?.fast_path_used, true);
     assert.ok(result.result.answer.includes("重建索引"));
     assert.equal(result.result.references.length > 0, true);
     assert.equal(result.result.citations.length > 0, true);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent keeps API answers structurally organized in fast path fallback", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/04-update-a-issue.api.mdx",
+    `---
+title: "Update a issue"
+---
+
+# Update a issue
+
+通过 PUT /project/issues/{issueID} 更新工作项。
+`
+  );
+
+  const adapter = createAdapter({});
+  adapter.writeApiSpecialistAnswer = async () => ({
+    question_type: "api_endpoint_lookup",
+    render_variant: "api",
+    direct_answer: "更新工作项可以使用更新工作项接口。",
+    claims: [
+      {
+        text: "可以通过 PUT /project/issues/{issueID} 更新工作项。",
+        kind: "verified_fact",
+        evidence_ids: ["local:open-docs/docs/openapi/api/04-update-a-issue.api.mdx:root"],
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["先准备 `teamID` 和 `issueID`。", "再提交更新字段的请求体。"],
+    unknowns: [],
+    api_method: "PUT",
+    api_path: "https://openapi.ones.pro/project/issues/{issueID}?teamID={teamID}",
+    required_params: ["`teamID`：从团队 URL 中获取。", "`issueID`：先通过查询接口拿到 UUID。"],
+    auth_scope: ["`write:project:issue`"],
+    response_field_hint: "返回更新后的工作项数据。",
+    important_note: "`issueID` 必须是 UUID，不能直接使用 `OPS-1` 这类编号。",
+    related_variant: "如果要先拿状态列表，可使用状态列表接口。",
+    escalation_needed: false
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "怎么通过接口更新工作项？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-fast-api-structure"
+    });
+
+    assert.equal(result.result.support_answer?.render_variant, "api");
+    assert.deepEqual(
+      result.result.support_answer?.sections.map((section) => section.title),
+      ["接口信息", "必填参数及获取方式", "关键说明"]
+    );
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });
@@ -929,15 +1011,17 @@ title: "获取工作项状态列表"
 
   await writeFixture(
     rootDir,
-    "docs/account-settings/account-binding.mdx",
+    "docs/ones-project/integrations/how-to-configure-multiple-integrations-ad-cas.mdx",
     `---
-title: "绑定账号"
+title: "如何配置多个集成?以 AD 和 CAS 为例"
+description: "支持的版本+ 集成 AD 和 CAS 仅在本地部署版本中可用。"
 slug: /admin/account-integration/start-to-account-integration/account-binding-or-unbinding
 sidebarposition: 2
 ---
 
-# 绑定账号
+# 如何配置多个集成?以 AD 和 CAS 为例
 
+支持的版本+ 集成 AD 和 CAS 仅在本地部署版本中可用。
 在添加 CAS 页面选择账号绑定方式时，需要选择“自动绑定具有相同唯一标识符的同步源账号”。
 `
   );
@@ -964,7 +1048,7 @@ sidebarposition: 2
     assert.match(String(result.caseFrame.question_type ?? ""), /^api_/);
     assert.equal(result.result.references.length > 0, true);
     assert.match(result.result.references[0]?.path ?? "", /open-docs\/docs\/openapi\/api\//);
-    assert.doesNotMatch(result.result.answer, /sidebarposition|slug:\s*\/admin\/account-integration/i);
+    assert.doesNotMatch(result.result.answer, /sidebarposition|slug:\s*\/admin\/account-integration|AD 和 CAS|本地部署版本中可用/i);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

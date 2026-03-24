@@ -41,6 +41,10 @@ function uniqueStrings(input: Array<string | undefined | null>, limit = 6): stri
   return values;
 }
 
+function localizedSectionTitle(language: "zh" | "en", zh: string, en: string): string {
+  return language === "zh" ? zh : en;
+}
+
 function isLowSignalMissingInfo(item: string): boolean {
   const normalized = item.trim().toLowerCase();
   return (
@@ -552,6 +556,13 @@ function fallbackSupportAnswer(input: {
         mode: "handoff",
         direct_answer: "抱歉，当前还没有足够的已验证证据形成可靠结论。建议直接创建工单，我会自动预填当前上下文。",
         why: [],
+        sections: [
+          {
+            kind: "bullet_list",
+            title: "建议你现在做什么",
+            items: ["点击“Create ticket now”生成工单草稿。", "补充报错原文、复现步骤和影响范围。"]
+          }
+        ],
         what_to_do_now: ["点击“Create ticket now”生成工单草稿。", "补充报错原文、复现步骤和影响范围。"],
         still_need_to_confirm: []
       };
@@ -562,6 +573,15 @@ function fallbackSupportAnswer(input: {
         mode: "clarification",
         direct_answer: "为了给你更可靠的结论，我还缺少一个关键信息。",
         why: [],
+        sections: input.missingInfo.length
+          ? [
+              {
+                kind: "bullet_list",
+                title: "还需要你补充",
+                items: input.missingInfo.slice(0, 3)
+              }
+            ]
+          : [],
         what_to_do_now: [input.missingInfo[0] ? `请先补充：${input.missingInfo[0]}` : "请先补充最关键的一条上下文。"],
         still_need_to_confirm: input.missingInfo.slice(0, 3)
       };
@@ -572,6 +592,15 @@ function fallbackSupportAnswer(input: {
         mode: "partial",
         direct_answer: "我可以先给出当前最可能的判断，但还有一部分结论尚未被文档直接确认。",
         why: [],
+        sections: input.missingInfo.length
+          ? [
+              {
+                kind: "bullet_list",
+                title: "还需要确认",
+                items: input.missingInfo.slice(0, 3)
+              }
+            ]
+          : [],
         what_to_do_now: [],
         still_need_to_confirm: input.missingInfo.slice(0, 3)
       };
@@ -592,6 +621,13 @@ function fallbackSupportAnswer(input: {
       mode: "handoff",
       direct_answer: "I’m sorry, but there is still not enough verified evidence for a reliable final answer. Create a ticket now and I will prefill the current context.",
       why: [],
+      sections: [
+        {
+          kind: "bullet_list",
+          title: "What to do now",
+          items: ["Create a ticket draft from this conversation.", "Add the exact error, repro steps, and impact scope."]
+        }
+      ],
       what_to_do_now: ["Create a ticket draft from this conversation.", "Add the exact error, repro steps, and impact scope."],
       still_need_to_confirm: []
     };
@@ -602,6 +638,15 @@ function fallbackSupportAnswer(input: {
       mode: "clarification",
       direct_answer: "To give you a more reliable answer, I still need one critical detail.",
       why: [],
+      sections: input.missingInfo.length
+        ? [
+            {
+              kind: "bullet_list",
+              title: "Need from you",
+              items: input.missingInfo.slice(0, 3)
+            }
+          ]
+        : [],
       what_to_do_now: [input.missingInfo[0] ? `Please share: ${input.missingInfo[0]}` : "Provide the single most important missing detail."],
       still_need_to_confirm: input.missingInfo.slice(0, 3)
     };
@@ -612,6 +657,15 @@ function fallbackSupportAnswer(input: {
       mode: "partial",
       direct_answer: "I can give the most likely answer now, but part of the conclusion is still not directly confirmed by documentation.",
       why: [],
+      sections: input.missingInfo.length
+        ? [
+            {
+              kind: "bullet_list",
+              title: "Still need to confirm",
+              items: input.missingInfo.slice(0, 3)
+            }
+          ]
+        : [],
       what_to_do_now: [],
       still_need_to_confirm: input.missingInfo.slice(0, 3)
     };
@@ -660,7 +714,13 @@ function buildEvidenceBundle(input: {
   selection?: SupportEvidenceSelection | null;
 }): SupportEvidenceBundle {
   const reranked = rerankReferencesForCaseFrame(input.references, input.query, input.caseFrame);
-  const byId = new Map(reranked.map((reference) => [reference.documentId, reference] as const));
+  const candidateReferences = String(input.caseFrame.question_type ?? "").startsWith("api_")
+    ? (() => {
+        const eligible = reranked.filter((reference) => isReferenceEligibleForCaseFrame(reference, input.caseFrame));
+        return eligible.length > 0 ? eligible : reranked;
+      })()
+    : reranked;
+  const byId = new Map(candidateReferences.map((reference) => [reference.documentId, reference] as const));
   const selectedPrimary =
     input.selection?.primary_ids
       .map((id) => byId.get(id))
@@ -675,8 +735,8 @@ function buildEvidenceBundle(input: {
   const primary = uniqueStrings(
     [
       ...selectedPrimary.map((item) => item.documentId),
-      ...collectProcedureCompanionChunkIds(reranked, selectedPrimary, input.caseFrame),
-      ...reranked.slice(0, 3).map((item) => item.documentId)
+      ...collectProcedureCompanionChunkIds(candidateReferences, selectedPrimary, input.caseFrame),
+      ...candidateReferences.slice(0, 3).map((item) => item.documentId)
     ],
     3
   )
@@ -686,9 +746,9 @@ function buildEvidenceBundle(input: {
   const supplemental = uniqueStrings(
     [
       ...selectedSupplemental.map((item) => item.documentId),
-      ...collectProcedureCompanionChunkIds(reranked, primary, input.caseFrame),
-      ...collectApiCompanionChunkIds(reranked, primary, input.caseFrame),
-      ...reranked
+      ...collectProcedureCompanionChunkIds(candidateReferences, primary, input.caseFrame),
+      ...collectApiCompanionChunkIds(candidateReferences, primary, input.caseFrame),
+      ...candidateReferences
         .filter((item) => !primary.some((primaryRef) => primaryRef.documentId === item.documentId))
         .slice(0, 5)
         .map((item) => item.documentId)
@@ -756,10 +816,16 @@ function collectApiCompanionChunkIds(
 
 function fallbackEvidenceSelection(references: SearchReference[], query: string, caseFrame: SupportCaseFrame): SupportEvidenceSelection {
   const reranked = rerankReferencesForCaseFrame(references, query, caseFrame);
+  const candidateReferences = String(caseFrame.question_type ?? "").startsWith("api_")
+    ? (() => {
+        const eligible = reranked.filter((reference) => isReferenceEligibleForCaseFrame(reference, caseFrame));
+        return eligible.length > 0 ? eligible : reranked;
+      })()
+    : reranked;
   return {
-    primary_ids: reranked.slice(0, 3).map((item) => item.documentId),
-    supplemental_ids: reranked.slice(3, 6).map((item) => item.documentId),
-    rejected_ids: reranked.slice(6).map((item) => item.documentId)
+    primary_ids: candidateReferences.slice(0, 3).map((item) => item.documentId),
+    supplemental_ids: candidateReferences.slice(3, 6).map((item) => item.documentId),
+    rejected_ids: reranked.filter((item) => !candidateReferences.some((candidate) => candidate.documentId === item.documentId)).map((item) => item.documentId)
   };
 }
 
@@ -768,6 +834,44 @@ function canonicalDocsPath(input?: string): string {
     .trim()
     .replace(/^i18n\/[^/]+\/docusaurus-plugin-content-docs-open-docs\/current\//i, "open-docs/docs/")
     .replace(/^i18n\/[^/]+\/docusaurus-plugin-content-docs\/current\//i, "docs/");
+}
+
+type EvidencePolicy = {
+  strict: boolean;
+  preferredPathPrefixes: string[];
+  allowedProductAreas: string[];
+  allowedEvidenceKinds: string[];
+};
+
+function buildEvidencePolicy(caseFrame: SupportCaseFrame): EvidencePolicy | null {
+  if (!String(caseFrame.question_type ?? "").startsWith("api_")) return null;
+  if (caseFrame.question_type === "api_scope_auth") {
+    return {
+      strict: true,
+      preferredPathPrefixes: ["open-docs/docs/openapi/"],
+      allowedProductAreas: ["openapi"],
+      allowedEvidenceKinds: ["api_operation", "capability", "constraint"]
+    };
+  }
+  return {
+    strict: true,
+    preferredPathPrefixes: ["open-docs/docs/openapi/api/"],
+    allowedProductAreas: ["openapi"],
+    allowedEvidenceKinds: ["api_operation"]
+  };
+}
+
+function isReferenceEligibleForCaseFrame(reference: SearchReference, caseFrame: SupportCaseFrame): boolean {
+  const policy = buildEvidencePolicy(caseFrame);
+  if (!policy) return true;
+  const canonicalPath = canonicalDocsPath(reference.path).toLowerCase();
+  const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
+  const evidenceKind = String(metadata.evidence_kind ?? "").toLowerCase();
+  const productArea = String(metadata.product_area ?? "").toLowerCase();
+  const pathMatched = policy.preferredPathPrefixes.some((prefix) => canonicalPath.startsWith(prefix));
+  const productMatched = policy.allowedProductAreas.includes(productArea);
+  const kindMatched = policy.allowedEvidenceKinds.includes(evidenceKind);
+  return pathMatched || productMatched || kindMatched || !policy.strict;
 }
 
 function resolveLocalDocsMirrorPath(reference: SearchReference): string | null {
@@ -966,6 +1070,11 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
       ) {
         topicScore += 8;
       }
+      if (caseFrame.question_type === "api_scope_auth") {
+        if (refPath.includes("openapi/auth/") || title.includes("scope") || title.includes("permission")) {
+          topicScore += 16;
+        }
+      }
       if (caseFrame.question_type === "how_to_product" || caseFrame.question_type === "config_setup") {
         if (evidenceKind === "procedure") topicScore += 14;
         if (deploymentModel === "private_deployment" && refPath.startsWith("deploy-docs/")) topicScore += 10;
@@ -997,6 +1106,9 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
           /sidebar label|hide title|custom edit url|import apitabs|import methodendpoint/.test(snippet))
       ) {
         topicScore -= 20;
+      }
+      if (String(caseFrame.question_type ?? "").startsWith("api_") && !isReferenceEligibleForCaseFrame(reference, caseFrame)) {
+        topicScore -= 40;
       }
       if (caseFrame.deployment_model === "private_deployment" && deploymentModel && deploymentModel !== "private_deployment") {
         topicScore -= 8;
@@ -1283,50 +1395,80 @@ function buildFallbackDirectAnswerFromSupportedClaims(input: {
     : leadingClaims.join("; ");
 }
 
-function buildFallbackSectionsFromDraft(draft: SpecialistDraftAnswer): SupportAnswer["sections"] {
+function buildFallbackSectionsFromDraft(draft: SpecialistDraftAnswer, language: "zh" | "en"): SupportAnswer["sections"] {
+  const title = (zh: string, en: string) => localizedSectionTitle(language, zh, en);
   switch (draft.render_variant) {
-    case "api":
-      return draft.api_method || draft.api_path
-        ? [
-            {
-              kind: "api_card",
-              title: "API",
-              method: draft.api_method ?? "",
-              path: draft.api_path ?? "",
-              required_params: draft.required_params ?? [],
-              auth_scope: draft.auth_scope ?? [],
-              response_field_hint: draft.response_field_hint,
-              important_note: draft.important_note,
-              related_variant: draft.related_variant
-            }
-          ]
-        : [];
+    case "api": {
+      const keyNotes = uniqueStrings(
+        [
+          draft.response_field_hint
+            ? language === "zh"
+              ? `返回字段：${draft.response_field_hint}`
+              : `Response field: ${draft.response_field_hint}`
+            : undefined,
+          draft.important_note,
+          draft.related_variant
+            ? language === "zh"
+              ? `相关变体：${draft.related_variant}`
+              : `Related variant: ${draft.related_variant}`
+            : undefined
+        ],
+        4
+      );
+      return [
+        ...(draft.api_method || draft.api_path
+          ? [
+              {
+                kind: "api_card" as const,
+                title: title("接口信息", "API information"),
+                method: draft.api_method ?? "",
+                path: draft.api_path ?? "",
+                required_params: draft.required_params ?? [],
+                auth_scope: draft.auth_scope ?? [],
+                response_field_hint: draft.response_field_hint,
+                important_note: draft.important_note,
+                related_variant: draft.related_variant
+              }
+            ]
+          : []),
+        ...(draft.required_params?.length
+          ? [{ kind: "bullet_list" as const, title: title("必填参数及获取方式", "Required parameters and how to get them"), items: draft.required_params }]
+          : []),
+        ...(keyNotes.length ? [{ kind: "bullet_list" as const, title: title("关键说明", "Key notes"), items: keyNotes }] : [])
+      ];
+    }
     case "how_to":
       return [
-        ...(draft.steps?.length ? [{ kind: "bullet_list" as const, title: "Steps", items: draft.steps }] : []),
-        ...(draft.prerequisites?.length ? [{ kind: "bullet_list" as const, title: "Prerequisites", items: draft.prerequisites }] : []),
-        ...(draft.limits_or_notes?.length ? [{ kind: "bullet_list" as const, title: "Notes", items: draft.limits_or_notes }] : [])
+        ...(draft.steps?.length ? [{ kind: "bullet_list" as const, title: title("操作步骤", "Steps"), items: draft.steps }] : []),
+        ...(draft.prerequisites?.length
+          ? [{ kind: "bullet_list" as const, title: title("前提条件", "Prerequisites"), items: draft.prerequisites }]
+          : []),
+        ...(draft.limits_or_notes?.length
+          ? [{ kind: "bullet_list" as const, title: title("关键说明", "Notes"), items: draft.limits_or_notes }]
+          : [])
       ];
     case "behavior":
       return [
         ...(draft.most_likely_explanation
-          ? [{ kind: "paragraph" as const, title: "Most likely explanation", body: draft.most_likely_explanation }]
+          ? [{ kind: "paragraph" as const, title: title("结论说明", "Conclusion"), body: draft.most_likely_explanation }]
           : []),
-        ...(draft.confirmed_facts?.length ? [{ kind: "bullet_list" as const, title: "Confirmed facts", items: draft.confirmed_facts }] : []),
+        ...(draft.confirmed_facts?.length
+          ? [{ kind: "bullet_list" as const, title: title("已确认事实", "Confirmed facts"), items: draft.confirmed_facts }]
+          : []),
         ...(draft.what_to_check_next?.length
-          ? [{ kind: "bullet_list" as const, title: "What to check next", items: draft.what_to_check_next }]
+          ? [{ kind: "bullet_list" as const, title: title("需要注意", "What to watch"), items: draft.what_to_check_next }]
           : [])
       ];
     case "troubleshooting":
       return [
         ...(draft.most_likely_causes?.length
-          ? [{ kind: "bullet_list" as const, title: "Most likely causes", items: draft.most_likely_causes }]
+          ? [{ kind: "bullet_list" as const, title: title("高概率原因", "Most likely causes"), items: draft.most_likely_causes }]
           : []),
         ...(draft.recommended_checks?.length
-          ? [{ kind: "bullet_list" as const, title: "Recommended checks", items: draft.recommended_checks }]
+          ? [{ kind: "bullet_list" as const, title: title("直接排查动作", "Checks to run now"), items: draft.recommended_checks }]
           : []),
         ...(draft.required_followup_info?.length
-          ? [{ kind: "bullet_list" as const, title: "Required follow-up info", items: draft.required_followup_info }]
+          ? [{ kind: "bullet_list" as const, title: title("还需要补充", "Still needed"), items: draft.required_followup_info }]
           : [])
       ];
     default:
@@ -1394,12 +1536,47 @@ function buildSupportAnswerFromDraft(input: {
           fallback
         })
       : safeComposedDirectAnswer || fallback.direct_answer;
+  const fallbackSections = buildFallbackSectionsFromDraft(input.draft, input.language);
+  const minimalStructuredSections =
+    input.mode === "clarification" && stillNeedToConfirm.length
+      ? [
+          {
+            kind: "bullet_list" as const,
+            title: localizedSectionTitle(input.language, "还需要你补充", "Need from you"),
+            items: stillNeedToConfirm
+          }
+        ]
+      : input.mode === "handoff" && whatToDoNow.length
+      ? [
+          {
+            kind: "bullet_list" as const,
+            title: localizedSectionTitle(input.language, "建议你现在做什么", "What to do now"),
+            items: whatToDoNow
+          }
+        ]
+      : input.mode === "partial" && stillNeedToConfirm.length && !fallbackSections.length
+      ? [
+          {
+            kind: "bullet_list" as const,
+            title: localizedSectionTitle(input.language, "还需要确认", "Still need to confirm"),
+            items: stillNeedToConfirm
+          }
+        ]
+      : [];
+  const sections =
+    input.composed?.sections?.length
+      ? input.composed.sections
+      : fallbackSections.length
+      ? fallbackSections
+      : minimalStructuredSections.length
+      ? minimalStructuredSections
+      : fallback.sections;
   return {
     question_type: input.composed?.question_type ?? input.draft.question_type ?? input.route.question_type,
     render_variant: input.composed?.render_variant ?? input.draft.render_variant ?? fallback.render_variant,
     mode: input.mode,
     direct_answer: directAnswer,
-    sections: input.composed?.sections?.length ? input.composed.sections : buildFallbackSectionsFromDraft(input.draft),
+    sections,
     why: why.length ? why : fallback.why,
     what_to_do_now: whatToDoNow.length ? whatToDoNow : fallback.what_to_do_now,
     still_need_to_confirm:
@@ -1951,7 +2128,7 @@ function recoverEvidenceAnchoredApiDraft(input: {
   if (hasGroundedDraftClaims(input.draft)) return null;
 
   const ranked = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].filter(
-    (reference) => reference.authority === "canonical_visible"
+    (reference) => reference.authority === "canonical_visible" && isReferenceEligibleForCaseFrame(reference, input.caseFrame)
   );
   if (!ranked.length) return null;
 
