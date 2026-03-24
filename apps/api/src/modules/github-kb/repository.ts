@@ -565,6 +565,42 @@ export async function searchVectorCandidates(input: {
   }));
 }
 
+function uniqueStrings(input: Array<string | undefined | null>, limit = 24): string[] {
+  const seen = new Set<string>();
+  const values: string[] = [];
+  for (const item of input) {
+    const value = String(item ?? "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    values.push(value);
+    if (values.length >= limit) break;
+  }
+  return values;
+}
+
+function tokenizeRetrievalTerms(query: string): string[] {
+  const normalized = query.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) return [];
+
+  const asciiTokens = [...normalized.matchAll(/[a-z0-9][a-z0-9._/-]{1,}/g)]
+    .map((match) => match[0])
+    .filter((token) => token.length >= 2);
+  const cjkRuns = [...normalized.matchAll(/[\u3400-\u9FBF]{2,}/g)].map((match) => match[0]);
+  const cjkTokens: string[] = [];
+
+  for (const run of cjkRuns) {
+    cjkTokens.push(run);
+    if (run.length <= 4) continue;
+    for (let size = 3; size >= 2; size -= 1) {
+      for (let index = 0; index <= run.length - size && cjkTokens.length < 32; index += 1) {
+        cjkTokens.push(run.slice(index, index + size));
+      }
+    }
+  }
+
+  return uniqueStrings([...asciiTokens, ...cjkTokens], 24);
+}
+
 export async function searchKeywordCandidates(input: {
   repoId?: string;
   branch?: string;
@@ -573,141 +609,26 @@ export async function searchKeywordCandidates(input: {
 }): Promise<RetrievalHit[]> {
   const hasCjk = /[\u3400-\u9FBF]/.test(input.query);
   const where = buildWhereClause({ repoId: input.repoId, branch: input.branch });
-  const queryParam = where.values.length + 1;
-  const limitParam = where.values.length + 2;
-
-  if (hasCjk) {
-    const CJK_STOP_WORDS = new Set([
-      "的", "是", "在", "了", "和", "有", "可以", "能", "能不能", "是否",
-      "我", "你", "他", "她", "它", "们", "这", "那", "哪",
-      "怎么", "如何", "什么", "哪个", "哪些", "为什么", "多少",
-      "一个", "目前", "通过", "使用", "进行", "需要", "已经", "正在",
-      "吗", "呢", "吧", "啊", "呀", "嘛", "么",
-      "会", "到", "从", "把", "被", "让", "给", "对", "于",
-      "不", "没", "没有", "还", "也", "都", "就", "才",
-    ]);
-    const splitTokens = input.query
-      .toLowerCase()
-      .split(/[\s,，。！？!?.:/_-]+/)
-      .map((token) => token.trim())
-      .filter(Boolean);
-    const expandedTokens = new Set<string>();
-    for (const token of splitTokens) {
-      if (CJK_STOP_WORDS.has(token)) continue;
-      expandedTokens.add(token);
-      if (/[\u3400-\u9FBF]/.test(token) && token.length >= 3) {
-        for (let i = 0; i < token.length - 1; i += 1) {
-          expandedTokens.add(token.slice(i, i + 2));
-        }
-      }
-    }
-    const tokens = [...expandedTokens].slice(0, 8);
-    if (tokens.length === 0) {
-      return [];
-    }
-    const likeValues = tokens.map((token) => `%${token}%`);
-    const likeParams: string[] = [];
-    for (let i = 0; i < likeValues.length; i += 1) {
-      likeParams.push(`$${queryParam + i}`);
-    }
-    const limitPlaceholder = queryParam + likeValues.length;
-    const tokenOr = likeParams.map((param) => `chunk.path ILIKE ${param} OR doc.title ILIKE ${param} OR chunk.content ILIKE ${param}`).join(" OR ");
-    const scoreExpr = likeParams
-      .map(
-        (param) =>
-          `(CASE WHEN doc.title ILIKE ${param} THEN 1.8 ELSE 0 END + CASE WHEN chunk.path ILIKE ${param} THEN 1.4 ELSE 0 END + CASE WHEN chunk.content ILIKE ${param} THEN 1.0 ELSE 0 END)`
-      )
-      .join(" + ");
-    const result = await pool.query<{
-      chunk_id: string;
-      document_id: string;
-      repo_id: string;
-      repo: string;
-      branch: string;
-      path: string;
-      source_url: string;
-      repo_source_url: string;
-      commit_sha: string;
-      title: string;
-      heading_path: string;
-      snippet: string;
-      lexical_score: string;
-      chunk_metadata_json: Record<string, unknown> | null;
-      doc_metadata_json: Record<string, unknown> | null;
-    }>(
-      `SELECT
-        chunk.id AS chunk_id,
-        doc.id AS document_id,
-        chunk.repo_id,
-        reg.repo_owner || '/' || reg.repo_name AS repo,
-        chunk.branch,
-        chunk.path,
-        doc.source_url,
-        doc.repo_source_url,
-        chunk.commit_sha,
-        doc.title,
-        chunk.heading_path,
-        LEFT(chunk.content, 400) AS snippet,
-        (${scoreExpr})::text AS lexical_score,
-        chunk.metadata_json AS chunk_metadata_json,
-        doc.metadata_json AS doc_metadata_json
-       FROM kb_chunks chunk
-       INNER JOIN kb_documents doc ON doc.id = chunk.doc_id
-       INNER JOIN kb_repo_registrations reg ON reg.id = chunk.repo_id
-       WHERE ${where.clause}
-         AND (${tokenOr})
-       ORDER BY (${scoreExpr}) DESC, chunk.updated_at DESC
-       LIMIT $${limitPlaceholder}`,
-      [...where.values, ...likeValues, input.limit]
-    );
-
-    return result.rows.map((row) => ({
-      chunkId: row.chunk_id,
-      documentId: row.document_id,
-      repoId: row.repo_id,
-      repo: row.repo,
-      branch: row.branch,
-      path: row.path,
-      sourceUrl: row.source_url,
-      repoSourceUrl: row.repo_source_url,
-      commitSha: row.commit_sha,
-      title: row.title,
-      headingPath: row.heading_path,
-      snippet: row.snippet || row.title,
-      score: Number(row.lexical_score),
-      lexicalScore: Number(row.lexical_score),
-      chunkMetadata: row.chunk_metadata_json ?? undefined,
-      docMetadata: row.doc_metadata_json ?? undefined,
-      supportMetadata:
-        ((row.chunk_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined ??
-        ((row.doc_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined
-    }));
-  }
-
-  const tokens = input.query
-    .toLowerCase()
-    .split(/[\s,，。！？!?.:/_-]+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length >= 2)
-    .slice(0, 8);
+  const tokens = tokenizeRetrievalTerms(input.query).slice(0, 10);
+  if (!tokens.length) return [];
   const likeValues = tokens.map((token) => `%${token}%`);
-  const tokenBase = queryParam + 1;
+  const queryParam = hasCjk ? null : where.values.length + 1;
+  const tokenBase = queryParam === null ? where.values.length + 1 : queryParam + 1;
   const tokenParams: string[] = [];
   for (let i = 0; i < likeValues.length; i += 1) {
     tokenParams.push(`$${tokenBase + i}`);
   }
   const limitPlaceholder = tokenBase + likeValues.length;
-  const tokenOr = tokenParams.length
-    ? tokenParams.map((param) => `chunk.path ILIKE ${param} OR doc.title ILIKE ${param} OR chunk.content ILIKE ${param}`).join(" OR ")
-    : "false";
-  const tokenScore = tokenParams.length
-    ? tokenParams
-        .map(
-          (param) =>
-            `(CASE WHEN doc.title ILIKE ${param} THEN 0.35 ELSE 0 END + CASE WHEN chunk.path ILIKE ${param} THEN 0.28 ELSE 0 END + CASE WHEN chunk.content ILIKE ${param} THEN 0.22 ELSE 0 END)`
-        )
-        .join(" + ")
-    : "0";
+  const tokenOr = tokenParams
+    .map((param) => `chunk.path ILIKE ${param} OR doc.title ILIKE ${param} OR chunk.heading_path ILIKE ${param} OR chunk.content ILIKE ${param}`)
+    .join(" OR ");
+  const tokenScore = tokenParams
+    .map(
+      (param) =>
+        `(CASE WHEN doc.title ILIKE ${param} THEN 1.8 ELSE 0 END + CASE WHEN chunk.heading_path ILIKE ${param} THEN 1.5 ELSE 0 END + CASE WHEN chunk.path ILIKE ${param} THEN 1.15 ELSE 0 END + CASE WHEN chunk.content ILIKE ${param} THEN 0.22 ELSE 0 END)`
+    )
+    .join(" + ");
+  const ordinalBoost = "CASE WHEN chunk.ordinal <= 3 THEN 0.9 WHEN chunk.ordinal <= 6 THEN 0.35 ELSE 0 END";
 
   const result = await pool.query<{
     chunk_id: string;
@@ -738,13 +659,18 @@ export async function searchKeywordCandidates(input: {
       chunk.commit_sha,
       doc.title,
       chunk.heading_path,
-      COALESCE(
-        NULLIF(ts_headline('english', chunk.content, websearch_to_tsquery('english', $${queryParam}), 'MaxWords=40, MinWords=15'), ''),
-        LEFT(chunk.content, 400)
-      ) AS snippet,
+      ${
+        hasCjk
+          ? `LEFT(chunk.content, 1200) AS snippet,`
+          : `COALESCE(
+        NULLIF(ts_headline('english', chunk.content, websearch_to_tsquery('english', $${queryParam ?? 0}), 'MaxWords=60, MinWords=20'), ''),
+        LEFT(chunk.content, 800)
+      ) AS snippet,`
+      }
       (
-        ts_rank_cd(chunk.search_vector, websearch_to_tsquery('english', $${queryParam}))
-        + ${tokenScore}
+        ${hasCjk ? "0" : `ts_rank_cd(chunk.search_vector, websearch_to_tsquery('english', $${queryParam ?? 0})) + `}
+        ${tokenScore}
+        + ${ordinalBoost}
       )::text AS lexical_score,
       chunk.metadata_json AS chunk_metadata_json,
       doc.metadata_json AS doc_metadata_json
@@ -752,16 +678,17 @@ export async function searchKeywordCandidates(input: {
      INNER JOIN kb_documents doc ON doc.id = chunk.doc_id
      INNER JOIN kb_repo_registrations reg ON reg.id = chunk.repo_id
      WHERE ${where.clause}
-       AND (
-         chunk.search_vector @@ websearch_to_tsquery('english', $${queryParam})
+      AND (
+         ${hasCjk ? "FALSE" : `chunk.search_vector @@ websearch_to_tsquery('english', $${queryParam ?? 0})`}
          OR (${tokenOr})
        )
      ORDER BY (
-       ts_rank_cd(chunk.search_vector, websearch_to_tsquery('english', $${queryParam}))
-       + ${tokenScore}
-     ) DESC
+       ${hasCjk ? "0" : `ts_rank_cd(chunk.search_vector, websearch_to_tsquery('english', $${queryParam ?? 0})) + `}
+       ${tokenScore}
+       + ${ordinalBoost}
+     ) DESC, chunk.ordinal ASC, chunk.updated_at DESC
      LIMIT $${limitPlaceholder}`,
-    [...where.values, input.query, ...likeValues, input.limit]
+    hasCjk ? [...where.values, ...likeValues, input.limit] : [...where.values, input.query, ...likeValues, input.limit]
   );
 
   return result.rows.map((row) => ({
@@ -792,9 +719,10 @@ export async function listCandidateDocumentsForFallback(input: {
   branch?: string;
   query: string;
   limit: number;
-}): Promise<Array<{ repoId: string; path: string; sourceUrl: string; repoSourceUrl: string; title: string; commitSha: string; branch: string; repo: string }>> {
+}): Promise<Array<{ repoId: string; path: string; sourceUrl: string; repoSourceUrl: string; title: string; commitSha: string; branch: string; repo: string; content: string }>> {
   const conditions: string[] = ["doc.is_active = true"];
   const values: unknown[] = [];
+  const tokens = tokenizeRetrievalTerms(input.query).slice(0, 8);
 
   if (input.repoId) {
     values.push(input.repoId);
@@ -805,10 +733,21 @@ export async function listCandidateDocumentsForFallback(input: {
     conditions.push(`doc.branch = $${values.length}`);
   }
 
-  values.push(`%${input.query}%`);
-  const queryParam = values.length;
-  values.push(input.limit);
-  const limitParam = values.length;
+  if (!tokens.length) return [];
+  const likeValues = tokens.map((token) => `%${token}%`);
+  const queryParam = values.length + 1;
+  const tokenParams: string[] = [];
+  for (let i = 0; i < likeValues.length; i += 1) {
+    tokenParams.push(`$${queryParam + i}`);
+  }
+  const tokenOr = tokenParams.map((param) => `doc.title ILIKE ${param} OR doc.path ILIKE ${param} OR doc.content ILIKE ${param}`).join(" OR ");
+  const tokenScore = tokenParams
+    .map(
+      (param) =>
+        `(CASE WHEN doc.title ILIKE ${param} THEN 2.2 ELSE 0 END + CASE WHEN doc.path ILIKE ${param} THEN 1.4 ELSE 0 END + CASE WHEN doc.content ILIKE ${param} THEN 0.18 ELSE 0 END)`
+    )
+    .join(" + ");
+  const limitParam = queryParam + likeValues.length;
 
   const result = await pool.query<{
     repo_id: string;
@@ -819,6 +758,7 @@ export async function listCandidateDocumentsForFallback(input: {
     commit_sha: string;
     branch: string;
     repo: string;
+    content: string;
   }>(
     `SELECT
       doc.repo_id,
@@ -828,14 +768,15 @@ export async function listCandidateDocumentsForFallback(input: {
       doc.title,
       doc.commit_sha,
       doc.branch,
-      reg.repo_owner || '/' || reg.repo_name AS repo
+      reg.repo_owner || '/' || reg.repo_name AS repo,
+      LEFT(doc.content, 2000) AS content
      FROM kb_documents doc
      INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
      WHERE ${conditions.join(" AND ")}
-       AND (doc.title ILIKE $${queryParam} OR doc.path ILIKE $${queryParam} OR doc.content ILIKE $${queryParam})
-     ORDER BY doc.updated_at DESC
+       AND (${tokenOr})
+     ORDER BY (${tokenScore}) DESC, doc.updated_at DESC
      LIMIT $${limitParam}`,
-    values
+    [...values, ...likeValues, input.limit]
   );
 
   return result.rows.map((row) => ({
@@ -846,7 +787,8 @@ export async function listCandidateDocumentsForFallback(input: {
     title: row.title,
     commitSha: row.commit_sha,
     branch: row.branch,
-    repo: row.repo
+    repo: row.repo,
+    content: row.content
   }));
 }
 

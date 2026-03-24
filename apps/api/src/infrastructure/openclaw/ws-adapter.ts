@@ -239,6 +239,16 @@ function specialistFromQuestionType(questionType: SupportQuestionRoute["question
   }
 }
 
+function isLowSignalMissingInfo(item: string): boolean {
+  const normalized = item.trim().toLowerCase();
+  return (
+    normalized === "the exact object or scenario you are working with" ||
+    normalized === "the single most important missing detail" ||
+    normalized === "more context" ||
+    normalized === "more details"
+  );
+}
+
 function renderVariantFromQuestionType(
   questionType: SupportQuestionRoute["question_type"]
 ): SpecialistDraftAnswer["render_variant"] {
@@ -485,6 +495,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Translate business-facing nouns into the documentation nouns when useful for retrieval, for example defect or bug may map to issue, and current status may map to issue details plus status field.",
       "- Propose 2 to 4 retrieval queries optimized for a documentation knowledge base.",
       "- Only put genuinely blocking items into missing_critical_info. If a useful best-effort answer can still be given from the current docs, do not block on extra clarification.",
+      "- Never output generic placeholders in missing_critical_info such as 'the exact object or scenario you are working with' or 'more context'. If clarification is needed, name the exact missing identifier, object, or condition.",
+      "- For API lookup or how-to questions that already name the resource family, leave missing_critical_info empty unless the answer truly depends on a tenant-specific identifier or deployment condition.",
       "- Keep deployment_model to one of: public_cloud, private_deployment, shared, unknown.",
       "- Keep product_area concise.",
       `context_type: ${input.contextType}`,
@@ -512,7 +524,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       deployment_model: typeof parsed.deployment_model === "string" ? parsed.deployment_model : "unknown",
       product_area: typeof parsed.product_area === "string" ? parsed.product_area : "general",
       constraints: Array.isArray(parsed.constraints) ? parsed.constraints.map((item) => String(item)) : [],
-      missing_critical_info: Array.isArray(parsed.missing_critical_info) ? parsed.missing_critical_info.map((item) => String(item)) : [],
+      missing_critical_info: Array.isArray(parsed.missing_critical_info)
+        ? parsed.missing_critical_info.map((item) => String(item)).filter((item) => !isLowSignalMissingInfo(item))
+        : [],
       retrieval_queries: Array.isArray(parsed.retrieval_queries) ? parsed.retrieval_queries.map((item) => String(item)).filter(Boolean) : [input.query],
       query_plan:
         queryPlan && typeof queryPlan === "object"
@@ -653,6 +667,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         "- For endpoint lookup, field lookup, and scope questions, provide the exact endpoint details when evidence supports them.",
         "- If there is a nearby ambiguity, such as current status versus status list, keep the most likely primary answer in direct_answer and put the nearby variant in related_variant or important_note.",
         "- For field lookup questions, prefer the operation whose response schema returns the current object details when the user asks for a current value.",
+        "- When the evidence shows a concrete method, path, request parameter, response field, or response example, convert that into a narrow verified_fact claim with the matching evidence_ids.",
+        "- For list or option APIs, if the evidence explicitly shows identifier fields such as id or uuid in the response schema or examples, state that exact identifier field directly.",
         "- Use claims with evidence_ids for the primary route and for any nearby variant that is also evidenced.",
         "- Keep wording polite, direct, and useful.",
         "- Do not output internal reasoning labels."
@@ -801,7 +817,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
       primaryLimit: 3,
       supplementalLimit: 2,
-      snippetMax: 260
+      snippetMax: String(input.caseFrame.question_type ?? "").startsWith("api_") ? 900 : 260
     });
     const prompt = [
       "You are a support engineer agent for ONES.",
@@ -873,7 +889,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
       primaryLimit: 3,
       supplementalLimit: 2,
-      snippetMax: 220
+      snippetMax: String(input.caseFrame.question_type ?? "").startsWith("api_") ? 900 : 220
     });
     const prompt = [
       "You are the Evidence Judge Agent for a support engineer system.",
@@ -907,7 +923,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
       primaryLimit: 3,
       supplementalLimit: 2,
-      snippetMax: 220
+      snippetMax: String(input.caseFrame.question_type ?? "").startsWith("api_") ? 900 : 220
     });
     const prompt = [
       "Verify whether the support answer is supported by the evidence.",
@@ -946,7 +962,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
       primaryLimit: 3,
       supplementalLimit: 2,
-      snippetMax: 220
+      snippetMax: String(input.caseFrame.question_type ?? "").startsWith("api_") ? 900 : 220
     });
     const prompt = [
       "You are a citation binder for a support engineer agent.",
@@ -1084,6 +1100,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- why should explain the answer briefly using the supported claims.",
       "- what_to_do_now should contain practical next steps only.",
       "- still_need_to_confirm should include only unresolved items.",
+      "- When supported claims or next actions already contain actionable documented content, restate that action directly instead of telling the user to read, open, or follow a documentation section.",
+      "- Do not answer with doc-navigation wording like 'see the doc', 'refer to section', 'open chapter', or '按《xxx》执行' unless there is no actionable content available.",
       "- Do not mention verification, unsupported claims, or internal system language.",
       `language: ${input.language}`,
       `mode: ${input.mode}`,
@@ -1136,6 +1154,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Why answers should prioritize the most likely explanation first.",
       "- For behavior/capability answers, do not start with generic partial wording like 'I can confirm part of the answer'. State the narrow supported conclusion directly.",
       "- How-to answers should prioritize steps and prerequisites.",
+      "- If the draft or supported claims already contain concrete documented actions, restate them directly. Do not send the user to a document section as the main answer.",
+      "- Avoid doc-navigation wording such as 'go read section', 'refer to chapter', 'open the documentation', or '按《xxx》执行' unless no actionable content is available.",
       "- Troubleshooting answers should prioritize recommended checks and follow-up info.",
       `language: ${input.language}`,
       `mode: ${input.mode}`,
@@ -1371,7 +1391,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const compactBundle = compactEvidenceBundle(input.evidenceBundle, {
       primaryLimit: 3,
       supplementalLimit: 2,
-      snippetMax: 260
+      snippetMax: input.route.question_type.startsWith("api_") ? 900 : 260
     });
     const prompt = [
       ...promptLines,

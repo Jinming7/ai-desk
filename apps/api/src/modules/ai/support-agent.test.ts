@@ -745,6 +745,80 @@ title: "Rebuild indexes after migration"
   }
 });
 
+test("runSupportSearchAgent turns how-to evidence into direct actionable steps instead of doc navigation", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/configure/ops/admin-password.cn.md",
+    `---
+title: "修改用户密码"
+---
+
+# 修改用户密码
+
+## 操作步骤
+
+#### 进入 ONES pod
+
+\`\`\`shell
+ones-ai-k8s.sh
+\`\`\`
+
+### 增加脚本
+
+将以下内容保存为 shell 文件 \`reset-password.sh\`
+
+\`\`\`shell
+#!/bin/bash
+echo "reset"
+\`\`\`
+
+### 使用脚本更新密码
+
+执行以下命令
+
+\`\`\`bash
+bash reset-password.sh
+\`\`\`
+
+根据提示输入邮箱账号，然后脚本会自动重置密码并输出新密码。
+
+注意：因为密码是固定的，记得提示用户修改密码。
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "how_to_product",
+      specialist_agent: "howto-specialist"
+    }
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "私有部署环境怎么重置管理员密码？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-howto-actionable-output"
+    });
+
+    assert.notEqual(result.result.support_answer?.mode, "handoff");
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.match(result.result.answer, /ones-ai-k8s\.sh|reset-password\.sh|输入邮箱账号/);
+    assert.doesNotMatch(result.result.answer, /按《|打开《|章节执行|section to follow|open the .* section/i);
+    assert.ok((result.result.internal_diagnostics?.claim_graph ?? []).length > 0);
+    assert.ok(result.result.citations.length > 0);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("runSupportSearchAgent uses AI stage budget to skip specialist and emit a claim graph", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;

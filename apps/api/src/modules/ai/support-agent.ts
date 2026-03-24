@@ -1278,6 +1278,217 @@ function shortHeadingLabel(headingPath?: string): string {
   return (parts[parts.length - 1] ?? heading).replace(/^[0-9.\-\s\\]+/, "").trim();
 }
 
+function normalizeProcedureText(input: string): string {
+  return input.replace(/\s+/g, " ").trim();
+}
+
+function stripProcedureMarkup(line: string): string {
+  return normalizeProcedureText(
+    line
+      .replace(/<RegionBlock[^>]*>/gi, " ")
+      .replace(/<\/RegionBlock>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
+      .replace(/`([^`]*)`/g, "$1")
+      .replace(/\*\*(.*?)\*\*/g, "$1")
+      .replace(/\*(.*?)\*/g, "$1")
+      .replace(/_{1,2}([^_]+)_{1,2}/g, "$1")
+      .replace(/^>\s+/, "")
+      .replace(/^#{1,6}\s+/, "")
+      .replace(/&nbsp;|&#x20;/gi, " ")
+  );
+}
+
+function sanitizeProcedureItem(input: string): string {
+  let value = stripProcedureMarkup(input)
+    .replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+|[（(]?\d+[）)]\s*)/, "")
+    .replace(/^[：:;,，；、.\-\s]+/, "")
+    .replace(/[：:;,，；、\s]+$/, "")
+    .trim();
+  if (value.length > 220) value = `${value.slice(0, 217).trimEnd()}...`;
+  return value;
+}
+
+function pushProcedureItem(target: string[], input: string, limit: number): void {
+  const value = sanitizeProcedureItem(input);
+  if (!value) return;
+  if (target.includes(value)) return;
+  target.push(value);
+  if (target.length > limit) target.length = limit;
+}
+
+function isProcedureHeading(text: string): boolean {
+  return /(操作步骤|操作方式|步骤|流程|procedure|procedures|steps?|how to|guide|guidance|执行方式|处理方式|处理步骤|使用步骤|配置步骤|安装步骤)/i.test(
+    text
+  );
+}
+
+function isProcedureNoteHeading(text: string): boolean {
+  return /(注意事项|注意|说明|提示|前提|要求|限制|风险|备注|校验|验证|prerequisite|note|notes|warning|important|requirement|requirements|validation|risk)/i.test(
+    text
+  );
+}
+
+function looksLikeProcedureAction(text: string): boolean {
+  if (!text || text.length < 4) return false;
+  if (
+    /^(先|首先|然后|再|接着|最后|执行|配置|确认|准备|提供|申请|登录|创建|设置|使用|输入|保存|安装|升级|重启|检查|联系|导出|导入|运行|开放|打通|关闭|开启|重建|重置|恢复)/.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  if (
+    /^(follow|run|open|configure|confirm|prepare|provide|apply|log in|create|set|use|enter|save|install|upgrade|restart|check|contact|export|import|rebuild|reset|restore)\b/i.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  return /(?:必须|需|需要|建议|推荐|确保|提前|用于|可按需|should|must|need to|required to|recommended to)/i.test(text);
+}
+
+function looksLikeProcedureNote(text: string): boolean {
+  if (/^(注意|说明|提示|前提|要求|限制|风险|备注|建议|必须|需|需要|推荐|校验|验证)/.test(text)) return true;
+  return /^(note|warning|important|prerequisite|requirement|risk|validate|validation)\b/i.test(text);
+}
+
+function loadProcedureSourceLines(reference: SearchReference): string[] {
+  const resolvedPath = resolveLocalDocsMirrorPath(reference);
+  const source = (() => {
+    if (!resolvedPath) return String(reference.snippet ?? "");
+    try {
+      return fs.readFileSync(resolvedPath, "utf8");
+    } catch {
+      return String(reference.snippet ?? "");
+    }
+  })();
+  const lines = source.replace(/^---\s*\n[\s\S]*?\n---\s*(?:\n|$)/, "").split(/\r?\n/);
+  const headingLabel = shortHeadingLabel(reference.headingPath);
+  if (!resolvedPath || !headingLabel || headingLabel.toUpperCase() === "ROOT") return lines.slice(0, 260);
+
+  const normalizedHeading = stripProcedureMarkup(headingLabel).toLowerCase();
+  let anchorIndex = -1;
+  let anchorLevel = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const matched = lines[index]?.match(/^\s*(#{1,6})\s+(.+)$/);
+    if (!matched) continue;
+    const candidate = stripProcedureMarkup(matched[2] ?? "").toLowerCase();
+    if (!candidate) continue;
+    if (candidate === normalizedHeading || candidate.includes(normalizedHeading) || normalizedHeading.includes(candidate)) {
+      anchorIndex = index;
+      anchorLevel = matched[1]?.length ?? 0;
+      break;
+    }
+  }
+
+  if (anchorIndex < 0) return lines.slice(0, 260);
+
+  const scoped = [lines[anchorIndex] ?? ""];
+  for (let index = anchorIndex + 1; index < lines.length && scoped.length < 260; index += 1) {
+    const matched = lines[index]?.match(/^\s*(#{1,6})\s+(.+)$/);
+    if (matched && (matched[1]?.length ?? 0) <= anchorLevel) break;
+    scoped.push(lines[index] ?? "");
+  }
+  return scoped;
+}
+
+function extractProcedureBlocks(reference: SearchReference): { steps: string[]; notes: string[] } {
+  const scopedLines = loadProcedureSourceLines(reference);
+  const steps: string[] = [];
+  const notes: string[] = [];
+  let sectionContext: "steps" | "notes" | null = null;
+  let inCodeBlock = false;
+  let codeLines: string[] = [];
+
+  const flushCodeBlock = () => {
+    if (!codeLines.length) return;
+    const command = normalizeProcedureText(codeLines.join(" "));
+    if (command && command.length <= 120 && codeLines.length <= 3 && steps.length > 0) {
+      const last = steps[steps.length - 1] ?? "";
+      if (last && !last.includes(command)) {
+        steps[steps.length - 1] = `${last} (${command})`;
+      }
+    }
+    codeLines = [];
+  };
+
+  for (const rawLine of scopedLines) {
+    const line = String(rawLine ?? "");
+    if (/^\s*```/.test(line)) {
+      if (inCodeBlock) flushCodeBlock();
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) {
+      const cleanedCode = sanitizeProcedureItem(line);
+      if (cleanedCode) codeLines.push(cleanedCode);
+      continue;
+    }
+
+    const headingMatch = line.match(/^\s*(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const headingText = sanitizeProcedureItem(headingMatch[2] ?? "");
+      if (!headingText) continue;
+      if (isProcedureNoteHeading(headingText)) {
+        sectionContext = "notes";
+        continue;
+      }
+      if (isProcedureHeading(headingText)) {
+        sectionContext = "steps";
+        continue;
+      }
+      if ((headingMatch[1]?.length ?? 0) >= 3 && headingText.length <= 80) {
+        sectionContext = "steps";
+        pushProcedureItem(steps, headingText, 6);
+        continue;
+      }
+      sectionContext = null;
+      continue;
+    }
+
+    if (!line.trim() || /^\s*import\s+/.test(line) || /^\s*api:\s*/.test(line) || /^\s*\|/.test(line)) continue;
+
+    const cleaned = sanitizeProcedureItem(line);
+    if (!cleaned) continue;
+
+    const bulletLike = /^\s*(?:[-*+]\s+|\d+[.)]\s+|[（(]?\d+[）)]\s*)/.test(line);
+    if (sectionContext === "notes" || looksLikeProcedureNote(cleaned)) {
+      pushProcedureItem(notes, cleaned, 5);
+      continue;
+    }
+    if (sectionContext === "steps" || bulletLike || looksLikeProcedureAction(cleaned)) {
+      pushProcedureItem(steps, cleaned, 6);
+    }
+  }
+
+  if (inCodeBlock) flushCodeBlock();
+
+  if (!steps.length || !notes.length) {
+    const fallbackFragments = String(reference.snippet ?? "")
+      .replace(/<[^>]+>/g, " ")
+      .split(/。|；|\. |\n/)
+      .map((item) => sanitizeProcedureItem(item))
+      .filter(Boolean);
+    for (const fragment of fallbackFragments) {
+      if (!steps.length && looksLikeProcedureAction(fragment)) pushProcedureItem(steps, fragment, 6);
+      else if (!notes.length && looksLikeProcedureNote(fragment)) pushProcedureItem(notes, fragment, 5);
+      if (steps.length >= 4 && notes.length >= 2) break;
+    }
+  }
+
+  return { steps, notes };
+}
+
+function scoreProcedureReference(reference: SearchReference, blocks: { steps: string[]; notes: string[] }): number {
+  let score = Math.round(reference.score * 10);
+  score += blocks.steps.length * 8;
+  score += blocks.notes.length * 3;
+  if (shortHeadingLabel(reference.headingPath)) score += 2;
+  if (reference.sourceType === "local_docs") score += 2;
+  return score;
+}
+
 function recoverEvidenceAnchoredHowToDraft(input: {
   language: "zh" | "en";
   query: string;
@@ -1291,32 +1502,51 @@ function recoverEvidenceAnchoredHowToDraft(input: {
   const ranked = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].filter(
     (reference) => reference.authority === "canonical_visible"
   );
-  const actionReference = ranked.find((reference) => {
-    const text = `${reference.title} ${reference.headingPath ?? ""} ${reference.snippet}`.toLowerCase();
-    return /重建|步骤|指南|配置|导出|setup|configure|guide|step|rebuild|index/.test(text);
-  });
-  if (!actionReference) return null;
-
-  const noteReference = ranked.find(
-    (reference) =>
-      reference.documentId !== actionReference.documentId &&
-      /影响|验证|注意|前提|prerequisite|impact|validate|note/.test(
-        `${reference.title} ${reference.headingPath ?? ""} ${reference.snippet}`.toLowerCase()
-      )
-  );
+  const analyzed = ranked
+    .map((reference) => {
+      const blocks = extractProcedureBlocks(reference);
+      return {
+        reference,
+        blocks,
+        score: scoreProcedureReference(reference, blocks)
+      };
+    })
+    .sort((left, right) => right.score - left.score);
+  const actionCandidate = analyzed.find((item) => item.blocks.steps.length > 0) ?? analyzed[0];
+  if (!actionCandidate) return null;
+  const noteCandidate =
+    analyzed.find((item) => item.reference.documentId !== actionCandidate.reference.documentId && item.blocks.notes.length > 0) ??
+    analyzed.find((item) => item.reference.documentId !== actionCandidate.reference.documentId && item.blocks.steps.length > 0) ??
+    null;
+  const actionReference = actionCandidate.reference;
+  const noteReference = noteCandidate?.reference;
+  const actionBlocks = actionCandidate.blocks;
+  const noteBlocks = noteCandidate?.blocks ?? { steps: [], notes: [] };
+  const howToSteps = uniqueStrings([...actionBlocks.steps, ...noteBlocks.steps], 4);
+  const supportNotes = uniqueStrings([...actionBlocks.notes, ...noteBlocks.notes], 3);
   const actionHeading = shortHeadingLabel(actionReference.headingPath) || actionReference.title;
   const noteHeading = noteReference ? shortHeadingLabel(noteReference.headingPath) || noteReference.title : "";
+  const zhDirectAnswer = [
+    howToSteps.length ? `可以直接这样处理：${howToSteps.join("；")}。` : `当前命中的文档已经给出了可执行处理方式，可以直接按下面步骤操作。`,
+    supportNotes.length ? `另外需要注意：${supportNotes.join("；")}。` : ""
+  ]
+    .filter(Boolean)
+    .join("");
+  const enDirectAnswer = [
+    howToSteps.length ? `You can handle it like this: ${howToSteps.join("; ")}.` : "The retrieved documentation already contains an actionable procedure you can follow directly.",
+    supportNotes.length ? `Also note: ${supportNotes.join("; ")}.` : ""
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   if (input.language === "zh") {
     return {
       ...input.draft,
       render_variant: "how_to",
-      direct_answer: `从当前命中的文档看，可以按《${actionReference.title}》中“${actionHeading}”这一节执行。${
-        noteReference ? `另外，执行前后再关注《${noteReference.title}》提到的“${noteHeading}”。` : ""
-      }`.trim(),
+      direct_answer: zhDirectAnswer,
       claims: [
         {
-          text: `《${actionReference.title}》包含“${actionHeading}”这一节，可作为当前问题的直接操作入口。`,
+          text: `《${actionReference.title}》中的“${actionHeading}”提供了与当前问题直接相关的操作步骤或处理要求。`,
           kind: "verified_fact",
           evidence_ids: [actionReference.documentId],
           authority: "canonical"
@@ -1324,7 +1554,7 @@ function recoverEvidenceAnchoredHowToDraft(input: {
         ...(noteReference
           ? [
               {
-                text: `《${noteReference.title}》补充说明了“${noteHeading}”相关的执行影响或验证信息。`,
+                text: `《${noteReference.title}》补充说明了“${noteHeading}”相关的限制、前提或验证信息。`,
                 kind: "verified_fact" as const,
                 evidence_ids: [noteReference.documentId],
                 authority: "canonical" as const
@@ -1334,20 +1564,19 @@ function recoverEvidenceAnchoredHowToDraft(input: {
       ],
       next_actions: uniqueStrings(
         [
-          `先按《${actionReference.title}》中“${actionHeading}”的步骤执行。`,
-          noteReference ? `执行前后核对《${noteReference.title}》中“${noteHeading}”提到的影响或验证点。` : "执行后确认索引任务已完成。"
+          ...howToSteps,
+          ...supportNotes
         ],
         4
       ),
       steps: uniqueStrings(
         [
-          `打开《${actionReference.title}》中“${actionHeading}”对应的操作章节。`,
-          `按该章节执行当前操作。`,
-          noteReference ? `再核对《${noteReference.title}》中“${noteHeading}”提到的执行影响或验证方式。` : "执行完成后检查结果是否符合预期。"
+          ...howToSteps,
+          ...(supportNotes.length ? supportNotes : ["执行完成后检查结果是否符合预期。"])
         ],
         4
       ),
-      limits_or_notes: noteReference ? [`补充参考《${noteReference.title}》中“${noteHeading}”的说明。`] : input.draft.limits_or_notes,
+      limits_or_notes: supportNotes.length ? supportNotes : input.draft.limits_or_notes,
       unknowns: []
     };
   }
@@ -1355,12 +1584,10 @@ function recoverEvidenceAnchoredHowToDraft(input: {
   return {
     ...input.draft,
     render_variant: "how_to",
-    direct_answer: `The retrieved documentation points to "${actionHeading}" in "${actionReference.title}" as the direct procedure to follow.${
-      noteReference ? ` Also review "${noteHeading}" in "${noteReference.title}" for execution impact or validation details.` : ""
-    }`.trim(),
+    direct_answer: enDirectAnswer,
     claims: [
       {
-        text: `"${actionReference.title}" contains a "${actionHeading}" section that is directly relevant to this operation.`,
+        text: `"${actionReference.title}" contains "${actionHeading}", which provides directly relevant procedure steps or requirements.`,
         kind: "verified_fact",
         evidence_ids: [actionReference.documentId],
         authority: "canonical"
@@ -1368,7 +1595,7 @@ function recoverEvidenceAnchoredHowToDraft(input: {
       ...(noteReference
         ? [
             {
-              text: `"${noteReference.title}" adds "${noteHeading}" details that are relevant for impact or validation.`,
+              text: `"${noteReference.title}" adds "${noteHeading}" details that are relevant for prerequisites, limits, or validation.`,
               kind: "verified_fact" as const,
               evidence_ids: [noteReference.documentId],
               authority: "canonical" as const
@@ -1378,20 +1605,19 @@ function recoverEvidenceAnchoredHowToDraft(input: {
     ],
     next_actions: uniqueStrings(
       [
-        `Follow the "${actionHeading}" section in "${actionReference.title}".`,
-        noteReference ? `Review "${noteHeading}" in "${noteReference.title}" before and after the operation.` : "Verify the result after the operation finishes."
+        ...howToSteps,
+        ...supportNotes
       ],
       4
     ),
     steps: uniqueStrings(
       [
-        `Open the "${actionHeading}" section in "${actionReference.title}".`,
-        "Execute the procedure described there.",
-        noteReference ? `Review "${noteHeading}" in "${noteReference.title}" for impact or validation details.` : "Check the final result after the procedure completes."
+        ...howToSteps,
+        ...(supportNotes.length ? supportNotes : ["Check the final result after the procedure completes."])
       ],
       4
     ),
-    limits_or_notes: noteReference ? [`Also review "${noteHeading}" in "${noteReference.title}".`] : input.draft.limits_or_notes,
+    limits_or_notes: supportNotes.length ? supportNotes : input.draft.limits_or_notes,
     unknowns: []
   };
 }

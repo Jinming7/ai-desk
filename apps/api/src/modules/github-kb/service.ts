@@ -25,6 +25,9 @@ import type { KbSyncSource, RepoRegistration, RetrievalHit, RetrievalProfile, Re
 const RETRIEVAL_CACHE_TTL_MS = 90_000;
 const RETRIEVAL_CACHE_MAX = 300;
 const retrievalCache = new Map<string, { expiresAt: number; value: RetrievalResponse }>();
+const EMBEDDING_CIRCUIT_BREAKER_MS = 10 * 60 * 1000;
+let embeddingDisabledUntil = 0;
+let embeddingDisabledReason = "";
 const LOCAL_DOCS_SUPPORTED_ROOTS = ["docs", "deploy-docs", "open-docs", "i18n", "blog"];
 const LOCAL_DOCS_SKIP_DIRS = new Set([".git", ".github", ".claude", "node_modules", ".docusaurus", "build", "dist"]);
 
@@ -557,6 +560,29 @@ function isApiIntent(query: string): boolean {
   return /\b(api|openapi|endpoint|rest|request|response|method|path)\b/i.test(query);
 }
 
+function tokenizeRetrievalQuery(query: string): string[] {
+  const normalized = normalizeSpaces(query).toLowerCase();
+  if (!normalized) return [];
+
+  const asciiTokens = [...normalized.matchAll(/[a-z0-9][a-z0-9._/-]{1,}/g)]
+    .map((match) => match[0])
+    .filter((token) => token.length >= 2);
+  const cjkRuns = [...normalized.matchAll(/[\u3400-\u9FBF]{2,}/g)].map((match) => match[0]);
+  const cjkTokens: string[] = [];
+
+  for (const run of cjkRuns) {
+    cjkTokens.push(run);
+    if (run.length <= 4) continue;
+    for (let size = 3; size >= 2; size -= 1) {
+      for (let index = 0; index <= run.length - size && cjkTokens.length < 32; index += 1) {
+        cjkTokens.push(run.slice(index, index + size));
+      }
+    }
+  }
+
+  return uniqueStrings([...asciiTokens, ...cjkTokens], 24);
+}
+
 function cleanSnippet(raw: string): string {
   return raw
     .replace(/<JsonSchemaViewer[^>]*\/>/gi, " ")
@@ -647,88 +673,16 @@ async function enrichOpenApiHits(hits: RetrievalHit[], answerLanguage: "zh" | "e
 
 function buildQueryVariants(query: string): string[] {
   const normalized = normalizeSpaces(query);
-  const variants = new Set<string>([normalized]);
-  const lower = normalized.toLowerCase();
-
-  const enSynonyms: Array<[RegExp, string]> = [
-    [/\bhow to\b/g, ""],
-    [/\bissue info\b/g, "issue details"],
-    [/\bissue detail\b/g, "issue details"],
-    [/\bintegrate with teams\b/g, "teams integration"],
-    [/\bms teams\b/g, "microsoft teams"],
-    [/\bopen\s*api\b/g, "openapi"]
-  ];
-  let enExpanded = lower;
-  for (const [pattern, value] of enSynonyms) {
-    enExpanded = enExpanded.replace(pattern, ` ${value} `);
-  }
-  enExpanded = normalizeSpaces(enExpanded);
-  if (enExpanded && enExpanded !== normalized.toLowerCase()) {
-    variants.add(enExpanded);
-  }
-
-  const replacements: Array<[RegExp, string]> = [
-    // English normalizations
-    [/webhook/gi, "webhook"],
-    [/openapi|open\s*api/gi, "open api"],
-    // General terms
-    [/配置/g, "configuration"],
-    [/开启|启用/g, "enable"],
-    [/关闭|禁用/g, "disable"],
-    [/功能/g, "feature"],
-    [/重装|重建/g, "reinstall"],
-    [/文档/g, "documentation"],
-    // API related
-    [/接口/g, "API endpoint"],
-    [/开放平台/g, "open platform openapi"],
-    [/调用/g, "call request"],
-    [/请求/g, "request"],
-    [/响应/g, "response"],
-    [/参数/g, "parameter"],
-    [/鉴权/g, "authorization auth"],
-    [/授权/g, "authorization auth"],
-    // ONES product objects
-    [/工作项/g, "issue work item"],
-    [/项目/g, "project"],
-    [/迭代/g, "sprint iteration"],
-    [/属性/g, "field property"],
-    [/字段/g, "field property"],
-    [/页面组/g, "space wiki space"],
-    [/页面/g, "page wiki page"],
-    [/知识库/g, "wiki knowledge base"],
-    [/工时/g, "worklog man hour"],
-    [/评论/g, "comment"],
-    [/附件/g, "attachment"],
-    [/成员/g, "user member"],
-    [/用户/g, "user member"],
-    [/团队/g, "team"],
-    [/工单/g, "ticket issue"],
-    [/看板/g, "board kanban"],
-    [/流水线/g, "pipeline"],
-    [/测试用例/g, "testcase"],
-    [/需求/g, "requirement story"],
-    [/缺陷/g, "bug defect"],
-    // Action verbs
-    [/创建|新建/g, "create add"],
-    [/删除/g, "delete remove"],
-    [/修改|更新|编辑/g, "update edit modify"],
-    [/查询|获取|查看/g, "get list query"],
-    [/统计/g, "count statistics"],
-    [/导出/g, "export"],
-    [/导入/g, "import"],
-    [/搜索/g, "search"],
-  ];
-
-  let translated = normalized.toLowerCase();
-  for (const [pattern, value] of replacements) {
-    translated = translated.replace(pattern, ` ${value} `);
-  }
-  translated = normalizeSpaces(translated);
-  if (translated && translated !== normalized) {
-    variants.add(translated);
-  }
-
-  return [...variants].filter((item) => item.length > 0).slice(0, 6);
+  const lowered = normalized.toLowerCase();
+  const compactTokenVariant = tokenizeRetrievalQuery(normalized).join(" ").trim();
+  return uniqueStrings(
+    [
+      normalized,
+      lowered !== normalized ? lowered : "",
+      compactTokenVariant && compactTokenVariant !== lowered ? compactTokenVariant : ""
+    ],
+    3
+  );
 }
 
 function buildRetrievalCacheKey(input: {
@@ -750,10 +704,15 @@ function buildRetrievalCacheKey(input: {
 }
 
 async function embedWithRetry(text: string): Promise<{ vectorLiteral: string; model: string; version: string }> {
+  if (embeddingDisabledUntil > Date.now()) {
+    throw new Error(embeddingDisabledReason || "Embedding temporarily disabled");
+  }
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= env.GITHUB_KB_EMBEDDING_MAX_RETRIES; attempt += 1) {
     try {
       const embedded = await embedText(text);
+      embeddingDisabledUntil = 0;
+      embeddingDisabledReason = "";
       return {
         vectorLiteral: toVectorLiteral(embedded.vector),
         model: embedded.model,
@@ -761,6 +720,11 @@ async function embedWithRetry(text: string): Promise<{ vectorLiteral: string; mo
       };
     } catch (error) {
       lastError = error as Error;
+      if (isPermanentEmbeddingError(error)) {
+        embeddingDisabledUntil = Date.now() + EMBEDDING_CIRCUIT_BREAKER_MS;
+        embeddingDisabledReason = (error as Error)?.message || "Embedding disabled after permanent API error";
+        break;
+      }
       if (attempt < env.GITHUB_KB_EMBEDDING_MAX_RETRIES) {
         const waitMs = Math.min(2000, 200 * Math.pow(2, attempt));
         await new Promise((resolve) => setTimeout(resolve, waitMs));
@@ -778,6 +742,17 @@ async function embedChunkBestEffort(
   } catch {
     return null;
   }
+}
+
+function isPermanentEmbeddingError(error: unknown): boolean {
+  const message = (error as Error)?.message?.toLowerCase?.() ?? "";
+  return (
+    message.includes("insufficient_quota") ||
+    message.includes("quota") ||
+    message.includes("invalid_api_key") ||
+    message.includes("incorrect api key") ||
+    message.includes("401")
+  );
 }
 
 function isTransientDbError(error: unknown): boolean {
@@ -1095,6 +1070,38 @@ async function runIncrementalSync(job: SyncJob, registration: RepoRegistration):
 async function runReindex(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
   const full = await runFullSync({ ...job, sync_mode: "full" }, registration);
   return { indexed: full.indexed, head: full.head, finished: full.finished, nextCursor: full.nextCursor };
+}
+
+export async function runRepositorySyncDirect(input: {
+  repoId: string;
+  branch?: string;
+  mode: "full" | "incremental" | "reindex";
+  source?: KbSyncSource;
+  cursor?: string;
+}): Promise<SyncExecutionResult> {
+  const registration = await repo.getRepoRegistrationById(input.repoId);
+  if (!registration || !registration.is_active) {
+    throw new Error(`Repository registration not found or inactive: ${input.repoId}`);
+  }
+
+  const branch = input.branch?.trim() || registration.default_branch;
+  const syntheticJob: SyncJob = {
+    ...buildSyntheticSyncJob({
+      repoId: registration.id,
+      branch,
+      mode: input.mode,
+      source: input.source ?? "manual"
+    }),
+    payload_json: input.cursor ? { cursor: input.cursor } : {}
+  };
+
+  if (input.mode === "full") {
+    return runFullSync(syntheticJob, registration);
+  }
+  if (input.mode === "incremental") {
+    return runIncrementalSync(syntheticJob, registration);
+  }
+  return runReindex(syntheticJob, registration);
 }
 
 async function enqueueLocalMirrorContinuation(job: SyncJob, registration: RepoRegistration, result: SyncExecutionResult): Promise<void> {
@@ -1755,9 +1762,7 @@ export async function retrieveKnowledge(input: {
       .catch(() => []);
 
     for (const doc of fallbackDocs) {
-      const registration = await repo.getRepoRegistrationById(doc.repoId);
-      if (!registration) continue;
-      const content = await getFileContentAtCommit(registration, doc.path, doc.commitSha).catch(() => "");
+      const content = doc.content;
       if (!content) continue;
       fallbackUsed = true;
       hits.push({
@@ -1772,8 +1777,8 @@ export async function retrieveKnowledge(input: {
         commitSha: doc.commitSha,
         title: doc.title,
         headingPath: "FALLBACK",
-        snippet: content.slice(0, 360),
-        score: 0.08,
+        snippet: content.slice(0, 1600),
+        score: 0.12,
         rankSignals: { fallback: 1 }
       });
     }
