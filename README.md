@@ -69,7 +69,7 @@ Required Vercel Environment Variables:
 - `OPENCLAW_WS_URL`
 - `OPENCLAW_BASIC_USER`
 - `OPENCLAW_BASIC_PASS`
-- `OPENCLAW_GATEWAY_TOKEN`
+- `OPENCLAW_GATEWAY_TOKEN` or `OPENCLAW_BASIC_PASS` as gateway auth fallback
 - `OPENCLAW_REQUEST_SCOPES` (comma-separated, default includes `operator.admin`)
 - `OPENCLAW_ALLOW_SELF_SIGNED` (set `true` only when OpenClaw uses self-signed cert)
 - `OPENCLAW_CONNECT_TIMEOUT_MS`

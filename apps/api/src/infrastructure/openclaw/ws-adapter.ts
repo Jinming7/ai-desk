@@ -288,6 +288,13 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   private consecutiveFailures = 0;
   private readonly requestedScopes = env.OPENCLAW_REQUEST_SCOPES.split(",").map((item) => item.trim()).filter(Boolean);
 
+  private buildConnectAuth() {
+    return {
+      ...(env.OPENCLAW_GATEWAY_TOKEN ? { token: env.OPENCLAW_GATEWAY_TOKEN } : {}),
+      ...(env.OPENCLAW_BASIC_PASS ? { password: env.OPENCLAW_BASIC_PASS } : {})
+    };
+  }
+
   async healthCheck(input?: { agentIds?: string[] }) {
     const configuredAgents = [...new Set((input?.agentIds ?? []).map((item) => String(item).trim()).filter(Boolean))];
     try {
@@ -1816,9 +1823,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
             role: "operator",
             scopes: this.requestedScopes,
             caps: [],
-            auth: {
-              token: env.OPENCLAW_GATEWAY_TOKEN
-            },
+            auth: this.buildConnectAuth(),
             userAgent: "ticket-core",
             locale: "en-US"
           }
@@ -1885,8 +1890,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         }
       });
 
-      if (!env.OPENCLAW_GATEWAY_TOKEN) {
-        reject(new Error("OPENCLAW_GATEWAY_TOKEN is not configured"));
+      if (!env.OPENCLAW_GATEWAY_TOKEN && !env.OPENCLAW_BASIC_PASS) {
+        reject(new Error("OpenClaw gateway auth is not configured"));
         ws.close();
       }
     });
@@ -1935,9 +1940,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
             role: "operator",
             scopes: this.requestedScopes,
             caps: [],
-            auth: {
-              token: env.OPENCLAW_GATEWAY_TOKEN
-            },
+            auth: this.buildConnectAuth(),
             userAgent: "ticket-core-health",
             locale: "en-US"
           }
@@ -1968,6 +1971,11 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       ws.on("close", () => {
         clearTimeout(timeout);
       });
+
+      if (!env.OPENCLAW_GATEWAY_TOKEN && !env.OPENCLAW_BASIC_PASS) {
+        reject(new Error("OpenClaw gateway auth is not configured"));
+        ws.close();
+      }
     });
   }
 

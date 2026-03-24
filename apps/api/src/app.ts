@@ -61,14 +61,44 @@ const aiAdapter =
     ? new MockOpenClawAdapter()
     : new WsOpenClawAdapter();
 
-const aiTopology = getAiTopology();
+function currentAiTopology() {
+  return getAiTopology();
+}
+
+function hasOpenClawGatewayAuth(): boolean {
+  return Boolean(env.OPENCLAW_GATEWAY_TOKEN || env.OPENCLAW_BASIC_PASS);
+}
+
+export async function ensureAiRuntimeReady() {
+  if (env.NODE_ENV === "test") return;
+  if (!hasOpenClawGatewayAuth()) {
+    throw new Error("OpenClaw gateway auth is not configured");
+  }
+  const topology = currentAiTopology();
+  if (!topology.multiAgentReady) {
+    throw new Error(`AI topology conflicts: ${topology.conflicts.map((item) => item.detail).join("; ")}`);
+  }
+  const health = await aiAdapter.healthCheck({
+    agentIds: topology.configuredAgents
+  });
+  if (!health.ok || (health.unreachableAgents?.length ?? 0) > 0) {
+    const detail =
+      health.unreachableAgents?.map((item) => `${item.agentId}: ${item.detail}`).join("; ") ||
+      health.detail ||
+      "Unknown OpenClaw health failure";
+    throw new Error(`OpenClaw multi-agent topology is not ready: ${detail}`);
+  }
+}
+
+const aiTopology = currentAiTopology();
 if (env.NODE_ENV !== "test") {
-  const dedicatedStageSummary = aiTopology.supportStages.stages
-    .filter((stage) => stage.dedicated)
+  const stageSummary = [...aiTopology.searchStages, ...aiTopology.supportStages.stages]
     .map((stage) => `${stage.stage}:${stage.agentId}`)
     .join(",");
   console.info(
-    `[ai-topology] searchBot=${aiTopology.searchBot.orchestration} openclawAgentBound=${String(aiTopology.searchBot.openclawAgentBound)} ticketAgent=${aiTopology.ticketAgent.agentId} dedicatedSupportStages=${aiTopology.supportStages.dedicatedCount}${dedicatedStageSummary ? ` [${dedicatedStageSummary}]` : ""}`
+    `[ai-topology] multiAgentReady=${String(aiTopology.multiAgentReady)} configuredAgents=${aiTopology.configuredAgents.length} topologyHash=${aiTopology.topologyHash}${stageSummary ? ` [${stageSummary}]` : ""}${
+      aiTopology.conflicts.length ? ` conflicts=${aiTopology.conflicts.map((item) => item.detail).join(" | ")}` : ""
+    }`
   );
 }
 
@@ -108,24 +138,47 @@ function requireInternalRequest(req: express.Request, res: express.Response, nex
   next();
 }
 
-app.get("/api/v1/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "nexusflow-api",
-    openclaw: env.OPENCLAW_GATEWAY_TOKEN ? "ws" : "unconfigured",
-    aiTopology
-  });
-});
+app.get(
+  "/api/v1/health",
+  asyncHandler(async (_req, res) => {
+    const topology = currentAiTopology();
+    const health = await aiAdapter.healthCheck({
+      agentIds: topology.configuredAgents
+    });
+    res.json({
+      ok: topology.multiAgentReady && health.ok,
+      service: "nexusflow-api",
+      openclaw: health.mode,
+      multiAgentReady: topology.multiAgentReady && health.ok,
+      topologyHash: topology.topologyHash,
+      aiTopology: topology,
+      configuredAgents: topology.configuredAgents,
+      reachableAgents: health.reachableAgents ?? [],
+      unreachableAgents: health.unreachableAgents ?? [],
+      conflicts: topology.conflicts
+    });
+  })
+);
 
 app.get("/api/v1/internal/ai/topology", requireInternalRequest, (_req, res) => {
-  res.json(getAiTopology());
+  res.json(currentAiTopology());
 });
 
 app.get(
   "/api/v1/integrations/openclaw/health",
   asyncHandler(async (_req, res) => {
-    const health = await aiAdapter.healthCheck();
-    res.status(health.ok ? 200 : 503).json(health);
+    const topology = currentAiTopology();
+    const health = await aiAdapter.healthCheck({
+      agentIds: topology.configuredAgents
+    });
+    const ok = topology.multiAgentReady && health.ok;
+    res.status(ok ? 200 : 503).json({
+      ...health,
+      multiAgentReady: ok,
+      topologyHash: topology.topologyHash,
+      configuredAgents: topology.configuredAgents,
+      conflicts: topology.conflicts
+    });
   })
 );
 
@@ -228,8 +281,8 @@ app.post(
 app.post(
   "/api/v1/ai/search",
   asyncHandler(async (req, res) => {
-    if (env.NODE_ENV !== "test" && !env.OPENCLAW_GATEWAY_TOKEN) {
-      res.status(503).json({ error: "OPENCLAW_GATEWAY_TOKEN is not configured" });
+    if (env.NODE_ENV !== "test" && !hasOpenClawGatewayAuth()) {
+      res.status(503).json({ error: "OpenClaw gateway auth is not configured" });
       return;
     }
     const body = aiSearchRequestSchema.parse(req.body);
