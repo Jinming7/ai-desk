@@ -7,6 +7,8 @@ import type {
   OpenClawAdapter,
   OpenClawAnalyzeInput,
   OpenClawAnalyzeOutput,
+  OpenClawHealthCheckInput,
+  OpenClawHealthCheckResult,
   OpenClawClassifyIntentInput,
   OpenClawClassifyIntentOutput,
   OpenClawRuntimeContext,
@@ -295,7 +297,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  async healthCheck(input?: { agentIds?: string[] }) {
+  async healthCheck(input?: OpenClawHealthCheckInput): Promise<OpenClawHealthCheckResult> {
     const configuredAgents = [...new Set((input?.agentIds ?? []).map((item) => String(item).trim()).filter(Boolean))];
     try {
       await this.connectOnly();

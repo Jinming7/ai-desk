@@ -2,6 +2,8 @@ import type {
   OpenClawAdapter,
   OpenClawAnalyzeInput,
   OpenClawAnalyzeOutput,
+  OpenClawHealthCheckInput,
+  OpenClawHealthCheckResult,
   OpenClawSupportEvidencePlannerInput,
   OpenClawSupportAnswerComposerInput,
   OpenClawSupportCitationSelectorInput,
@@ -759,7 +761,15 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  async healthCheck() {
-    return { ok: true, mode: "mock" as const, detail: "Mock adapter active" };
+  async healthCheck(input?: OpenClawHealthCheckInput): Promise<OpenClawHealthCheckResult> {
+    const configuredAgents = [...new Set((input?.agentIds ?? []).map((item) => String(item).trim()).filter(Boolean))];
+    return {
+      ok: true,
+      mode: "mock" as const,
+      detail: "Mock adapter active",
+      configuredAgents,
+      reachableAgents: configuredAgents,
+      unreachableAgents: []
+    };
   }
 }
