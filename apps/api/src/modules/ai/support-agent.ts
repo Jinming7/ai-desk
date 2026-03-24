@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { env } from "../../config/env.js";
 import type {
   OpenClawAdapter,
@@ -37,6 +39,20 @@ function uniqueStrings(input: Array<string | undefined | null>, limit = 6): stri
     if (values.length >= limit) break;
   }
   return values;
+}
+
+function isLowSignalMissingInfo(item: string): boolean {
+  const normalized = item.trim().toLowerCase();
+  return (
+    normalized === "the exact object or scenario you are working with" ||
+    normalized === "the single most important missing detail" ||
+    normalized === "more context" ||
+    normalized === "more details"
+  );
+}
+
+function sanitizeMissingCriticalInfo(input: Array<string | undefined | null>, limit = 3): string[] {
+  return uniqueStrings(input, limit).filter((item) => !isLowSignalMissingInfo(item));
 }
 
 function elapsedMs(startedAt: number): number {
@@ -149,7 +165,7 @@ function fallbackCaseFrame(query: string): SupportCaseFrame {
       : "shared",
     product_area: /api|openapi|接口/i.test(query) ? "openapi" : "general",
     constraints: [],
-    missing_critical_info: ["the exact object or scenario you are working with"],
+    missing_critical_info: [],
     retrieval_queries: [normalized],
     query_plan: {
       concept_queries: [normalized],
@@ -218,6 +234,7 @@ function fallbackEvidencePlan(query: string): SupportEvidencePlan {
 function mergeRouteAndEvidencePlan(caseFrame: SupportCaseFrame, route: SupportQuestionRoute, plan: SupportEvidencePlan): SupportCaseFrame {
   return {
     ...caseFrame,
+    missing_critical_info: sanitizeMissingCriticalInfo(caseFrame.missing_critical_info, 3),
     question_type: route.question_type,
     specialist_agent: route.specialist_agent,
     answer_contract: route.answer_contract,
@@ -510,7 +527,8 @@ function buildEvidenceBundle(input: {
     3
   )
     .map((id) => byId.get(id))
-    .filter((item): item is SearchReference => Boolean(item));
+    .filter((item): item is SearchReference => Boolean(item))
+    .map((item) => hydrateReferenceEvidence(item));
   const supplemental = uniqueStrings(
     [
       ...selectedSupplemental.map((item) => item.documentId),
@@ -524,7 +542,8 @@ function buildEvidenceBundle(input: {
     5
   )
     .map((id) => byId.get(id))
-    .filter((item): item is SearchReference => Boolean(item));
+    .filter((item): item is SearchReference => Boolean(item))
+    .map((item) => hydrateReferenceEvidence(item));
   return {
     primary,
     supplemental,
@@ -595,6 +614,68 @@ function canonicalDocsPath(input?: string): string {
     .trim()
     .replace(/^i18n\/[^/]+\/docusaurus-plugin-content-docs-open-docs\/current\//i, "open-docs/docs/")
     .replace(/^i18n\/[^/]+\/docusaurus-plugin-content-docs\/current\//i, "docs/");
+}
+
+function resolveLocalDocsMirrorPath(reference: SearchReference): string | null {
+  const rawPath = String(reference.path ?? "").trim();
+  if (!rawPath || !env.LOCAL_DOCS_COM_PATH.trim()) return null;
+  const candidates = [rawPath, canonicalDocsPath(rawPath)]
+    .filter(Boolean)
+    .map((candidate) => path.resolve(env.LOCAL_DOCS_COM_PATH, candidate));
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function buildLocalDocsEvidenceSnippet(reference: SearchReference): string | null {
+  const resolvedPath = resolveLocalDocsMirrorPath(reference);
+  if (!resolvedPath) return null;
+
+  const raw = fs.readFileSync(resolvedPath, "utf8");
+  const normalizeEvidenceLine = (line: string): string => {
+    const trimmed = line.trim();
+    const methodMatch = trimmed.match(/<MethodEndpoint[\s\S]*method=\{"([^"]+)"\}[\s\S]*path=\{"([^"]+)"\}/);
+    if (methodMatch) {
+      return `MethodEndpoint method={"${methodMatch[1]}"} path={"${methodMatch[2]}"}`;
+    }
+    const paramsMatch = trimmed.match(/<ParamsItem[\s\S]*"name":"([^"]+)"[\s\S]*"description":"([^"]+)"/);
+    if (paramsMatch) {
+      return `ParamsItem name={"${paramsMatch[1]}"} description={"${paramsMatch[2]}"}`;
+    }
+    const schemaMatch = trimmed.match(/<SchemaItem[\s\S]*name=\{"([^"]+)"\}[\s\S]*description":"([^"]+)"/);
+    if (schemaMatch) {
+      return `SchemaField name={"${schemaMatch[1]}"} description={"${schemaMatch[2]}"}`;
+    }
+    return trimmed.length <= 220 ? trimmed : trimmed.slice(0, 220);
+  };
+  const cleanedLines = raw
+    .replace(/^---[\s\S]*?---\s*/, "")
+    .split("\n")
+    .map((line) => normalizeEvidenceLine(line))
+    .filter(Boolean)
+    .filter((line) => !line.startsWith("import "))
+    .filter((line) => !/^api:\s/.test(line))
+    .filter((line) => !/^(sidebar_|hide_|custom_edit_url:|info_path:)/.test(line))
+    .filter((line) => line.length <= 220);
+
+  const heading = String(reference.headingPath ?? "").trim();
+  const headingNeedle = heading && heading.toUpperCase() !== "ROOT" ? shortHeadingLabel(heading).toLowerCase() : "";
+  const anchorIndex = headingNeedle ? cleanedLines.findIndex((line) => line.toLowerCase().includes(headingNeedle)) : -1;
+  const scopedLines =
+    anchorIndex >= 0 ? cleanedLines.slice(Math.max(0, anchorIndex - 18), anchorIndex + 90) : cleanedLines.slice(0, 140);
+  const enriched = scopedLines.join(" ").replace(/\s+/g, " ").trim();
+  return enriched ? enriched.slice(0, 3200) : null;
+}
+
+function hydrateReferenceEvidence(reference: SearchReference): SearchReference {
+  if (reference.sourceType !== "local_docs") return reference;
+  const enrichedSnippet = buildLocalDocsEvidenceSnippet(reference);
+  if (!enrichedSnippet || enrichedSnippet.length <= reference.snippet.length) return reference;
+  return {
+    ...reference,
+    snippet: enrichedSnippet
+  };
 }
 
 function uniqueCitationIds(claims: SupportVerificationResult["claim_to_citation_map"]): string[] {
@@ -1315,6 +1396,284 @@ function recoverEvidenceAnchoredHowToDraft(input: {
   };
 }
 
+type ApiEvidenceCandidate = {
+  text: string;
+  evidenceId: string;
+  kind: SpecialistDraftAnswer["claims"][number]["kind"];
+  authority: SpecialistDraftAnswer["claims"][number]["authority"];
+  score: number;
+  fieldName?: string;
+  method?: string;
+  path?: string;
+};
+
+function expandApiSemanticFocusTerms(query: string, caseFrame: SupportCaseFrame): string[] {
+  const raw = `${query} ${caseFrame.goal} ${caseFrame.object} ${caseFrame.symptom}`.toLowerCase();
+  const expanded = new Set<string>(collectFocusTerms(query, caseFrame));
+  const add = (values: string[]) => values.forEach((value) => expanded.add(value));
+
+  if (/(标识|id|uuid|identifier|唯一)/i.test(raw)) add(["标识", "id", "uuid", "identifier", "项目id", "属性uuid"]);
+  if (/(负责人|成员|owner|assignee|user|用户)/i.test(raw)) add(["负责人", "成员", "member", "user", "owner", "assignee", "uuid", "name", "avatar"]);
+  if (/(选项|option|options)/i.test(raw)) add(["选项", "option", "options", "field/options", "属性选项"]);
+  if (/(项目|project)/i.test(raw)) add(["项目", "project", "projects", "项目id", "项目列表"]);
+  if (/(状态|status)/i.test(raw)) add(["状态", "status"]);
+  if (/(评论|comment)/i.test(raw)) add(["评论", "comment"]);
+  if (/(scope|权限|授权|oauth|token)/i.test(raw)) add(["scope", "权限", "授权", "oauth", "token"]);
+
+  return uniqueStrings([...expanded], 32);
+}
+
+function extractApiOperationSignature(reference: SearchReference): { method?: string; path?: string } {
+  const snippet = String(reference.snippet ?? "");
+  const jsxMatch = snippet.match(/method=\{"([a-z]+)"\}\s+path=\{"([^"]+)"\}/i);
+  if (jsxMatch) {
+    return {
+      method: jsxMatch[1].toUpperCase(),
+      path: jsxMatch[2]
+    };
+  }
+  const plainMatch = snippet.match(/\b(GET|POST|PUT|PATCH|DELETE)\s+([/A-Za-z0-9._:-]+)/);
+  if (plainMatch) {
+    return {
+      method: plainMatch[1].toUpperCase(),
+      path: plainMatch[2]
+    };
+  }
+  return {};
+}
+
+function buildApiExtractionSource(reference: SearchReference): string {
+  const snippet = String(reference.snippet ?? "");
+  const resolvedPath = resolveLocalDocsMirrorPath(reference);
+  if (!resolvedPath) return snippet;
+  try {
+    const raw = fs.readFileSync(resolvedPath, "utf8");
+    return `${snippet}\n${raw}`;
+  } catch {
+    return snippet;
+  }
+}
+
+function extractApiFieldCandidates(reference: SearchReference, language: "zh" | "en"): ApiEvidenceCandidate[] {
+  const candidates: ApiEvidenceCandidate[] = [];
+  const source = buildApiExtractionSource(reference);
+  for (const match of source.matchAll(/name=\{"([^"]+)"\}[\s\S]{0,1200}?(?:"description":"|description=\{")([^"}]+)/g)) {
+    const fieldName = String(match[1] ?? "").trim();
+    const description = String(match[2] ?? "").trim();
+    if (!fieldName || !description) continue;
+    candidates.push({
+      text:
+        language === "zh"
+          ? `该接口的字段 ${fieldName} 在文档中说明为“${description}”。`
+          : `The documentation describes field ${fieldName} as "${description}".`,
+      evidenceId: reference.documentId,
+      kind: "verified_fact",
+      authority: "canonical",
+      score: 0,
+      fieldName
+    });
+  }
+  return candidates;
+}
+
+function extractApiNarrativeCandidates(reference: SearchReference, language: "zh" | "en"): ApiEvidenceCandidate[] {
+  const candidates: ApiEvidenceCandidate[] = [];
+  const rawSnippet = String(reference.snippet ?? "").replace(/\s+/g, " ").trim();
+  const fragments = rawSnippet
+    .split(/\s+-\s+|。|\.\s+/)
+    .map((item) => item.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .filter((item) => item.length >= 8 && item.length <= 180);
+
+  for (const fragment of fragments) {
+    if (!/(返回包含|支持|获取.+列表|returns?|includes?|supports?)/i.test(fragment)) continue;
+    candidates.push({
+      text:
+        language === "zh"
+          ? `《${reference.title}》说明：${fragment.replace(/^[-•]\s*/, "")}。`
+          : `"${reference.title}" states: ${fragment.replace(/^[-•]\s*/, "")}.`,
+      evidenceId: reference.documentId,
+      kind: "verified_fact",
+      authority: "canonical",
+      score: 0
+    });
+  }
+  return candidates;
+}
+
+function extractApiRequestParamNames(reference: SearchReference): string[] {
+  const source = buildApiExtractionSource(reference);
+  return uniqueStrings(
+    [
+      ...[...source.matchAll(/param=\{\{"name":"([^"]+)"/g)].map((match) => String(match[1] ?? "").trim()),
+      ...[...source.matchAll(/name=\{"([^"]+)"\}[\s\S]{0,400}?required=\{true\}/g)].map((match) => String(match[1] ?? "").trim())
+    ],
+    6
+  );
+}
+
+function scoreApiEvidenceCandidate(candidate: ApiEvidenceCandidate, focusTerms: string[], reference: SearchReference, primaryBoost: number): number {
+  const haystack = `${candidate.text} ${candidate.fieldName ?? ""} ${candidate.method ?? ""} ${candidate.path ?? ""} ${reference.title} ${reference.headingPath ?? ""} ${reference.path ?? ""}`.toLowerCase();
+  let score = primaryBoost + Math.round(reference.score * 10);
+  const wantsIdentifier = focusTerms.some((term) => /标识|id|uuid|identifier/i.test(term));
+  const wantsProject = focusTerms.some((term) => /项目|project/i.test(term));
+  const wantsMember = focusTerms.some((term) => /负责人|成员|member|user|owner|assignee/i.test(term));
+  for (const term of focusTerms) {
+    if (!term) continue;
+    const normalized = term.toLowerCase();
+    if (haystack.includes(normalized)) score += normalized.length >= 4 ? 7 : 4;
+  }
+  if (candidate.fieldName && /^(id|uuid)$/i.test(candidate.fieldName) && wantsIdentifier) {
+    score += 18;
+  }
+  if (wantsProject && /项目|project/i.test(candidate.text)) score += 12;
+  if (wantsMember && /负责人|成员|member|user|owner|assignee/i.test(candidate.text)) score += 12;
+  if (wantsProject && /成员|member|user|owner|assignee/i.test(candidate.text)) score -= 8;
+  if (wantsMember && /项目|project/i.test(candidate.text) && !/成员|member|user|owner|assignee/i.test(candidate.text)) score -= 6;
+  if (/(返回包含|returns?)/i.test(candidate.text)) score += 4;
+  if (candidate.method && candidate.path) score += 6;
+  return score;
+}
+
+function recoverEvidenceAnchoredApiDraft(input: {
+  language: "zh" | "en";
+  query: string;
+  draft: SpecialistDraftAnswer;
+  evidenceBundle: SupportEvidenceBundle;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+}): SpecialistDraftAnswer | null {
+  if (input.route.specialist_agent !== "api-specialist") return null;
+  if (hasGroundedDraftClaims(input.draft)) return null;
+
+  const ranked = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].filter(
+    (reference) => reference.authority === "canonical_visible"
+  );
+  if (!ranked.length) return null;
+
+  const focusTerms = expandApiSemanticFocusTerms(input.query, input.caseFrame);
+  const wantsIdentifier = focusTerms.some((term) => /标识|id|uuid|identifier/i.test(term));
+  const scoredClaims: ApiEvidenceCandidate[] = [];
+  let topOperationMethod = "";
+  let topOperationPath = "";
+  let topOperationScore = -1;
+  let requiredParams: string[] = [];
+
+  ranked.forEach((reference, index) => {
+    const primaryBoost = index < input.evidenceBundle.primary.length ? 24 : 10;
+    const operation = extractApiOperationSignature(reference);
+    if (operation.method && operation.path) {
+      const operationCandidate: ApiEvidenceCandidate = {
+        text:
+          input.language === "zh"
+            ? `《${reference.title}》文档给出的接口是 ${operation.method} ${operation.path}。`
+            : `The documented operation in "${reference.title}" is ${operation.method} ${operation.path}.`,
+        evidenceId: reference.documentId,
+        kind: "verified_fact",
+        authority: "canonical",
+        score: 0,
+        method: operation.method,
+        path: operation.path
+      };
+      operationCandidate.score = scoreApiEvidenceCandidate(operationCandidate, focusTerms, reference, primaryBoost);
+      scoredClaims.push(operationCandidate);
+      if (operationCandidate.score > topOperationScore) {
+        topOperationMethod = operation.method;
+        topOperationPath = operation.path;
+        topOperationScore = operationCandidate.score;
+        requiredParams = extractApiRequestParamNames(reference);
+      }
+    }
+
+    extractApiFieldCandidates(reference, input.language).forEach((candidate) => {
+      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost);
+      scoredClaims.push(candidate);
+    });
+    extractApiNarrativeCandidates(reference, input.language).forEach((candidate) => {
+      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost);
+      scoredClaims.push(candidate);
+    });
+  });
+
+  const selectedClaims = scoredClaims
+    .sort((a, b) => {
+      const aIdentifierBoost =
+        wantsIdentifier && /字段 (?:id|uuid)|field (?:id|uuid)|项目id|属性uuid/i.test(a.text) ? 50 : 0;
+      const bIdentifierBoost =
+        wantsIdentifier && /字段 (?:id|uuid)|field (?:id|uuid)|项目id|属性uuid/i.test(b.text) ? 50 : 0;
+      return b.score + bIdentifierBoost - (a.score + aIdentifierBoost);
+    })
+    .filter((candidate, index, all) => all.findIndex((item) => item.text === candidate.text) === index)
+    .slice(0, 3)
+    .map((candidate) => ({
+      text: candidate.text,
+      kind: candidate.kind,
+      evidence_ids: [candidate.evidenceId],
+      authority: candidate.authority
+    }));
+
+  if (!selectedClaims.length) return null;
+  const anchorEvidenceId = selectedClaims[0]?.evidence_ids[0];
+  const identifierClaim = wantsIdentifier
+    ? selectedClaims.find((claim) => /字段 (?:id|uuid)|field (?:id|uuid)|项目id|属性uuid/i.test(claim.text))
+    : undefined;
+  const coherentClaims = selectedClaims
+    .sort((a, b) => {
+      const aAnchor = Number(a.evidence_ids[0] === anchorEvidenceId);
+      const bAnchor = Number(b.evidence_ids[0] === anchorEvidenceId);
+      const aIdentifier = Number(identifierClaim?.text === a.text);
+      const bIdentifier = Number(identifierClaim?.text === b.text);
+      return bIdentifier - aIdentifier || bAnchor - aAnchor;
+    })
+    .slice(0, 3);
+
+  const directAnswerLead = coherentClaims[0]?.text ?? "";
+  const operationMethod = topOperationMethod || undefined;
+  const operationPath = topOperationPath || undefined;
+  const operationLabel = operationMethod && operationPath ? `${operationMethod} ${operationPath}` : "";
+  const directAnswer =
+    input.language === "zh"
+      ? operationLabel
+        ? `${directAnswerLead}${directAnswerLead.includes(operationLabel) ? "" : ` 对应接口是 ${operationLabel}。`}`.trim()
+        : directAnswerLead
+      : operationLabel
+      ? `${directAnswerLead}${directAnswerLead.includes(operationLabel) ? "" : ` The endpoint is ${operationLabel}.`}`.trim()
+      : directAnswerLead;
+
+  const nextActions =
+    input.language === "zh"
+      ? uniqueStrings(
+          [
+            operationLabel ? `优先按 ${operationLabel} 这个接口核对调用。` : "",
+            requiredParams.length ? `调用前确认必填参数是否已补齐，例如 ${requiredParams.join("、")}。` : ""
+          ],
+          3
+        )
+      : uniqueStrings(
+          [
+            operationLabel ? `Start by checking ${operationLabel}.` : "",
+            requiredParams.length ? `Confirm the required inputs are present, for example ${requiredParams.join(", ")}.` : ""
+          ],
+          3
+        );
+
+  const responseFieldClaim = coherentClaims.find((claim) => /字段|field/i.test(claim.text));
+  const responseFieldHint = responseFieldClaim?.text.replace(/^.*?(?:字段|field)\s+/i, "").slice(0, 80);
+
+  return {
+    ...input.draft,
+    render_variant: "api",
+    direct_answer: directAnswer,
+    claims: coherentClaims,
+    next_actions: nextActions,
+    unknowns: [],
+    api_method: operationMethod,
+    api_path: operationPath,
+    required_params: requiredParams,
+    response_field_hint: responseFieldHint
+  };
+}
+
 function combineRetrievalQueries(query: string, caseFrame: SupportCaseFrame, orchestrator: SearchOrchestrator): string[] {
   const groupedQueries = [
     ...caseFrame.retrieval_queries,
@@ -1673,26 +2032,43 @@ export async function runSupportSearchAgent(input: {
       missingInfo: caseFrame.missing_critical_info
     });
   const draftSupportAnswer =
+    recoverEvidenceAnchoredApiDraft({
+      language: input.language,
+      query: input.query,
+      draft: rawDraftSupportAnswer,
+      evidenceBundle,
+      route,
+      caseFrame
+    }) ??
     recoverEvidenceAnchoredHowToDraft({
       language: input.language,
       query: input.query,
       draft: rawDraftSupportAnswer,
       evidenceBundle,
       route
-    }) ?? rawDraftSupportAnswer;
+    }) ??
+    rawDraftSupportAnswer;
+  const draftClaimsWithEvidence = draftSupportAnswer.claims.filter(
+    (claim: SpecialistDraftAnswer["claims"][number]) =>
+      claim.evidence_ids.length > 0 && (claim.kind === "verified_fact" || claim.kind === "grounded_inference")
+  );
+  const draftClaimsWithoutEvidence = draftSupportAnswer.claims.filter(
+    (claim: SpecialistDraftAnswer["claims"][number]) =>
+      claim.evidence_ids.length === 0 && (claim.kind === "verified_fact" || claim.kind === "grounded_inference")
+  );
   const writerBoundVerification = sanitizeVerification({
     verification: {
       verdict:
-        draftSupportAnswer.claims.some((claim: SpecialistDraftAnswer["claims"][number]) => claim.evidence_ids.length > 0)
-          ? "partial"
-          : "unsupported",
+        draftClaimsWithEvidence.length === 0
+          ? "unsupported"
+          : draftClaimsWithoutEvidence.length === 0 && draftSupportAnswer.unknowns.length === 0
+          ? "verified"
+          : "partial",
       summary:
         input.language === "zh"
           ? "已根据回答草稿中的证据引用补充文档绑定。"
           : "Documentation bindings were recovered from the draft answer evidence ids.",
-      unsupported_claims: draftSupportAnswer.claims
-        .filter((claim: SpecialistDraftAnswer["claims"][number]) => claim.evidence_ids.length === 0)
-        .map((claim: SpecialistDraftAnswer["claims"][number]) => claim.text),
+      unsupported_claims: draftClaimsWithoutEvidence.map((claim: SpecialistDraftAnswer["claims"][number]) => claim.text),
       missing_info: [],
       verified_citation_ids: uniqueStrings(
         draftSupportAnswer.claims.flatMap((claim: SpecialistDraftAnswer["claims"][number]) => claim.evidence_ids),

@@ -864,6 +864,125 @@ test("runSupportSearchAgent reports dedicated selector stages in orchestration t
   assert.equal(evidenceSelector?.agent_id, "support-evidence-selector");
 });
 
+test("runSupportSearchAgent recovers grounded API field claims from project list evidence when specialist claims are empty", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "i18n/zh-Hans/docusaurus-plugin-content-docs-open-docs/current/openapi/api/get-team-projects.api.mdx",
+    `---
+title: "获取团队下项目列表"
+---
+
+<MethodEndpoint
+  method={"get"}
+  path={"/project/projects"}
+>
+</MethodEndpoint>
+
+<ParamsItem param={{"name":"teamID","in":"query","description":"团队ID","required":true,"schema":{"type":"string"}}} />
+
+<SchemaItem
+  collapsible={false}
+  name={"id"}
+  required={false}
+  schemaName={"string"}
+  schema={{"type":"string","description":"项目ID"}}
+>
+</SchemaItem>
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "api_field_lookup",
+      specialist_agent: "api-specialist"
+    }
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "获取项目列表的API怎样拿到项目标识？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-project-id-recovery"
+    });
+
+    assert.notEqual(result.result.support_answer?.mode, "handoff");
+    assert.match(result.result.answer, /GET \/project\/projects/);
+    assert.match(result.result.answer, /项目ID|字段 id/i);
+    assert.ok((result.result.internal_diagnostics?.claim_graph ?? []).length > 0);
+    assert.ok(result.result.citations.length >= 1);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent recovers grounded API option facts from field options evidence when specialist claims are empty", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "i18n/zh-Hans/docusaurus-plugin-content-docs-open-docs/current/openapi/api/get-field-options.api.mdx",
+    `---
+title: "获取属性选项"
+---
+
+<MethodEndpoint
+  method={"post"}
+  path={"/field/options"}
+>
+</MethodEndpoint>
+
+- 获取成员列表：返回包含 uuid、name、avatar 的用户信息
+- 获取项目列表：返回包含 uuid、name、status 的项目信息
+
+<SchemaItem
+  collapsible={false}
+  name={"field_uuid"}
+  required={true}
+  schemaName={"string"}
+  schema={{"type":"string","description":"属性UUID"}}
+>
+</SchemaItem>
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "api_field_lookup",
+      specialist_agent: "api-specialist"
+    }
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "哪个接口可以获取负责人的选项值",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-field-options-recovery"
+    });
+
+    assert.notEqual(result.result.support_answer?.mode, "handoff");
+    assert.match(result.result.answer, /POST \/field\/options/);
+    assert.match(result.result.answer, /uuid|name|avatar/i);
+    assert.ok((result.result.internal_diagnostics?.claim_graph ?? []).length > 0);
+    assert.ok(result.result.citations.length >= 1);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("runSupportSearchAgent only displays claim-linked citations even when unrelated references are retrieved", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;

@@ -252,6 +252,14 @@ function buildQueryVariants(query: string): string[] {
     [/open\s*api/gi, "openapi"],
     [/开放平台/gi, "openapi open platform"],
     [/接口/gi, "api endpoint"],
+    [/项目标识|项目id|project id/gi, "项目 标识 project id uuid"],
+    [/标识|标识符/gi, "identifier id uuid 标识"],
+    [/项目列表/gi, "项目列表 project list projects"],
+    [/项目/gi, "项目 project"],
+    [/负责人/gi, "负责人 owner assignee member user"],
+    [/成员/gi, "成员 member user owner assignee"],
+    [/选项值|选项/gi, "选项 option options field options"],
+    [/属性/gi, "属性 field property"],
     [/缺陷/gi, "缺陷 defect bug issue 工作项"],
     [/工作项/gi, "工作项 issue work item"],
     [/状态列表|状态枚举/gi, "status list statuses enum issueStatuses"],
@@ -308,6 +316,8 @@ function scoreEntry(entry: LocalDocsIndexEntry, phrases: string[], tokens: strin
   const needsTokenLifecycleEvidence = /token|credential|revoke|reset|refresh/.test(joinedTokens);
   const needsIssueEntity = /issue|defect|bug|工作项|缺陷/.test(joinedTokens);
   const needsStatusEntity = /status|state|workflow_status|状态/.test(joinedTokens);
+  const needsProjectEntity = /project|projects|项目/.test(joinedTokens);
+  const needsMemberEntity = /负责人|成员|member|user|owner|assignee/.test(joinedTokens);
   const needsDetailOperation = /detail|details|get by id|current value|详细信息|详情|当前/.test(joinedTokens);
   const needsListOperation = /statuses|list|enum|collection|列表|枚举/.test(joinedTokens);
   const normalizedPhrases = phrases.map((phrase) => phrase.toLowerCase()).filter((phrase) => phrase.length >= 2);
@@ -331,6 +341,15 @@ function scoreEntry(entry: LocalDocsIndexEntry, phrases: string[], tokens: strin
   }
   if (/callback|redirect|integration|github|oauth/.test(tokens.join(" ")) && /integrations|deploy-docs/i.test(entry.path)) {
     score += 1.2;
+  }
+  if (needsProjectEntity) {
+    if (entry.searchableTitle.includes("项目") || entry.searchableTitle.includes("project")) score += 6;
+    if (entry.searchablePath.includes("project")) score += 5;
+    if (entry.searchableContent.includes("项目id") || entry.searchableContent.includes("\"id\"")) score += 4;
+  }
+  if (needsMemberEntity) {
+    if (entry.searchableContent.includes("成员") || entry.searchableContent.includes("member")) score += 4;
+    if (entry.searchableContent.includes("avatar") || entry.searchableContent.includes("assignee")) score += 3;
   }
   if (needsScopeEvidence) {
     if (permissions.length > 0) score += 7;
