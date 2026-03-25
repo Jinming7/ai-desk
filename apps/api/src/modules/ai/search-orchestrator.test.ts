@@ -295,7 +295,7 @@ function createAdapter(searchKnowledgeCalls: { count: number }): OpenClawAdapter
   };
 }
 
-test("collectEvidence uses local docs as the primary evidence source when docs-com hits exist", async () => {
+test("collectEvidence does not promote local docs into primary evidence when github kb has no matching document", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
   const searchKnowledgeCalls = { count: 0 };
@@ -324,13 +324,17 @@ Scopes:
     const result = await orchestrator.collectEvidence({
       queries: ["What scope is required to create an issue comment via OpenAPI?"],
       idempotencyKey: "search-orchestrator-local-first",
-      answerLanguage: "en"
+      answerLanguage: "en",
+      runtime: {
+        intent: "retrieval",
+        sessionKey: "search-orchestrator-disable-local-docs",
+        disableLocalDocs: true
+      }
     });
 
     assert.equal(searchKnowledgeCalls.count, 0);
-    assert.equal(result.references.length > 0, true);
-    assert.equal(result.references[0]?.path, "open-docs/docs/openapi/api/issue-comment.info.mdx");
-    assert.equal(result.references[0]?.sourceUrl, "https://docs.ones.com/developer/openapi/api/issue-comment");
+    assert.equal(result.references.length, 0);
+    assert.equal(result.retrievalStatus, "no_results");
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

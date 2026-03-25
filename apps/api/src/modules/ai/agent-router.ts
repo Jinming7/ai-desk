@@ -326,6 +326,7 @@ export function buildSearchRuntime(input: {
       : {
           overallTimeoutMs: 90000,
           requestStartedAtMs: Date.now(),
+          disableLocalDocs: true,
           allowMultiPassRetrieval: true,
           allowRefinement: true,
           kbTopK: 8,
@@ -354,7 +355,9 @@ export function resolveExecutionRuntime(sessionId: string): OpenClawRuntimeConte
           kbTopK: 6,
           queryLimit: 1
         }
-      : {})
+      : {
+          disableLocalDocs: true
+        })
   };
 }
 

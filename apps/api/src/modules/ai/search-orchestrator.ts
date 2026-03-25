@@ -12,6 +12,14 @@ type SearchEvidenceCollection = SearchResponseEnvelope & {
 export class SearchOrchestrator {
   constructor(private readonly adapter: OpenClawAdapter) {}
 
+  private extractQueryTerms(query?: string): string[] {
+    const raw = String(query ?? "").trim().toLowerCase();
+    if (!raw) return [];
+    const ascii = [...raw.matchAll(/[a-z0-9:_./-]{3,}/g)].map((match) => match[0]);
+    const cjk = [...raw.matchAll(/[\u4e00-\u9fff]{2,}/g)].map((match) => match[0]);
+    return [...new Set([...ascii, ...cjk])].slice(0, 16);
+  }
+
   private canonicalDocsPath(input?: string): string {
     const value = String(input ?? "").trim();
     if (!value) return "";
@@ -117,7 +125,24 @@ export class SearchOrchestrator {
     );
   }
 
-  private mergeReferences(references: SearchReference[]): SearchReference[] {
+  private scoreReferenceQueryMatch(reference: SearchReference, queryTerms: string[]): number {
+    if (!queryTerms.length) return 0;
+    const title = String(reference.title ?? "").toLowerCase();
+    const heading = String(reference.headingPath ?? "").toLowerCase();
+    const path = this.canonicalDocsPath(reference.path).toLowerCase();
+    const snippet = String(reference.snippet ?? "").toLowerCase();
+    let score = 0;
+    for (const term of queryTerms) {
+      if (title.includes(term)) score += 12;
+      else if (heading.includes(term)) score += 9;
+      else if (path.includes(term)) score += 7;
+      else if (snippet.includes(term)) score += 2;
+    }
+    return score;
+  }
+
+  private mergeReferences(references: SearchReference[], options?: { query?: string }): SearchReference[] {
+    const queryTerms = this.extractQueryTerms(options?.query);
     const byKey = new Map<string, SearchReference>();
     for (const item of references) {
       if (!this.hasUsableEvidence(item)) continue;
@@ -128,17 +153,26 @@ export class SearchOrchestrator {
         .filter(Boolean)
         .join("::");
       const previous = byKey.get(key);
-      if (!previous || item.score > previous.score) {
+      const itemQueryScore = this.scoreReferenceQueryMatch(item, queryTerms);
+      const previousQueryScore = previous ? this.scoreReferenceQueryMatch(previous, queryTerms) : -1;
+      if (
+        !previous ||
+        itemQueryScore > previousQueryScore ||
+        (itemQueryScore === previousQueryScore && item.score > previous.score) ||
+        (itemQueryScore === previousQueryScore && item.score === previous.score && item.snippet.length > previous.snippet.length)
+      ) {
         byKey.set(key, item);
       }
     }
-    const sorted = [...byKey.values()].sort((a, b) => b.score - a.score);
-    const topScore = sorted[0]?.score ?? 0;
-    const scoreFloor = topScore > 0 ? Math.max(0.25, Number((topScore * 0.6).toFixed(2))) : 0;
+    const combinedScore = (reference: SearchReference) =>
+      this.scoreReferenceQueryMatch(reference, queryTerms) + Math.round(reference.score * 10);
+    const sorted = [...byKey.values()].sort((a, b) => combinedScore(b) - combinedScore(a) || b.score - a.score);
+    const topCombinedScore = sorted[0] ? combinedScore(sorted[0]) : 0;
+    const scoreFloor = topCombinedScore > 0 ? Math.max(6, Math.round(topCombinedScore * 0.55)) : 0;
     const perDocument = new Map<string, number>();
     const limited: SearchReference[] = [];
     for (const item of sorted) {
-      if (limited.length >= 3 && item.score < scoreFloor) continue;
+      if (limited.length >= 4 && combinedScore(item) < scoreFloor) continue;
       const docKey = item.path || item.documentId || item.sourceUrl || item.title;
       const seen = perDocument.get(docKey) ?? 0;
       if (seen >= 2) continue;
@@ -146,6 +180,29 @@ export class SearchOrchestrator {
       limited.push(item);
     }
     return limited;
+  }
+
+  private enrichGithubKbReferencesWithLocalDocs(
+    kbReferences: SearchReference[],
+    localDocsReferences: SearchReference[]
+  ): SearchReference[] {
+    if (!kbReferences.length || !localDocsReferences.length) return kbReferences;
+    return kbReferences.map((reference) => {
+      const referencePath = this.canonicalDocsPath(reference.path).toLowerCase();
+      const referenceHeading = String(reference.headingPath ?? "ROOT").trim().toLowerCase();
+      const localMatch = localDocsReferences.find((candidate) => {
+        const candidatePath = this.canonicalDocsPath(candidate.path).toLowerCase();
+        const candidateHeading = String(candidate.headingPath ?? "ROOT").trim().toLowerCase();
+        return candidatePath === referencePath && candidateHeading === referenceHeading;
+      });
+      if (!localMatch || localMatch.snippet.length <= reference.snippet.length) {
+        return reference;
+      }
+      return {
+        ...reference,
+        snippet: localMatch.snippet
+      };
+    });
   }
 
   private scoreDocKindMatch(reference: SearchReference, requiredDocKinds: string[]): number {
@@ -392,10 +449,14 @@ export class SearchOrchestrator {
           .catch(() => null)
       ]);
 
-      const mergedReferences = this.mergeReferences([
-        ...(localDocsResult?.references ?? []),
-        ...(kbResult?.references ?? [])
-      ]);
+      const kbReferences = kbResult?.references ?? [];
+      const localDocsReferences = localDocsResult?.references ?? [];
+      const mergedReferences = this.mergeReferences(
+        input.runtime?.disableLocalDocs
+          ? this.enrichGithubKbReferencesWithLocalDocs(kbReferences, localDocsReferences)
+          : [...localDocsReferences, ...this.enrichGithubKbReferencesWithLocalDocs(kbReferences, localDocsReferences)],
+        { query }
+      );
 
       if (!mergedReferences.length) {
         if (!localDocsResult && !kbResult) {
@@ -424,7 +485,9 @@ export class SearchOrchestrator {
     };
 
     const firstRound = await Promise.all(normalizedQueries.map((query) => retrieveOnce(query)));
-    const merged = this.mergeReferences(firstRound.flatMap((item) => item.references)).slice(0, env.GITHUB_KB_PROFILE_AGENT_TOPK);
+    const merged = this.mergeReferences(firstRound.flatMap((item) => item.references), {
+      query: normalizedQueries.join(" ")
+    }).slice(0, env.GITHUB_KB_PROFILE_AGENT_TOPK);
     const confidence = Math.max(0, ...firstRound.map((item) => item.confidence));
     const fallbackUsed = firstRound.some((item) => item.fallbackUsed);
     const resolvedQueries = [...new Set(firstRound.flatMap((item) => item.resolvedQueries))];
