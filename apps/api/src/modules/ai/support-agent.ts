@@ -408,7 +408,9 @@ function mergeRouteAndEvidencePlan(caseFrame: SupportCaseFrame, route: SupportQu
 }
 
 function normalizeStageBudget(input: { route: SupportQuestionRoute; plan: SupportEvidencePlan }) {
-  const retrievalRounds = Math.max(1, Math.min(2, Number(input.plan.retrieval_rounds ?? 2) || 2));
+  const apiRoute = String(input.route.question_type ?? "").startsWith("api_");
+  const retrievalFloor = apiRoute ? 2 : 1;
+  const retrievalRounds = Math.max(retrievalFloor, Math.min(2, Number(input.plan.retrieval_rounds ?? 2) || 2));
   const rawSpecialistBudget = input.route.specialist_budget ?? 1;
   const specialistBudget = Math.max(0, Math.min(1, Number.isFinite(rawSpecialistBudget) ? rawSpecialistBudget : 1));
   return {
@@ -2064,6 +2066,13 @@ function extractApiOperationSignature(reference: SearchReference): { method?: st
       path: plainMatch[2]
     };
   }
+  const titleMatch = String(reference.title ?? "").match(/\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+([/A-Za-z0-9._:{}?=&-]+)/i);
+  if (titleMatch) {
+    return {
+      method: titleMatch[1].toUpperCase(),
+      path: titleMatch[2]
+    };
+  }
   return {};
 }
 
@@ -2369,15 +2378,43 @@ function recoverEvidenceAnchoredApiDraft(input: {
   };
 }
 
+function buildApiRetrievalBridgeQuery(query: string, caseFrame: SupportCaseFrame): string | null {
+  if (!String(caseFrame.question_type ?? "").startsWith("api_")) return null;
+  const intents = collectApiOperationIntents(query, caseFrame);
+  const intentLexicon: Record<ApiOperationIntent, string[]> = {
+    create: ["create", "add", "new"],
+    read: ["get", "read", "detail"],
+    list: ["list", "enum", "statuses"],
+    update: ["update", "modify", "edit", "patch", "put"],
+    delete: ["delete", "remove"],
+    execute: ["execute", "trigger", "run"]
+  };
+  const intentTokens = uniqueStrings(
+    [...intents].flatMap((intent) => intentLexicon[intent] ?? []),
+    6
+  );
+  const focusTerms = collectFocusTerms(query, caseFrame).filter(
+    (term) =>
+      !/^(api|openapi|endpoint|接口|开放平台|如何|怎么|what|how|through|via|please|question|query)$/i.test(term) &&
+      term.length >= 2
+  );
+  const focusTokens = uniqueStrings(focusTerms, 7);
+  const bridgeTokens = uniqueStrings(["openapi", "api", "endpoint", ...intentTokens, ...focusTokens], 14);
+  return bridgeTokens.length > 0 ? bridgeTokens.join(" ") : null;
+}
+
 function combineRetrievalQueries(query: string, caseFrame: SupportCaseFrame, orchestrator: SearchOrchestrator): string[] {
+  const apiBridge = buildApiRetrievalBridgeQuery(query, caseFrame);
+  const compactFocus = buildCompactFocusQuery(query, caseFrame);
   const groupedQueries = [
+    apiBridge,
+    compactFocus,
     ...caseFrame.retrieval_queries,
     ...(caseFrame.query_plan?.object_queries ?? []),
     ...(caseFrame.query_plan?.concept_queries ?? []),
-    ...(caseFrame.query_plan?.behavior_queries ?? []),
-    buildCompactFocusQuery(query, caseFrame)
+    ...(caseFrame.query_plan?.behavior_queries ?? [])
   ];
-  return uniqueStrings([query, ...groupedQueries], 6).filter(
+  return uniqueStrings([query, ...groupedQueries], 8).filter(
     (item) => orchestrator.normalizeQuery(item) !== orchestrator.normalizeQuery(query)
   );
 }

@@ -1055,6 +1055,56 @@ sidebarposition: 2
   }
 });
 
+test("runSupportSearchAgent enforces a second retrieval round for api routes even when planner requests one round", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/04-update-a-issue.api.mdx",
+    `---
+id: 04-update-a-issue
+title: "Update a issue"
+---
+
+# Update a issue
+
+通过 PUT /project/issues/{issueID} 更新工作项字段。
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "api_endpoint_lookup",
+      specialist_agent: "api-specialist",
+      answer_contract: "Provide the exact API answer first."
+    },
+    evidencePlanOverride: {
+      retrieval_rounds: 1,
+      allow_refinement: true
+    }
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "如何通过接口更新工作项属性/状态？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-api-force-second-round"
+    });
+
+    assert.equal(result.stageTimings.retrieval_extra.status, "completed");
+    assert.equal(result.result.references.length > 0, true);
+    assert.match(result.result.answer, /PUT \/project\/issues\/\{issueID\}/);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("runSupportSearchAgent prioritizes update operations over status-list variants for composite API queries", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
