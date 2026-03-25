@@ -1124,6 +1124,7 @@ title: "获取工作项状态列表"
       assert.equal(result.result.support_answer.sections[0].path, "/project/issues/{issueID}");
     }
     assert.ok(result.result.references.some((reference) => /04-update-a-issue\.api\.mdx/.test(reference.path ?? "")));
+    assert.match(result.result.citations[0]?.title ?? "", /Update a issue/i);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

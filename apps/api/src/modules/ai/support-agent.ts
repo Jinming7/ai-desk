@@ -1161,9 +1161,13 @@ function sanitizeVerification(input: {
   );
   const claimLinkedCitationIds = uniqueCitationIds(sanitizedClaims);
   const claimLinkedCitationSet = new Set(claimLinkedCitationIds);
-  const displayCitationIds = uniqueStrings(input.verification.display_citation_ids, 6).filter(
-    (citationId) => evidenceById.has(citationId) && claimLinkedCitationSet.has(citationId)
-  );
+  const displayCitationIds = uniqueStrings(
+    [
+      ...claimLinkedCitationIds,
+      ...input.verification.display_citation_ids
+    ],
+    6
+  ).filter((citationId) => evidenceById.has(citationId) && claimLinkedCitationSet.has(citationId));
   const unsupportedClaims = uniqueStrings(
     [
       ...input.verification.unsupported_claims,
