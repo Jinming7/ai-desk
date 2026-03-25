@@ -318,10 +318,10 @@ export function buildSearchRuntime(input: {
           overallTimeoutMs: 22000,
           requestStartedAtMs: Date.now(),
           disableLocalDocs: true,
-          allowMultiPassRetrieval: false,
-          allowRefinement: false,
-          kbTopK: 6,
-          queryLimit: 1
+          allowMultiPassRetrieval: true,
+          allowRefinement: true,
+          kbTopK: 8,
+          queryLimit: 2
         }
       : {
           overallTimeoutMs: 90000,
