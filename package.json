@@ -19,7 +19,9 @@
     "start:api": "npm run start -w apps/api",
     "build": "npm run build -w apps/api && npm run build -w apps/web",
     "db:migrate": "npm run db:migrate -w apps/api",
-    "test:api-integration": "NODE_ENV=test npm run test:integration -w apps/api"
+    "test:api-integration": "NODE_ENV=test npm run test:integration -w apps/api",
+    "kb:ensure:docs-com": "node scripts/ensure-docs-com-kb.mjs",
+    "smoke:support-quality": "node scripts/smoke-support-quality.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

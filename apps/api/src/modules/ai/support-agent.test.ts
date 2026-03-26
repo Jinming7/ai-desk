@@ -1047,8 +1047,71 @@ sidebarposition: 2
     assert.equal(result.caseFrame.specialist_agent, "api-specialist");
     assert.match(String(result.caseFrame.question_type ?? ""), /^api_/);
     assert.equal(result.result.references.length > 0, true);
-    assert.match(result.result.references[0]?.path ?? "", /open-docs\/docs\/openapi\/api\//);
+    assert.equal(String(result.result.references[0]?.supportMetadata?.product_area ?? ""), "openapi");
+    assert.equal(String(result.result.references[0]?.supportMetadata?.evidence_kind ?? ""), "api_operation");
     assert.doesNotMatch(result.result.answer, /sidebarposition|slug:\s*\/admin\/account-integration|AD 和 CAS|本地部署版本中可用/i);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent keeps integration callback troubleshooting out of forced API auth routing", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "docs/ones-devops/code-integration/github-and-public-gitlab.mdx",
+    `---
+title: "GitHub 和公共 GitLab"
+---
+
+# GitHub 和公共 GitLab
+
+## 链接仓库
+
+如果授权完成后无法返回 ONES，或者回调页面显示 page not found，请检查 Redirect URI、Webhook 回调地址，以及 baseURL 配置是否一致。
+`
+  );
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/auth/scope.md",
+    `# Scopes
+
+## Scope list
+
+- write:project:issue-comment
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "api_scope_auth",
+      specialist_agent: "api-specialist",
+      answer_contract: "Provide the exact API answer first."
+    }
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "GitHub 集成授权后回调页面显示 page not found，怎么排查？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-integration-callback-troubleshooting"
+    });
+
+    assert.equal(result.caseFrame.product_area, "integrations");
+    assert.equal(result.caseFrame.question_type, "troubleshooting");
+    assert.equal(result.caseFrame.specialist_agent, "troubleshooting-specialist");
+    assert.equal(result.result.references.length > 0, true);
+    assert.equal(String(result.result.references[0]?.supportMetadata?.product_area ?? ""), "integrations");
+    assert.match(result.result.references[0]?.snippet ?? "", /Redirect URI|回调|page not found/i);
+    assert.equal(result.result.support_answer?.render_variant, "troubleshooting");
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });
@@ -1099,6 +1162,93 @@ title: "Update a issue"
     assert.equal(result.stageTimings.retrieval_extra.status, "completed");
     assert.equal(result.result.references.length > 0, true);
     assert.match(result.result.answer, /PUT \/project\/issues\/\{issueID\}/);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent reclassifies self-hosted deployment architecture questions onto deployment evidence", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "docs/admin/account-integration/third-party-integration/azure-ad-and-ones.mdx",
+    `---
+id: azure-ad-and-ones
+title: "Azure AD & ONES.com"
+---
+
+# Azure AD & ONES.com
+
+Microsoft Azure AD integration is available only in ONES.com Cloud.
+`
+  );
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/prepare/deployment-requirements.md",
+    `# ONES 私有部署环境要求
+
+ONES K3s single-node deployment uses a unified app plus storage topology by default.
+Storage can also be externalized to NFS or OSS.
+`
+  );
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/scaling/database/OceanBase-external.cn.md",
+    `# OceanBase 外置
+
+OceanBase can be used as an external database for ONES private deployment.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract:
+        "State whether requirements and issues are deployed on shared or separable backend services, databases, and query paths in self-hosted deployments."
+    },
+    evidencePlanOverride: {
+      required_doc_kinds: ["openapi/api", "syntax_reference"]
+    },
+    writerAnswer: {
+      question_type: "capability_confirmation",
+      render_variant: "behavior",
+      direct_answer: "",
+      claims: [],
+      next_actions: [],
+      unknowns: [],
+      escalation_needed: false
+    } as Partial<SpecialistDraftAnswer>
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query:
+        "Since we are considering a self-hosted deployment, can requirements and issues use isolated backend services, databases, and query paths?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-self-hosted-architecture"
+    });
+
+    assert.equal(result.caseFrame.deployment_model, "private_deployment");
+    assert.equal(result.caseFrame.product_area, "deployment");
+    assert.ok(result.caseFrame.required_doc_kinds?.includes("deployment_runbook"));
+    assert.ok(!(result.caseFrame.required_doc_kinds ?? []).includes("openapi/api"));
+    assert.equal(result.result.references.length > 0, true);
+    assert.equal(String(result.result.references[0]?.supportMetadata?.product_area ?? ""), "deployment");
+    assert.equal(String(result.result.references[0]?.supportMetadata?.deployment_model ?? ""), "private_deployment");
+    assert.doesNotMatch(result.result.references[0]?.title ?? "", /Azure AD|ONES\.com/i);
+    assert.equal(result.result.support_answer?.mode === "partial" || result.result.support_answer?.mode === "grounded", true);
+    assert.match(result.result.answer, /unified|colocated|externalized|cannot confirm/i);
+    assert.equal(result.result.citations.length > 0, true);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

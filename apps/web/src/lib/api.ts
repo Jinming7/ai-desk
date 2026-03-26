@@ -3,6 +3,8 @@ import type {
   AiCapabilities,
   AiAgentMode,
   AiEscalation,
+  DocsComEnsureResult,
+  DocsComStatusResult,
   OnesCatalogStatus,
   ConversationTurn,
   OnesConfigHistoryItem,
@@ -484,6 +486,34 @@ export async function getSupportUxMetrics(): Promise<{
   });
   if (!res.ok) throw new Error("Failed to fetch support UX metrics");
   return (await res.json()).metrics;
+}
+
+export async function getDocsComKbStatus(limit = 10): Promise<DocsComStatusResult> {
+  const res = await fetch(`${API}/api/v1/internal/kb/docs-com/status?limit=${limit}`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load docs-com KB status");
+  const data = await res.json();
+  return data.result;
+}
+
+export async function ensureDocsComKb(input?: {
+  mode?: "incremental" | "full" | "reindex";
+  actor?: string;
+  runLimit?: number;
+}): Promise<DocsComEnsureResult> {
+  const res = await fetch(`${API}/api/v1/internal/kb/docs-com/ensure`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(input ?? {})
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to ensure docs-com KB");
+  const data = await res.json();
+  return data.result;
 }
 
 export async function runBulkTicketAction(input: {

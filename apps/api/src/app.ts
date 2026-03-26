@@ -22,6 +22,8 @@ import {
   aiTicketSubmitRequestSchema
 } from "./contracts/ai-search.js";
 import {
+  kbDocsComEnsureSchema,
+  kbDocsComStatusQuerySchema,
   kbEnqueueSyncSchema,
   kbRepoRegistrationSchema,
   kbRetrievalQuerySchema,
@@ -136,6 +138,22 @@ function requireInternalRequest(req: express.Request, res: express.Response, nex
     return;
   }
   next();
+}
+
+function hasAutomationBearerToken(req: express.Request): boolean {
+  const authorization = req.header("authorization") ?? "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  const token = match?.[1]?.trim();
+  if (!token) return false;
+  return token === env.INTERNAL_OPS_TOKEN || token === env.CRON_SECRET;
+}
+
+function requireInternalOrAutomationRequest(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (req.header("x-portal-surface") === "internal" || hasAutomationBearerToken(req)) {
+    next();
+    return;
+  }
+  res.status(403).json({ error: "Forbidden: internal portal or automation token required" });
 }
 
 app.get(
@@ -905,6 +923,31 @@ app.post(
     const body = kbRepoRegistrationSchema.parse(req.body);
     const result = await githubKbService.registerRepository(body);
     res.status(201).json(result);
+  })
+);
+
+app.get(
+  "/api/v1/internal/kb/docs-com/status",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const query = kbDocsComStatusQuerySchema.parse(req.query);
+    const result = await githubKbService.getDocsComStatus({ recentJobLimit: query.limit });
+    res.json({ result });
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/docs-com/ensure",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const body = kbDocsComEnsureSchema.parse(req.body ?? {});
+    const result = await githubKbService.ensureDocsComKnowledgeBase({
+      actor: body.actor,
+      mode: body.mode,
+      runLimit: body.runLimit,
+      idempotencySeed: req.header("x-vercel-deployment-url") ?? req.header("x-deployment-id") ?? undefined
+    });
+    res.status(202).json({ result });
   })
 );
 

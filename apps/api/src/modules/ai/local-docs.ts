@@ -146,6 +146,9 @@ function stripMarkup(content: string): string {
       .replace(/api:\s*eJ[0-9A-Za-z+/_=-]{16,}/g, " ")
       .replace(/^import\s+.+$/gm, " ")
       .replace(/```[\s\S]*?```/g, " ")
+      .replace(/<MethodEndpoint[\s\S]*?method=\{"([^"]+)"\}[\s\S]*?path=\{"([^"]+)"\}[\s\S]*?>[\s\S]*?<\/MethodEndpoint>/gi, "$1 $2 ")
+      .replace(/<ParamsItem[\s\S]*?"name":"([^"]+)"[\s\S]*?"description":"([^"]+)"/gi, "param $1 $2 ")
+      .replace(/<SchemaItem[\s\S]*?name=\{"([^"]+)"\}[\s\S]*?"description":"([^"]+)"/gi, "field $1 $2 ")
       .replace(/<[^>]+>/g, " ")
       .replace(/\{[^}]{0,160}\}/g, (matched) => (/["':]/.test(matched) ? matched : " "))
       .replace(/`{1,3}/g, "")
@@ -247,48 +250,27 @@ function buildAnchorTokens(query: string): string[] {
 
 function buildQueryVariants(query: string): string[] {
   const normalized = normalizeSpaces(query);
-  const variants = new Set<string>([normalized, normalized.toLowerCase()]);
-  const replacements: Array<[RegExp, string]> = [
-    [/open\s*api/gi, "openapi"],
-    [/开放平台/gi, "openapi open platform"],
-    [/接口/gi, "api endpoint"],
-    [/项目标识|项目id|project id/gi, "项目 标识 project id uuid"],
-    [/标识|标识符/gi, "identifier id uuid 标识"],
-    [/项目列表/gi, "项目列表 project list projects"],
-    [/项目/gi, "项目 project"],
-    [/负责人/gi, "负责人 owner assignee member user"],
-    [/成员/gi, "成员 member user owner assignee"],
-    [/选项值|选项/gi, "选项 option options field options"],
-    [/属性/gi, "属性 field property"],
-    [/缺陷/gi, "缺陷 defect bug issue 工作项"],
-    [/工作项/gi, "工作项 issue work item"],
-    [/状态列表|状态枚举/gi, "status list statuses enum issueStatuses"],
-    [/状态/gi, "状态 status state workflow_status issue status"],
-    [/详情|详细信息/gi, "详情 details detail get by id current value"],
-    [/字段/gi, "字段 field response schema property"],
-    [/列表/gi, "列表 list collection enum"],
-    [/获取|查询/gi, "get query retrieve fetch"],
-    [/评论/gi, "comment issue comment"],
-    [/权限/gi, "permission scope access"],
-    [/scope/gi, "scope permission"],
-    [/访问权限/gi, "access scope permission"],
-    [/令牌|token/gi, "token credential access token"],
-    [/重置|重设|reset/gi, "reset rotate revoke reissue"],
-    [/授权/gi, "authorization oauth"],
-    [/回调/gi, "callback redirect uri"],
-    [/page not found|404/gi, "page not found 404"],
-    [/集成/gi, "integration"],
-    [/报错|错误|异常|失败/gi, "error failed troubleshooting"],
-    [/排查/gi, "troubleshooting diagnose"],
-    [/工单/gi, "ticket issue"]
-  ];
-  let expanded = normalized.toLowerCase();
-  for (const [pattern, replacement] of replacements) {
-    expanded = expanded.replace(pattern, ` ${replacement} `);
-  }
-  expanded = normalizeSpaces(expanded);
-  if (expanded) variants.add(expanded);
-  return [...variants].filter(Boolean).slice(0, 6);
+  const lowered = normalized.toLowerCase();
+  const semanticNormalized = normalizeSpaces(
+    lowered
+      .replace(/open\s*api/g, "openapi")
+      .replace(/开放平台/g, "openapi")
+      .replace(/接口/g, "api")
+      .replace(/重建/g, "rebuild")
+      .replace(/索引/g, "index indexes")
+      .replace(/导入/g, "import")
+      .replace(/导出/g, "export")
+      .replace(/重置/g, "reset")
+      .replace(/权限/g, "permission")
+      .replace(/授权/g, "oauth")
+      .replace(/项目标识|标识符|标识/g, "identifier id uuid")
+      .replace(/项目列表/g, "project list projects")
+      .replace(/工作项/g, "issue work item")
+      .replace(/字段|属性/g, "field property")
+      .replace(/报错|错误|异常|失败/g, "troubleshooting")
+  );
+  const compactTokens = tokenize(semanticNormalized || normalized).join(" ").trim();
+  return uniqueStrings([normalized, lowered, semanticNormalized, compactTokens], 4);
 }
 
 function computeLanguageBoost(entry: LocalDocsIndexEntry, answerLanguage: "zh" | "en"): number {
@@ -305,11 +287,22 @@ function getSupportMetadataList(entry: LocalDocsIndexEntry, key: string): string
   return Array.isArray(value) ? value.map((item) => String(item).toLowerCase()).filter(Boolean) : [];
 }
 
+function getSupportMetadataValue(entry: LocalDocsIndexEntry, key: string): string {
+  const metadata = entry.supportMetadata as Record<string, unknown> | undefined;
+  return String(metadata?.[key] ?? "").toLowerCase();
+}
+
 function scoreEntry(entry: LocalDocsIndexEntry, phrases: string[], tokens: string[], answerLanguage: "zh" | "en"): number {
   let score = computeLanguageBoost(entry, answerLanguage);
   const joinedTokens = tokens.join(" ");
   const permissions = getSupportMetadataList(entry, "permissions");
   const prerequisites = getSupportMetadataList(entry, "prerequisites");
+  const objects = getSupportMetadataList(entry, "objects");
+  const actions = getSupportMetadataList(entry, "actions");
+  const appliesTo = getSupportMetadataList(entry, "applies_to");
+  const evidenceKind = getSupportMetadataValue(entry, "evidence_kind");
+  const productArea = getSupportMetadataValue(entry, "product_area");
+  const deploymentModel = getSupportMetadataValue(entry, "deployment_model");
   const needsScopeEvidence = /scope|permission|oauth|authorization|access token/.test(joinedTokens);
   const needsCommentEvidence = /comment|issue-comment/.test(joinedTokens);
   const needsIntegrationEvidence = /github|gitlab|integration|callback|redirect|webhook|oauth/.test(joinedTokens);
@@ -320,11 +313,11 @@ function scoreEntry(entry: LocalDocsIndexEntry, phrases: string[], tokens: strin
   const needsMemberEntity = /负责人|成员|member|user|owner|assignee/.test(joinedTokens);
   const needsDetailOperation = /detail|details|get by id|current value|详细信息|详情|当前/.test(joinedTokens);
   const needsListOperation = /statuses|list|enum|collection|列表|枚举/.test(joinedTokens);
+  const needsDeploymentEvidence = /private deployment|self-hosted|on-prem|部署|私有部署|数据库|架构|拓扑|isolation|隔离/.test(joinedTokens);
   const normalizedPhrases = phrases.map((phrase) => phrase.toLowerCase()).filter((phrase) => phrase.length >= 2);
   for (const phrase of normalizedPhrases) {
     if (entry.searchableTitle.includes(phrase)) score += 7;
     if (entry.searchableHeading.includes(phrase)) score += 5;
-    if (entry.searchablePath.includes(phrase)) score += 4;
     if (entry.searchableContent.includes(phrase)) score += phrase.length >= 10 ? 4 : 2;
   }
 
@@ -332,24 +325,22 @@ function scoreEntry(entry: LocalDocsIndexEntry, phrases: string[], tokens: strin
     if (token.length < 2) continue;
     if (entry.searchableTitle.includes(token)) score += 2.2;
     if (entry.searchableHeading.includes(token)) score += 1.8;
-    if (entry.searchablePath.includes(token)) score += 1.6;
     if (entry.searchableContent.includes(token)) score += /:/.test(token) ? 2.2 : 0.9;
   }
 
-  if (/openapi|scope|oauth|token|comment/.test(tokens.join(" ")) && /open-docs\/docs\/openapi\//i.test(entry.path)) {
-    score += 1.4;
-  }
-  if (/callback|redirect|integration|github|oauth/.test(tokens.join(" ")) && /integrations|deploy-docs/i.test(entry.path)) {
-    score += 1.2;
-  }
+  if (/openapi|scope|oauth|token|comment|api/.test(tokens.join(" ")) && productArea === "openapi") score += 4;
+  if (needsIntegrationEvidence && productArea === "integrations") score += 5;
+  if (needsDeploymentEvidence && (productArea === "deployment" || deploymentModel === "private_deployment")) score += 8;
+  if (deploymentModel === "private_deployment" && appliesTo.includes("private_deployment")) score += 3;
   if (needsProjectEntity) {
     if (entry.searchableTitle.includes("项目") || entry.searchableTitle.includes("project")) score += 6;
-    if (entry.searchablePath.includes("project")) score += 5;
     if (entry.searchableContent.includes("项目id") || entry.searchableContent.includes("\"id\"")) score += 4;
+    if (objects.some((item) => /project|项目/.test(item))) score += 8;
   }
   if (needsMemberEntity) {
     if (entry.searchableContent.includes("成员") || entry.searchableContent.includes("member")) score += 4;
     if (entry.searchableContent.includes("avatar") || entry.searchableContent.includes("assignee")) score += 3;
+    if (objects.some((item) => /member|user|owner|assignee|成员|负责人/.test(item))) score += 6;
   }
   if (needsScopeEvidence) {
     if (permissions.length > 0) score += 7;
@@ -371,18 +362,12 @@ function scoreEntry(entry: LocalDocsIndexEntry, phrases: string[], tokens: strin
   if (/token|credential|revoke|reset/.test(joinedTokens) && prerequisites.some((item) => item.includes("scope:"))) {
     score += 2;
   }
-  if (needsIssueEntity && needsStatusEntity && /open-docs\/docs\/openapi\/api\//i.test(entry.path)) {
-    if (/03-get-a-issue-details|\/project\/issues\/\{issueid\}/i.test(entry.searchablePath + " " + entry.searchableContent)) {
+  if (needsIssueEntity && needsStatusEntity && evidenceKind === "api_operation") {
+    if (/\/project\/issues\/\{issueid\}|issue details|获取工作项详细信息/i.test(entry.searchableContent)) {
       score += needsDetailOperation || !needsListOperation ? 18 : 6;
     }
-    if (/get-a-list-of-issue-status|\/project\/issuestatuses/i.test(entry.searchablePath + " " + entry.searchableContent)) {
+    if (/\/project\/issuestatuses|issue status|获取工作项状态列表/i.test(entry.searchableContent)) {
       score += needsListOperation ? 18 : 8;
-    }
-    if (entry.searchableTitle.includes("获取工作项详细信息") || entry.searchableHeading.includes("获取工作项详细信息")) {
-      score += needsDetailOperation || !needsListOperation ? 10 : 3;
-    }
-    if (entry.searchableTitle.includes("获取工作项状态列表") || entry.searchableHeading.includes("获取工作项状态列表")) {
-      score += needsListOperation ? 10 : 4;
     }
   }
   if (needsIntegrationEvidence) {
@@ -391,24 +376,24 @@ function scoreEntry(entry: LocalDocsIndexEntry, phrases: string[], tokens: strin
       (signal) =>
         entry.searchableTitle.includes(signal) ||
         entry.searchableHeading.includes(signal) ||
-        entry.searchablePath.includes(signal) ||
         entry.searchableContent.includes(signal)
     ).length;
     score += matchedSignals * 2.4;
-    if (/code-integration|github|gitlab|integrations/.test(entry.searchablePath)) score += 4;
     if (matchedSignals === 0 && /\bpage\b/.test(entry.searchableTitle)) score -= 6;
-    if (/^page$/.test(entry.searchableTitle) && !/github|gitlab|integration|callback|redirect/.test(entry.searchablePath)) {
+    if (/^page$/.test(entry.searchableTitle) && productArea !== "integrations") {
       score -= 8;
     }
   }
   if (needsTokenLifecycleEvidence) {
     if (/credential|revoke access token|revoke a token|refresh token/.test(entry.searchableTitle)) score += 5;
-    if (/credential-types|revoke-access-token/.test(entry.searchablePath)) score += 5;
     if (entry.searchableContent.includes("issued tokens generally do not change automatically")) score += 6;
     if (entry.searchableContent.includes("re-run the authorization flow") || entry.searchableContent.includes("issue a new token")) {
       score += 5;
     }
   }
+  if (needsDetailOperation && actions.some((item) => /get|read|detail/.test(item))) score += 6;
+  if (needsListOperation && actions.some((item) => /list|search/.test(item))) score += 6;
+  if (needsProjectEntity && /id|uuid|identifier|标识/.test(joinedTokens) && /"id"|项目id|project id/.test(entry.searchableContent)) score += 10;
 
   return Number(score.toFixed(3));
 }
@@ -452,33 +437,69 @@ function countAnchorMatches(entry: LocalDocsIndexEntry, anchorTokens: string[]):
 function inferEvidenceKind(filePath: string, title: string, content: string): string {
   const normalizedPath = filePath.toLowerCase();
   const normalizedTitle = title.toLowerCase();
-  if (normalizedPath.includes("/openapi/")) return "api_operation";
+  const normalizedContent = content.toLowerCase();
+  if (
+    /<methodendpoint|<paramsitem|<schemaitem|\b(get|post|put|patch|delete)\s+\/[a-z0-9_/{}/.-]+/.test(normalizedContent) ||
+    normalizedPath.includes(".api.")
+  ) return "api_operation";
   if (normalizedPath.includes("/troubleshooting/") || /troubleshooting|troubleshoot|排查|故障/.test(normalizedTitle)) {
     return "troubleshooting";
   }
-  if (normalizedPath.includes("/integrations/") || /oauth|callback|redirect|github|gitlab|teams|slack/.test(content.toLowerCase())) {
+  if (normalizedPath.includes("/integrations/") || /oauth|callback|redirect|github|gitlab|teams|slack/.test(normalizedContent)) {
     return "integration_guidance";
   }
+  if (/limitation|限制|注意事项|not supported|unsupported/.test(normalizedContent)) return "constraint";
   return "procedure";
 }
 
 function inferSupportMetadata(filePath: string, title: string, content: string): Record<string, unknown> {
   const normalizedContent = content.toLowerCase();
-  return {
-    evidence_kind: inferEvidenceKind(filePath, title, content),
-    product_area: /openapi|oauth|scope|token|credential/.test(normalizedContent)
+  const evidenceKind = inferEvidenceKind(filePath, title, content);
+  const productArea =
+    /<methodendpoint|<paramsitem|<schemaitem|\b(get|post|put|patch|delete)\s+\/[a-z0-9_/{}/.-]+|openapi|oauth|scope|token|credential/.test(
+      normalizedContent
+    )
       ? "openapi"
       : /github|gitlab|teams|slack|webhook|integration/.test(normalizedContent)
       ? "integrations"
-      : /deploy|kubernetes|cluster|pod|ingress/.test(normalizedContent)
+      : /deploy|deployment|kubernetes|cluster|pod|ingress|database|storage|topology|architecture|self-hosted|on-prem|私有部署|本地部署/.test(
+          normalizedContent
+        )
       ? "deployment"
-      : "general",
-    deployment_model:
-      /private deployment|on-prem|私有部署|本地部署|deploy-docs/i.test(filePath) || /private deployment|on-prem|私有部署|本地部署/i.test(content)
-        ? "private_deployment"
-        : /public cloud|公有云|saas/i.test(content)
-        ? "public_cloud"
-        : "shared",
+      : /issue|project|field|comment|attachment|sprint|workflow|wiki|space|page/.test(normalizedContent)
+      ? "project_management"
+      : "general";
+  const deploymentModel =
+    /private deployment|self-hosted|on-prem|私有部署|本地部署|闭网|离线/.test(normalizedContent)
+      ? "private_deployment"
+      : /public cloud|公有云|saas/.test(normalizedContent)
+      ? "public_cloud"
+      : "shared";
+  const actions = uniqueStrings(
+    [
+      ...[...content.matchAll(/\b(create|update|delete|get|list|search|export|import|configure|deploy|reset|recover|rebuild)\b/gi)].map((match) => match[1]),
+      ...[...content.matchAll(/method=\{"([a-z]+)"\}/gi)].map((match) => match[1])
+    ],
+    8
+  );
+  const objects = uniqueStrings(
+    [
+      ...[...content.matchAll(/\b(issue|comment|attachment|project|status|field|member|user|owner|assignee|wiki|space|page|sprint|token|oauth|database|storage|deployment|index|password)\b/gi)].map(
+        (match) => match[1]
+      ),
+      ...[...content.matchAll(/path=\{"([^"]+)"\}/gi)].flatMap((match) =>
+        String(match[1] ?? "")
+          .split("/")
+          .filter((segment) => segment && !segment.startsWith("{"))
+          .slice(-2)
+      )
+    ],
+    8
+  );
+  return {
+    evidence_kind: evidenceKind,
+    product_area: productArea,
+    deployment_model: deploymentModel,
     permissions: uniqueStrings([...content.matchAll(/\b(?:read|write):[A-Za-z0-9:_-]+\b/g)].map((match) => match[0]), 10),
     prerequisites: uniqueStrings(
       [...content.matchAll(/(?:Prerequisites?|前提|需要|必须)[：:\s-]*([^\n.。]+)/gi)].map((match) => match[1]),
@@ -487,6 +508,16 @@ function inferSupportMetadata(filePath: string, title: string, content: string):
     limitations: uniqueStrings(
       [...content.matchAll(/(?:Limitations?|限制|注意事项|Note)[：:\s-]*([^\n.。]+)/gi)].map((match) => match[1]),
       6
+    ),
+    actions,
+    objects,
+    applies_to: uniqueStrings(
+      [
+        deploymentModel === "private_deployment" ? "private_deployment" : "",
+        deploymentModel === "public_cloud" ? "public_cloud" : "",
+        productArea !== "general" ? productArea : ""
+      ],
+      4
     )
   };
 }
@@ -671,8 +702,8 @@ export async function searchLocalDocs(
   const scored = entries
     .map((entry) => {
       const anchorMatches = countAnchorMatches(entry, anchorTokens);
-      if (anchorTokens.length > 0 && anchorMatches === 0) return null;
-      const score = scoreEntry(entry, phrases, tokens, answerLanguage);
+      const anchorPenalty = anchorTokens.length > 0 && anchorMatches === 0 ? 2 : 0;
+      const score = scoreEntry(entry, phrases, tokens, answerLanguage) - anchorPenalty;
       if (score <= 0) return null;
       return {
         ...entry,

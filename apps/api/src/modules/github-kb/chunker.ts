@@ -15,13 +15,52 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.trim().split(/\s+/).length * 1.2);
 }
 
-function splitIntoSentences(text: string): string[] {
-  const normalized = text.replace(/\n{3,}/g, "\n\n").trim();
-  if (!normalized) return [];
-  return normalized
-    .split(/(?<=[\.!?。！？])\s+|\n{2,}/)
+function splitLongBlock(block: string): string[] {
+  return block
+    .split(/(?<=[\.!?。！？])\s+/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function splitIntoUnits(text: string): string[] {
+  const normalized = text.replace(/\n{3,}/g, "\n\n").trim();
+  if (!normalized) return [];
+  const blocks = normalized
+    .split(/\n{2,}/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const units: string[] = [];
+
+  for (const block of blocks) {
+    const lines = block
+      .split("\n")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (!lines.length) continue;
+
+    const listLikeLines = lines.filter((line) => /^([-*+]\s+|\d+\.\s+)/.test(line));
+    if (listLikeLines.length > 0) {
+      for (const line of listLikeLines) {
+        units.push(line.replace(/^([-*+]\s+|\d+\.\s+)/, "").trim());
+      }
+      const nonList = lines.filter((line) => !/^([-*+]\s+|\d+\.\s+)/.test(line)).join(" ").trim();
+      if (nonList) {
+        if (estimateTokens(nonList) <= 120) units.push(nonList);
+        else units.push(...splitLongBlock(nonList));
+      }
+      continue;
+    }
+
+    const merged = lines.join(" ").trim();
+    if (!merged) continue;
+    if (estimateTokens(merged) <= 120) {
+      units.push(merged);
+      continue;
+    }
+    units.push(...splitLongBlock(merged));
+  }
+
+  return units.filter(Boolean);
 }
 
 export function buildChunks(docKey: string, sections: ParsedSection[], options: ChunkingOptions): ChunkDraft[] {
@@ -29,25 +68,25 @@ export function buildChunks(docKey: string, sections: ParsedSection[], options: 
   let ordinal = 0;
 
   for (const section of sections) {
-    const sentences = splitIntoSentences(section.content);
-    if (!sentences.length) {
+    const units = splitIntoUnits(section.content);
+    if (!units.length) {
       continue;
     }
 
     let cursor = 0;
-    while (cursor < sentences.length) {
+    while (cursor < units.length) {
       const startCursor = cursor;
       let acc: string[] = [];
       let tokenCount = 0;
 
-      while (cursor < sentences.length) {
-        const sentence = sentences[cursor];
-        const sentenceTokens = estimateTokens(sentence);
-        if (acc.length > 0 && tokenCount + sentenceTokens > options.targetTokens) {
+      while (cursor < units.length) {
+        const unit = units[cursor];
+        const unitTokens = estimateTokens(unit);
+        if (acc.length > 0 && tokenCount + unitTokens > options.targetTokens) {
           break;
         }
-        acc.push(sentence);
-        tokenCount += sentenceTokens;
+        acc.push(unit);
+        tokenCount += unitTokens;
         cursor += 1;
       }
 
@@ -76,7 +115,7 @@ export function buildChunks(docKey: string, sections: ParsedSection[], options: 
 
       ordinal += 1;
 
-      if (options.overlapTokens > 0 && cursor < sentences.length) {
+      if (options.overlapTokens > 0 && cursor < units.length) {
         let rewindTokens = 0;
         let rewindCount = 0;
         for (let i = acc.length - 1; i >= 0; i -= 1) {

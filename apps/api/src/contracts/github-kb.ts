@@ -4,7 +4,7 @@ export const kbRepoRegistrationSchema = z.object({
   repoUrl: z.string().min(1),
   publicBaseUrl: z.string().url().optional(),
   defaultBranch: z.string().min(1).default("main"),
-  includePaths: z.array(z.string().min(1)).default(["**/*.md"]),
+  includePaths: z.array(z.string().min(1)).default(["**/*.md", "**/*.mdx"]),
   excludePaths: z.array(z.string().min(1)).default([]),
   pollingIntervalSeconds: z.coerce.number().int().min(30).max(86400).default(300),
   actor: z.string().min(1).default("internal_operator")
@@ -23,6 +23,16 @@ export const kbEnqueueSyncSchema = z.object({
 
 export const kbRunJobsSchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(10)
+});
+
+export const kbDocsComEnsureSchema = z.object({
+  mode: z.enum(["incremental", "full", "reindex"]).default("incremental"),
+  actor: z.string().min(1).default("internal_operator"),
+  runLimit: z.coerce.number().int().min(1).max(20).default(4)
+});
+
+export const kbDocsComStatusQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(50).default(10)
 });
 
 export const kbRetrievalQuerySchema = z.object({

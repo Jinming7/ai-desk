@@ -3,6 +3,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   discoverOnesIssueStatuses,
   discoverOnesProjects,
+  ensureDocsComKb,
+  getDocsComKbStatus,
   discoverProjectIssueTypes,
   getOnesSyncConfig,
   getProjectIssueTypeConfig,
@@ -12,7 +14,7 @@ import {
   setProjectIssueTypeExposure,
   updateOnesSyncConfig
 } from "../lib/api";
-import type { OnesProjectIssueType, OnesProjectIssueTypeConfig, OnesSyncConfig } from "../lib/types";
+import type { DocsComEnsureResult, DocsComStatusResult, OnesProjectIssueType, OnesProjectIssueTypeConfig, OnesSyncConfig } from "../lib/types";
 
 type Step = 0 | 1;
 type ToastKind = "error" | "success";
@@ -64,6 +66,9 @@ export function OnesSyncConfigPage() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const [kbStatus, setKbStatus] = useState<DocsComStatusResult | null>(null);
+  const [kbLoading, setKbLoading] = useState(true);
+  const [kbActionLoading, setKbActionLoading] = useState<false | "incremental" | "reindex" | "full">(false);
 
   const [config, setConfig] = useState<OnesSyncConfig | null>(null);
   const [baseUrl, setBaseUrl] = useState("");
@@ -131,6 +136,50 @@ export function OnesSyncConfigPage() {
     window.setTimeout(() => {
       setToasts((prev) => prev.filter((item) => item.id !== id));
     }, 4200);
+  };
+
+  const loadKbStatus = async () => {
+    setKbLoading(true);
+    try {
+      const result = await getDocsComKbStatus(8);
+      setKbStatus(result);
+    } catch (e) {
+      pushToast("error", (e as Error).message);
+    } finally {
+      setKbLoading(false);
+    }
+  };
+
+  const handleEnsureKb = async (mode: "incremental" | "reindex" | "full") => {
+    setKbActionLoading(mode);
+    try {
+      const result: DocsComEnsureResult = await ensureDocsComKb({
+        mode,
+        actor: "support_portal",
+        runLimit: 4
+      });
+      setKbStatus({
+        exists: true,
+        canonical: kbStatus?.canonical ?? {
+          repoUrl: "https://github.com/BangWork/docs-com",
+          publicBaseUrl: "https://docs.ones.com",
+          defaultBranch: "master",
+          includePaths: ["**/*.md", "**/*.mdx"],
+          excludePaths: [],
+          pollingIntervalSeconds: 300,
+          actor: "support_portal"
+        },
+        status: result.afterStatus
+      });
+      pushToast(
+        "success",
+        `${mode} completed: processed ${result.runResult.processed}, succeeded ${result.runResult.succeeded}, failed ${result.runResult.failed}.`
+      );
+    } catch (e) {
+      pushToast("error", (e as Error).message);
+    } finally {
+      setKbActionLoading(false);
+    }
   };
 
   const enabledTypeCount = useMemo(() => issueTypes.filter((item) => item.enabledForCustomer).length, [issueTypes]);
@@ -239,6 +288,10 @@ export function OnesSyncConfigPage() {
       }
     };
     void load();
+  }, []);
+
+  useEffect(() => {
+    void loadKbStatus();
   }, []);
 
   useEffect(() => {
@@ -651,6 +704,127 @@ export function OnesSyncConfigPage() {
           Active Version: {config?.configVersion ?? "-"} | Publish State: {config?.publishState ?? "draft"} | Updated by {config?.updatedBy ?? "-"}
         </p>
       </header>
+
+      <section className="rounded-mdplus border border-slate-200 bg-white p-5">
+        <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+          <div className="max-w-3xl">
+            <h2 className="text-lg font-semibold text-[#16171A]">Knowledge Base Sync</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Primary source is <span className="font-medium text-slate-900">BangWork/docs-com:master</span>. Production runs on Vercel serverless, so KB sync uses explicit automation instead of background loops.
+            </p>
+            <p className="mt-1 text-xs text-slate-500">
+              Automatic path should call the same ensure endpoint after deploy and on schedule. The buttons below are backup operations for Support Portal only.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              className="rounded-mdplus border border-slate-300 px-4 py-2 text-sm text-slate-700 disabled:opacity-40"
+              onClick={() => void loadKbStatus()}
+              disabled={kbLoading || kbActionLoading !== false}
+            >
+              {kbLoading ? "Refreshing..." : "Refresh Status"}
+            </button>
+            <button
+              className="rounded-mdplus border border-slate-300 px-4 py-2 text-sm text-slate-700 disabled:opacity-40"
+              onClick={() => void handleEnsureKb("incremental")}
+              disabled={kbActionLoading !== false}
+            >
+              {kbActionLoading === "incremental" ? "Running..." : "Run Incremental"}
+            </button>
+            <button
+              className="rounded-mdplus border border-slate-300 px-4 py-2 text-sm text-slate-700 disabled:opacity-40"
+              onClick={() => void handleEnsureKb("reindex")}
+              disabled={kbActionLoading !== false}
+            >
+              {kbActionLoading === "reindex" ? "Running..." : "Run Reindex"}
+            </button>
+            <button
+              className="rounded-mdplus bg-brand-500 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+              onClick={() => void handleEnsureKb("full")}
+              disabled={kbActionLoading !== false}
+            >
+              {kbActionLoading === "full" ? "Running..." : "Run Full Sync"}
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 md:grid-cols-4">
+          <div className="rounded-mdplus border border-slate-200 bg-slate-50 p-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Registration</p>
+            <p className="mt-2 text-sm font-medium text-slate-900">
+              {kbStatus?.exists ? kbStatus.status?.registration.repo ?? "docs-com" : "Missing"}
+            </p>
+            <p className="mt-1 text-xs text-slate-500">{kbStatus?.status?.registration.branch ?? kbStatus?.canonical.defaultBranch ?? "master"}</p>
+          </div>
+          <div className="rounded-mdplus border border-slate-200 bg-slate-50 p-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Coverage</p>
+            <p className={`mt-2 text-sm font-medium ${kbStatus?.status?.health.ok ? "text-emerald-700" : "text-amber-700"}`}>
+              {kbStatus?.status?.health.ok ? "Healthy" : kbStatus?.status ? "Needs Attention" : "Unknown"}
+            </p>
+            <p className="mt-1 text-xs text-slate-500">{kbStatus?.status?.health.message ?? "Waiting for first status load."}</p>
+          </div>
+          <div className="rounded-mdplus border border-slate-200 bg-slate-50 p-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Last Sync</p>
+            <p className="mt-2 text-sm font-medium text-slate-900">{kbStatus?.status?.checkpoint?.lastSyncedAt ?? "-"}</p>
+            <p className="mt-1 text-xs text-slate-500">{kbStatus?.status?.checkpoint?.lastSyncedCommitSha ?? "No checkpoint yet"}</p>
+          </div>
+          <div className="rounded-mdplus border border-slate-200 bg-slate-50 p-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Include Paths</p>
+            <p className="mt-2 text-sm font-medium text-slate-900">
+              {(kbStatus?.status?.registration.includePaths ?? kbStatus?.canonical.includePaths ?? []).join(", ") || "-"}
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 lg:grid-cols-[1.2fr_0.8fr]">
+          <div className="rounded-mdplus border border-slate-200">
+            <div className="border-b border-slate-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-slate-900">Corpus Families</h3>
+            </div>
+            <div className="divide-y divide-slate-100">
+              {(kbStatus?.status?.corpus ?? []).map((row) => (
+                <div key={row.prefix} className="flex items-center justify-between px-4 py-3 text-sm">
+                  <div>
+                    <p className="font-medium text-slate-900">{row.prefix}</p>
+                    <p className="text-xs text-slate-500">total {row.total} / active {row.active}</p>
+                  </div>
+                  <span
+                    className={`rounded-full px-2 py-1 text-xs font-medium ${
+                      row.total > 0 && row.active > 0 ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"
+                    }`}
+                  >
+                    {row.total > 0 && row.active > 0 ? "Ready" : "Check"}
+                  </span>
+                </div>
+              ))}
+              {!kbStatus?.status?.corpus?.length ? (
+                <div className="px-4 py-5 text-sm text-slate-500">No corpus status loaded yet.</div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="rounded-mdplus border border-slate-200">
+            <div className="border-b border-slate-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-slate-900">Recent Jobs</h3>
+            </div>
+            <div className="divide-y divide-slate-100">
+              {(kbStatus?.status?.recentJobs ?? []).map((job) => (
+                <div key={job.id} className="px-4 py-3 text-sm">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-medium text-slate-900">{job.mode}</span>
+                    <span className="text-xs text-slate-500">{job.status}</span>
+                  </div>
+                  <p className="mt-1 text-xs text-slate-500">{job.updatedAt}</p>
+                  {job.errorMessage ? <p className="mt-1 text-xs text-rose-600">{job.errorMessage}</p> : null}
+                </div>
+              ))}
+              {!kbStatus?.status?.recentJobs?.length ? (
+                <div className="px-4 py-5 text-sm text-slate-500">No jobs recorded yet.</div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </section>
 
       <div className="fixed right-6 top-20 z-[90] flex w-[360px] max-w-[calc(100vw-2rem)] flex-col gap-2">
         {toasts.map((toast) => (

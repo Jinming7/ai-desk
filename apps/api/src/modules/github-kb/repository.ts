@@ -123,6 +123,40 @@ export async function listActiveRepoRegistrations(): Promise<RepoRegistration[]>
   return result.rows;
 }
 
+export async function countDocumentsByPathPrefixes(input: {
+  repoId: string;
+  branch?: string;
+  prefixes: string[];
+}): Promise<Array<{ prefix: string; total: number; active: number }>> {
+  const prefixes = input.prefixes.map((item) => String(item ?? "").trim()).filter(Boolean);
+  if (!prefixes.length) return [];
+
+  const branch = input.branch?.trim() || null;
+  const result = await pool.query<{ prefix: string; total: string; active: string }>(
+    `WITH prefixes(prefix) AS (
+       SELECT UNNEST($3::text[])
+     )
+     SELECT
+       prefixes.prefix,
+       COUNT(doc.id)::text AS total,
+       COUNT(doc.id) FILTER (WHERE doc.is_active = true)::text AS active
+     FROM prefixes
+     LEFT JOIN kb_documents doc
+       ON doc.repo_id = $1
+      AND ($2::text IS NULL OR doc.branch = $2)
+      AND doc.path LIKE prefixes.prefix || '%'
+     GROUP BY prefixes.prefix
+     ORDER BY prefixes.prefix`,
+    [input.repoId, branch, prefixes]
+  );
+
+  return result.rows.map((row) => ({
+    prefix: row.prefix,
+    total: Number(row.total),
+    active: Number(row.active)
+  }));
+}
+
 export async function getRepoRegistrationById(repoId: string): Promise<RepoRegistration | null> {
   const result = await pool.query<RepoRegistration>(`SELECT * FROM kb_repo_registrations WHERE id = $1 LIMIT 1`, [repoId]);
   return result.rows[0] ?? null;
@@ -528,7 +562,7 @@ export async function searchVectorCandidates(input: {
       chunk.commit_sha,
       doc.title,
       chunk.heading_path,
-      LEFT(chunk.content, 400) AS snippet,
+      LEFT(chunk.content, 2400) AS snippet,
       (1 - (chunk.embedding <=> $${vectorParam}::vector))::text AS vector_score,
       chunk.metadata_json AS chunk_metadata_json,
       doc.metadata_json AS doc_metadata_json
@@ -661,7 +695,7 @@ export async function searchKeywordCandidates(input: {
       chunk.heading_path,
       ${
         hasCjk
-          ? `LEFT(chunk.content, 1200) AS snippet,`
+          ? `LEFT(chunk.content, 2400) AS snippet,`
           : `COALESCE(
         NULLIF(ts_headline('english', chunk.content, websearch_to_tsquery('english', $${queryParam ?? 0}), 'MaxWords=60, MinWords=20'), ''),
         LEFT(chunk.content, 800)

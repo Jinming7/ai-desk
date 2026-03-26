@@ -67,6 +67,88 @@ export interface AiCapabilities {
   reason: string;
 }
 
+export interface DocsComCanonicalConfig {
+  repoUrl: string;
+  publicBaseUrl: string;
+  defaultBranch: string;
+  includePaths: string[];
+  excludePaths: string[];
+  pollingIntervalSeconds: number;
+  actor: string;
+}
+
+export interface DocsComCorpusStat {
+  prefix: string;
+  total: number;
+  active: number;
+}
+
+export interface DocsComRecentJob {
+  id: string;
+  mode: "full" | "incremental" | "reindex";
+  status: string;
+  branch: string;
+  errorMessage: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  updatedAt: string;
+}
+
+export interface DocsComStatusSnapshot {
+  registration: {
+    id: string;
+    repo: string;
+    branch: string;
+    repoUrl: string;
+    publicBaseUrl: string | null;
+    includePaths: string[];
+    excludePaths: string[];
+    lastValidationError: string | null;
+  };
+  corpus: DocsComCorpusStat[];
+  checkpoint: {
+    lastSyncedCommitSha: string | null;
+    lastSyncedAt: string | null;
+    lastFullSyncedCommitSha: string | null;
+    lastFullSyncedAt: string | null;
+  } | null;
+  health: {
+    ok: boolean;
+    message: string | null;
+  };
+  recentJobs: DocsComRecentJob[];
+}
+
+export interface DocsComStatusResult {
+  exists: boolean;
+  canonical: DocsComCanonicalConfig;
+  status: DocsComStatusSnapshot | null;
+}
+
+export interface DocsComEnsureResult {
+  registrationChanged: boolean;
+  validation: {
+    ok: boolean;
+    scopes: string[];
+    message: string;
+  };
+  enqueuedJob: {
+    id: string;
+    mode: "full" | "incremental" | "reindex";
+    status: string;
+    branch: string;
+    idempotencyKey: string;
+  };
+  runResult: {
+    processed: number;
+    succeeded: number;
+    failed: number;
+    deadLetter: number;
+  };
+  beforeStatus: DocsComStatusSnapshot | null;
+  afterStatus: DocsComStatusSnapshot;
+}
+
 export interface AgentQueueTicket {
   id: string;
   ticket_no: string;

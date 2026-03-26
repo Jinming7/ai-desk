@@ -89,6 +89,8 @@ const envSchema = z.object({
   ONES_SYNC_DEFAULT_FIELDS_PATH_TEMPLATE: z.string().default("/project/issueFields"),
   ONES_SYNC_DEFAULT_CREATE_TICKET_PATH: z.string().default("/project/issues"),
   GITHUB_KB_ENABLED: z.coerce.boolean().default(false),
+  INTERNAL_OPS_TOKEN: z.string().optional(),
+  CRON_SECRET: z.string().optional(),
   GITHUB_API_BASE_URL: z.string().default("https://api.github.com"),
   GITHUB_TOKEN_READONLY: z.string().optional(),
   GITHUB_WEBHOOK_SECRET: z.string().optional(),
@@ -96,7 +98,7 @@ const envSchema = z.object({
   GITHUB_KB_BOOTSTRAP_REPO_URL: z.string().optional(),
   GITHUB_KB_BOOTSTRAP_PUBLIC_BASE_URL: z.string().url().optional(),
   GITHUB_KB_BOOTSTRAP_BRANCH: z.string().default("main"),
-  GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS: z.string().default("**/*.md"),
+  GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS: z.string().default("**/*.md,**/*.mdx"),
   GITHUB_KB_BOOTSTRAP_EXCLUDE_PATHS: z
     .string()
     .default(".claude/**,.github/**,.docusaurus/**,node_modules/**,build/**,dist/**"),

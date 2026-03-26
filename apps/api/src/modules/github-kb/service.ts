@@ -30,6 +30,14 @@ let embeddingDisabledUntil = 0;
 let embeddingDisabledReason = "";
 const LOCAL_DOCS_SUPPORTED_ROOTS = ["docs", "deploy-docs", "open-docs", "i18n", "blog"];
 const LOCAL_DOCS_SKIP_DIRS = new Set([".git", ".github", ".claude", "node_modules", ".docusaurus", "build", "dist"]);
+const DEFAULT_BOOTSTRAP_INCLUDE_PATHS = ["**/*.md", "**/*.mdx"];
+const DEFAULT_BOOTSTRAP_EXCLUDE_PATHS = [".claude/**", ".github/**", ".docusaurus/**", "node_modules/**", "build/**", "dist/**"];
+const DOCS_COM_REQUIRED_PREFIXES = ["docs/", "deploy-docs/", "open-docs/"];
+const DOCS_COM_REPO_OWNER = "BangWork";
+const DOCS_COM_REPO_NAME = "docs-com";
+const DOCS_COM_DEFAULT_BRANCH = "master";
+const DOCS_COM_REPO_URL = "https://github.com/BangWork/docs-com";
+const DOCS_COM_PUBLIC_BASE_URL = "https://docs.ones.com";
 
 interface SyncExecutionResult {
   indexed: number;
@@ -64,11 +72,142 @@ function parseRepoOwnerName(repoUrl: string): { owner: string; name: string } {
 }
 
 function isDocsComRepo(owner: string, name: string): boolean {
-  return owner.toLowerCase() === "bangwork" && name.toLowerCase() === "docs-com";
+  return owner.toLowerCase() === DOCS_COM_REPO_OWNER.toLowerCase() && name.toLowerCase() === DOCS_COM_REPO_NAME.toLowerCase();
 }
 
 function isDocsComRegistration(registration: RepoRegistration): boolean {
   return isDocsComRepo(registration.repo_owner, registration.repo_name);
+}
+
+function hasIncludePattern(includePaths: string[], extension: "md" | "mdx"): boolean {
+  const normalizedExtension = extension.toLowerCase();
+  return includePaths.some((item) => {
+    const pattern = String(item ?? "").trim().toLowerCase();
+    if (!pattern) return false;
+    return pattern.includes(`.${normalizedExtension}`) || pattern.includes(`*.${normalizedExtension}`);
+  });
+}
+
+export function resolveBootstrapIncludePaths(raw: string): string[] {
+  const parsed = raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const includePaths = uniqueStrings(parsed, 8);
+  return includePaths.length ? includePaths : [...DEFAULT_BOOTSTRAP_INCLUDE_PATHS];
+}
+
+function resolveBootstrapExcludePaths(raw: string): string[] {
+  const parsed = raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const excludePaths = uniqueStrings(parsed, 16);
+  return excludePaths.length ? excludePaths : [...DEFAULT_BOOTSTRAP_EXCLUDE_PATHS];
+}
+
+function buildDocsComRegistrationInput(actor: string) {
+  return {
+    repoUrl: DOCS_COM_REPO_URL,
+    publicBaseUrl: DOCS_COM_PUBLIC_BASE_URL,
+    defaultBranch: DOCS_COM_DEFAULT_BRANCH,
+    includePaths: [...DEFAULT_BOOTSTRAP_INCLUDE_PATHS],
+    excludePaths: resolveBootstrapExcludePaths(env.GITHUB_KB_BOOTSTRAP_EXCLUDE_PATHS),
+    pollingIntervalSeconds: env.GITHUB_KB_BOOTSTRAP_POLLING_INTERVAL_SECONDS,
+    actor
+  };
+}
+
+async function getDocsComRegistration(): Promise<RepoRegistration | null> {
+  return repo.findActiveRepoByOwnerNameBranch(DOCS_COM_REPO_OWNER, DOCS_COM_REPO_NAME, DOCS_COM_DEFAULT_BRANCH);
+}
+
+async function summarizeDocsComCorpus(registration: RepoRegistration, recentJobLimit = 10) {
+  const branch = registration.default_branch || DOCS_COM_DEFAULT_BRANCH;
+  const corpus = await repo.countDocumentsByPathPrefixes({
+    repoId: registration.id,
+    branch,
+    prefixes: DOCS_COM_REQUIRED_PREFIXES
+  });
+  const checkpoints = await repo.getCheckpoint(registration.id, branch);
+  const recentJobs = (await repo.listRecentSyncJobs(recentJobLimit)).filter((job) => job.repo_id === registration.id);
+  const health = await validateDocsComCorpusCoverage(registration, branch);
+  return {
+    registration: {
+      id: registration.id,
+      repo: `${registration.repo_owner}/${registration.repo_name}`,
+      branch,
+      repoUrl: registration.repo_url,
+      publicBaseUrl: registration.public_base_url,
+      includePaths: registration.include_paths,
+      excludePaths: registration.exclude_paths,
+      lastValidationError: registration.last_validation_error
+    },
+    corpus: corpus.map((item) => ({
+      prefix: item.prefix,
+      total: item.total,
+      active: item.active
+    })),
+    checkpoint: checkpoints
+      ? {
+          lastSyncedCommitSha: checkpoints.last_synced_commit_sha,
+          lastSyncedAt: checkpoints.last_synced_at,
+          lastFullSyncedCommitSha: checkpoints.last_full_synced_commit_sha,
+          lastFullSyncedAt: checkpoints.last_full_synced_at
+        }
+      : null,
+    health,
+    recentJobs: recentJobs.map((job) => ({
+      id: job.id,
+      mode: job.sync_mode,
+      status: job.status,
+      branch: job.branch,
+      errorMessage: job.error_message,
+      startedAt: job.started_at,
+      finishedAt: job.finished_at,
+      updatedAt: job.updated_at
+    }))
+  };
+}
+
+async function validateDocsComCorpusCoverage(
+  registration: RepoRegistration,
+  branch: string
+): Promise<{ ok: boolean; message: string | null }> {
+  if (!isDocsComRegistration(registration)) return { ok: true, message: null };
+
+  const issues: string[] = [];
+  if (!hasIncludePattern(registration.include_paths, "mdx")) {
+    issues.push("include_paths do not cover *.mdx, so open-docs pages can be skipped during sync");
+  }
+
+  const counts = await repo
+    .countDocumentsByPathPrefixes({
+      repoId: registration.id,
+      branch,
+      prefixes: DOCS_COM_REQUIRED_PREFIXES
+    })
+    .catch(() => []);
+
+  for (const prefix of DOCS_COM_REQUIRED_PREFIXES) {
+    const row = counts.find((item) => item.prefix === prefix);
+    if (!row) {
+      issues.push(`${prefix} coverage could not be measured`);
+      continue;
+    }
+    if (row.total === 0) {
+      issues.push(`${prefix} has 0 indexed docs`);
+      continue;
+    }
+    if (row.active === 0) {
+      issues.push(`${prefix} has ${row.total} indexed docs but 0 active docs`);
+    }
+  }
+
+  return {
+    ok: issues.length === 0,
+    message: issues.length ? issues.join("; ") : null
+  };
 }
 
 async function pathExists(targetPath: string): Promise<boolean> {
@@ -430,18 +569,24 @@ function findMatches(input: string, pattern: RegExp, limit = 6): string[] {
 function inferProductArea(path: string, content: string): string {
   const normalizedPath = path.toLowerCase();
   const normalizedContent = content.toLowerCase();
-  if (normalizedPath.includes("/openapi/")) return "openapi";
+  if (
+    /<methodendpoint|<paramsitem|<schemaitem|\b(get|post|put|patch|delete)\s+\/[a-z0-9_/{}/.-]+|openapi|oauth|scope|token|credential/.test(
+      normalizedContent
+    )
+  ) return "openapi";
   if (normalizedPath.includes("/integrations/") || /oauth|sso|webhook|github|gitlab|slack|teams/.test(normalizedContent)) return "integrations";
   if (normalizedPath.includes("/wiki/") || /wiki|page group|space/.test(normalizedContent)) return "wiki";
-  if (normalizedPath.includes("/deploy-docs/") || /kubernetes|pod|pvc|volume|cluster/.test(normalizedContent)) return "deployment";
+  if (/deploy|deployment|self-hosted|on-prem|kubernetes|pod|pvc|volume|cluster|database|storage|topology|architecture|私有部署/.test(normalizedContent)) {
+    return "deployment";
+  }
   if (/issue|project|sprint|field|comment|attachment/.test(normalizedContent)) return "project_management";
+  if (normalizedPath.includes("/openapi/")) return "openapi";
   return "general";
 }
 
 function inferDeploymentModel(path: string, content: string): string {
-  const normalizedPath = path.toLowerCase();
   const normalizedContent = content.toLowerCase();
-  if (normalizedPath.includes("/deploy-docs/") || /private deployment|私有部署|本地部署|on-prem/i.test(content)) return "private_deployment";
+  if (/private deployment|self-hosted|私有部署|本地部署|on-prem|air-gapped|closed network|offline/i.test(content)) return "private_deployment";
   if (/public cloud|公有云|saas/i.test(content)) return "public_cloud";
   return "shared";
 }
@@ -450,7 +595,10 @@ function inferEvidenceKind(path: string, title: string, content: string): string
   const normalizedPath = path.toLowerCase();
   const normalizedTitle = title.toLowerCase();
   const normalizedContent = content.toLowerCase();
-  if (normalizedPath.includes("/openapi/")) return "api_operation";
+  if (
+    /<methodendpoint|<paramsitem|<schemaitem|\b(get|post|put|patch|delete)\s+\/[a-z0-9_/{}/.-]+/.test(normalizedContent) ||
+    normalizedPath.includes(".api.")
+  ) return "api_operation";
   if (normalizedPath.includes("/troubleshooting/") || /troubleshoot|troubleshooting|排查|故障/.test(normalizedTitle)) return "troubleshooting";
   if (/limitation|限制|注意事项|not supported|unsupported/.test(normalizedContent)) return "constraint";
   if (/how to|步骤|guide|配置|setup|configure/.test(normalizedTitle) || normalizedPath.includes("/guide/")) return "procedure";
@@ -597,7 +745,7 @@ function tokenizeRetrievalQuery(query: string): string[] {
   return uniqueStrings([...asciiTokens, ...cjkTokens], 24);
 }
 
-function cleanSnippet(raw: string): string {
+function normalizeSnippetText(raw: string): string {
   return raw
     .replace(/^---\s*\n[\s\S]*?\n---\s*(?:\n|$)/, " ")
     .replace(/^import\s+.+$/gm, " ")
@@ -613,8 +761,37 @@ function cleanSnippet(raw: string): string {
     .replace(/\*\*/g, "")
     .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 600);
+    .trim();
+}
+
+function cleanSnippet(raw: string): string {
+  return normalizeSnippetText(raw).slice(0, 600);
+}
+
+function scoreSnippetTerm(term: string): number {
+  const normalized = term.toLowerCase();
+  let score = Math.min(normalized.length, 24);
+  if (/[/{}`:]/.test(normalized)) score += 18;
+  if (/redirect|callback|webhook|baseurl|oauth|scope|permission|token|page|404|onesql|group|order/.test(normalized)) {
+    score += 36;
+  }
+  if (/[\u3400-\u9fff]/.test(normalized)) score += Math.min(18, normalized.length * 2);
+  return score;
+}
+
+export function buildQueryAnchoredSnippet(raw: string, terms: string[]): string {
+  const cleaned = normalizeSnippetText(raw);
+  if (!cleaned) return "";
+  const lower = cleaned.toLowerCase();
+  const rankedTerms = uniqueStrings(terms.map((item) => item.toLowerCase()), 24)
+    .filter((term) => term.length >= 2)
+    .sort((a, b) => scoreSnippetTerm(b) - scoreSnippetTerm(a));
+  const match = rankedTerms.find((term) => lower.includes(term));
+  if (!match) return cleaned.slice(0, 600);
+  const index = lower.indexOf(match);
+  const start = Math.max(0, index - 180);
+  const end = Math.min(cleaned.length, index + 360);
+  return cleaned.slice(start, end).trim().slice(0, 600);
 }
 
 function isOpenApiPath(path: string): boolean {
@@ -691,34 +868,30 @@ async function enrichOpenApiHits(hits: RetrievalHit[], answerLanguage: "zh" | "e
 function buildQueryVariants(query: string): string[] {
   const normalized = normalizeSpaces(query);
   const lowered = normalized.toLowerCase();
-  const replacements: Array<[RegExp, string]> = [
-    [/open\s*api/gi, "openapi"],
-    [/开放平台/gi, "openapi open platform"],
-    [/接口/gi, "api endpoint openapi"],
-    [/工作项/gi, "工作项 issue work item"],
-    [/状态列表|状态枚举/gi, "状态列表 status list statuses enum issueStatuses"],
-    [/状态/gi, "状态 status state issue status"],
-    [/字段|属性/gi, "字段 field property schema"],
-    [/更新|修改/gi, "update modify edit"],
-    [/获取|查询/gi, "get query retrieve fetch"],
-    [/创建/gi, "create add new"],
-    [/删除/gi, "delete remove"],
-    [/评论/gi, "comment issue comment"],
-    [/权限/gi, "permission scope access"],
-    [/授权/gi, "authorization oauth"],
-    [/令牌|token/gi, "token credential access token"]
-  ];
-  let expanded = lowered;
-  for (const [pattern, replacement] of replacements) {
-    expanded = expanded.replace(pattern, ` ${replacement} `);
-  }
-  expanded = normalizeSpaces(expanded);
-  const compactTokenVariant = tokenizeRetrievalQuery(expanded || normalized).join(" ").trim();
+  const semanticNormalized = normalizeSpaces(
+    lowered
+      .replace(/open\s*api/g, "openapi")
+      .replace(/开放平台/g, "openapi")
+      .replace(/接口/g, "api")
+      .replace(/重建/g, "rebuild")
+      .replace(/索引/g, "index indexes")
+      .replace(/导入/g, "import")
+      .replace(/导出/g, "export")
+      .replace(/重置/g, "reset")
+      .replace(/权限/g, "permission")
+      .replace(/授权/g, "oauth")
+      .replace(/项目标识|标识符|标识/g, "identifier id uuid")
+      .replace(/项目列表/g, "project list projects")
+      .replace(/工作项/g, "issue work item")
+      .replace(/字段|属性/g, "field property")
+      .replace(/报错|错误|异常|失败/g, "troubleshooting")
+  );
+  const compactTokenVariant = tokenizeRetrievalQuery(semanticNormalized || normalized).join(" ").trim();
   return uniqueStrings(
     [
       normalized,
       lowered !== normalized ? lowered : "",
-      expanded && expanded !== lowered ? expanded : "",
+      semanticNormalized && semanticNormalized !== lowered ? semanticNormalized : "",
       compactTokenVariant && compactTokenVariant !== lowered ? compactTokenVariant : ""
     ],
     4
@@ -1171,17 +1344,24 @@ export async function validateStartupConfig(): Promise<{ healthy: boolean; check
 
   for (const registration of repos) {
     const localMirror = await getLocalDocsMirrorState(registration);
-    if (localMirror) {
-      await repo.setRepoValidation(registration.id, null);
-      continue;
-    }
-    const validation = await validateReadOnlyAccess(registration).catch((error) => ({
-      ok: false,
-      scopes: [],
-      message: (error as Error).message
-    }));
-    await repo.setRepoValidation(registration.id, validation.ok ? null : validation.message);
-    if (!validation.ok) {
+    const branch = localMirror?.branch || registration.default_branch;
+    const upstreamValidation = localMirror
+      ? {
+          ok: true,
+          scopes: ["local_mirror"],
+          message: "validated via local docs-com mirror"
+        }
+      : await validateReadOnlyAccess(registration).catch((error) => ({
+          ok: false,
+          scopes: [],
+          message: (error as Error).message
+        }));
+    const docsCoverage = await validateDocsComCorpusCoverage(registration, branch);
+    const validationMessage = [upstreamValidation.ok ? "" : upstreamValidation.message, docsCoverage.ok ? "" : docsCoverage.message]
+      .filter(Boolean)
+      .join("; ");
+    await repo.setRepoValidation(registration.id, validationMessage || null);
+    if (!upstreamValidation.ok || !docsCoverage.ok) {
       healthy = false;
     }
   }
@@ -1247,6 +1427,76 @@ export async function registerRepository(input: {
 
 export async function listRepositories() {
   return repo.listActiveRepoRegistrations();
+}
+
+export async function getDocsComStatus(options?: { recentJobLimit?: number }) {
+  const registration = await getDocsComRegistration();
+  if (!registration) {
+    return {
+      exists: false,
+      canonical: buildDocsComRegistrationInput("internal_operator"),
+      status: null
+    };
+  }
+  return {
+    exists: true,
+    canonical: buildDocsComRegistrationInput("internal_operator"),
+    status: await summarizeDocsComCorpus(registration, options?.recentJobLimit ?? 10)
+  };
+}
+
+export async function ensureDocsComKnowledgeBase(input?: {
+  actor?: string;
+  mode?: "incremental" | "full" | "reindex";
+  runLimit?: number;
+  idempotencySeed?: string;
+}) {
+  const actor = input?.actor?.trim() || "internal_operator";
+  const mode = input?.mode ?? "incremental";
+  const registrationInput = buildDocsComRegistrationInput(actor);
+  const beforeRegistration = await getDocsComRegistration();
+  const beforeStatus = beforeRegistration ? await summarizeDocsComCorpus(beforeRegistration, 5) : null;
+
+  const { registration, validation } = await registerRepository(registrationInput);
+
+  const idempotencyKey = [
+    "docs-com",
+    mode,
+    registration.id,
+    registration.default_branch,
+    input?.idempotencySeed?.trim() || new Date().toISOString().slice(0, 16)
+  ].join(":");
+
+  const job = await enqueueSyncJob({
+    repoId: registration.id,
+    branch: registration.default_branch,
+    mode,
+    source: "system",
+    idempotencyKey
+  });
+  const runResult = await runDueSyncJobs(Math.max(1, Math.min(20, input?.runLimit ?? 4)));
+  const afterStatus = await summarizeDocsComCorpus(registration, 10);
+
+  return {
+    registrationChanged:
+      !beforeRegistration ||
+      beforeRegistration.repo_url !== registration.repo_url ||
+      beforeRegistration.public_base_url !== registration.public_base_url ||
+      beforeRegistration.default_branch !== registration.default_branch ||
+      JSON.stringify(beforeRegistration.include_paths) !== JSON.stringify(registration.include_paths) ||
+      JSON.stringify(beforeRegistration.exclude_paths) !== JSON.stringify(registration.exclude_paths),
+    validation,
+    enqueuedJob: {
+      id: job.id,
+      mode: job.sync_mode,
+      status: job.status,
+      branch: job.branch,
+      idempotencyKey: job.idempotency_key
+    },
+    runResult,
+    beforeStatus,
+    afterStatus
+  };
 }
 
 export async function enqueueSyncJob(input: {
@@ -1872,6 +2122,11 @@ export async function retrieveKnowledge(input: {
   hits = await enrichOpenApiHits(hits, answerLanguage).catch(() => hits);
   hits = await hydratePublicSourceUrls(hits).catch(() => hits);
   hits = rerankHitsForIntent(input.query, hits);
+  const snippetTerms = tokenizeRetrievalQuery(queryVariants.join(" "));
+  hits = hits.map((hit) => ({
+    ...hit,
+    snippet: buildQueryAnchoredSnippet(hit.snippet || hit.title, snippetTerms)
+  }));
   // Guardrail: fallback-only retrieval must not be treated as grounded-high-confidence.
   if (hits.length > 0 && hits.every((item) => item.rankSignals?.fallback)) {
     confidence = Math.min(confidence, Math.max(0, cfg.threshold - 0.12));
@@ -1980,14 +2235,14 @@ export async function bootstrapRepositoryFromEnvIfConfigured(): Promise<void> {
   if (!env.GITHUB_KB_BOOTSTRAP_REPO_URL) {
     return;
   }
-  const includePaths = env.GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS.split(",").map((item) => item.trim()).filter(Boolean);
-  const excludePaths = env.GITHUB_KB_BOOTSTRAP_EXCLUDE_PATHS.split(",").map((item) => item.trim()).filter(Boolean);
+  const includePaths = resolveBootstrapIncludePaths(env.GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS);
+  const excludePaths = resolveBootstrapExcludePaths(env.GITHUB_KB_BOOTSTRAP_EXCLUDE_PATHS);
 
   const { registration } = await registerRepository({
     repoUrl: env.GITHUB_KB_BOOTSTRAP_REPO_URL,
     publicBaseUrl: env.GITHUB_KB_BOOTSTRAP_PUBLIC_BASE_URL,
     defaultBranch: env.GITHUB_KB_BOOTSTRAP_BRANCH,
-    includePaths: includePaths.length ? includePaths : ["**/*.md"],
+    includePaths,
     excludePaths,
     pollingIntervalSeconds: env.GITHUB_KB_BOOTSTRAP_POLLING_INTERVAL_SECONDS,
     actor: "system_bootstrap"

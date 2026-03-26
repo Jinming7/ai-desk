@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { after, before, beforeEach, test } from "node:test";
 import type { AddressInfo } from "node:net";
 import { app } from "../app.js";
 import { pool } from "../db/client.js";
+import { env } from "../config/env.js";
 
 let baseUrl = "";
 let server: ReturnType<typeof app.listen>;
+const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
 
 function assertSafeTestDatabase() {
   const url = process.env.DATABASE_URL ?? "";
@@ -25,6 +30,16 @@ async function resetKbDb() {
   await pool.query("DELETE FROM kb_repo_registrations");
 }
 
+async function createFixtureRoot(): Promise<string> {
+  return mkdtemp(path.join(os.tmpdir(), "github-kb-integration-"));
+}
+
+async function writeFixture(rootDir: string, relativePath: string, content: string): Promise<void> {
+  const filePath = path.join(rootDir, relativePath);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, content, "utf8");
+}
+
 before(async () => {
   assertSafeTestDatabase();
   server = app.listen(0);
@@ -35,10 +50,12 @@ before(async () => {
 
 beforeEach(async () => {
   await resetKbDb();
+  env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
 });
 
 after(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
   await pool.end();
 });
 
@@ -333,6 +350,111 @@ test("incremental sync is idempotent and propagates deletion", async () => {
   );
   assert.equal(removed.rowCount, 1);
   assert.equal(removed.rows[0].is_active, false);
+});
+
+test("docs-com ensure auto-fixes registration to include mdx and runs sync immediately", async () => {
+  const rootDir = await createFixtureRoot();
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  try {
+    await writeFixture(
+      rootDir,
+      "open-docs/docs/openapi/api/execute-onesql.api.mdx",
+      `---
+title: "Execute ONESQL query"
+---
+
+# Execute ONESQL query
+
+ONESQL supports ORDER BY and GROUP BY clauses in POST /onesql/query.
+`
+    );
+    await writeFixture(
+      rootDir,
+      "docs/ones-devops/code-integration/github-and-public-gitlab.mdx",
+      `---
+title: "GitHub 和公共 GitLab"
+---
+
+# GitHub 和公共 GitLab
+
+如果授权完成后无法返回 ONES，或者回调页面显示 page not found，请检查 Redirect URI、Webhook 回调地址，以及 baseURL 配置是否一致。
+`
+    );
+
+    const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        repoUrl: "https://github.com/BangWork/docs-com",
+        publicBaseUrl: "https://docs.ones.com",
+        defaultBranch: "master",
+        includePaths: ["**/*.md"],
+        excludePaths: [],
+        pollingIntervalSeconds: 60,
+        actor: "test"
+      })
+    });
+    assert.equal(register.status, 201);
+
+    const ensure = await fetch(`${baseUrl}/api/v1/internal/kb/docs-com/ensure`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        mode: "full",
+        actor: "test",
+        runLimit: 4
+      })
+    });
+    assert.equal(ensure.status, 202);
+    const ensurePayload = (await ensure.json()) as {
+      result: {
+        registrationChanged: boolean;
+        runResult: { processed: number; succeeded: number };
+        afterStatus: {
+          registration: { includePaths: string[] };
+          corpus: Array<{ prefix: string; total: number; active: number }>;
+        };
+      };
+    };
+
+    assert.equal(ensurePayload.result.registrationChanged, true);
+    assert.equal(ensurePayload.result.runResult.processed >= 1, true);
+    assert.equal(ensurePayload.result.runResult.succeeded >= 1, true);
+    assert.deepEqual(ensurePayload.result.afterStatus.registration.includePaths, ["**/*.md", "**/*.mdx"]);
+    const openDocs = ensurePayload.result.afterStatus.corpus.find((item) => item.prefix === "open-docs/");
+    assert.equal(openDocs?.total, 1);
+    assert.equal(openDocs?.active, 1);
+
+    const status = await fetch(`${baseUrl}/api/v1/internal/kb/docs-com/status?limit=5`, {
+      headers: { "x-portal-surface": "internal" }
+    });
+    assert.equal(status.status, 200);
+    const statusPayload = (await status.json()) as {
+      result: {
+        exists: boolean;
+        status: {
+          registration: { branch: string; includePaths: string[] };
+          corpus: Array<{ prefix: string; total: number; active: number }>;
+        };
+      };
+    };
+
+    assert.equal(statusPayload.result.exists, true);
+    assert.equal(statusPayload.result.status.registration.branch, "master");
+    assert.deepEqual(statusPayload.result.status.registration.includePaths, ["**/*.md", "**/*.mdx"]);
+    const docsCorpus = statusPayload.result.status.corpus.find((item) => item.prefix === "docs/");
+    assert.equal(docsCorpus?.total, 1);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
 });
 
 test("read-only compliance endpoint reports blocked write method", async () => {

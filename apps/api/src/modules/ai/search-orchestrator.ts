@@ -2,7 +2,7 @@ import { env } from "../../config/env.js";
 import type { OpenClawAdapter, OpenClawRuntimeContext } from "../../infrastructure/openclaw/types.js";
 import * as githubKbService from "../github-kb/service.js";
 import { searchLocalDocs } from "./local-docs.js";
-import type { SearchReference, SearchResponseEnvelope } from "./types.js";
+import type { SearchReference, SearchResponseEnvelope, SupportCaseFrame } from "./types.js";
 
 type SearchEvidenceCollection = SearchResponseEnvelope & {
   resolvedQueries: string[];
@@ -11,6 +11,57 @@ type SearchEvidenceCollection = SearchResponseEnvelope & {
 
 export class SearchOrchestrator {
   constructor(private readonly adapter: OpenClawAdapter) {}
+
+  private getMetadataList(reference: SearchReference, key: string): string[] {
+    const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
+    const raw = metadata[key];
+    return Array.isArray(raw) ? raw.map((item) => String(item ?? "").toLowerCase()).filter(Boolean) : [];
+  }
+
+  private getReferenceProfile(reference: SearchReference): {
+    title: string;
+    heading: string;
+    snippet: string;
+    evidenceKind: string;
+    productArea: string;
+    deploymentModel: string;
+    permissions: string[];
+    prerequisites: string[];
+    actions: string[];
+    objects: string[];
+    appliesTo: string[];
+  } {
+    const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
+    return {
+      title: String(reference.title ?? "").toLowerCase(),
+      heading: String(reference.headingPath ?? "").toLowerCase(),
+      snippet: String(reference.snippet ?? "").toLowerCase(),
+      evidenceKind: String(metadata.evidence_kind ?? "").toLowerCase(),
+      productArea: String(metadata.product_area ?? "").toLowerCase(),
+      deploymentModel: String(metadata.deployment_model ?? "").toLowerCase(),
+      permissions: this.getMetadataList(reference, "permissions"),
+      prerequisites: this.getMetadataList(reference, "prerequisites"),
+      actions: this.getMetadataList(reference, "actions"),
+      objects: this.getMetadataList(reference, "objects"),
+      appliesTo: this.getMetadataList(reference, "applies_to")
+    };
+  }
+
+  private getReferenceSemanticText(reference: SearchReference): string {
+    const profile = this.getReferenceProfile(reference);
+    return [
+      profile.title,
+      profile.heading,
+      profile.snippet,
+      ...profile.permissions,
+      ...profile.prerequisites,
+      ...profile.actions,
+      ...profile.objects,
+      ...profile.appliesTo
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
 
   private extractQueryTerms(query?: string): string[] {
     const raw = String(query ?? "").trim().toLowerCase();
@@ -127,16 +178,12 @@ export class SearchOrchestrator {
 
   private scoreReferenceQueryMatch(reference: SearchReference, queryTerms: string[]): number {
     if (!queryTerms.length) return 0;
-    const title = String(reference.title ?? "").toLowerCase();
-    const heading = String(reference.headingPath ?? "").toLowerCase();
-    const path = this.canonicalDocsPath(reference.path).toLowerCase();
-    const snippet = String(reference.snippet ?? "").toLowerCase();
+    const profile = this.getReferenceProfile(reference);
     let score = 0;
     for (const term of queryTerms) {
-      if (title.includes(term)) score += 12;
-      else if (heading.includes(term)) score += 9;
-      else if (path.includes(term)) score += 7;
-      else if (snippet.includes(term)) score += 2;
+      if (profile.title.includes(term)) score += 12;
+      else if (profile.heading.includes(term)) score += 8;
+      else if (profile.snippet.includes(term)) score += 3;
     }
     return score;
   }
@@ -207,33 +254,70 @@ export class SearchOrchestrator {
 
   private scoreDocKindMatch(reference: SearchReference, requiredDocKinds: string[]): number {
     if (!requiredDocKinds.length) return 0;
-    const path = this.canonicalDocsPath(reference.path).toLowerCase();
-    const title = String(reference.title ?? "").toLowerCase();
-    const heading = String(reference.headingPath ?? "").toLowerCase();
-    const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
-    const evidenceKind = String(metadata.evidence_kind ?? "").toLowerCase();
-    const productArea = String(metadata.product_area ?? "").toLowerCase();
+    const profile = this.getReferenceProfile(reference);
+    const semanticText = this.getReferenceSemanticText(reference);
 
     let score = 0;
     for (const kind of requiredDocKinds.map((item) => item.toLowerCase())) {
-      if (kind === "openapi/api" && path.includes("openapi/api/")) score += 24;
+      if (kind === "openapi/api") {
+        if (profile.productArea === "openapi") score += 14;
+        if (profile.evidenceKind === "api_operation") score += 18;
+      }
       else if (kind === "schema" || kind === "field") {
-        if (path.includes("issue-field") || path.includes("field") || evidenceKind.includes("schema")) score += 16;
+        if (
+          /\b(schema|field|fields|property|properties|response|status object)\b|字段|属性|响应/.test(semanticText) ||
+          profile.evidenceKind.includes("schema")
+        ) score += 16;
       } else if (kind === "syntax_reference") {
-        if (path.includes("onesql") || title.includes("onesql") || heading.includes("onesql")) score += 20;
+        if (/\b(onesql|syntax|query language|reference)\b|语法|查询语言/.test(semanticText)) score += 20;
       } else if (kind === "permissions") {
-        if (path.includes("scope") || title.includes("scope") || title.includes("permission")) score += 18;
+        if (profile.permissions.length > 0 || /\b(scope|permission|oauth|authorization|authentication)\b/.test(semanticText)) score += 18;
       } else if (kind === "rules") {
-        if (title.includes("rule") || title.includes("workflow") || heading.includes("workflow")) score += 14;
+        if (profile.evidenceKind === "constraint" || /\b(rule|workflow|behavior|limitation)\b|规则|流程|行为|限制/.test(semanticText)) score += 14;
       } else if (kind === "troubleshooting") {
-        if (title.includes("troubleshooting") || heading.includes("why") || heading.includes("faq")) score += 12;
+        if (profile.evidenceKind === "troubleshooting" || /\b(troubleshoot|faq|why|failure|error)\b|排查|故障|失败|报错/.test(semanticText)) score += 12;
       } else if (kind === "product_guide") {
-        if (path.startsWith("docs/") && !path.includes("openapi/api/")) score += 12;
+        if (profile.evidenceKind === "procedure" || profile.evidenceKind === "capability") score += 12;
+      } else if (kind === "deployment_runbook") {
+        if (profile.productArea === "deployment") score += 16;
+        if (profile.deploymentModel === "private_deployment") score += 14;
+        if (profile.evidenceKind === "procedure" || profile.evidenceKind === "constraint" || profile.evidenceKind === "troubleshooting") {
+          score += 10;
+        }
       }
     }
 
-    if (productArea === "openapi" && requiredDocKinds.some((item) => item.toLowerCase() === "openapi/api")) {
+    if (profile.productArea === "openapi" && requiredDocKinds.some((item) => item.toLowerCase() === "openapi/api")) {
       score += 4;
+    }
+
+    return score;
+  }
+
+  private scoreCaseFrameMatch(reference: SearchReference, caseFrame?: SupportCaseFrame): number {
+    if (!caseFrame) return 0;
+    const profile = this.getReferenceProfile(reference);
+    const semanticText = this.getReferenceSemanticText(reference);
+    let score = 0;
+
+    if (caseFrame.product_area && caseFrame.product_area !== "general" && caseFrame.product_area !== "unknown") {
+      if (profile.productArea === caseFrame.product_area) score += 20;
+      else if (profile.productArea) score -= 8;
+    }
+    if (caseFrame.deployment_model === "private_deployment") {
+      if (profile.deploymentModel === "private_deployment" || profile.appliesTo.includes("private_deployment")) score += 18;
+      else if (profile.deploymentModel) score -= 8;
+    }
+    if (String(caseFrame.question_type ?? "").startsWith("api_")) {
+      if (profile.productArea === "openapi") score += 10;
+      if (profile.evidenceKind === "api_operation") score += 14;
+    }
+    if (caseFrame.question_type === "how_to_product" || caseFrame.question_type === "config_setup") {
+      if (profile.evidenceKind === "procedure") score += 12;
+      if (profile.evidenceKind === "troubleshooting") score += 6;
+    }
+    if (caseFrame.product_area === "deployment" && /\b(unified|shared|external|database|storage|topology|architecture|isolation|separate)\b|统一|外置|数据库|存储|拓扑|架构|隔离|独立/.test(semanticText)) {
+      score += 12;
     }
 
     return score;
@@ -242,16 +326,20 @@ export class SearchOrchestrator {
   rerankReferencesForRoute(references: SearchReference[], options?: {
     requiredDocKinds?: string[];
     questionType?: string;
+    caseFrame?: SupportCaseFrame;
   }): SearchReference[] {
     const requiredDocKinds = options?.requiredDocKinds ?? [];
     const questionType = String(options?.questionType ?? "");
     return [...references].sort((a, b) => {
+      const caseFrameDiff = this.scoreCaseFrameMatch(b, options?.caseFrame) - this.scoreCaseFrameMatch(a, options?.caseFrame);
+      if (caseFrameDiff !== 0) return caseFrameDiff;
+
       const docKindDiff = this.scoreDocKindMatch(b, requiredDocKinds) - this.scoreDocKindMatch(a, requiredDocKinds);
       if (docKindDiff !== 0) return docKindDiff;
 
       if (questionType.startsWith("api_")) {
-        const aApi = this.canonicalDocsPath(a.path).includes("openapi/api/");
-        const bApi = this.canonicalDocsPath(b.path).includes("openapi/api/");
+        const aApi = this.getReferenceProfile(a).productArea === "openapi" || this.getReferenceProfile(a).evidenceKind === "api_operation";
+        const bApi = this.getReferenceProfile(b).productArea === "openapi" || this.getReferenceProfile(b).evidenceKind === "api_operation";
         if (aApi !== bApi) return bApi ? 1 : -1;
       }
 
@@ -302,6 +390,7 @@ export class SearchOrchestrator {
     runtime?: OpenClawRuntimeContext;
     answerLanguage?: "zh" | "en";
     attachments?: string[];
+    caseFrame?: SupportCaseFrame;
   }): Promise<SearchEvidenceCollection> {
     const normalizedBaseQuery = this.normalizeQuery(input.baseQuery);
     const refinementQueries = this.mergeReferences(input.references)
@@ -318,7 +407,8 @@ export class SearchOrchestrator {
       idempotencyKey: `${input.idempotencyKey}:refine`,
       runtime: input.runtime,
       answerLanguage: input.answerLanguage,
-      attachments: input.attachments
+      attachments: input.attachments,
+      caseFrame: input.caseFrame
     });
   }
 
@@ -362,6 +452,7 @@ export class SearchOrchestrator {
     runtime?: OpenClawRuntimeContext;
     answerLanguage?: "zh" | "en";
     attachments?: string[];
+    caseFrame?: SupportCaseFrame;
   }): Promise<SearchEvidenceCollection> {
     const queryLimit = Math.max(1, Math.min(4, input.runtime?.queryLimit ?? 4));
     const topK = Math.max(1, Math.min(env.GITHUB_KB_PROFILE_AGENT_TOPK, input.runtime?.kbTopK ?? env.GITHUB_KB_PROFILE_AGENT_TOPK));
@@ -457,8 +548,13 @@ export class SearchOrchestrator {
           : [...localDocsReferences, ...this.enrichGithubKbReferencesWithLocalDocs(kbReferences, localDocsReferences)],
         { query }
       );
+      const rerankedReferences = this.rerankReferencesForRoute(mergedReferences, {
+        requiredDocKinds: input.caseFrame?.required_doc_kinds,
+        questionType: input.caseFrame?.question_type,
+        caseFrame: input.caseFrame
+      });
 
-      if (!mergedReferences.length) {
+      if (!rerankedReferences.length) {
         if (!localDocsResult && !kbResult) {
           throw new Error(`KB retrieval unavailable for query: ${query}`);
         }
@@ -480,13 +576,17 @@ export class SearchOrchestrator {
           ...(localDocsResult?.resolvedQueries ?? []),
           ...(kbResult?.resolvedQueries ?? [query])
         ],
-        references: mergedReferences
+        references: rerankedReferences
       };
     };
 
     const firstRound = await Promise.all(normalizedQueries.map((query) => retrieveOnce(query)));
-    const merged = this.mergeReferences(firstRound.flatMap((item) => item.references), {
+    const merged = this.rerankReferencesForRoute(this.mergeReferences(firstRound.flatMap((item) => item.references), {
       query: normalizedQueries.join(" ")
+    }), {
+      requiredDocKinds: input.caseFrame?.required_doc_kinds,
+      questionType: input.caseFrame?.question_type,
+      caseFrame: input.caseFrame
     }).slice(0, env.GITHUB_KB_PROFILE_AGENT_TOPK);
     const confidence = Math.max(0, ...firstRound.map((item) => item.confidence));
     const fallbackUsed = firstRound.some((item) => item.fallbackUsed);
