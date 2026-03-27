@@ -28,7 +28,7 @@ export const kbRunJobsSchema = z.object({
 export const kbDocsComEnsureSchema = z.object({
   mode: z.enum(["incremental", "full", "reindex"]).default("incremental"),
   actor: z.string().min(1).default("internal_operator"),
-  runLimit: z.coerce.number().int().min(1).max(20).default(4)
+  runLimit: z.coerce.number().int().min(0).max(20).default(0)
 });
 
 export const kbDocsComStatusQuerySchema = z.object({

@@ -128,6 +128,96 @@ test("full sync builds index and retrieval returns source citation", async () =>
   assert.equal(typeof body.result.hits[0].commitSha, "string");
 });
 
+test("remote full sync continues in batches until all docs are indexed", async () => {
+  const originalBatchSize = env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE;
+  env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE = 2;
+
+  try {
+    const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        repoUrl: "mock://acme/ticket-kb",
+        defaultBranch: "main",
+        includePaths: ["docs/*.md", "docs/**/*.md", "deploy-docs/*.md", "deploy-docs/**/*.md"],
+        excludePaths: [],
+        pollingIntervalSeconds: 60,
+        actor: "test"
+      })
+    });
+    assert.equal(register.status, 201);
+    const regPayload = (await register.json()) as { registration: { id: string; default_branch: string } };
+
+    const enqueue = await fetch(`${baseUrl}/api/v1/internal/kb/sync/full`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        repoId: regPayload.registration.id,
+        branch: regPayload.registration.default_branch,
+        afterCommitSha: "mockc2",
+        idempotencyKey: "test-remote-full-batch"
+      })
+    });
+    assert.equal(enqueue.status, 202);
+
+    const run1 = await fetch(`${baseUrl}/api/v1/internal/kb/sync/run`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({ limit: 1 })
+    });
+    assert.equal(run1.status, 200);
+    const run1Body = (await run1.json()) as { result: { processed: number; succeeded: number } };
+    assert.equal(run1Body.result.processed, 1);
+    assert.equal(run1Body.result.succeeded, 1);
+
+    const jobsAfterRun1 = await fetch(`${baseUrl}/api/v1/internal/kb/sync/jobs?limit=10`, {
+      headers: { "x-portal-surface": "internal" }
+    });
+    assert.equal(jobsAfterRun1.status, 200);
+    const jobsAfterRun1Body = (await jobsAfterRun1.json()) as { jobs: Array<{ status: string }> };
+    assert.equal(jobsAfterRun1Body.jobs.some((job) => job.status === "queued"), true);
+
+    const run2 = await fetch(`${baseUrl}/api/v1/internal/kb/sync/run`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({ limit: 1 })
+    });
+    assert.equal(run2.status, 200);
+
+    const retrieval = await fetch(`${baseUrl}/api/v1/kb/retrieval/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: "KubeVersionMismatch",
+        profile: "search",
+        repoId: regPayload.registration.id,
+        includeFallback: false
+      })
+    });
+    assert.equal(retrieval.status, 200);
+    const body = (await retrieval.json()) as {
+      result: {
+        hits: Array<{ path: string }>;
+      };
+    };
+    assert.equal(body.result.hits.some((hit) => hit.path === "deploy-docs/troubleshooting/infra/k3s-alert-handler.md"), true);
+  } finally {
+    env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE = originalBatchSize;
+  }
+});
+
 test("retrieval prefers public docs url when repo registration configures docs base", async () => {
   const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
     method: "POST",

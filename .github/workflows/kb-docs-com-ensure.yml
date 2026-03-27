@@ -62,7 +62,7 @@ jobs:
           KB_AUTOMATION_BASE_URL: ${{ vars.KB_AUTOMATION_BASE_URL }}
           INTERNAL_OPS_TOKEN: ${{ secrets.INTERNAL_OPS_TOKEN }}
           KB_ENSURE_MODE: ${{ steps.mode.outputs.value }}
-          KB_ENSURE_RUN_LIMIT: "4"
-          KB_ENSURE_MAX_ATTEMPTS: "24"
+          KB_ENSURE_RUN_LIMIT: "0"
+          KB_ENSURE_MAX_ATTEMPTS: "60"
           KB_ENSURE_WAIT_MS: "15000"
         run: node scripts/ensure-docs-com-kb.mjs

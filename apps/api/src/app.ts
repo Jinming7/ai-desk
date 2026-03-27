@@ -918,7 +918,7 @@ app.get(
 
 app.post(
   "/api/v1/internal/kb/repos/register",
-  requireInternalRequest,
+  requireInternalOrAutomationRequest,
   asyncHandler(async (req, res) => {
     const body = kbRepoRegistrationSchema.parse(req.body);
     const result = await githubKbService.registerRepository(body);
@@ -953,7 +953,7 @@ app.post(
 
 app.post(
   "/api/v1/internal/kb/sync/full",
-  requireInternalRequest,
+  requireInternalOrAutomationRequest,
   asyncHandler(async (req, res) => {
     const body = kbEnqueueSyncSchema.parse({ ...req.body, mode: "full", source: "manual" });
     const job = await githubKbService.enqueueSyncJob({
@@ -972,7 +972,7 @@ app.post(
 
 app.post(
   "/api/v1/internal/kb/sync/incremental",
-  requireInternalRequest,
+  requireInternalOrAutomationRequest,
   asyncHandler(async (req, res) => {
     const body = kbEnqueueSyncSchema.parse({ ...req.body, mode: "incremental", source: "manual" });
     const job = await githubKbService.enqueueSyncJob({
@@ -991,7 +991,7 @@ app.post(
 
 app.post(
   "/api/v1/internal/kb/sync/reindex",
-  requireInternalRequest,
+  requireInternalOrAutomationRequest,
   asyncHandler(async (req, res) => {
     const repoId = z.string().uuid().parse(req.body?.repoId);
     const branch = z.string().default("main").parse(req.body?.branch);
@@ -1002,7 +1002,7 @@ app.post(
 
 app.post(
   "/api/v1/internal/kb/sync/run",
-  requireInternalRequest,
+  requireInternalOrAutomationRequest,
   asyncHandler(async (req, res) => {
     const body = kbRunJobsSchema.parse(req.body);
     const result = await githubKbService.runDueSyncJobs(body.limit);
@@ -1012,7 +1012,7 @@ app.post(
 
 app.get(
   "/api/v1/internal/kb/sync/jobs",
-  requireInternalRequest,
+  requireInternalOrAutomationRequest,
   asyncHandler(async (req, res) => {
     const limit = z.coerce.number().int().min(1).max(200).default(50).parse(req.query.limit);
     const jobs = await githubKbService.listSyncJobs(limit);
@@ -1022,7 +1022,7 @@ app.get(
 
 app.get(
   "/api/v1/internal/kb/sync/health",
-  requireInternalRequest,
+  requireInternalOrAutomationRequest,
   asyncHandler(async (_req, res) => {
     const health = await githubKbService.getSyncHealthSummary();
     res.json({ health });

@@ -54,6 +54,12 @@ interface LocalMirrorBatchResult extends SyncExecutionResult {
   remaining: number;
 }
 
+interface RemoteBatchResult extends SyncExecutionResult {
+  deactivated: number;
+  total: number;
+  remaining: number;
+}
+
 function sha256(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
@@ -1157,6 +1163,49 @@ async function runLocalMirrorSyncBatch(input: {
   };
 }
 
+async function runRemoteSnapshotBatch(input: {
+  registration: RepoRegistration;
+  branch: string;
+  head: string;
+  cursor?: string;
+  limit: number;
+}): Promise<RemoteBatchResult> {
+  const files = await listFilesAtCommit(input.registration, input.head);
+  const markdownFiles = files
+    .filter((file) => /\.(md|mdx)$/i.test(file.path))
+    .filter((file) => isPathIncluded(file.path, input.registration.include_paths, input.registration.exclude_paths))
+    .map((file) => file.path)
+    .sort((left, right) => left.localeCompare(right, "en"));
+
+  const window = sliceSnapshotForBackfill(markdownFiles, input.cursor, input.limit);
+  let indexed = 0;
+  for (const relativePath of window.files) {
+    await indexDocument(input.registration, input.branch, input.head, relativePath);
+    indexed += 1;
+  }
+
+  let deactivated = 0;
+  if (window.finished) {
+    deactivated = await repo.deactivateDocumentsMissingFromSnapshot(input.registration.id, input.branch, markdownFiles);
+    await repo.upsertCheckpoint({
+      repoId: input.registration.id,
+      branch: input.branch,
+      lastSyncedCommitSha: input.head,
+      fullSync: true
+    });
+  }
+
+  return {
+    indexed,
+    deactivated,
+    head: input.head,
+    total: window.total,
+    remaining: window.remaining,
+    nextCursor: window.nextCursor,
+    finished: window.finished
+  };
+}
+
 function buildSyntheticSyncJob(input: {
   repoId: string;
   branch: string;
@@ -1195,29 +1244,14 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
   const branch = resolved.branch;
   const effectiveRegistration = resolved.registration;
   const head = job.after_commit_sha ?? (await getBranchHead(effectiveRegistration, branch));
-  const files = await listFilesAtCommit(effectiveRegistration, head);
-  const markdownFiles = files
-    .filter((file) => /\.(md|mdx)$/i.test(file.path))
-    .filter((file) => isPathIncluded(file.path, effectiveRegistration.include_paths, effectiveRegistration.exclude_paths));
-
-  for (const file of markdownFiles) {
-    await indexDocument(effectiveRegistration, branch, head, file.path);
-  }
-
-  const deactivated = await repo.deactivateDocumentsMissingFromSnapshot(
-    effectiveRegistration.id,
+  const cursor = getLocalMirrorCursor(job);
+  return runRemoteSnapshotBatch({
+    registration: effectiveRegistration,
     branch,
-    markdownFiles.map((file) => file.path)
-  );
-
-  await repo.upsertCheckpoint({
-    repoId: effectiveRegistration.id,
-    branch,
-    lastSyncedCommitSha: head,
-    fullSync: true
+    head,
+    cursor,
+    limit: env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE
   });
-
-  return { indexed: markdownFiles.length, deactivated, head, finished: true, nextCursor: null };
 }
 
 async function runIncrementalSync(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
@@ -1317,7 +1351,7 @@ export async function runRepositorySyncDirect(input: {
   return runReindex(syntheticJob, registration);
 }
 
-async function enqueueLocalMirrorContinuation(job: SyncJob, registration: RepoRegistration, result: SyncExecutionResult): Promise<void> {
+async function enqueueSyncContinuation(job: SyncJob, registration: RepoRegistration, result: SyncExecutionResult): Promise<void> {
   if (result.finished || !result.nextCursor) return;
   await enqueueSyncJob({
     repoId: registration.id,
@@ -1330,7 +1364,7 @@ async function enqueueLocalMirrorContinuation(job: SyncJob, registration: RepoRe
       ...job.payload_json,
       cursor: result.nextCursor
     },
-    idempotencyKey: `local-mirror:${job.sync_mode}:${registration.id}:${job.branch}:${result.head}:${result.nextCursor}`
+    idempotencyKey: `sync-continuation:${job.sync_mode}:${registration.id}:${job.branch}:${result.head}:${result.nextCursor}`
   });
 }
 
@@ -1474,7 +1508,8 @@ export async function ensureDocsComKnowledgeBase(input?: {
     source: "system",
     idempotencyKey
   });
-  const runResult = await runDueSyncJobs(Math.max(1, Math.min(20, input?.runLimit ?? 4)));
+  const runLimit = Math.max(0, Math.min(20, input?.runLimit ?? 0));
+  const runResult = runLimit > 0 ? await runDueSyncJobs(runLimit) : { processed: 0, succeeded: 0, failed: 0, deadLetter: 0 };
   const afterStatus = await summarizeDocsComCorpus(registration, 10);
 
   return {
@@ -1585,9 +1620,7 @@ export async function runDueSyncJobs(limit: number): Promise<{ processed: number
         });
       }
 
-      if (localMirror) {
-        await enqueueLocalMirrorContinuation(job, registration, executionResult);
-      }
+      await enqueueSyncContinuation(job, registration, executionResult);
 
       await repo.markSyncJobSucceeded(job.id);
       await repo.recordMetric({
