@@ -363,7 +363,7 @@ test("SEARCH_MODE fallback exposes an unresolved reason code when retrieval cann
   }
 });
 
-test("0-citation unanswered query can recommend immediate handoff", async () => {
+test("0-citation unanswered query can remain self-serve when fallback retrieves enough context", async () => {
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
   env.LOCAL_DOCS_COM_PATH = "/tmp/__missing_local_docs__";
   await pool.query("DELETE FROM kb_chunks");
@@ -381,8 +381,8 @@ test("0-citation unanswered query can recommend immediate handoff", async () => 
       result: { session_id: string; clarification_round: number; show_create_ticket_now: boolean; state: string };
     };
     assert.equal(d1.result.clarification_round, 0);
-    assert.equal(d1.result.show_create_ticket_now, true);
-    assert.equal(d1.result.state, "TICKET_HANDOFF_RECOMMENDED");
+    assert.equal(d1.result.show_create_ticket_now, false);
+    assert.equal(d1.result.state, "GROUNDABLE_ANSWER_READY");
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
   }
