@@ -793,8 +793,13 @@ export async function replaceRelationsForMemoryIds(memoryIds: string[], relation
     await pool.query(
       `INSERT INTO kb_memory_relations (id, from_memory_id, to_memory_id, relation_type, weight, metadata_json)
        VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-       ON CONFLICT (from_memory_id, to_memory_id, relation_type)
-       DO UPDATE SET weight = EXCLUDED.weight, metadata_json = EXCLUDED.metadata_json`,
+       ON CONFLICT (id)
+       DO UPDATE SET
+         from_memory_id = EXCLUDED.from_memory_id,
+         to_memory_id = EXCLUDED.to_memory_id,
+         relation_type = EXCLUDED.relation_type,
+         weight = EXCLUDED.weight,
+         metadata_json = EXCLUDED.metadata_json`,
       [relation.id, relation.from_memory_id, relation.to_memory_id, relation.relation_type, relation.weight, toJson(relation.metadata_json ?? {})]
     );
   }

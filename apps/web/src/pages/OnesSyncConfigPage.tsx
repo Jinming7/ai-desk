@@ -757,22 +757,54 @@ export function OnesSyncConfigPage() {
             <p className="mt-1 text-xs text-slate-500">{kbStatus?.status?.registration.branch ?? kbStatus?.canonical.defaultBranch ?? "master"}</p>
           </div>
           <div className="rounded-mdplus border border-slate-200 bg-slate-50 p-3">
-            <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Coverage</p>
+            <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Sync Coverage</p>
             <p className={`mt-2 text-sm font-medium ${kbStatus?.status?.health.ok ? "text-emerald-700" : "text-amber-700"}`}>
-              {kbStatus?.status?.health.ok ? "Healthy" : kbStatus?.status ? "Needs Attention" : "Unknown"}
+              {typeof kbStatus?.status?.overview.activeCoverageRate === "number"
+                ? `${Math.round(kbStatus.status.overview.activeCoverageRate * 100)}% indexed`
+                : kbStatus?.status?.health.ok
+                  ? "Healthy"
+                  : kbStatus?.status
+                    ? "Needs Attention"
+                    : "Unknown"}
             </p>
-            <p className="mt-1 text-xs text-slate-500">{kbStatus?.status?.health.message ?? "Waiting for first status load."}</p>
+            <p className="mt-1 text-xs text-slate-500">
+              {kbStatus?.status
+                ? `source ${kbStatus.status.overview.sourceTotal} / kb active ${kbStatus.status.overview.kbActive}`
+                : "Waiting for first status load."}
+            </p>
+          </div>
+          <div className="rounded-mdplus border border-slate-200 bg-slate-50 p-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Source Snapshot</p>
+            <p className="mt-2 text-sm font-medium text-slate-900">
+              {kbStatus?.status?.sourceSnapshot.mode === "local_mirror" ? "Local Mirror" : kbStatus?.status ? "Remote GitHub" : "-"}
+            </p>
+            <p className="mt-1 text-xs text-slate-500">
+              {kbStatus?.status?.sourceSnapshot.head ?? kbStatus?.status?.sourceSnapshot.errorMessage ?? "Waiting for source probe."}
+            </p>
           </div>
           <div className="rounded-mdplus border border-slate-200 bg-slate-50 p-3">
             <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Last Sync</p>
-            <p className="mt-2 text-sm font-medium text-slate-900">{kbStatus?.status?.checkpoint?.lastSyncedAt ?? "-"}</p>
+            <p className="mt-2 text-sm font-medium text-slate-900">
+              {kbStatus?.status?.checkpoint?.lastSyncedAt ?? "-"}
+            </p>
             <p className="mt-1 text-xs text-slate-500">{kbStatus?.status?.checkpoint?.lastSyncedCommitSha ?? "No checkpoint yet"}</p>
           </div>
-          <div className="rounded-mdplus border border-slate-200 bg-slate-50 p-3">
-            <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Include Paths</p>
-            <p className="mt-2 text-sm font-medium text-slate-900">
-              {(kbStatus?.status?.registration.includePaths ?? kbStatus?.canonical.includePaths ?? []).join(", ") || "-"}
-            </p>
+        </div>
+
+        <div className="mt-3 rounded-mdplus border border-slate-200 bg-[linear-gradient(135deg,rgba(0,100,255,0.06),rgba(51,221,255,0.08))] p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Probe Summary</p>
+              <p className="mt-1 text-sm font-medium text-slate-900">
+                Compare current source repo markdown totals against indexed KB totals in the shared database.
+              </p>
+            </div>
+            <div className="text-right text-sm text-slate-700">
+              <p>Gap: {kbStatus?.status?.overview.syncGap ?? "-"}</p>
+              <p className="text-xs text-slate-500">
+                {kbStatus?.status?.health.message ?? "The source probe will show whether missing data is a real sync gap or simply zero documents upstream."}
+              </p>
+            </div>
           </div>
         </div>
 
@@ -780,20 +812,28 @@ export function OnesSyncConfigPage() {
           <div className="rounded-mdplus border border-slate-200">
             <div className="border-b border-slate-200 px-4 py-3">
               <h3 className="text-sm font-semibold text-slate-900">Corpus Families</h3>
+              <p className="mt-1 text-xs text-slate-500">Each family compares source markdown counts against what the KB has already indexed.</p>
             </div>
             <div className="divide-y divide-slate-100">
               {(kbStatus?.status?.corpus ?? []).map((row) => (
                 <div key={row.prefix} className="flex items-center justify-between px-4 py-3 text-sm">
                   <div>
                     <p className="font-medium text-slate-900">{row.prefix}</p>
-                    <p className="text-xs text-slate-500">total {row.total} / active {row.active}</p>
+                    <p className="text-xs text-slate-500">
+                      source {row.sourceTotal ?? "-"} / kb total {row.total} / kb active {row.active}
+                    </p>
+                    <p className="mt-1 text-xs text-slate-400">gap {row.gap ?? "-"}</p>
                   </div>
                   <span
                     className={`rounded-full px-2 py-1 text-xs font-medium ${
-                      row.total > 0 && row.active > 0 ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"
+                      row.sourceTotal !== null && row.sourceTotal === row.active
+                        ? "bg-emerald-50 text-emerald-700"
+                        : row.active > 0
+                          ? "bg-sky-50 text-sky-700"
+                          : "bg-amber-50 text-amber-700"
                     }`}
                   >
-                    {row.total > 0 && row.active > 0 ? "Ready" : "Check"}
+                    {row.sourceTotal !== null && row.sourceTotal === row.active ? "In Sync" : row.active > 0 ? "Catching Up" : "Check"}
                   </span>
                 </div>
               ))}

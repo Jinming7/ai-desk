@@ -62,6 +62,14 @@ interface RemoteBatchResult extends SyncExecutionResult {
   remaining: number;
 }
 
+interface DocsComSourceCorpusSnapshot {
+  mode: "local_mirror" | "remote";
+  branch: string;
+  head: string;
+  total: number;
+  corpus: Array<{ prefix: string; total: number }>;
+}
+
 function sha256(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
@@ -137,6 +145,44 @@ async function getDocsComRegistration(): Promise<RepoRegistration | null> {
   return repo.findActiveRepoByOwnerNameBranch(DOCS_COM_REPO_OWNER, DOCS_COM_REPO_NAME, DOCS_COM_DEFAULT_BRANCH);
 }
 
+function summarizePrefixTotals(paths: string[]): Array<{ prefix: string; total: number }> {
+  return DOCS_COM_REQUIRED_PREFIXES.map((prefix) => ({
+    prefix,
+    total: paths.filter((item) => item.startsWith(prefix)).length
+  }));
+}
+
+async function summarizeDocsComSourceCorpus(registration: RepoRegistration): Promise<DocsComSourceCorpusSnapshot> {
+  const localMirror = await getLocalDocsMirrorState(registration);
+  if (localMirror) {
+    const markdownFiles = await collectLocalMirrorSnapshot(registration, localMirror);
+    return {
+      mode: "local_mirror",
+      branch: localMirror.branch || registration.default_branch || DOCS_COM_DEFAULT_BRANCH,
+      head: localMirror.head,
+      total: markdownFiles.length,
+      corpus: summarizePrefixTotals(markdownFiles)
+    };
+  }
+
+  const resolved = await resolveRegistrationBranch(registration, registration.default_branch || DOCS_COM_DEFAULT_BRANCH, "status_probe");
+  const head = await getBranchHead(resolved.registration, resolved.branch);
+  const files = await listFilesAtCommit(resolved.registration, head);
+  const markdownFiles = files
+    .filter((file) => /\.(md|mdx)$/i.test(file.path))
+    .filter((file) => isPathIncluded(file.path, resolved.registration.include_paths, resolved.registration.exclude_paths))
+    .map((file) => file.path)
+    .sort((left, right) => left.localeCompare(right, "en"));
+
+  return {
+    mode: "remote",
+    branch: resolved.branch,
+    head,
+    total: markdownFiles.length,
+    corpus: summarizePrefixTotals(markdownFiles)
+  };
+}
+
 async function summarizeDocsComCorpus(registration: RepoRegistration, recentJobLimit = 10) {
   const branch = registration.default_branch || DOCS_COM_DEFAULT_BRANCH;
   const corpus = await repo.countDocumentsByPathPrefixes({
@@ -147,6 +193,23 @@ async function summarizeDocsComCorpus(registration: RepoRegistration, recentJobL
   const checkpoints = await repo.getCheckpoint(registration.id, branch);
   const recentJobs = (await repo.listRecentSyncJobs(recentJobLimit)).filter((job) => job.repo_id === registration.id);
   const health = await validateDocsComCorpusCoverage(registration, branch);
+  const sourceSnapshot = await summarizeDocsComSourceCorpus(registration).catch((error) => ({
+    mode: "remote" as const,
+    branch,
+    head: "",
+    total: 0,
+    corpus: DOCS_COM_REQUIRED_PREFIXES.map((prefix) => ({ prefix, total: 0 })),
+    errorMessage: (error as Error).message
+  }));
+  const sourceTotals = new Map(sourceSnapshot.corpus.map((item) => [item.prefix, item.total]));
+  const kbTotals = corpus.reduce(
+    (acc, item) => {
+      acc.total += item.total;
+      acc.active += item.active;
+      return acc;
+    },
+    { total: 0, active: 0 }
+  );
   return {
     registration: {
       id: registration.id,
@@ -161,8 +224,25 @@ async function summarizeDocsComCorpus(registration: RepoRegistration, recentJobL
     corpus: corpus.map((item) => ({
       prefix: item.prefix,
       total: item.total,
-      active: item.active
+      active: item.active,
+      sourceTotal: sourceTotals.get(item.prefix) ?? null,
+      gap: typeof sourceTotals.get(item.prefix) === "number" ? Math.max(0, (sourceTotals.get(item.prefix) ?? 0) - item.active) : null
     })),
+    sourceSnapshot: {
+      mode: sourceSnapshot.mode,
+      branch: sourceSnapshot.branch,
+      head: sourceSnapshot.head || null,
+      total: sourceSnapshot.total,
+      errorMessage: "errorMessage" in sourceSnapshot ? sourceSnapshot.errorMessage : null,
+      corpus: sourceSnapshot.corpus
+    },
+    overview: {
+      kbTotal: kbTotals.total,
+      kbActive: kbTotals.active,
+      sourceTotal: sourceSnapshot.total,
+      activeCoverageRate: sourceSnapshot.total > 0 ? Number((kbTotals.active / sourceSnapshot.total).toFixed(4)) : null,
+      syncGap: Math.max(0, sourceSnapshot.total - kbTotals.active)
+    },
     checkpoint: checkpoints
       ? {
           lastSyncedCommitSha: checkpoints.last_synced_commit_sha,

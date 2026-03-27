@@ -81,6 +81,13 @@ export interface DocsComCorpusStat {
   prefix: string;
   total: number;
   active: number;
+  sourceTotal: number | null;
+  gap: number | null;
+}
+
+export interface DocsComSourceCorpusStat {
+  prefix: string;
+  total: number;
 }
 
 export interface DocsComRecentJob {
@@ -106,6 +113,21 @@ export interface DocsComStatusSnapshot {
     lastValidationError: string | null;
   };
   corpus: DocsComCorpusStat[];
+  sourceSnapshot: {
+    mode: "local_mirror" | "remote";
+    branch: string;
+    head: string | null;
+    total: number;
+    errorMessage: string | null;
+    corpus: DocsComSourceCorpusStat[];
+  };
+  overview: {
+    kbTotal: number;
+    kbActive: number;
+    sourceTotal: number;
+    activeCoverageRate: number | null;
+    syncGap: number;
+  };
   checkpoint: {
     lastSyncedCommitSha: string | null;
     lastSyncedAt: string | null;

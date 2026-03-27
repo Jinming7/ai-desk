@@ -11,21 +11,39 @@ async function tick() {
   await pollAndEnqueueIncremental(env.GITHUB_KB_POLL_BATCH_SIZE);
 }
 
+async function runTickSafely() {
+  try {
+    await tick();
+  } catch (error) {
+    console.error("github-kb worker tick failed", error);
+  }
+}
+
+async function runStartupSafely() {
+  try {
+    await bootstrapRepositoryFromEnvIfConfigured();
+  } catch (error) {
+    console.error("github-kb bootstrap failed", error);
+  }
+
+  try {
+    const health = await validateStartupConfig();
+    console.log(`github-kb startup validation: healthy=${health.healthy}, repos=${health.checkedRepos}`);
+  } catch (error) {
+    console.error("github-kb startup validation failed", error);
+  }
+}
+
 async function main() {
   if (!env.GITHUB_KB_ENABLED) {
     console.log("github-kb worker disabled by config");
     return;
   }
 
-  await bootstrapRepositoryFromEnvIfConfigured();
-  const health = await validateStartupConfig();
-  console.log(`github-kb startup validation: healthy=${health.healthy}, repos=${health.checkedRepos}`);
-
-  await tick();
+  await runStartupSafely();
+  await runTickSafely();
   setInterval(() => {
-    void tick().catch((error) => {
-      console.error("github-kb worker tick failed", error);
-    });
+    void runTickSafely();
   }, env.GITHUB_KB_WORKER_INTERVAL_SECONDS * 1000);
 }
 
