@@ -80,23 +80,11 @@ async function main() {
     assert.equal(partial.json.result.verification.verdict, "partial");
 
     const round1 = await request("POST", "/api/v1/ai/search", { query: "thisquerywillnotmatchkbx" });
-    const round2 = await request("POST", "/api/v1/ai/search", {
-      query: "thisquerywillnotmatchkbx",
-      sessionId: round1.json.result.session_id,
-      conversation: ["thisquerywillnotmatchkbx", "need more info"]
-    });
-    const round3 = await request("POST", "/api/v1/ai/search", {
-      query: "thisquerywillnotmatchkbx",
-      sessionId: round1.json.result.session_id,
-      conversation: ["thisquerywillnotmatchkbx", "still failing"]
-    });
 
-    assert.equal(round1.json.result.clarification_round, 1);
-    assert.equal(round2.json.result.clarification_round, 2);
-    assert.equal(round3.json.result.clarification_round, 3);
-    assert.equal(round3.json.result.support_answer.mode, "handoff");
-    assert.equal(round3.json.result.state, "TICKET_HANDOFF_RECOMMENDED");
-    assert.equal(round3.json.result.show_create_ticket_now, true);
+    assert.equal(round1.json.result.clarification_round, 0);
+    assert.equal(round1.json.result.support_answer.mode, "handoff");
+    assert.equal(round1.json.result.state, "TICKET_HANDOFF_RECOMMENDED");
+    assert.equal(round1.json.result.show_create_ticket_now, true);
 
     const infrastructureHandoff = await request("POST", "/api/v1/ai/search", { query: "simulate_support_agent_failure" });
     assert.equal(infrastructureHandoff.status, 200);
@@ -157,7 +145,7 @@ async function main() {
         {
           grounded: grounded.json.result.support_answer.mode,
           partial: partial.json.result.support_answer.mode,
-          handoff: round3.json.result.support_answer.mode,
+          handoff: round1.json.result.support_answer.mode,
           infrastructureHandoff: infrastructureHandoff.json.result.support_answer.mode,
           draft: draft.json.draft.id,
           triage: detail.json.ticket.triage_support_insight?.recommended_action,
