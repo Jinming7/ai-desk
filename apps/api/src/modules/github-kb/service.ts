@@ -117,7 +117,7 @@ function buildDocsComRegistrationInput(actor: string) {
     repoUrl: DOCS_COM_REPO_URL,
     publicBaseUrl: DOCS_COM_PUBLIC_BASE_URL,
     defaultBranch: DOCS_COM_DEFAULT_BRANCH,
-    includePaths: [...DEFAULT_BOOTSTRAP_INCLUDE_PATHS],
+    includePaths: resolveBootstrapIncludePaths(env.GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS),
     excludePaths: resolveBootstrapExcludePaths(env.GITHUB_KB_BOOTSTRAP_EXCLUDE_PATHS),
     pollingIntervalSeconds: env.GITHUB_KB_BOOTSTRAP_POLLING_INTERVAL_SECONDS,
     actor
