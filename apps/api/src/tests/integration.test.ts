@@ -333,11 +333,14 @@ test("SEARCH_MODE returns partial when evidence is incomplete but usable", async
   assert.equal(Array.isArray(data.result.support_answer.still_need_to_confirm), true);
 });
 
-test("SEARCH_MODE falls back to direct KB retrieval when support-agent orchestration fails", async () => {
+test("SEARCH_MODE fallback exposes an unresolved reason code when retrieval cannot answer", async () => {
+  await pool.query("DELETE FROM kb_chunks");
+  await pool.query("DELETE FROM kb_documents");
+
   const response = await fetch(`${baseUrl}/api/v1/ai/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: "reset api token access simulate_openclaw_failure" })
+    body: JSON.stringify({ query: "simulate_openclaw_failure" })
   });
   assert.equal(response.status, 200);
 
@@ -349,12 +352,18 @@ test("SEARCH_MODE falls back to direct KB retrieval when support-agent orchestra
     };
   };
 
-  assert.equal(data.result.suggested_next_step, "self_serve");
-  assert.equal(data.result.unresolved_reason_code, null);
-  assert.equal(data.result.references.length > 0, true);
+  assert.equal(data.result.suggested_next_step, "submit_ticket");
+  assert.equal(
+    data.result.unresolved_reason_code === "KB_RETRIEVAL_UNAVAILABLE" || data.result.unresolved_reason_code === "NO_MATCHING_KB",
+    true
+  );
+  assert.equal(data.result.references.length, 0);
 });
 
-test("0-citation unanswered query recommends immediate handoff when no blocking clarification exists", async () => {
+test("0-citation multi-turn reaches handoff CTA after 3 rounds", async () => {
+  await pool.query("DELETE FROM kb_chunks");
+  await pool.query("DELETE FROM kb_documents");
+
   const q = "thisquerywillnotmatchkbx";
 
   const r1 = await fetch(`${baseUrl}/api/v1/ai/search`, {
@@ -364,11 +373,35 @@ test("0-citation unanswered query recommends immediate handoff when no blocking 
   });
   assert.equal(r1.status, 200);
   const d1 = (await r1.json()) as {
-    result: { session_id: string; clarification_round: number; show_create_ticket_now: boolean; state: string };
+    result: { session_id: string; clarification_round: number; show_create_ticket_now: boolean };
   };
-  assert.equal(d1.result.clarification_round, 0);
-  assert.equal(d1.result.show_create_ticket_now, true);
-  assert.equal(d1.result.state, "TICKET_HANDOFF_RECOMMENDED");
+  assert.equal(d1.result.clarification_round, 1);
+  assert.equal(d1.result.show_create_ticket_now, false);
+
+  const r2 = await fetch(`${baseUrl}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: q, sessionId: d1.result.session_id, conversation: [q, "need more info"] })
+  });
+  assert.equal(r2.status, 200);
+  const d2 = (await r2.json()) as {
+    result: { clarification_round: number; show_create_ticket_now: boolean };
+  };
+  assert.equal(d2.result.clarification_round, 2);
+  assert.equal(d2.result.show_create_ticket_now, false);
+
+  const r3 = await fetch(`${baseUrl}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: q, sessionId: d1.result.session_id, conversation: [q, "still failing"] })
+  });
+  assert.equal(r3.status, 200);
+  const d3 = (await r3.json()) as {
+    result: { clarification_round: number; show_create_ticket_now: boolean; state: string };
+  };
+  assert.equal(d3.result.clarification_round, 3);
+  assert.equal(d3.result.show_create_ticket_now, true);
+  assert.equal(d3.result.state, "TICKET_HANDOFF_RECOMMENDED");
 });
 
 test("chat handoff draft and submit creates ticket", async () => {
