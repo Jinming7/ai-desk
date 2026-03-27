@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import http from "node:http";
 import https from "node:https";
 import { app } from "../app.js";
+import { env } from "../config/env.js";
 import { pool } from "../db/client.js";
 import * as kbRepo from "../modules/github-kb/repository.js";
 
@@ -334,74 +335,84 @@ test("SEARCH_MODE returns partial when evidence is incomplete but usable", async
 });
 
 test("SEARCH_MODE fallback exposes an unresolved reason code when retrieval cannot answer", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = "/tmp/__missing_local_docs__";
   await pool.query("DELETE FROM kb_chunks");
   await pool.query("DELETE FROM kb_documents");
+  try {
+    const response = await fetch(`${baseUrl}/api/v1/ai/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "simulate_openclaw_failure" })
+    });
+    assert.equal(response.status, 200);
 
-  const response = await fetch(`${baseUrl}/api/v1/ai/search`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: "simulate_openclaw_failure" })
-  });
-  assert.equal(response.status, 200);
-
-  const data = (await response.json()) as {
-    result: {
-      suggested_next_step: "self_serve" | "submit_ticket";
-      unresolved_reason_code: string | null;
-      references: unknown[];
+    const data = (await response.json()) as {
+      result: {
+        suggested_next_step: "self_serve" | "submit_ticket";
+        unresolved_reason_code: string | null;
+        references: unknown[];
+      };
     };
-  };
 
-  assert.equal(data.result.suggested_next_step, "submit_ticket");
-  assert.equal(
-    data.result.unresolved_reason_code === "KB_RETRIEVAL_UNAVAILABLE" || data.result.unresolved_reason_code === "NO_MATCHING_KB",
-    true
-  );
-  assert.equal(data.result.references.length, 0);
+    assert.equal(data.result.suggested_next_step, "submit_ticket");
+    assert.equal(
+      data.result.unresolved_reason_code === "KB_RETRIEVAL_UNAVAILABLE" || data.result.unresolved_reason_code === "NO_MATCHING_KB",
+      true
+    );
+    assert.equal(data.result.references.length, 0);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+  }
 });
 
 test("0-citation multi-turn reaches handoff CTA after 3 rounds", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = "/tmp/__missing_local_docs__";
   await pool.query("DELETE FROM kb_chunks");
   await pool.query("DELETE FROM kb_documents");
+  try {
+    const q = "thisquerywillnotmatchkbx";
 
-  const q = "thisquerywillnotmatchkbx";
+    const r1 = await fetch(`${baseUrl}/api/v1/ai/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q })
+    });
+    assert.equal(r1.status, 200);
+    const d1 = (await r1.json()) as {
+      result: { session_id: string; clarification_round: number; show_create_ticket_now: boolean };
+    };
+    assert.equal(d1.result.clarification_round, 1);
+    assert.equal(d1.result.show_create_ticket_now, false);
 
-  const r1 = await fetch(`${baseUrl}/api/v1/ai/search`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: q })
-  });
-  assert.equal(r1.status, 200);
-  const d1 = (await r1.json()) as {
-    result: { session_id: string; clarification_round: number; show_create_ticket_now: boolean };
-  };
-  assert.equal(d1.result.clarification_round, 1);
-  assert.equal(d1.result.show_create_ticket_now, false);
+    const r2 = await fetch(`${baseUrl}/api/v1/ai/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q, sessionId: d1.result.session_id, conversation: [q, "need more info"] })
+    });
+    assert.equal(r2.status, 200);
+    const d2 = (await r2.json()) as {
+      result: { clarification_round: number; show_create_ticket_now: boolean };
+    };
+    assert.equal(d2.result.clarification_round, 2);
+    assert.equal(d2.result.show_create_ticket_now, false);
 
-  const r2 = await fetch(`${baseUrl}/api/v1/ai/search`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: q, sessionId: d1.result.session_id, conversation: [q, "need more info"] })
-  });
-  assert.equal(r2.status, 200);
-  const d2 = (await r2.json()) as {
-    result: { clarification_round: number; show_create_ticket_now: boolean };
-  };
-  assert.equal(d2.result.clarification_round, 2);
-  assert.equal(d2.result.show_create_ticket_now, false);
-
-  const r3 = await fetch(`${baseUrl}/api/v1/ai/search`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: q, sessionId: d1.result.session_id, conversation: [q, "still failing"] })
-  });
-  assert.equal(r3.status, 200);
-  const d3 = (await r3.json()) as {
-    result: { clarification_round: number; show_create_ticket_now: boolean; state: string };
-  };
-  assert.equal(d3.result.clarification_round, 3);
-  assert.equal(d3.result.show_create_ticket_now, true);
-  assert.equal(d3.result.state, "TICKET_HANDOFF_RECOMMENDED");
+    const r3 = await fetch(`${baseUrl}/api/v1/ai/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q, sessionId: d1.result.session_id, conversation: [q, "still failing"] })
+    });
+    assert.equal(r3.status, 200);
+    const d3 = (await r3.json()) as {
+      result: { clarification_round: number; show_create_ticket_now: boolean; state: string };
+    };
+    assert.equal(d3.result.clarification_round, 3);
+    assert.equal(d3.result.show_create_ticket_now, true);
+    assert.equal(d3.result.state, "TICKET_HANDOFF_RECOMMENDED");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+  }
 });
 
 test("chat handoff draft and submit creates ticket", async () => {
