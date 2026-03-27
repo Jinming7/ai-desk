@@ -21,6 +21,12 @@ function assertSafeTestDatabase() {
 }
 
 async function resetKbDb() {
+  await pool.query("DELETE FROM kb_memory_profiles");
+  await pool.query("DELETE FROM kb_memory_relations");
+  await pool.query("DELETE FROM kb_memory_aliases");
+  await pool.query("DELETE FROM kb_memory_signals");
+  await pool.query("DELETE FROM kb_memory_sources");
+  await pool.query("DELETE FROM kb_memory_entries");
   await pool.query("DELETE FROM kb_chunks");
   await pool.query("DELETE FROM kb_documents");
   await pool.query("DELETE FROM kb_sync_jobs");
@@ -541,6 +547,140 @@ title: "GitHub 和公共 GitLab"
     assert.deepEqual(statusPayload.result.status.registration.includePaths, ["**/*.md", "**/*.mdx"]);
     const docsCorpus = statusPayload.result.status.corpus.find((item) => item.prefix === "docs/");
     assert.equal(docsCorpus?.total, 1);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("docs-com sync builds memory graph and grounds callback troubleshooting retrieval", async () => {
+  const rootDir = await createFixtureRoot();
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  try {
+    await writeFixture(
+      rootDir,
+      "open-docs/docs/openapi/api/execute-onesql.api.mdx",
+      `---
+title: "Execute ONESQL query"
+---
+
+# Execute ONESQL query
+
+ONESQL supports ORDER BY and GROUP BY clauses in POST /onesql/query.
+`
+    );
+    await writeFixture(
+      rootDir,
+      "docs/ones-devops/code-integration/github-and-public-gitlab.mdx",
+      `---
+title: "GitHub 和公共 GitLab"
+---
+
+# GitHub 和公共 GitLab
+
+如果授权完成后无法返回 ONES，或者回调页面显示 page not found，请检查 Redirect URI、Webhook 回调地址，以及 baseURL 配置是否一致。
+`
+    );
+
+    const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        repoUrl: "https://github.com/BangWork/docs-com",
+        publicBaseUrl: "https://docs.ones.com",
+        defaultBranch: "master",
+        includePaths: ["**/*.md", "**/*.mdx"],
+        excludePaths: [],
+        pollingIntervalSeconds: 60,
+        actor: "test"
+      })
+    });
+    assert.equal(register.status, 201);
+    const regPayload = (await register.json()) as { registration: { id: string; default_branch: string } };
+
+    const enqueue = await fetch(`${baseUrl}/api/v1/internal/kb/sync/full`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        repoId: regPayload.registration.id,
+        branch: regPayload.registration.default_branch,
+        afterCommitSha: "local-memory-graph",
+        idempotencyKey: "docs-com-memory-graph"
+      })
+    });
+    assert.equal(enqueue.status, 202);
+
+    const run = await fetch(`${baseUrl}/api/v1/internal/kb/sync/run`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({ limit: 10 })
+    });
+    assert.equal(run.status, 200);
+
+    const counts = await pool.query<{
+      entry_count: string;
+      alias_count: string;
+      signal_count: string;
+      source_count: string;
+    }>(
+      `SELECT
+         (SELECT COUNT(*)::text FROM kb_memory_entries) AS entry_count,
+         (SELECT COUNT(*)::text FROM kb_memory_aliases) AS alias_count,
+         (SELECT COUNT(*)::text FROM kb_memory_signals) AS signal_count,
+         (SELECT COUNT(*)::text FROM kb_memory_sources) AS source_count`
+    );
+    assert.equal(Number(counts.rows[0].entry_count) >= 2, true);
+    assert.equal(Number(counts.rows[0].alias_count) >= 1, true);
+    assert.equal(Number(counts.rows[0].signal_count) >= 1, true);
+    assert.equal(Number(counts.rows[0].source_count) >= 2, true);
+
+    const callbackRetrieval = await fetch(`${baseUrl}/api/v1/kb/retrieval/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: "GitHub 集成授权后回调页面显示 page not found，怎么排查？",
+        profile: "agent",
+        repoId: regPayload.registration.id,
+        includeFallback: false
+      })
+    });
+    assert.equal(callbackRetrieval.status, 200);
+    const callbackBody = (await callbackRetrieval.json()) as {
+      result: {
+        hits: Array<{ path: string; headingPath: string; sourceUrl: string }>;
+      };
+    };
+    assert.equal(callbackBody.result.hits.length > 0, true);
+    assert.equal(callbackBody.result.hits[0].path, "docs/ones-devops/code-integration/github-and-public-gitlab.mdx");
+    assert.equal(callbackBody.result.hits[0].sourceUrl.startsWith("https://docs.ones.com/"), true);
+
+    const onesqlRetrieval = await fetch(`${baseUrl}/api/v1/kb/retrieval/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: "Does ONESQL support ORDER BY and GROUP BY?",
+        profile: "search",
+        repoId: regPayload.registration.id,
+        includeFallback: false
+      })
+    });
+    assert.equal(onesqlRetrieval.status, 200);
+    const onesqlBody = (await onesqlRetrieval.json()) as {
+      result: {
+        hits: Array<{ path: string }>;
+      };
+    };
+    assert.equal(onesqlBody.result.hits[0]?.path, "open-docs/docs/openapi/api/execute-onesql.api.mdx");
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

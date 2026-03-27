@@ -18,6 +18,8 @@ import {
   validateReadOnlyAccess
 } from "./github-client.js";
 import { parseMarkdownSections } from "./markdown.js";
+import type { MemoryCaseFrame, SupportExactSignals } from "./memory-types.js";
+import { retrieveGroundedMemoryHits, syncDocumentMemoryGraph } from "./memory-service.js";
 import { buildPublicSourceUrl } from "./public-url.js";
 import * as repo from "./repository.js";
 import type { KbSyncSource, RepoRegistration, RetrievalHit, RetrievalProfile, RetrievalResponse, SyncJob } from "./types.js";
@@ -94,6 +96,13 @@ function hasIncludePattern(includePaths: string[], extension: "md" | "mdx"): boo
   });
 }
 
+function ensureMarkdownCoverage(includePaths: string[]): string[] {
+  const next = [...includePaths];
+  if (!hasIncludePattern(next, "md")) next.push("**/*.md");
+  if (!hasIncludePattern(next, "mdx")) next.push("**/*.mdx");
+  return uniqueStrings(next, 8);
+}
+
 export function resolveBootstrapIncludePaths(raw: string): string[] {
   const parsed = raw
     .split(",")
@@ -117,7 +126,7 @@ function buildDocsComRegistrationInput(actor: string) {
     repoUrl: DOCS_COM_REPO_URL,
     publicBaseUrl: DOCS_COM_PUBLIC_BASE_URL,
     defaultBranch: DOCS_COM_DEFAULT_BRANCH,
-    includePaths: resolveBootstrapIncludePaths(env.GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS),
+    includePaths: ensureMarkdownCoverage(resolveBootstrapIncludePaths(env.GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS)),
     excludePaths: resolveBootstrapExcludePaths(env.GITHUB_KB_BOOTSTRAP_EXCLUDE_PATHS),
     pollingIntervalSeconds: env.GITHUB_KB_BOOTSTRAP_POLLING_INTERVAL_SECONDS,
     actor
@@ -227,7 +236,7 @@ async function pathExists(targetPath: string): Promise<boolean> {
 
 function readGitValue(rootDir: string, args: string[], fallback: string): string {
   try {
-    return execFileSync("git", ["-C", rootDir, ...args], { encoding: "utf8" }).trim() || fallback;
+    return execFileSync("git", ["-C", rootDir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || fallback;
   } catch {
     return fallback;
   }
@@ -725,7 +734,7 @@ function normalizeSpaces(input: string): string {
 }
 
 function isApiIntent(query: string): boolean {
-  return /\b(api|openapi|endpoint|rest|request|response|method|path)\b/i.test(query);
+  return /\b(api|openapi|endpoint|rest|request|response|method|path|scope|token|onesql)\b/i.test(query) || /接口|开放平台|接口文档|请求方法|路径参数|响应字段/.test(query);
 }
 
 function tokenizeRetrievalQuery(query: string): string[] {
@@ -992,6 +1001,10 @@ export async function retrieveKnowledgeWithRetry(input: {
   branch?: string;
   topK?: number;
   includeFallback: boolean;
+  rewrites?: string[];
+  supportSignals?: SupportExactSignals;
+  caseFrame?: MemoryCaseFrame;
+  requiredDocKinds?: string[];
 }): Promise<RetrievalResponse> {
   let lastError: unknown;
   const maxAttempts = 3;
@@ -1075,6 +1088,13 @@ async function indexDocumentContent(input: {
     targetTokens: env.GITHUB_KB_CHUNK_TARGET_TOKENS,
     overlapTokens: env.GITHUB_KB_CHUNK_OVERLAP_TOKENS
   });
+  const persistedChunks: Array<{
+    id: string;
+    headingPath: string;
+    ordinal: number;
+    content: string;
+    metadata: Record<string, unknown>;
+  }> = [];
 
   for (const chunk of chunks) {
     const chunkSupportEvidence = extractSupportEvidenceMetadata({
@@ -1106,7 +1126,29 @@ async function indexDocumentContent(input: {
       embeddingModel: embedded?.model ?? null,
       embeddingVersion: embedded?.version ?? null
     });
+    persistedChunks.push({
+      id: chunk.id,
+      headingPath: chunk.headingPath,
+      ordinal: chunk.ordinal,
+      content: chunk.content,
+      metadata: {
+        ...chunk.metadata,
+        supportEvidence: chunkSupportEvidence,
+        embeddingState: embedded ? "ready" : "missing"
+      }
+    });
   }
+
+  await syncDocumentMemoryGraph({
+    repoId: registration.id,
+    branch,
+    commitSha,
+    docId: doc.id,
+    path,
+    title,
+    docSupportEvidence,
+    chunks: persistedChunks
+  });
 }
 
 async function runLocalMirrorFullSync(
@@ -1413,6 +1455,7 @@ export async function registerRepository(input: {
   actor: string;
 }) {
   const parsed = parseRepoOwnerName(input.repoUrl);
+  const includePaths = isDocsComRepo(parsed.owner, parsed.name) ? ensureMarkdownCoverage(input.includePaths) : input.includePaths;
   const publicBaseUrl = pickDefaultPublicBaseUrl(input.repoUrl, input.publicBaseUrl);
   const resolvedBranch = await resolveBranchForRegistrationInput({
     repoUrl: input.repoUrl,
@@ -1420,7 +1463,7 @@ export async function registerRepository(input: {
     repoName: parsed.name,
     publicBaseUrl,
     defaultBranch: input.defaultBranch,
-    includePaths: input.includePaths,
+    includePaths,
     excludePaths: input.excludePaths,
     pollingIntervalSeconds: input.pollingIntervalSeconds,
     actor: input.actor
@@ -1431,7 +1474,7 @@ export async function registerRepository(input: {
     repoUrl: input.repoUrl,
     publicBaseUrl,
     defaultBranch: resolvedBranch,
-    includePaths: input.includePaths,
+    includePaths,
     excludePaths: input.excludePaths,
     pollingIntervalSeconds: input.pollingIntervalSeconds,
     createdBy: input.actor
@@ -1877,7 +1920,9 @@ function mergeHybridCandidates(
   const apiIntent = isApiIntent(query);
   const troubleshootingInfraIntent =
     /\b(k8s|kubernetes|pod|pvc|pv|pd|disk|volume|oom|crashloop|loadstore|rebuild|index|sync)\b/i.test(normalizedQuery);
-  const integrationIntent = /\b(integrate|integration|teams|slack|webhook|zapier|oauth)\b/i.test(normalizedQuery);
+  const integrationIntent =
+    /\b(integrate|integration|teams|slack|webhook|zapier|oauth|github|gitlab|callback|redirect|baseurl)\b/i.test(normalizedQuery) ||
+    /集成|回调|重定向|授权登录|oauth|github|gitlab|baseurl/.test(query);
   const merged = [...byChunk.values()].map((hit) => {
     let boosted = hit.score;
     const metadata = (hit.supportMetadata ?? {}) as Record<string, unknown>;
@@ -1928,7 +1973,7 @@ function mergeHybridCandidates(
 
 function rerankHitsForIntent(query: string, hits: RetrievalHit[]): RetrievalHit[] {
   if (!hits.length) return hits;
-  const apiIntent = isApiIntent(query) || /接口|开放平台|鉴权|授权/.test(query);
+  const apiIntent = isApiIntent(query);
   if (!apiIntent) return hits;
 
   const tokens = tokenizeRetrievalQuery(buildQueryVariants(query).join(" ")).slice(0, 12);
@@ -1998,7 +2043,7 @@ async function buildGroundedAnswerFromTopHit(
   }
 
   const top =
-    (isApiIntent(query) || /接口|开放平台|鉴权|授权/.test(query)
+    (isApiIntent(query)
       ? hits.find((item) => /\/openapi\/api\/.+\.api\.mdx$/i.test(item.path))
       : null) ?? hits[0];
   if (/\/openapi\/api\/.+\.api\.mdx$/i.test(top.path)) {
@@ -2057,6 +2102,10 @@ export async function retrieveKnowledge(input: {
   branch?: string;
   topK?: number;
   includeFallback: boolean;
+  rewrites?: string[];
+  supportSignals?: SupportExactSignals;
+  caseFrame?: MemoryCaseFrame;
+  requiredDocKinds?: string[];
 }): Promise<RetrievalResponse> {
   const topK = input.topK ?? getProfileConfig(input.profile).topK;
   const cacheKey = buildRetrievalCacheKey({
@@ -2077,10 +2126,49 @@ export async function retrieveKnowledge(input: {
   const cfg = getProfileConfig(input.profile);
   const effectiveTopK = input.topK ?? cfg.topK;
   const answerLanguage = input.answerLanguage ?? detectQueryLanguage(input.query);
-  const queryVariants = buildQueryVariants(input.query);
+  const queryVariants = uniqueStrings([...(input.rewrites ?? []), ...buildQueryVariants(input.query)], 6);
 
-  const variantBuckets = await Promise.all(
-    queryVariants.map(async (variant) => {
+  const [memoryResult, variantBuckets] = await Promise.all([
+    retrieveGroundedMemoryHits({
+      query: input.query,
+      rewrites: queryVariants,
+      repoId: input.repoId,
+      branch: input.branch,
+      supportSignals: input.supportSignals,
+      caseFrame: input.caseFrame,
+      requiredDocKinds: input.requiredDocKinds,
+      limit: effectiveTopK
+    }).catch(() => ({
+      hits: [],
+      diagnostics: {
+        rewrittenQueries: queryVariants,
+        extractedSignals: input.supportSignals ?? {
+          methods: [],
+          apiPaths: [],
+          scopes: [],
+          callbacks: [],
+          redirectUris: [],
+          baseUrls: [],
+          errorCodes: [],
+          errorTexts: [],
+          pageTexts: [],
+          objects: [],
+          actions: [],
+          all: []
+        },
+        candidateCounts: {
+          entry: 0,
+          alias: 0,
+          signal: 0,
+          profile: 0,
+          relation: 0,
+          grounded: 0
+        },
+        topMemoryReasons: []
+      }
+    })),
+    Promise.all(
+      queryVariants.map(async (variant) => {
       const lexicalPromise = repo
         .searchKeywordCandidates({
           repoId: input.repoId,
@@ -2106,13 +2194,14 @@ export async function retrieveKnowledge(input: {
 
       const [vectorCandidates, lexicalCandidates] = await Promise.all([vectorPromise, lexicalPromise]);
       return { vectorCandidates, lexicalCandidates };
-    })
-  );
+      })
+    )
+  ]);
   const vectorBuckets: RetrievalHit[] = variantBuckets.flatMap((item) => item.vectorCandidates);
   const lexicalBuckets: RetrievalHit[] = variantBuckets.flatMap((item) => item.lexicalCandidates);
 
   const merged = mergeHybridCandidates(vectorBuckets, lexicalBuckets, cfg.vectorWeight, cfg.keywordWeight, queryVariants[0]);
-  let hits = dedupeHitsByPath(merged).slice(0, effectiveTopK);
+  let hits = dedupeHitsByPath([...memoryResult.hits, ...merged]).slice(0, effectiveTopK);
   let fallbackUsed = false;
 
   let confidence = estimateConfidence(hits[0]);
@@ -2202,7 +2291,11 @@ export async function retrieveKnowledge(input: {
     debug: {
       vectorCandidates: vectorBuckets.length,
       keywordCandidates: lexicalBuckets.length,
-      mergedCandidates: merged.length
+      mergedCandidates: merged.length,
+      memoryCandidates: memoryResult.diagnostics.candidateCounts,
+      rewrittenQueries: memoryResult.diagnostics.rewrittenQueries,
+      extractedSignals: memoryResult.diagnostics.extractedSignals as unknown as Record<string, unknown>,
+      topMemoryReasons: memoryResult.diagnostics.topMemoryReasons
     }
   };
   retrievalCache.set(cacheKey, {

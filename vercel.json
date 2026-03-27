@@ -6,7 +6,7 @@
   "functions": {
     "api/index.ts": {
       "regions": ["hkg1"],
-      "maxDuration": 30,
+      "maxDuration": 300,
       "includeFiles": "apps/api/dist/**"
     }
   },

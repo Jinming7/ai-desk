@@ -146,6 +146,10 @@ export interface RetrievalResponse {
     vectorCandidates: number;
     keywordCandidates: number;
     mergedCandidates: number;
+    memoryCandidates?: Record<string, number>;
+    rewrittenQueries?: string[];
+    extractedSignals?: Record<string, unknown>;
+    topMemoryReasons?: Array<Record<string, unknown>>;
   };
 }
 

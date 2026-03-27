@@ -1,5 +1,7 @@
 import { env } from "../../config/env.js";
 import type { OpenClawAdapter, OpenClawRuntimeContext } from "../../infrastructure/openclaw/types.js";
+import { extractSupportSignals } from "../github-kb/memory-extractor.js";
+import type { SupportExactSignals } from "../github-kb/memory-types.js";
 import * as githubKbService from "../github-kb/service.js";
 import { searchLocalDocs } from "./local-docs.js";
 import type { SearchReference, SearchResponseEnvelope, SupportCaseFrame } from "./types.js";
@@ -446,6 +448,30 @@ export class SearchOrchestrator {
     return signals || compact;
   }
 
+  private extractExactSupportSignals(query: string): SupportExactSignals {
+    return extractSupportSignals(query);
+  }
+
+  private buildMemoryRetrievalQueries(input: { query: string; caseFrame?: SupportCaseFrame }): string[] {
+    const normalized = this.normalizeQuery(input.query);
+    const rewrites = new Set<string>();
+    const add = (value?: string) => {
+      const compact = String(value ?? "").trim().replace(/\s+/g, " ");
+      if (!compact) return;
+      rewrites.add(compact);
+    };
+
+    const exactSignals = this.extractExactSupportSignals(input.query);
+    add(input.query);
+    add(normalized);
+    add([input.caseFrame?.symptom, input.caseFrame?.goal].filter(Boolean).join(" "));
+    add([input.caseFrame?.object, input.caseFrame?.action_type, input.caseFrame?.product_area].filter(Boolean).join(" "));
+    add([input.caseFrame?.question_type, ...(input.caseFrame?.required_doc_kinds ?? []), input.caseFrame?.product_area].filter(Boolean).join(" "));
+    add(exactSignals.all.join(" "));
+
+    return [...rewrites].slice(0, 6);
+  }
+
   async collectEvidence(input: {
     queries: string[];
     idempotencyKey: string;
@@ -466,6 +492,11 @@ export class SearchOrchestrator {
     }
 
     const retrieveOnce = async (query: string) => {
+      const supportSignals = this.extractExactSupportSignals(query);
+      const memoryQueries = this.buildMemoryRetrievalQueries({
+        query,
+        caseFrame: input.caseFrame
+      });
       if (env.NODE_ENV === "test" && /simulate_(?:openclaw|support_agent)_failure/i.test(query)) {
         throw new Error(`KB retrieval unavailable for query: ${query}`);
       }
@@ -516,7 +547,20 @@ export class SearchOrchestrator {
             answerLanguage: lang,
             profile: "agent",
             topK,
-            includeFallback: true
+            includeFallback: true,
+            rewrites: memoryQueries,
+            supportSignals,
+            caseFrame: input.caseFrame
+              ? {
+                  question_type: input.caseFrame.question_type,
+                  product_area: input.caseFrame.product_area,
+                  action_type: input.caseFrame.action_type,
+                  deployment_model: input.caseFrame.deployment_model,
+                  object: input.caseFrame.object,
+                  required_doc_kinds: input.caseFrame.required_doc_kinds
+                }
+              : undefined,
+            requiredDocKinds: input.caseFrame?.required_doc_kinds
           })
           .then((kb) => {
             const docsComHits = kb.hits
