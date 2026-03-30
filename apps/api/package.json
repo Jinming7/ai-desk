@@ -1,0 +1,40 @@
+{
+  "name": "@nexusflow/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "../../scripts/restart-api-safe.sh",
+    "start:raw": "node dist/index.js",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:seed:mock": "tsx src/db/seed-mock.ts",
+    "test:ai-support-agent:smoke": "NODE_ENV=test tsx src/tests/ai-support-agent.smoke.ts",
+    "test:ai-support-agent:business": "tsx src/tests/ai-support-agent.business-eval.ts",
+    "test:ai-support-agent:business:real": "tsx src/tests/ai-support-agent.business-eval.ts",
+    "test:ai-support-agent:business:mock": "NODE_ENV=test tsx src/tests/ai-support-agent.business-eval.ts",
+    "test:integration": "NODE_ENV=test tsx --test src/tests/integration.test.ts",
+    "test:github-kb": "NODE_ENV=test tsx --test --test-concurrency=1 src/tests/github-kb.integration.test.ts",
+    "kb:worker": "tsx src/modules/github-kb/worker.ts",
+    "kb:eval": "tsx src/modules/github-kb/eval.ts"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "pg": "^8.16.3",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.3",
+    "zod": "^4.1.8"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.5.2",
+    "@types/pg": "^8.15.6",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}

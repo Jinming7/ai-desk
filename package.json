@@ -1,0 +1,29 @@
+{
+  "name": "nexusflow",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=20.20.1 <21"
+  },
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:reset": "bash ./scripts/dev-reset.sh",
+    "dev:api": "npm run dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
+    "dev:support-plugin": "bash ./scripts/dev-support-plugin.sh",
+    "dev:support-plugin:clear": "bash ./scripts/dev-support-plugin.sh --clear",
+    "start:api": "npm run start -w apps/api",
+    "build": "npm run build -w apps/api && npm run build -w apps/web",
+    "db:migrate": "npm run db:migrate -w apps/api",
+    "test:api-integration": "NODE_ENV=test npm run test:integration -w apps/api",
+    "kb:ensure:docs-com": "node scripts/ensure-docs-com-kb.mjs",
+    "smoke:support-quality": "node scripts/smoke-support-quality.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

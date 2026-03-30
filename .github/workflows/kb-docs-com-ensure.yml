@@ -1,0 +1,68 @@
+name: Ensure Docs-Com KB
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: KB sync mode
+        required: false
+        default: reindex
+        type: choice
+        options:
+          - incremental
+          - reindex
+          - full
+
+concurrency:
+  group: kb-docs-com-ensure
+  cancel-in-progress: false
+
+jobs:
+  ensure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check automation config
+        id: config
+        run: |
+          if [ -z "${{ vars.KB_AUTOMATION_BASE_URL }}" ] || [ -z "${{ secrets.INTERNAL_OPS_TOKEN }}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "KB automation skipped because KB_AUTOMATION_BASE_URL or INTERNAL_OPS_TOKEN is missing."
+            exit 0
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve sync mode
+        id: mode
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "value=incremental" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.mode }}" ]; then
+            echo "value=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=reindex" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure docs-com KB
+        if: steps.config.outputs.configured == 'true'
+        env:
+          KB_AUTOMATION_BASE_URL: ${{ vars.KB_AUTOMATION_BASE_URL }}
+          INTERNAL_OPS_TOKEN: ${{ secrets.INTERNAL_OPS_TOKEN }}
+          KB_ENSURE_MODE: ${{ steps.mode.outputs.value }}
+          KB_ENSURE_RUN_LIMIT: "0"
+          KB_ENSURE_MAX_ATTEMPTS: "60"
+          KB_ENSURE_WAIT_MS: "15000"
+        run: node scripts/ensure-docs-com-kb.mjs

@@ -1,0 +1,8 @@
+UPDATE tickets
+SET status = CASE
+  WHEN status = 'NEW' THEN 'OPEN'
+  WHEN status = 'AI_REVIEWING' THEN 'IN_PROGRESS'
+  WHEN status = 'ESCALATED' THEN 'ESCALATED_RND'
+  ELSE status
+END
+WHERE status IN ('NEW', 'AI_REVIEWING', 'ESCALATED');

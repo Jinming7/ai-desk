@@ -1,0 +1,4 @@
+interface:
+  display_name: "ONES OpenAPI Expert"
+  short_description: "严格基于ONES OpenAPI文档的接口映射、代码实现与排障专家助手"
+  default_prompt: "Use $ones-openapi-expert to translate ONES business intent into validated OpenAPI call chains and runnable examples."

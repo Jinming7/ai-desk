@@ -1,0 +1,422 @@
+import crypto from "node:crypto";
+import { env } from "../../config/env.js";
+import { isServerlessRuntime } from "../../config/runtime-env.js";
+import type { OpenClawRuntimeContext } from "../../infrastructure/openclaw/types.js";
+
+export type AiAgentIntent = "retrieval" | "clarify" | "execution";
+
+function sanitizeSessionPart(input: string): string {
+  return input.replace(/[^a-zA-Z0-9:_-]/g, "_").slice(0, 120);
+}
+
+function buildAgentScopedSessionKey(agentId: string, mainKey: string): string {
+  return `agent:${agentId}:${sanitizeSessionPart(mainKey)}`;
+}
+
+type SupportStage = NonNullable<OpenClawRuntimeContext["stage"]>;
+type RoutedSupportStage =
+  | "router"
+  | "evidence-planner"
+  | "planner"
+  | "support-evidence-selector"
+  | "api-specialist"
+  | "howto-specialist"
+  | "behavior-specialist"
+  | "troubleshooting-specialist"
+  | "evidence-judge"
+  | "citation-curator"
+  | "support-citation-selector"
+  | "answer-composer";
+
+type StageBinding = {
+  stage: RoutedSupportStage;
+  agentId: string;
+  model: string | null;
+  dedicated: boolean;
+  fallback: "stage_binding" | "runtime_override" | "default_topology" | "global_default";
+};
+
+type SearchStage = "retrieval" | "clarify" | "execution";
+
+type SearchStageBinding = {
+  stage: SearchStage;
+  agentId: string;
+  model: string | null;
+  fallback: "stage_binding" | "default_topology" | "global_default";
+};
+
+export type AiTopologyConflict = {
+  type: "duplicate_agent";
+  agentId: string;
+  stages: string[];
+  detail: string;
+};
+
+export type AiTopologySnapshot = {
+  searchStages: SearchStageBinding[];
+  supportStages: {
+    dedicatedCount: number;
+    executionFallbackAgentId: string;
+    stages: StageBinding[];
+  };
+  configuredAgents: string[];
+  conflicts: AiTopologyConflict[];
+  multiAgentReady: boolean;
+  topologyHash: string;
+};
+
+const DEFAULT_SEARCH_AGENT_IDS = {
+  retrieval: "search-retrieval",
+  clarify: "search-clarify",
+  execution: "ticket-execution"
+} as const;
+
+const DEFAULT_SUPPORT_STAGE_AGENT_IDS: Record<RoutedSupportStage, string> = {
+  router: "support-router",
+  "evidence-planner": "support-evidence-planner",
+  planner: "support-planner",
+  "support-evidence-selector": "support-evidence-selector",
+  "api-specialist": "support-api-specialist",
+  "howto-specialist": "support-howto-specialist",
+  "behavior-specialist": "support-behavior-specialist",
+  "troubleshooting-specialist": "support-troubleshooting-specialist",
+  "evidence-judge": "support-evidence-judge",
+  "citation-curator": "support-citation-curator",
+  "support-citation-selector": "support-citation-selector",
+  "answer-composer": "support-answer-composer"
+};
+
+function globalDefaultAgentId() {
+  return env.OPENCLAW_AGENT_ID.trim() || "main";
+}
+
+function globalDefaultModel() {
+  return env.OPENCLAW_AGENT_MODEL.trim() || undefined;
+}
+
+function executionFallbackAgentId() {
+  return env.OPENCLAW_AGENT_ID_EXECUTION.trim() || DEFAULT_SEARCH_AGENT_IDS.execution;
+}
+
+function executionFallbackModel() {
+  return env.OPENCLAW_AGENT_MODEL_EXECUTION.trim() || env.OPENCLAW_AGENT_MODEL.trim() || undefined;
+}
+
+function resolveSearchStageBinding(stage: SearchStage): SearchStageBinding {
+  const envAgentId =
+    stage === "retrieval"
+      ? env.OPENCLAW_AGENT_ID_RETRIEVAL.trim()
+      : stage === "clarify"
+      ? env.OPENCLAW_AGENT_ID_CLARIFY.trim()
+      : env.OPENCLAW_AGENT_ID_EXECUTION.trim();
+  const envModel =
+    stage === "retrieval"
+      ? env.OPENCLAW_AGENT_MODEL_RETRIEVAL.trim()
+      : stage === "clarify"
+      ? env.OPENCLAW_AGENT_MODEL_CLARIFY.trim()
+      : env.OPENCLAW_AGENT_MODEL_EXECUTION.trim();
+  const defaultAgentId =
+    stage === "retrieval"
+      ? DEFAULT_SEARCH_AGENT_IDS.retrieval
+      : stage === "clarify"
+      ? DEFAULT_SEARCH_AGENT_IDS.clarify
+      : DEFAULT_SEARCH_AGENT_IDS.execution;
+  const agentId = envAgentId || defaultAgentId || globalDefaultAgentId();
+  const fallback: SearchStageBinding["fallback"] = envAgentId
+    ? "stage_binding"
+    : agentId === defaultAgentId
+    ? "default_topology"
+    : "global_default";
+  return {
+    stage,
+    agentId,
+    model: envModel || globalDefaultModel() || null,
+    fallback
+  };
+}
+
+export function resolveStageSpecificAgent(stage: SupportStage, runtime?: OpenClawRuntimeContext): {
+  agentId: string;
+  model?: string;
+} {
+  const explicitRuntimeAgentId = runtime?.agentId?.trim();
+  const explicitRuntimeModel = runtime?.model?.trim();
+
+  const stageBinding = (() => {
+    switch (stage) {
+      case "router":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_ROUTER.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_ROUTER.trim()
+        };
+      case "evidence-planner":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_EVIDENCE_PLANNER.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_EVIDENCE_PLANNER.trim()
+        };
+      case "planner":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_PLANNER.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_PLANNER.trim()
+        };
+      case "support-evidence-selector":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_SUPPORT_EVIDENCE_SELECTOR.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_SUPPORT_EVIDENCE_SELECTOR.trim()
+        };
+      case "api-specialist":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_API_SPECIALIST.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_API_SPECIALIST.trim()
+        };
+      case "howto-specialist":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_HOWTO_SPECIALIST.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_HOWTO_SPECIALIST.trim()
+        };
+      case "behavior-specialist":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_BEHAVIOR_SPECIALIST.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_BEHAVIOR_SPECIALIST.trim()
+        };
+      case "troubleshooting-specialist":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_TROUBLESHOOTING_SPECIALIST.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_TROUBLESHOOTING_SPECIALIST.trim()
+        };
+      case "evidence-judge":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_EVIDENCE_JUDGE.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_EVIDENCE_JUDGE.trim()
+        };
+      case "citation-curator":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_CITATION_CURATOR.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_CITATION_CURATOR.trim()
+        };
+      case "support-citation-selector":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_SUPPORT_CITATION_SELECTOR.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_SUPPORT_CITATION_SELECTOR.trim()
+        };
+      case "answer-composer":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_ANSWER_COMPOSER.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_ANSWER_COMPOSER.trim()
+        };
+      default:
+        return {
+          agentId: "",
+          model: ""
+        };
+    }
+  })();
+
+  const defaultTopologyAgentId = stage in DEFAULT_SUPPORT_STAGE_AGENT_IDS ? DEFAULT_SUPPORT_STAGE_AGENT_IDS[stage as RoutedSupportStage] : "";
+  return {
+    agentId: stageBinding.agentId || explicitRuntimeAgentId || defaultTopologyAgentId || globalDefaultAgentId(),
+    model: stageBinding.model || explicitRuntimeModel || globalDefaultModel()
+  };
+}
+
+function resolveStageBinding(stage: RoutedSupportStage): StageBinding {
+  const envAgentId = (() => {
+    switch (stage) {
+      case "router":
+        return env.OPENCLAW_AGENT_ID_ROUTER.trim();
+      case "evidence-planner":
+        return env.OPENCLAW_AGENT_ID_EVIDENCE_PLANNER.trim();
+      case "planner":
+        return env.OPENCLAW_AGENT_ID_PLANNER.trim();
+      case "support-evidence-selector":
+        return env.OPENCLAW_AGENT_ID_SUPPORT_EVIDENCE_SELECTOR.trim();
+      case "api-specialist":
+        return env.OPENCLAW_AGENT_ID_API_SPECIALIST.trim();
+      case "howto-specialist":
+        return env.OPENCLAW_AGENT_ID_HOWTO_SPECIALIST.trim();
+      case "behavior-specialist":
+        return env.OPENCLAW_AGENT_ID_BEHAVIOR_SPECIALIST.trim();
+      case "troubleshooting-specialist":
+        return env.OPENCLAW_AGENT_ID_TROUBLESHOOTING_SPECIALIST.trim();
+      case "evidence-judge":
+        return env.OPENCLAW_AGENT_ID_EVIDENCE_JUDGE.trim();
+      case "citation-curator":
+        return env.OPENCLAW_AGENT_ID_CITATION_CURATOR.trim();
+      case "support-citation-selector":
+        return env.OPENCLAW_AGENT_ID_SUPPORT_CITATION_SELECTOR.trim();
+      case "answer-composer":
+        return env.OPENCLAW_AGENT_ID_ANSWER_COMPOSER.trim();
+    }
+  })();
+  const envModel = (() => {
+    switch (stage) {
+      case "router":
+        return env.OPENCLAW_AGENT_MODEL_ROUTER.trim();
+      case "evidence-planner":
+        return env.OPENCLAW_AGENT_MODEL_EVIDENCE_PLANNER.trim();
+      case "planner":
+        return env.OPENCLAW_AGENT_MODEL_PLANNER.trim();
+      case "support-evidence-selector":
+        return env.OPENCLAW_AGENT_MODEL_SUPPORT_EVIDENCE_SELECTOR.trim();
+      case "api-specialist":
+        return env.OPENCLAW_AGENT_MODEL_API_SPECIALIST.trim();
+      case "howto-specialist":
+        return env.OPENCLAW_AGENT_MODEL_HOWTO_SPECIALIST.trim();
+      case "behavior-specialist":
+        return env.OPENCLAW_AGENT_MODEL_BEHAVIOR_SPECIALIST.trim();
+      case "troubleshooting-specialist":
+        return env.OPENCLAW_AGENT_MODEL_TROUBLESHOOTING_SPECIALIST.trim();
+      case "evidence-judge":
+        return env.OPENCLAW_AGENT_MODEL_EVIDENCE_JUDGE.trim();
+      case "citation-curator":
+        return env.OPENCLAW_AGENT_MODEL_CITATION_CURATOR.trim();
+      case "support-citation-selector":
+        return env.OPENCLAW_AGENT_MODEL_SUPPORT_CITATION_SELECTOR.trim();
+      case "answer-composer":
+        return env.OPENCLAW_AGENT_MODEL_ANSWER_COMPOSER.trim();
+    }
+  })();
+  const runtime = resolveStageSpecificAgent(stage);
+  const defaultAgentId = DEFAULT_SUPPORT_STAGE_AGENT_IDS[stage];
+  const dedicated = runtime.agentId !== executionFallbackAgentId();
+  const fallback: StageBinding["fallback"] = envAgentId
+    ? "stage_binding"
+    : defaultAgentId === runtime.agentId
+    ? "default_topology"
+    : runtime.agentId === globalDefaultAgentId()
+    ? "global_default"
+    : "runtime_override";
+  return {
+    stage,
+    agentId: runtime.agentId,
+    model: runtime.model ?? envModel ?? globalDefaultModel() ?? null,
+    dedicated,
+    fallback
+  };
+}
+
+export function buildSearchRuntime(input: {
+  intent: Exclude<AiAgentIntent, "execution">;
+  sessionId: string;
+}): OpenClawRuntimeContext {
+  const searchAgentId = (input.intent === "clarify" ? env.OPENCLAW_AGENT_ID_CLARIFY : env.OPENCLAW_AGENT_ID_RETRIEVAL).trim();
+  const searchAgentModel = (
+    input.intent === "clarify" ? env.OPENCLAW_AGENT_MODEL_CLARIFY : env.OPENCLAW_AGENT_MODEL_RETRIEVAL
+  ).trim();
+  const fallbackAgentId =
+    searchAgentId || (input.intent === "clarify" ? DEFAULT_SEARCH_AGENT_IDS.clarify : DEFAULT_SEARCH_AGENT_IDS.retrieval);
+  const fallbackAgentModel = searchAgentModel || globalDefaultModel();
+  const prefix = env.OPENCLAW_AGENT_SESSION_PREFIX.trim() || "nf";
+  const serverless = isServerlessRuntime();
+  return {
+    intent: input.intent,
+    agentId: fallbackAgentId,
+    model: fallbackAgentModel,
+    sessionKey: buildAgentScopedSessionKey(fallbackAgentId, `${prefix}:${input.intent}:${input.sessionId}`),
+    ...(serverless
+      ? {
+          overallTimeoutMs: 22000,
+          requestStartedAtMs: Date.now(),
+          disableLocalDocs: true,
+          allowMultiPassRetrieval: true,
+          allowRefinement: true,
+          kbTopK: 8,
+          queryLimit: 2
+        }
+      : {
+          overallTimeoutMs: 90000,
+          requestStartedAtMs: Date.now(),
+          disableLocalDocs: true,
+          allowMultiPassRetrieval: true,
+          allowRefinement: true,
+          kbTopK: 8,
+          queryLimit: 4
+        })
+  };
+}
+
+export function resolveExecutionRuntime(sessionId: string): OpenClawRuntimeContext {
+  const executionAgentId = executionFallbackAgentId();
+  const executionAgentModel = executionFallbackModel();
+  const prefix = env.OPENCLAW_AGENT_SESSION_PREFIX.trim() || "nf";
+  const serverless = isServerlessRuntime();
+  return {
+    intent: "execution",
+    agentId: executionAgentId,
+    model: executionAgentModel,
+    sessionKey: buildAgentScopedSessionKey(executionAgentId, `${prefix}:execution:${sessionId}`),
+    ...(serverless
+      ? {
+          overallTimeoutMs: 22000,
+          requestStartedAtMs: Date.now(),
+          disableLocalDocs: true,
+          allowMultiPassRetrieval: false,
+          allowRefinement: false,
+          kbTopK: 6,
+          queryLimit: 1
+        }
+      : {
+          disableLocalDocs: true
+        })
+  };
+}
+
+function buildTopologyConflicts(searchStages: SearchStageBinding[], supportStages: StageBinding[]): AiTopologyConflict[] {
+  const stageByAgent = new Map<string, string[]>();
+  for (const stage of [...searchStages, ...supportStages]) {
+    const agentId = stage.agentId.trim();
+    if (!agentId) continue;
+    stageByAgent.set(agentId, [...(stageByAgent.get(agentId) ?? []), stage.stage]);
+  }
+  return [...stageByAgent.entries()]
+    .filter(([, stages]) => stages.length > 1)
+    .map(([agentId, stages]) => ({
+      type: "duplicate_agent" as const,
+      agentId,
+      stages,
+      detail: `Agent '${agentId}' is bound to multiple stages: ${stages.join(", ")}`
+    }));
+}
+
+function buildTopologyHash(searchStages: SearchStageBinding[], supportStages: StageBinding[]) {
+  const payload = {
+    searchStages: searchStages.map((stage) => ({ stage: stage.stage, agentId: stage.agentId, model: stage.model })),
+    supportStages: supportStages.map((stage) => ({ stage: stage.stage, agentId: stage.agentId, model: stage.model }))
+  };
+  return crypto.createHash("sha1").update(JSON.stringify(payload)).digest("hex").slice(0, 12);
+}
+
+export function getAiTopology(): AiTopologySnapshot {
+  const supportStages = [
+    resolveStageBinding("router"),
+    resolveStageBinding("evidence-planner"),
+    resolveStageBinding("planner"),
+    resolveStageBinding("support-evidence-selector"),
+    resolveStageBinding("api-specialist"),
+    resolveStageBinding("howto-specialist"),
+    resolveStageBinding("behavior-specialist"),
+    resolveStageBinding("troubleshooting-specialist"),
+    resolveStageBinding("evidence-judge"),
+    resolveStageBinding("citation-curator"),
+    resolveStageBinding("support-citation-selector"),
+    resolveStageBinding("answer-composer")
+  ];
+  const searchStages = [
+    resolveSearchStageBinding("retrieval"),
+    resolveSearchStageBinding("clarify"),
+    resolveSearchStageBinding("execution")
+  ];
+  const conflicts = buildTopologyConflicts(searchStages, supportStages);
+  return {
+    searchStages,
+    supportStages: {
+      dedicatedCount: supportStages.filter((stage) => stage.dedicated).length,
+      executionFallbackAgentId: searchStages.find((stage) => stage.stage === "execution")?.agentId ?? executionFallbackAgentId(),
+      stages: supportStages
+    },
+    configuredAgents: [...new Set([...searchStages, ...supportStages].map((stage) => stage.agentId).filter(Boolean))],
+    conflicts,
+    multiAgentReady: conflicts.length === 0,
+    topologyHash: buildTopologyHash(searchStages, supportStages)
+  };
+}
