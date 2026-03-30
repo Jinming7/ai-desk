@@ -125,6 +125,7 @@ const envSchema = z.object({
   GITHUB_KB_WORKER_INTERVAL_SECONDS: z.coerce.number().int().min(5).max(3600).default(30),
   GITHUB_KB_LOCAL_MIRROR_BATCH_SIZE: z.coerce.number().int().min(1).max(200).default(5),
   GITHUB_KB_REMOTE_SYNC_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(8),
+  GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR: z.coerce.boolean().default(false),
   LOCAL_DOCS_COM_PATH: z.string().default("/tmp/docs-com"),
   LOCAL_DOCS_CACHE_TTL_SECONDS: z.coerce.number().int().min(10).max(86400).default(300)
 });

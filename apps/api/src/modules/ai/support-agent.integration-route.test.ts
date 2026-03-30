@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
@@ -37,7 +38,13 @@ import type {
 } from "./types.js";
 
 async function createFixtureRoot(): Promise<string> {
-  return mkdtemp(path.join(os.tmpdir(), "support-agent-integration-route-"));
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "support-agent-integration-route-"));
+  execFileSync("git", ["init"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["-c", "user.name=Test User", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "init"], {
+    cwd: rootDir,
+    stdio: "ignore"
+  });
+  return rootDir;
 }
 
 async function writeFixture(rootDir: string, relativePath: string, content: string): Promise<void> {

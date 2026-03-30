@@ -62,13 +62,40 @@ interface RemoteBatchResult extends SyncExecutionResult {
   remaining: number;
 }
 
+interface LocalDocsMirrorState {
+  rootDir: string;
+  head: string;
+  branch: string;
+  markdownCount: number;
+}
+
+interface LocalDocsMirrorDiagnostics {
+  enabled: boolean;
+  path: string;
+  available: boolean;
+  valid: boolean;
+  reason: string | null;
+  head: string | null;
+  branch: string | null;
+  markdownCount: number;
+}
+
 interface DocsComSourceCorpusSnapshot {
   mode: "local_mirror" | "remote";
   branch: string;
   head: string;
   total: number;
   corpus: Array<{ prefix: string; total: number }>;
+  diagnostics?: {
+    localMirror: LocalDocsMirrorDiagnostics;
+  };
+  errorMessage?: string;
 }
+
+type LocalMirrorRegistrationTarget = Pick<
+  RepoRegistration,
+  "repo_owner" | "repo_name" | "default_branch" | "include_paths" | "exclude_paths"
+>;
 
 function sha256(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
@@ -109,6 +136,10 @@ function ensureMarkdownCoverage(includePaths: string[]): string[] {
   if (!hasIncludePattern(next, "md")) next.push("**/*.md");
   if (!hasIncludePattern(next, "mdx")) next.push("**/*.mdx");
   return uniqueStrings(next, 8);
+}
+
+export function isValidGitCommitSha(value: string | null | undefined): boolean {
+  return /^[0-9a-f]{7,40}$/i.test(String(value ?? "").trim());
 }
 
 export function resolveBootstrapIncludePaths(raw: string): string[] {
@@ -153,15 +184,18 @@ function summarizePrefixTotals(paths: string[]): Array<{ prefix: string; total: 
 }
 
 async function summarizeDocsComSourceCorpus(registration: RepoRegistration): Promise<DocsComSourceCorpusSnapshot> {
-  const localMirror = await getLocalDocsMirrorState(registration);
-  if (localMirror) {
-    const markdownFiles = await collectLocalMirrorSnapshot(registration, localMirror);
+  const localMirrorProbe = await inspectLocalDocsMirror(registration);
+  if (localMirrorProbe.state) {
+    const markdownFiles = await collectLocalMirrorSnapshot(registration, localMirrorProbe.state);
     return {
       mode: "local_mirror",
-      branch: localMirror.branch || registration.default_branch || DOCS_COM_DEFAULT_BRANCH,
-      head: localMirror.head,
+      branch: localMirrorProbe.state.branch || registration.default_branch || DOCS_COM_DEFAULT_BRANCH,
+      head: localMirrorProbe.state.head,
       total: markdownFiles.length,
-      corpus: summarizePrefixTotals(markdownFiles)
+      corpus: summarizePrefixTotals(markdownFiles),
+      diagnostics: {
+        localMirror: localMirrorProbe.diagnostics
+      }
     };
   }
 
@@ -179,7 +213,10 @@ async function summarizeDocsComSourceCorpus(registration: RepoRegistration): Pro
     branch: resolved.branch,
     head,
     total: markdownFiles.length,
-    corpus: summarizePrefixTotals(markdownFiles)
+    corpus: summarizePrefixTotals(markdownFiles),
+    diagnostics: {
+      localMirror: localMirrorProbe.diagnostics
+    }
   };
 }
 
@@ -199,7 +236,10 @@ async function summarizeDocsComCorpus(registration: RepoRegistration, recentJobL
     head: "",
     total: 0,
     corpus: DOCS_COM_REQUIRED_PREFIXES.map((prefix) => ({ prefix, total: 0 })),
-    errorMessage: (error as Error).message
+    errorMessage: (error as Error).message,
+    diagnostics: {
+      localMirror: buildLocalDocsMirrorDiagnostics()
+    }
   }));
   const sourceTotals = new Map(sourceSnapshot.corpus.map((item) => [item.prefix, item.total]));
   const kbTotals = corpus.reduce(
@@ -234,7 +274,8 @@ async function summarizeDocsComCorpus(registration: RepoRegistration, recentJobL
       head: sourceSnapshot.head || null,
       total: sourceSnapshot.total,
       errorMessage: "errorMessage" in sourceSnapshot ? sourceSnapshot.errorMessage : null,
-      corpus: sourceSnapshot.corpus
+      corpus: sourceSnapshot.corpus,
+      diagnostics: sourceSnapshot.diagnostics ?? null
     },
     overview: {
       kbTotal: kbTotals.total,
@@ -314,21 +355,101 @@ async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
-function readGitValue(rootDir: string, args: string[], fallback: string): string {
+function readGitValue(rootDir: string, args: string[]): string | null {
   try {
-    return execFileSync("git", ["-C", rootDir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || fallback;
+    const value = execFileSync("git", ["-C", rootDir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return value || null;
   } catch {
-    return fallback;
+    return null;
   }
 }
 
-async function getLocalDocsMirrorState(registration: RepoRegistration): Promise<{ rootDir: string; head: string; branch: string } | null> {
-  if (!isDocsComRegistration(registration)) return null;
-  const rootDir = env.LOCAL_DOCS_COM_PATH;
-  if (!(await pathExists(rootDir))) return null;
-  const head = readGitValue(rootDir, ["rev-parse", "HEAD"], "local");
-  const branch = readGitValue(rootDir, ["rev-parse", "--abbrev-ref", "HEAD"], registration.default_branch || "master");
-  return { rootDir, head, branch };
+function buildLocalDocsMirrorDiagnostics(): LocalDocsMirrorDiagnostics {
+  return {
+    enabled: env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR,
+    path: env.LOCAL_DOCS_COM_PATH.trim(),
+    available: false,
+    valid: false,
+    reason: null,
+    head: null,
+    branch: null,
+    markdownCount: 0
+  };
+}
+
+function warnLocalDocsMirror(reason: string, diagnostics: LocalDocsMirrorDiagnostics): void {
+  console.warn(
+    `[github-kb] ignoring local docs-com mirror: ${reason} (path=${diagnostics.path || "<empty>"} head=${diagnostics.head ?? "<none>"})`
+  );
+}
+
+async function inspectLocalDocsMirror(
+  registration: LocalMirrorRegistrationTarget
+): Promise<{ state: LocalDocsMirrorState | null; diagnostics: LocalDocsMirrorDiagnostics }> {
+  const diagnostics = buildLocalDocsMirrorDiagnostics();
+  if (!isDocsComRepo(registration.repo_owner, registration.repo_name)) {
+    diagnostics.reason = "not_docs_com_registration";
+    return { state: null, diagnostics };
+  }
+  if (!diagnostics.enabled) {
+    diagnostics.reason = "disabled_by_flag";
+    return { state: null, diagnostics };
+  }
+
+  const rootDir = diagnostics.path;
+  if (!rootDir) {
+    diagnostics.reason = "missing_path";
+    warnLocalDocsMirror(diagnostics.reason, diagnostics);
+    return { state: null, diagnostics };
+  }
+  if (!(await pathExists(rootDir))) {
+    diagnostics.reason = "path_not_found";
+    warnLocalDocsMirror(diagnostics.reason, diagnostics);
+    return { state: null, diagnostics };
+  }
+  diagnostics.available = true;
+
+  const isWorkTree = readGitValue(rootDir, ["rev-parse", "--is-inside-work-tree"]);
+  if (isWorkTree !== "true") {
+    diagnostics.reason = "not_git_worktree";
+    warnLocalDocsMirror(diagnostics.reason, diagnostics);
+    return { state: null, diagnostics };
+  }
+
+  const head = readGitValue(rootDir, ["rev-parse", "HEAD"]);
+  diagnostics.head = head;
+  if (!isValidGitCommitSha(head)) {
+    diagnostics.reason = "invalid_head";
+    warnLocalDocsMirror(diagnostics.reason, diagnostics);
+    return { state: null, diagnostics };
+  }
+  const validatedHead = String(head);
+
+  const branch = readGitValue(rootDir, ["rev-parse", "--abbrev-ref", "HEAD"]) || registration.default_branch || DOCS_COM_DEFAULT_BRANCH;
+  diagnostics.branch = branch;
+
+  const state: LocalDocsMirrorState = {
+    rootDir,
+    head: validatedHead,
+    branch,
+    markdownCount: 0
+  };
+  const markdownFiles = await collectLocalMirrorSnapshot(registration, state);
+  diagnostics.markdownCount = markdownFiles.length;
+  if (!markdownFiles.length) {
+    diagnostics.reason = "empty_markdown_snapshot";
+    warnLocalDocsMirror(diagnostics.reason, diagnostics);
+    return { state: null, diagnostics };
+  }
+
+  diagnostics.valid = true;
+  state.markdownCount = markdownFiles.length;
+  return { state, diagnostics };
+}
+
+export async function getLocalDocsMirrorState(registration: LocalMirrorRegistrationTarget): Promise<LocalDocsMirrorState | null> {
+  const result = await inspectLocalDocsMirror(registration);
+  return result.state;
 }
 
 async function collectLocalMirrorMarkdownFiles(
@@ -357,8 +478,8 @@ async function collectLocalMirrorMarkdownFiles(
 }
 
 async function collectLocalMirrorSnapshot(
-  registration: RepoRegistration,
-  localMirror: { rootDir: string; head: string; branch: string }
+  registration: LocalMirrorRegistrationTarget,
+  localMirror: LocalDocsMirrorState
 ): Promise<string[]> {
   const fileGroups = await Promise.all(
     LOCAL_DOCS_SUPPORTED_ROOTS.map(async (subdir) =>
@@ -370,7 +491,11 @@ async function collectLocalMirrorSnapshot(
   return fileGroups.flat().sort((left, right) => left.localeCompare(right, "en"));
 }
 
-function sliceSnapshotForBackfill(paths: string[], cursor?: string, limit?: number): {
+function compareSnapshotPaths(left: string, right: string): number {
+  return left.localeCompare(right, "en");
+}
+
+export function sliceSnapshotForBackfill(paths: string[], cursor?: string, limit?: number): {
   files: string[];
   total: number;
   remaining: number;
@@ -378,7 +503,7 @@ function sliceSnapshotForBackfill(paths: string[], cursor?: string, limit?: numb
   finished: boolean;
 } {
   const normalizedLimit = Number.isFinite(limit) && (limit ?? 0) > 0 ? Math.max(1, Math.floor(limit as number)) : paths.length;
-  const startIndex = cursor ? paths.findIndex((item) => item > cursor) : 0;
+  const startIndex = cursor ? paths.findIndex((item) => compareSnapshotPaths(item, cursor) > 0) : 0;
   const safeStart = startIndex >= 0 ? startIndex : paths.length;
   const files = paths.slice(safeStart, safeStart + normalizedLimit);
   const consumed = safeStart + files.length;
@@ -535,9 +660,15 @@ async function resolveBranchForRegistrationInput(input: {
   pollingIntervalSeconds: number;
   actor: string;
 }): Promise<string> {
-  if (isDocsComRepo(input.repoOwner, input.repoName) && (await pathExists(env.LOCAL_DOCS_COM_PATH))) {
-    const localBranch = readGitValue(env.LOCAL_DOCS_COM_PATH, ["rev-parse", "--abbrev-ref", "HEAD"], input.defaultBranch || "master");
-    return input.defaultBranch?.trim() || localBranch;
+  const localMirror = await getLocalDocsMirrorState({
+    repo_owner: input.repoOwner,
+    repo_name: input.repoName,
+    default_branch: input.defaultBranch?.trim() || "main",
+    include_paths: input.includePaths,
+    exclude_paths: input.excludePaths
+  });
+  if (localMirror) {
+    return input.defaultBranch?.trim() || localMirror.branch;
   }
   const candidate = input.defaultBranch?.trim();
   const probe: RepoRegistration = {
@@ -1234,7 +1365,7 @@ async function indexDocumentContent(input: {
 async function runLocalMirrorFullSync(
   job: SyncJob,
   registration: RepoRegistration,
-  localMirror: { rootDir: string; head: string; branch: string }
+  localMirror: LocalDocsMirrorState
 ): Promise<LocalMirrorBatchResult> {
   const branch = job.branch || localMirror.branch || registration.default_branch;
   return runLocalMirrorSyncBatch({
@@ -1249,7 +1380,7 @@ async function runLocalMirrorFullSync(
 async function runLocalMirrorSyncBatch(input: {
   registration: RepoRegistration;
   branch: string;
-  localMirror: { rootDir: string; head: string; branch: string };
+  localMirror: LocalDocsMirrorState;
   cursor?: string;
   limit: number;
 }): Promise<LocalMirrorBatchResult> {
@@ -1265,6 +1396,9 @@ async function runLocalMirrorSyncBatch(input: {
 
   let deactivated = 0;
   if (window.finished) {
+    if (!isValidGitCommitSha(input.localMirror.head)) {
+      throw new Error(`Refusing to checkpoint invalid local docs-com mirror head: ${input.localMirror.head || "<empty>"}`);
+    }
     deactivated = await repo.deactivateDocumentsMissingFromSnapshot(input.registration.id, input.branch, markdownFiles);
     await repo.upsertCheckpoint({
       repoId: input.registration.id,
@@ -1297,7 +1431,7 @@ async function runRemoteSnapshotBatch(input: {
     .filter((file) => /\.(md|mdx)$/i.test(file.path))
     .filter((file) => isPathIncluded(file.path, input.registration.include_paths, input.registration.exclude_paths))
     .map((file) => file.path)
-    .sort((left, right) => left.localeCompare(right, "en"));
+    .sort(compareSnapshotPaths);
 
   const window = sliceSnapshotForBackfill(markdownFiles, input.cursor, input.limit);
   let indexed = 0;
@@ -1783,6 +1917,10 @@ export async function pollAndEnqueueIncremental(limit = env.GITHUB_KB_POLL_BATCH
   for (const registration of registrations.slice(0, limit)) {
     const localMirror = await getLocalDocsMirrorState(registration);
     if (localMirror) {
+      if (!isValidGitCommitSha(localMirror.head)) {
+        console.warn(`[github-kb] skipping local docs-com polling enqueue because head is invalid: ${localMirror.head || "<empty>"}`);
+        continue;
+      }
       const branch = localMirror.branch || registration.default_branch;
       const checkpoint = await repo.getCheckpoint(registration.id, branch);
       if (checkpoint?.last_synced_commit_sha === localMirror.head) {
