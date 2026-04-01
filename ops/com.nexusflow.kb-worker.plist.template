@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.nexusflow.kb-worker</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>__ROOT_DIR__</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>__ROOT_DIR__/scripts/run-kb-worker-launchd.sh</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>__ROOT_DIR__/logs/kb-worker.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__ROOT_DIR__/logs/kb-worker.stderr.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+  </dict>
+</plist>
