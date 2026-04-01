@@ -3,9 +3,26 @@ import path from "node:path";
 import { z } from "zod";
 
 const envFile = process.env.NODE_ENV === "test" ? ".env.test" : ".env";
+const SAFE_TEST_DATABASE_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "postgres"]);
 
 config({ path: path.resolve(process.cwd(), envFile) });
 config({ path: path.resolve(process.cwd(), "../../", envFile), override: false });
+
+function parseDatabaseHostname(url: string): string | null {
+  const value = url.trim();
+  if (!value) return null;
+  try {
+    const normalized = value.replace(/^postgres(ql)?:\/\//i, "http://");
+    return new URL(normalized).hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+export function isSafeTestDatabaseUrl(url: string | null | undefined): boolean {
+  const hostname = parseDatabaseHostname(String(url ?? ""));
+  return hostname ? SAFE_TEST_DATABASE_HOSTS.has(hostname.toLowerCase()) : false;
+}
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -131,3 +148,8 @@ const envSchema = z.object({
 });
 
 export const env = envSchema.parse(process.env);
+
+if (env.NODE_ENV === "test" && !isSafeTestDatabaseUrl(env.DATABASE_URL)) {
+  const host = parseDatabaseHostname(env.DATABASE_URL) ?? "<unknown>";
+  throw new Error(`Refusing to run NODE_ENV=test against non-local database host: ${host}`);
+}

@@ -1,11 +1,13 @@
 import crypto from "node:crypto";
 import { env } from "../../config/env.js";
 import type { RetrievalHit } from "./types.js";
+import type { KbKnowledgeSpace } from "./types.js";
 import { extractMemoryEntriesForDocument, extractSupportSignals } from "./memory-extractor.js";
 import * as memoryRepo from "./memory-repository.js";
 import type {
   KbMemoryEntry,
   MemoryCaseFrame,
+  MemoryEntryDraft,
   MemoryProfileDraft,
   MemoryRetrievalDiagnostics,
   MemoryRetrievalHit,
@@ -227,6 +229,7 @@ function buildProfileDrafts(entries: KbMemoryEntry[], buildVersion: string): Mem
     return {
       id: stableUuid([group[0].repo_id, group[0].branch, "profile", profileKey, buildVersion]),
       repo_id: group[0].repo_id,
+      knowledge_space: group[0].knowledge_space,
       branch: group[0].branch,
       profile_key: profileKey,
       profile_kind: objectType === "general" ? "product_area" : "surface",
@@ -295,14 +298,18 @@ function buildRelationDrafts(entries: KbMemoryEntry[]): MemoryRelationDraft[] {
   return relations.slice(0, 200);
 }
 
-export function buildMemoryBuildVersion(commitSha: string): string {
-  return `${commitSha}:${Date.now()}`;
+export function buildMemoryBuildVersion(commitSha: string, seed?: string): string {
+  const normalizedSeed = String(seed ?? "").trim();
+  return normalizedSeed ? `${commitSha}:${normalizedSeed}` : `${commitSha}:${Date.now()}`;
 }
 
 export async function syncDocumentMemoryGraph(input: {
+  knowledgeSpace: KbKnowledgeSpace;
   repoId: string;
   branch: string;
   commitSha: string;
+  buildVersion?: string;
+  activationMode?: "immediate" | "staged";
   docId: string;
   path: string;
   title: string;
@@ -314,35 +321,47 @@ export async function syncDocumentMemoryGraph(input: {
     content: string;
     metadata: Record<string, unknown>;
   }>;
+  memoryEntries?: MemoryEntryDraft[];
 }): Promise<void> {
   if (!env.FEATURE_KB_MEMORY_GRAPH) return;
-  const buildVersion = buildMemoryBuildVersion(input.commitSha);
+  const buildVersion = input.buildVersion?.trim() || buildMemoryBuildVersion(input.commitSha);
+  const activationMode = input.activationMode ?? "immediate";
   await memoryRepo.deactivateMemoryArtifactsByDocument(input.docId);
+  await memoryRepo.deleteBuildScopedMemoryEntriesForDocument(input.docId, buildVersion);
 
-  const entries = extractMemoryEntriesForDocument({
-    repoId: input.repoId,
-    branch: input.branch,
-    docId: input.docId,
-    path: input.path,
-    title: input.title,
-    buildVersion,
-    docSupportEvidence: input.docSupportEvidence,
-    chunks: input.chunks
-  });
+  const entries =
+    input.memoryEntries && input.memoryEntries.length
+      ? input.memoryEntries
+      : extractMemoryEntriesForDocument({
+          repoId: input.repoId,
+          knowledgeSpace: input.knowledgeSpace,
+          branch: input.branch,
+          docId: input.docId,
+          path: input.path,
+          title: input.title,
+          buildVersion,
+          docSupportEvidence: input.docSupportEvidence,
+          chunks: input.chunks
+        });
 
   for (const entry of entries) {
     await memoryRepo.upsertMemoryEntry(entry);
     await memoryRepo.replaceMemoryAliases(entry.id, entry.aliases);
     await memoryRepo.replaceMemorySignals(entry.id, entry.signals);
     await memoryRepo.replaceMemorySources(entry.id, entry.sources);
+    await memoryRepo.replaceMemoryCitations(entry.id, entry.citations ?? []);
   }
 
-  await memoryRepo.markPriorBuildVersionInactive(input.repoId, input.branch, input.path, buildVersion);
+  if (activationMode === "immediate") {
+    await memoryRepo.markPriorBuildVersionInactive(input.repoId, input.branch, input.path, buildVersion);
+  }
 
   const scopeEntries = await memoryRepo.listActiveMemoryEntriesForScope({
+    knowledgeSpace: input.knowledgeSpace,
     repoId: input.repoId,
     branch: input.branch,
     productArea: String(input.docSupportEvidence.product_area ?? "general") || "general",
+    buildVersion: activationMode === "staged" ? buildVersion : undefined,
     limit: 200
   });
 
@@ -354,18 +373,21 @@ export async function syncDocumentMemoryGraph(input: {
   if (env.FEATURE_KB_MEMORY_PROFILES) {
     const profiles = buildProfileDrafts(scopeEntries, buildVersion);
     await memoryRepo.upsertMemoryProfiles(profiles);
-    await memoryRepo.deactivatePriorProfiles(
-      input.repoId,
-      input.branch,
-      buildVersion,
-      profiles.map((item) => item.profile_key)
-    );
+    if (activationMode === "immediate") {
+      await memoryRepo.deactivatePriorProfiles(
+        input.repoId,
+        input.branch,
+        buildVersion,
+        profiles.map((item) => item.profile_key)
+      );
+    }
   }
 }
 
 export async function retrieveGroundedMemoryHits(input: {
   query: string;
   rewrites?: string[];
+  knowledgeSpace: KbKnowledgeSpace;
   repoId?: string;
   branch?: string;
   limit?: number;
@@ -397,16 +419,25 @@ export async function retrieveGroundedMemoryHits(input: {
   const rawLimit = 24;
 
   const [entryHits, aliasHits, profileHits] = await Promise.all([
-    Promise.all(rewrites.map((query) => memoryRepo.searchMemoryEntries({ repoId: input.repoId, branch: input.branch, query, limit: rawLimit }))).then(
+    Promise.all(
+      rewrites.map((query) =>
+        memoryRepo.searchMemoryEntries({ knowledgeSpace: input.knowledgeSpace, repoId: input.repoId, branch: input.branch, query, limit: rawLimit })
+      )
+    ).then(
       (rows) => rows.flat()
     ),
-    Promise.all(rewrites.map((query) => memoryRepo.searchMemoryAliases({ repoId: input.repoId, branch: input.branch, query, limit: rawLimit }))).then(
+    Promise.all(
+      rewrites.map((query) =>
+        memoryRepo.searchMemoryAliases({ knowledgeSpace: input.knowledgeSpace, repoId: input.repoId, branch: input.branch, query, limit: rawLimit })
+      )
+    ).then(
       (rows) => rows.flat()
     ),
     env.FEATURE_KB_MEMORY_PROFILES
       ? Promise.all(
           rewrites.slice(0, 2).map((query) =>
             memoryRepo.searchMemoryProfiles({
+              knowledgeSpace: input.knowledgeSpace,
               repoId: input.repoId,
               branch: input.branch,
               query,
@@ -420,6 +451,7 @@ export async function retrieveGroundedMemoryHits(input: {
 
   const signalHits = diagnostics.extractedSignals.all.length
     ? await memoryRepo.searchMemorySignals({
+        knowledgeSpace: input.knowledgeSpace,
         repoId: input.repoId,
         branch: input.branch,
         signals: signalRowsFromExactSignals(diagnostics.extractedSignals),
@@ -471,6 +503,7 @@ export async function retrieveGroundedMemoryHits(input: {
 
   if (env.FEATURE_KB_MEMORY_RELATION_EXPANSION && ranked.length) {
     const relationHits = await memoryRepo.expandMemoryRelations({
+      knowledgeSpace: input.knowledgeSpace,
       memoryIds: ranked.map((item) => item.memoryId),
       limitPerMemory: 4
     });
@@ -490,30 +523,44 @@ export async function retrieveGroundedMemoryHits(input: {
       .slice(0, 16);
   }
 
-  const groundedSources = ranked.length
-    ? await memoryRepo.resolveMemorySourcesToChunks({
+  const candidateMap = new Map(ranked.map((item) => [item.memoryId, item]));
+  const citationSources = ranked.length
+    ? await memoryRepo.resolveMemorySourcesToCitations({
+        knowledgeSpace: input.knowledgeSpace,
         memoryIds: ranked.slice(0, 8).map((item) => item.memoryId),
         limitPerMemory: 2
       })
     : [];
+  const groundedSources =
+    citationSources.length > 0
+      ? citationSources
+      : ranked.length
+      ? await memoryRepo.resolveMemorySourcesToChunks({
+          knowledgeSpace: input.knowledgeSpace,
+          memoryIds: ranked.slice(0, 8).map((item) => item.memoryId),
+          limitPerMemory: 2
+        })
+      : [];
   diagnostics.candidateCounts.grounded = groundedSources.length;
 
-  const candidateMap = new Map(ranked.map((item) => [item.memoryId, item]));
   const hits = groundedSources
     .map((source): RetrievalHit | null => {
       const candidate = candidateMap.get(source.memoryId);
       if (!candidate) return null;
+      const isCitation = "citationId" in source;
       const supportMetadata = {
-        ...(((source.chunkMetadata ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined),
         ...(((source.docMetadata ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined),
+        ...(isCitation ? ((source.citationMetadata ?? {}) as Record<string, unknown>) : (((source.chunkMetadata ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined)),
         memory_id: source.memoryId,
         memory_kind: candidate.memoryKind,
         memory_source: candidate.source,
         memory_relation_path: candidate.relationBonus > 0 ? candidate.reasons.filter((item) => item === "relation_expansion") : [],
-        memory_doc_kind: candidate.docKind
+        memory_doc_kind: candidate.docKind,
+        citation_family: isCitation ? source.citationFamily : "doc_chunk",
+        source_family: isCitation ? source.sourceFamily : "doc_page"
       };
       return {
-        chunkId: source.chunkId,
+        chunkId: isCitation ? source.citationId : source.chunkId,
         documentId: source.documentId,
         repoId: source.repoId,
         repo: source.repo,
@@ -531,7 +578,7 @@ export async function retrieveGroundedMemoryHits(input: {
           memorySourceScore: source.sourceScore
         },
         supportMetadata,
-        chunkMetadata: source.chunkMetadata,
+        chunkMetadata: isCitation ? undefined : source.chunkMetadata,
         docMetadata: source.docMetadata
       };
     })

@@ -6,18 +6,8 @@ on:
       - main
       - master
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
-    inputs:
-      mode:
-        description: KB sync mode
-        required: false
-        default: reindex
-        type: choice
-        options:
-          - incremental
-          - reindex
-          - full
 
 concurrency:
   group: kb-docs-com-ensure
@@ -44,25 +34,19 @@ jobs:
           fi
           echo "configured=true" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve sync mode
-        id: mode
-        if: steps.config.outputs.configured == 'true'
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "value=incremental" >> "$GITHUB_OUTPUT"
-          elif [ -n "${{ inputs.mode }}" ]; then
-            echo "value=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=reindex" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Ensure docs-com KB
+      - name: Drain docs-com sync lanes
         if: steps.config.outputs.configured == 'true'
         env:
           KB_AUTOMATION_BASE_URL: ${{ vars.KB_AUTOMATION_BASE_URL }}
           INTERNAL_OPS_TOKEN: ${{ secrets.INTERNAL_OPS_TOKEN }}
-          KB_ENSURE_MODE: ${{ steps.mode.outputs.value }}
-          KB_ENSURE_RUN_LIMIT: "0"
-          KB_ENSURE_MAX_ATTEMPTS: "60"
-          KB_ENSURE_WAIT_MS: "15000"
-        run: node scripts/ensure-docs-com-kb.mjs
+        run: |
+          set -euo pipefail
+          base="${KB_AUTOMATION_BASE_URL%/}"
+
+          for lane in lane-a lane-b lane-c poll; do
+            echo "[kb-drain] hitting ${lane}"
+            curl -fsS --max-time 60 \
+              -H "Authorization: Bearer ${INTERNAL_OPS_TOKEN}" \
+              "${base}/api/v1/internal/kb/sync/cron/${lane}"
+            echo
+          done

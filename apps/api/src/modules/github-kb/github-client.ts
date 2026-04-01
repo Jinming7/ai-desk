@@ -76,6 +76,23 @@ function assertReadMethod(method: string) {
   }
 }
 
+function isTransientGithubError(error: unknown): boolean {
+  const message = (error as Error)?.message?.toLowerCase?.() ?? "";
+  return (
+    message.includes("fetch failed") ||
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("econnreset") ||
+    message.includes("enotfound") ||
+    message.includes("socket hang up") ||
+    message.includes("und_err_connect_timeout")
+  );
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function getGithubHeaders(extra?: Record<string, string>, includeAuth = true) {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
@@ -97,12 +114,38 @@ async function githubRequest(path: string, method = "GET", extraHeaders?: Record
       headers: getGithubHeaders(extraHeaders, includeAuth)
     });
 
-  const response = await doRequest(true);
+  let response;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      response = await doRequest(true);
+      break;
+    } catch (error) {
+      if (!env.GITHUB_TOKEN_READONLY || !isTransientGithubError(error) || attempt >= 2) {
+        throw error;
+      }
+      await sleep((attempt + 1) * 1500);
+    }
+  }
+
+  if (!response) {
+    throw new Error(`GitHub request returned no response: ${path}`);
+  }
   if (response.status !== 401 || !env.GITHUB_TOKEN_READONLY) {
     return response;
   }
 
-  return doRequest(false);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await doRequest(false);
+    } catch (error) {
+      if (!isTransientGithubError(error) || attempt >= 2) {
+        throw error;
+      }
+      await sleep((attempt + 1) * 1500);
+    }
+  }
+
+  throw new Error(`GitHub anonymous retry exhausted: ${path}`);
 }
 
 function mockGetSnapshot(repo: RepoIdentity, commitSha: string): MockSnapshot {

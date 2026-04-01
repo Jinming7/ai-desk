@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import http from "node:http";
 import https from "node:https";
 import { app } from "../app.js";
-import { env } from "../config/env.js";
+import { env, isSafeTestDatabaseUrl } from "../config/env.js";
 import { pool } from "../db/client.js";
 import * as kbRepo from "../modules/github-kb/repository.js";
 
@@ -83,14 +83,9 @@ if (typeof globalThis.fetch !== "function") {
 }
 
 function assertSafeTestDatabase() {
-  const url = process.env.DATABASE_URL ?? "";
-  const isLocal =
-    /localhost|127\.0\.0\.1/i.test(url) ||
-    /test/i.test(url);
-  if (!isLocal) {
-    throw new Error(
-      `Refusing to run integration tests against non-test database: ${url}`
-    );
+  const url = process.env.DATABASE_URL ?? env.DATABASE_URL;
+  if (!isSafeTestDatabaseUrl(url)) {
+    throw new Error("Refusing to run integration tests against a non-local database");
   }
 }
 

@@ -270,6 +270,7 @@ export function extractSupportSignals(query: string): SupportExactSignals {
 
 export function extractMemoryEntriesForDocument(input: {
   repoId: string;
+  knowledgeSpace: MemoryEntryDraft["knowledge_space"];
   branch: string;
   docId: string;
   path: string;
@@ -325,6 +326,7 @@ export function extractMemoryEntriesForDocument(input: {
     entries.push({
       id: stableUuidFromParts([input.repoId, input.branch, input.docId, chunk.id, memoryKind, canonicalClaim]),
       repo_id: input.repoId,
+      knowledge_space: input.knowledgeSpace,
       branch: input.branch,
       doc_id: input.docId,
       path: input.path,

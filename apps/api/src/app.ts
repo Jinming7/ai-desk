@@ -22,9 +22,13 @@ import {
   aiTicketSubmitRequestSchema
 } from "./contracts/ai-search.js";
 import {
+  kbBuildsFullSchema,
+  kbBuildsIncrementalSchema,
   kbDocsComEnsureSchema,
   kbDocsComStatusQuerySchema,
   kbEnqueueSyncSchema,
+  kbPublicationPromoteSchema,
+  kbPublicationStatusQuerySchema,
   kbRepoRegistrationSchema,
   kbRetrievalQuerySchema,
   kbRunJobsSchema,
@@ -926,6 +930,60 @@ app.post(
   })
 );
 
+app.post(
+  "/api/v1/internal/kb/builds/full",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const body = kbBuildsFullSchema.parse(req.body ?? {});
+    const result = await githubKbService.startKnowledgeBaseFullBuild(body);
+    res.status(202).json({ result });
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/builds/incremental",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const body = kbBuildsIncrementalSchema.parse(req.body ?? {});
+    const result = await githubKbService.startKnowledgeBaseIncrementalBuild(body);
+    res.status(202).json({ result });
+  })
+);
+
+app.get(
+  "/api/v1/internal/kb/builds/:id",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const buildId = z.string().uuid().parse(req.params.id);
+    const result = await githubKbService.getKnowledgeBaseBuildDetails(buildId);
+    if (!result) {
+      res.status(404).json({ error: "build_not_found" });
+      return;
+    }
+    res.json({ result });
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/publications/promote",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const body = kbPublicationPromoteSchema.parse(req.body ?? {});
+    const result = await githubKbService.promoteValidatedBuild(body);
+    res.json({ result });
+  })
+);
+
+app.get(
+  "/api/v1/internal/kb/publications/status",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const query = kbPublicationStatusQuerySchema.parse(req.query);
+    const result = await githubKbService.getKnowledgeBasePublicationStatus(query);
+    res.json({ result });
+  })
+);
+
 app.get(
   "/api/v1/internal/kb/docs-com/status",
   requireInternalOrAutomationRequest,
@@ -1007,6 +1065,17 @@ app.post(
     const body = kbRunJobsSchema.parse(req.body);
     const result = await githubKbService.runDueSyncJobs(body.limit);
     res.json({ result });
+  })
+);
+
+app.get(
+  "/api/v1/internal/kb/sync/cron/:lane",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const lane = z.enum(["lane-a", "lane-b", "lane-c", "poll"]).parse(req.params.lane);
+    const pollResult = lane === "poll" ? await githubKbService.pollAndEnqueueIncremental(env.GITHUB_KB_POLL_BATCH_SIZE) : null;
+    const result = await githubKbService.runDueSyncJobs(1);
+    res.json({ lane, pollResult, result });
   })
 );
 

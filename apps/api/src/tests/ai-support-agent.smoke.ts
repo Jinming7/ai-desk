@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { app } from "../app.js";
+import { env, isSafeTestDatabaseUrl } from "../config/env.js";
 import { pool } from "../db/client.js";
 
 async function resetForSmoke() {
@@ -32,6 +33,9 @@ async function resetForSmoke() {
 }
 
 async function main() {
+  if (!isSafeTestDatabaseUrl(process.env.DATABASE_URL ?? env.DATABASE_URL)) {
+    throw new Error("Refusing to run smoke test against a non-local database");
+  }
   await resetForSmoke();
 
   const server = app.listen(0, "127.0.0.1");

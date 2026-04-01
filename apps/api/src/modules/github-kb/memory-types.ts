@@ -1,3 +1,5 @@
+import type { KbKnowledgeSpace } from "./types.js";
+
 export type KbMemoryKind =
   | "concept"
   | "procedure"
@@ -6,7 +8,10 @@ export type KbMemoryKind =
   | "troubleshooting_pattern"
   | "behavior_rule"
   | "constraint"
-  | "ui_surface";
+  | "ui_surface"
+  | "config_surface"
+  | "symbol_responsibility"
+  | "schema_constraint";
 
 export type KbMemoryRelationType = "updates" | "extends" | "derives";
 
@@ -15,6 +20,7 @@ export type KbMemoryStatus = "active" | "superseded" | "inactive";
 export interface KbMemoryEntry {
   id: string;
   repo_id: string;
+  knowledge_space: KbKnowledgeSpace;
   branch: string;
   doc_id: string;
   path: string;
@@ -60,6 +66,7 @@ export interface KbMemorySignal {
 export interface KbMemoryProfile {
   id: string;
   repo_id: string;
+  knowledge_space: KbKnowledgeSpace;
   branch: string;
   profile_key: string;
   profile_kind: string;
@@ -95,9 +102,16 @@ export interface MemorySourceDraft {
   source_metadata_json?: Record<string, unknown>;
 }
 
+export interface MemoryCitationDraft {
+  citation_id: string;
+  source_score: number;
+  source_metadata_json?: Record<string, unknown>;
+}
+
 export interface MemoryEntryDraft {
   id: string;
   repo_id: string;
+  knowledge_space: KbKnowledgeSpace;
   branch: string;
   doc_id: string;
   path: string;
@@ -117,6 +131,7 @@ export interface MemoryEntryDraft {
   aliases: MemoryAliasDraft[];
   signals: MemorySignalDraft[];
   sources: MemorySourceDraft[];
+  citations?: MemoryCitationDraft[];
 }
 
 export interface MemoryRelationDraft {
@@ -131,6 +146,7 @@ export interface MemoryRelationDraft {
 export interface MemoryProfileDraft {
   id: string;
   repo_id: string;
+  knowledge_space: KbKnowledgeSpace;
   branch: string;
   profile_key: string;
   profile_kind: string;
@@ -194,6 +210,28 @@ export interface MemorySourceChunkHit {
   snippet: string;
   sourceScore: number;
   chunkMetadata?: Record<string, unknown>;
+  docMetadata?: Record<string, unknown>;
+  memoryMetadata?: Record<string, unknown>;
+}
+
+export interface MemorySourceCitationHit {
+  memoryId: string;
+  citationId: string;
+  documentId: string;
+  repoId: string;
+  repo: string;
+  branch: string;
+  path: string;
+  sourceUrl: string;
+  repoSourceUrl: string;
+  commitSha: string;
+  title: string;
+  headingPath: string;
+  snippet: string;
+  sourceScore: number;
+  citationFamily: string;
+  sourceFamily: string;
+  citationMetadata?: Record<string, unknown>;
   docMetadata?: Record<string, unknown>;
   memoryMetadata?: Record<string, unknown>;
 }

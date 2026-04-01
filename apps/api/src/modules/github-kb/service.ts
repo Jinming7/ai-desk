@@ -6,6 +6,9 @@ import zlib from "node:zlib";
 import { env } from "../../config/env.js";
 import { buildChunks } from "./chunker.js";
 import { embedText, toVectorLiteral } from "./embedding.js";
+import { buildRepositoryKnowledgeArtifacts } from "./builders/repository-knowledge-builder.js";
+import { buildDocumentRetrievalUnits } from "./builders/document-builder.js";
+import { classifySourceFamily } from "./parsers/source-classifier.js";
 import {
   assertGithubReadOnlyMethod,
   buildSourceUrl,
@@ -18,11 +21,29 @@ import {
   validateReadOnlyAccess
 } from "./github-client.js";
 import { parseMarkdownSections } from "./markdown.js";
+import { buildDocChunkCitations } from "./chunkers/doc-citation-builder.js";
+import { generateMemoryEntriesFromRetrievalUnits } from "./memory/generate-memory-entries.js";
 import type { MemoryCaseFrame, SupportExactSignals } from "./memory-types.js";
 import { retrieveGroundedMemoryHits, syncDocumentMemoryGraph } from "./memory-service.js";
 import { buildPublicSourceUrl } from "./public-url.js";
 import * as repo from "./repository.js";
-import type { KbSyncSource, RepoRegistration, RetrievalHit, RetrievalProfile, RetrievalResponse, SyncJob } from "./types.js";
+import { canPublishToKnowledgeSpace, resolveRequestedFromEnv, resolveRuntimeKnowledgeSpace } from "./runtime-space.js";
+import type {
+  GitHubTreeFile,
+  KbBuild,
+  KbFullSyncShardKey,
+  KbKnowledgeSpace,
+  KbRequestedFromEnv,
+  KbSyncManifestItem,
+  KbSyncRun,
+  KbSyncRunShard,
+  KbSyncSource,
+  RepoRegistration,
+  RetrievalHit,
+  RetrievalProfile,
+  RetrievalResponse,
+  SyncJob
+} from "./types.js";
 
 const RETRIEVAL_CACHE_TTL_MS = 90_000;
 const RETRIEVAL_CACHE_MAX = 300;
@@ -32,8 +53,10 @@ let embeddingDisabledUntil = 0;
 let embeddingDisabledReason = "";
 const LOCAL_DOCS_SUPPORTED_ROOTS = ["docs", "deploy-docs", "open-docs", "i18n", "blog"];
 const LOCAL_DOCS_SKIP_DIRS = new Set([".git", ".github", ".claude", "node_modules", ".docusaurus", "build", "dist"]);
+const SUPPORTED_KNOWLEDGE_FILE_RE = /\.(md|mdx|ya?ml|json|toml|sql|ddl|ts|tsx|js|jsx|mjs|cjs|go|py|java|rb|php|rs)$/i;
 const DEFAULT_BOOTSTRAP_INCLUDE_PATHS = ["**/*.md", "**/*.mdx"];
 const DEFAULT_BOOTSTRAP_EXCLUDE_PATHS = [".claude/**", ".github/**", ".docusaurus/**", "node_modules/**", "build/**", "dist/**"];
+const MAX_BOOTSTRAP_INCLUDE_PATHS = 64;
 const DOCS_COM_REQUIRED_PREFIXES = ["docs/", "deploy-docs/", "open-docs/"];
 const DOCS_COM_REPO_OWNER = "BangWork";
 const DOCS_COM_REPO_NAME = "docs-com";
@@ -92,6 +115,14 @@ interface DocsComSourceCorpusSnapshot {
   errorMessage?: string;
 }
 
+interface FrozenDocsComSourceSnapshot {
+  mode: "local_mirror" | "remote";
+  branch: string;
+  head: string;
+  files: GitHubTreeFile[];
+  localMirror?: LocalDocsMirrorState;
+}
+
 type LocalMirrorRegistrationTarget = Pick<
   RepoRegistration,
   "repo_owner" | "repo_name" | "default_branch" | "include_paths" | "exclude_paths"
@@ -131,11 +162,11 @@ function hasIncludePattern(includePaths: string[], extension: "md" | "mdx"): boo
   });
 }
 
-function ensureMarkdownCoverage(includePaths: string[]): string[] {
+export function ensureMarkdownCoverage(includePaths: string[]): string[] {
   const next = [...includePaths];
   if (!hasIncludePattern(next, "md")) next.push("**/*.md");
   if (!hasIncludePattern(next, "mdx")) next.push("**/*.mdx");
-  return uniqueStrings(next, 8);
+  return uniqueStrings(next, MAX_BOOTSTRAP_INCLUDE_PATHS);
 }
 
 export function isValidGitCommitSha(value: string | null | undefined): boolean {
@@ -147,8 +178,16 @@ export function resolveBootstrapIncludePaths(raw: string): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
-  const includePaths = uniqueStrings(parsed, 8);
+  const includePaths = uniqueStrings(parsed, MAX_BOOTSTRAP_INCLUDE_PATHS);
   return includePaths.length ? includePaths : [...DEFAULT_BOOTSTRAP_INCLUDE_PATHS];
+}
+
+export function buildDocsComIncludePaths(raw: string): string[] {
+  const parsed = resolveBootstrapIncludePaths(raw);
+  const docsComPrefixes = DOCS_COM_REQUIRED_PREFIXES.map((prefix) => prefix.toLowerCase());
+  const filtered = parsed.filter((item) => docsComPrefixes.some((prefix) => item.toLowerCase().startsWith(prefix)));
+  const defaults = DOCS_COM_REQUIRED_PREFIXES.flatMap((prefix) => [`${prefix}*.md`, `${prefix}*.mdx`, `${prefix}**/*.md`, `${prefix}**/*.mdx`]);
+  return ensureMarkdownCoverage(filtered.length ? filtered : defaults);
 }
 
 function resolveBootstrapExcludePaths(raw: string): string[] {
@@ -165,7 +204,7 @@ function buildDocsComRegistrationInput(actor: string) {
     repoUrl: DOCS_COM_REPO_URL,
     publicBaseUrl: DOCS_COM_PUBLIC_BASE_URL,
     defaultBranch: DOCS_COM_DEFAULT_BRANCH,
-    includePaths: ensureMarkdownCoverage(resolveBootstrapIncludePaths(env.GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS)),
+    includePaths: buildDocsComIncludePaths(env.GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS),
     excludePaths: resolveBootstrapExcludePaths(env.GITHUB_KB_BOOTSTRAP_EXCLUDE_PATHS),
     pollingIntervalSeconds: env.GITHUB_KB_BOOTSTRAP_POLLING_INTERVAL_SECONDS,
     actor
@@ -181,6 +220,384 @@ function summarizePrefixTotals(paths: string[]): Array<{ prefix: string; total: 
     prefix,
     total: paths.filter((item) => item.startsWith(prefix)).length
   }));
+}
+
+function classifyDocsComShard(pathname: string): KbFullSyncShardKey | null {
+  if (pathname.startsWith("deploy-docs/")) return "deploy-docs";
+  if (pathname.startsWith("docs/")) return "docs";
+  if (pathname.startsWith("open-docs/")) return "open-docs";
+  return null;
+}
+
+function buildFullRunBuildVersion(targetHead: string, runId: string): string {
+  return `${targetHead}:${runId}`;
+}
+
+function buildKnowledgeSpaceLeaseKey(knowledgeSpace: KbKnowledgeSpace, repoId: string, branch: string): string {
+  return `build:${knowledgeSpace}:${repoId}:${branch}`;
+}
+
+function buildPublicationLeaseKey(knowledgeSpace: KbKnowledgeSpace, repoId: string, branch: string): string {
+  return `publish:${knowledgeSpace}:${repoId}:${branch}`;
+}
+
+function parseKnowledgeSpace(value: unknown): KbKnowledgeSpace | null {
+  if (
+    value === "support-prod" ||
+    value === "support-preview" ||
+    value === "support-local" ||
+    value === "support-shadow" ||
+    value === "support-eval"
+  ) {
+    return value;
+  }
+  return null;
+}
+
+function resolveJobKnowledgeSpace(job: SyncJob): KbKnowledgeSpace {
+  return parseKnowledgeSpace(job.payload_json?.knowledgeSpace) ?? resolveRuntimeKnowledgeSpace();
+}
+
+async function ensureBuildRecord(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  buildVersion: string;
+  targetHead: string;
+  buildKind: KbBuild["build_kind"];
+  requestedBy: string;
+  requestedFromEnv: KbRequestedFromEnv;
+  sourceSnapshotTotal?: number;
+}): Promise<KbBuild> {
+  return repo.ensureBuild({
+    knowledgeSpace: input.knowledgeSpace,
+    repoId: input.repoId,
+    branch: input.branch,
+    buildVersion: input.buildVersion,
+    targetHead: input.targetHead,
+    buildKind: input.buildKind,
+    requestedBy: input.requestedBy,
+    requestedFromEnv: input.requestedFromEnv,
+    sourceSnapshotTotal: input.sourceSnapshotTotal
+  });
+}
+
+async function validateBuildForPublication(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  buildVersion: string;
+  buildId: string;
+  requiredPrefixes?: string[];
+}): Promise<{
+  passed: boolean;
+  summary: Record<string, unknown>;
+}> {
+  const snapshot = await repo.getBuildValidationSnapshot({
+    knowledgeSpace: input.knowledgeSpace,
+    repoId: input.repoId,
+    branch: input.branch,
+    buildVersion: input.buildVersion
+  });
+  const prefixRows = input.requiredPrefixes?.length
+    ? await repo.countDocumentsByPathPrefixes({
+        knowledgeSpace: input.knowledgeSpace,
+        repoId: input.repoId,
+        branch: input.branch,
+        prefixes: input.requiredPrefixes
+      })
+    : [];
+
+  const results: Array<{
+    validationKind: string;
+    passed: boolean;
+    severity: "info" | "warn" | "error";
+    summary: string;
+    details: Record<string, unknown>;
+  }> = [
+    {
+      validationKind: "document_count_match",
+      passed: snapshot.totalDocuments > 0,
+      severity: "error" as const,
+      summary: snapshot.totalDocuments > 0 ? `build contains ${snapshot.totalDocuments} documents` : "build contains 0 documents",
+      details: { totalDocuments: snapshot.totalDocuments }
+    },
+    {
+      validationKind: "duplicate_active_guard",
+      passed: snapshot.duplicatePaths === 0,
+      severity: "error" as const,
+      summary:
+        snapshot.duplicatePaths === 0
+          ? "no duplicate document paths found inside build"
+          : `build contains ${snapshot.duplicatePaths} duplicate document paths`,
+      details: { duplicatePaths: snapshot.duplicatePaths }
+    },
+    {
+      validationKind: "chunk_orphan_check",
+      passed: snapshot.orphanChunks === 0 && snapshot.missingChunkDocuments === 0,
+      severity: "error" as const,
+      summary:
+        snapshot.orphanChunks === 0 && snapshot.missingChunkDocuments === 0
+          ? "all chunks resolve to same-build documents"
+          : `build contains ${snapshot.orphanChunks + snapshot.missingChunkDocuments} invalid chunk-document links`,
+      details: {
+        orphanChunks: snapshot.orphanChunks,
+        missingChunkDocuments: snapshot.missingChunkDocuments
+      }
+    },
+    {
+      validationKind: "memory_source_integrity",
+      passed: snapshot.crossBuildMemorySources === 0,
+      severity: "error" as const,
+      summary:
+        snapshot.crossBuildMemorySources === 0
+          ? "all memory sources resolve to same-build chunks"
+          : `build contains ${snapshot.crossBuildMemorySources} cross-build memory sources`,
+      details: { crossBuildMemorySources: snapshot.crossBuildMemorySources }
+    },
+    {
+      validationKind: "manifest_complete",
+      passed: true,
+      severity: "info" as const,
+      summary: "build artifact validation executed",
+      details: {
+        totalDocuments: snapshot.totalDocuments,
+        totalChunks: snapshot.totalChunks,
+        totalMemoryEntries: snapshot.totalMemoryEntries
+      }
+    }
+  ];
+
+  for (const row of prefixRows) {
+    results.push({
+      validationKind: `required_doc_family:${row.prefix}`,
+      passed: row.active > 0,
+      severity: "error" as const,
+      summary: row.active > 0 ? `${row.prefix} present in published candidate build` : `${row.prefix} missing from build`,
+      details: { prefix: row.prefix, total: row.total, active: row.active }
+    });
+  }
+
+  await repo.replaceBuildValidationResults({
+    buildId: input.buildId,
+    results
+  });
+
+  const passed = results.every((item) => item.passed || item.severity !== "error");
+  const summary = {
+    totalChecks: results.length,
+    failedChecks: results.filter((item) => !item.passed).map((item) => item.validationKind),
+    snapshot
+  };
+
+  await repo.updateBuildStatus({
+    buildId: input.buildId,
+    status: passed ? "validated" : "failed",
+    validationPassed: passed,
+    validationSummary: summary,
+    errorMessage: passed ? null : `validation failed for build ${input.buildVersion}`,
+    finished: !passed
+  });
+
+  return { passed, summary };
+}
+
+async function publishValidatedBuild(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  buildId: string;
+  buildVersion: string;
+  targetHead: string;
+  publishedBy: string;
+  publishedFromEnv: KbRequestedFromEnv;
+}): Promise<void> {
+  const publicationLeaseKey = buildPublicationLeaseKey(input.knowledgeSpace, input.repoId, input.branch);
+  await repo.acquireIngestLease({
+    leaseKey: publicationLeaseKey,
+    ownerId: input.buildId,
+    ownerEnv: input.publishedFromEnv,
+    ttlSeconds: 300,
+    metadata: {
+      buildVersion: input.buildVersion,
+      branch: input.branch
+    }
+  });
+  try {
+    const previousPublication = await repo.getPublication({
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.repoId,
+      branch: input.branch
+    });
+    await repo.upsertPublication({
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.repoId,
+      branch: input.branch,
+      publishedBuildVersion: input.buildVersion,
+      publishedHead: input.targetHead,
+      publishedBy: input.publishedBy,
+      publishedFromEnv: input.publishedFromEnv
+    });
+    await repo.upsertServingVersion({
+      repoId: input.repoId,
+      branch: input.branch,
+      activeBuildVersion: input.buildVersion,
+      activeHead: input.targetHead
+    });
+    await repo.updateBuildStatus({
+      buildId: input.buildId,
+      status: "published",
+      validationPassed: true,
+      finished: true
+    });
+    if (previousPublication && previousPublication.published_build_version !== input.buildVersion) {
+      const previousBuild = await repo.getBuildByVersion({
+        knowledgeSpace: input.knowledgeSpace,
+        repoId: input.repoId,
+        branch: input.branch,
+        buildVersion: previousPublication.published_build_version
+      });
+      if (previousBuild) {
+        await repo.updateBuildStatus({
+          buildId: previousBuild.id,
+          status: "superseded",
+          finished: true
+        });
+      }
+    }
+  } finally {
+    await repo.releaseIngestLease(publicationLeaseKey, input.buildId).catch(() => undefined);
+  }
+}
+
+async function finalizeAndPublishBuild(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  buildVersion: string;
+  targetHead: string;
+  buildKind: KbBuild["build_kind"];
+  requestedBy: string;
+  requestedFromEnv: KbRequestedFromEnv;
+  sourceSnapshotTotal?: number;
+  requiredPrefixes?: string[];
+}): Promise<KbBuild> {
+  const build =
+    (await repo.getBuildByVersion({
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.repoId,
+      branch: input.branch,
+      buildVersion: input.buildVersion
+    })) ??
+    (await ensureBuildRecord({
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.repoId,
+      branch: input.branch,
+      buildVersion: input.buildVersion,
+      targetHead: input.targetHead,
+      buildKind: input.buildKind,
+      requestedBy: input.requestedBy,
+      requestedFromEnv: input.requestedFromEnv,
+      sourceSnapshotTotal: input.sourceSnapshotTotal
+    }));
+
+  await repo.updateBuildArtifactCounts({
+    knowledgeSpace: input.knowledgeSpace,
+    repoId: input.repoId,
+    branch: input.branch,
+    buildVersion: input.buildVersion
+  });
+  await repo.updateBuildStatus({
+    buildId: build.id,
+    status: "built",
+    finished: false,
+    errorMessage: null
+  });
+  const validation = await validateBuildForPublication({
+    knowledgeSpace: input.knowledgeSpace,
+    repoId: input.repoId,
+    branch: input.branch,
+    buildVersion: input.buildVersion,
+    buildId: build.id,
+    requiredPrefixes: input.requiredPrefixes
+  });
+  if (!validation.passed) {
+    throw new Error(`Build validation failed for ${input.buildVersion}`);
+  }
+  if (!canPublishToKnowledgeSpace(input.requestedFromEnv, input.knowledgeSpace)) {
+    throw new Error(`Environment ${input.requestedFromEnv} cannot publish into ${input.knowledgeSpace}`);
+  }
+  await publishValidatedBuild({
+    knowledgeSpace: input.knowledgeSpace,
+    repoId: input.repoId,
+    branch: input.branch,
+    buildId: build.id,
+    buildVersion: input.buildVersion,
+    targetHead: input.targetHead,
+    publishedBy: input.requestedBy,
+    publishedFromEnv: input.requestedFromEnv
+  });
+  return (await repo.getBuildById(build.id)) ?? build;
+}
+
+async function freezeDocsComSourceSnapshot(registration: RepoRegistration, branch?: string): Promise<FrozenDocsComSourceSnapshot> {
+  const localMirror = await getLocalDocsMirrorState(registration);
+  if (localMirror) {
+    const markdownFiles = await collectLocalMirrorSnapshot(registration, localMirror);
+    const files: GitHubTreeFile[] = [];
+    for (const relativePath of markdownFiles.sort(compareSnapshotPaths)) {
+      const absolutePath = path.join(localMirror.rootDir, relativePath);
+      const content = await readFile(absolutePath, "utf8").catch(() => "");
+      files.push({
+        path: relativePath,
+        sha: sha256(content),
+        size: Buffer.byteLength(content, "utf8"),
+        type: "blob"
+      });
+    }
+    return {
+      mode: "local_mirror",
+      branch: branch || registration.default_branch || DOCS_COM_DEFAULT_BRANCH,
+      head: localMirror.head,
+      files,
+      localMirror
+    };
+  }
+
+  const resolved = await resolveRegistrationBranch(registration, branch || registration.default_branch || DOCS_COM_DEFAULT_BRANCH, "full_run_plan");
+  const head = await getBranchHead(resolved.registration, resolved.branch);
+  const files = (await listFilesAtCommit(resolved.registration, head))
+    .filter((file) => isSupportedKnowledgePath(file.path))
+    .filter((file) => isPathIncluded(file.path, resolved.registration.include_paths, resolved.registration.exclude_paths))
+    .filter((file) => Boolean(classifyDocsComShard(file.path)))
+    .sort((left, right) => compareSnapshotPaths(left.path, right.path));
+
+  return {
+    mode: "remote",
+    branch: resolved.branch,
+    head,
+    files
+  };
+}
+
+function getFullRunPayload(job: SyncJob): null | {
+  runId: string;
+  shardKey: KbFullSyncShardKey;
+  targetHead: string;
+  buildVersion: string;
+  sourceMode: "local_mirror" | "remote";
+  cursor?: string;
+} {
+  const runId = String(job.payload_json?.runId ?? "").trim();
+  const shardKey = String(job.payload_json?.shardKey ?? "").trim() as KbFullSyncShardKey;
+  const targetHead = String(job.payload_json?.targetHead ?? "").trim();
+  const buildVersion = String(job.payload_json?.buildVersion ?? "").trim();
+  const sourceMode = String(job.payload_json?.sourceMode ?? "").trim() as "local_mirror" | "remote";
+  const cursor = String(job.payload_json?.cursor ?? "").trim() || undefined;
+  if (!runId || !targetHead || !buildVersion || !sourceMode) return null;
+  if (!["deploy-docs", "docs", "open-docs"].includes(shardKey)) return null;
+  if (sourceMode !== "local_mirror" && sourceMode !== "remote") return null;
+  return { runId, shardKey, targetHead, buildVersion, sourceMode, cursor };
 }
 
 async function summarizeDocsComSourceCorpus(registration: RepoRegistration): Promise<DocsComSourceCorpusSnapshot> {
@@ -203,7 +620,7 @@ async function summarizeDocsComSourceCorpus(registration: RepoRegistration): Pro
   const head = await getBranchHead(resolved.registration, resolved.branch);
   const files = await listFilesAtCommit(resolved.registration, head);
   const markdownFiles = files
-    .filter((file) => /\.(md|mdx)$/i.test(file.path))
+    .filter((file) => isSupportedKnowledgePath(file.path))
     .filter((file) => isPathIncluded(file.path, resolved.registration.include_paths, resolved.registration.exclude_paths))
     .map((file) => file.path)
     .sort((left, right) => left.localeCompare(right, "en"));
@@ -222,13 +639,22 @@ async function summarizeDocsComSourceCorpus(registration: RepoRegistration): Pro
 
 async function summarizeDocsComCorpus(registration: RepoRegistration, recentJobLimit = 10) {
   const branch = registration.default_branch || DOCS_COM_DEFAULT_BRANCH;
+  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
   const corpus = await repo.countDocumentsByPathPrefixes({
+    knowledgeSpace,
     repoId: registration.id,
     branch,
     prefixes: DOCS_COM_REQUIRED_PREFIXES
   });
   const checkpoints = await repo.getCheckpoint(registration.id, branch);
+  const servingVersion = await repo.getServingVersion(registration.id, branch);
+  const activeRun = await repo.findActiveFullSyncRun(registration.id, branch);
+  const activeRunShards = activeRun ? await repo.listSyncRunShards(activeRun.id) : [];
   const recentJobs = (await repo.listRecentSyncJobs(recentJobLimit)).filter((job) => job.repo_id === registration.id);
+  const publications = await repo.listPublications({
+    repoId: registration.id,
+    branch
+  });
   const health = await validateDocsComCorpusCoverage(registration, branch);
   const sourceSnapshot = await summarizeDocsComSourceCorpus(registration).catch((error) => ({
     mode: "remote" as const,
@@ -255,6 +681,7 @@ async function summarizeDocsComCorpus(registration: RepoRegistration, recentJobL
       id: registration.id,
       repo: `${registration.repo_owner}/${registration.repo_name}`,
       branch,
+      knowledgeSpace,
       repoUrl: registration.repo_url,
       publicBaseUrl: registration.public_base_url,
       includePaths: registration.include_paths,
@@ -292,6 +719,41 @@ async function summarizeDocsComCorpus(registration: RepoRegistration, recentJobL
           lastFullSyncedAt: checkpoints.last_full_synced_at
         }
       : null,
+    serving: servingVersion
+      ? {
+          activeBuildVersion: servingVersion.active_build_version,
+          activeHead: servingVersion.active_head,
+          activatedAt: servingVersion.activated_at
+        }
+      : null,
+    publications: publications.map((item) => ({
+      knowledgeSpace: item.knowledge_space,
+      publishedBuildVersion: item.published_build_version,
+      publishedHead: item.published_head,
+      publishedBy: item.published_by,
+      publishedFromEnv: item.published_from_env,
+      publishedAt: item.published_at
+    })),
+    activeFullRun: activeRun
+      ? {
+          id: activeRun.id,
+          targetHead: activeRun.target_head,
+          status: activeRun.status,
+          startedAt: activeRun.started_at,
+          updatedAt: activeRun.updated_at,
+          shards: activeRunShards.map((shard) => ({
+            shardKey: shard.shard_key,
+            totalDocs: shard.total_docs,
+            completedDocs: shard.completed_docs,
+            reusableDocs: shard.reusable_docs,
+            rebuiltDocs: shard.rebuilt_docs,
+            failedDocs: shard.failed_docs,
+            nextCursor: shard.next_cursor,
+            status: shard.status,
+            lastHeartbeatAt: shard.last_heartbeat_at
+          }))
+        }
+      : null,
     health,
     recentJobs: recentJobs.map((job) => ({
       id: job.id,
@@ -319,6 +781,7 @@ async function validateDocsComCorpusCoverage(
 
   const counts = await repo
     .countDocumentsByPathPrefixes({
+      knowledgeSpace: resolveRuntimeKnowledgeSpace(),
       repoId: registration.id,
       branch,
       prefixes: DOCS_COM_REQUIRED_PREFIXES
@@ -468,7 +931,7 @@ async function collectLocalMirrorMarkdownFiles(
       output.push(...(await collectLocalMirrorMarkdownFiles(rootDir, includePaths, excludePaths, path.join(relativeDir, entry.name))));
       continue;
     }
-    if (!entry.isFile() || !/\.(md|mdx)$/i.test(entry.name)) continue;
+    if (!entry.isFile() || !(SUPPORTED_KNOWLEDGE_FILE_RE.test(entry.name) || /(^|\/)\.env(\.|$)/.test(entry.name))) continue;
     const relativePath = path.posix.join(relativeDir.split(path.sep).join(path.posix.sep), entry.name);
     if (isPathIncluded(relativePath, includePaths, excludePaths)) {
       output.push(relativePath);
@@ -519,9 +982,12 @@ export function sliceSnapshotForBackfill(paths: string[], cursor?: string, limit
 
 async function indexLocalMirrorPaths(input: {
   registration: RepoRegistration;
+  knowledgeSpace: KbKnowledgeSpace;
   branch: string;
   commitSha: string;
   rootDir: string;
+  buildVersion?: string;
+  publicationMode?: "build_only" | "publish_inline";
   paths: string[];
 }): Promise<number> {
   let indexed = 0;
@@ -531,8 +997,11 @@ async function indexLocalMirrorPaths(input: {
     if (!content.trim()) continue;
     await indexDocumentContent({
       registration: input.registration,
+      knowledgeSpace: input.knowledgeSpace,
       branch: input.branch,
       commitSha: input.commitSha,
+      buildVersion: input.buildVersion,
+      publicationMode: input.publicationMode,
       path: relativePath,
       content
     });
@@ -573,6 +1042,10 @@ function isPathIncluded(path: string, includePaths: string[], excludePaths: stri
   const included = includeRegex.some((regex) => regex.test(path));
   const excluded = excludeRegex.some((regex) => regex.test(path));
   return included && !excluded;
+}
+
+function isSupportedKnowledgePath(pathname: string): boolean {
+  return SUPPORTED_KNOWLEDGE_FILE_RE.test(pathname) || /(^|\/)\.env(\.|$)/.test(pathname);
 }
 
 function pickTitle(path: string, content: string): string {
@@ -1204,6 +1677,23 @@ function isTransientDbError(error: unknown): boolean {
   );
 }
 
+async function withTransientDbRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientDbError(error) || attempt === maxAttempts) {
+        throw error;
+      }
+      const waitMs = Math.min(1200, 200 * attempt * attempt);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
+  throw lastError;
+}
+
 export async function retrieveKnowledgeWithRetry(input: {
   query: string;
   answerLanguage?: "zh" | "en";
@@ -1234,12 +1724,22 @@ export async function retrieveKnowledgeWithRetry(input: {
   throw lastError;
 }
 
-async function indexDocument(registration: RepoRegistration, branch: string, commitSha: string, path: string): Promise<void> {
+async function indexDocument(
+  registration: RepoRegistration,
+  knowledgeSpace: KbKnowledgeSpace,
+  branch: string,
+  commitSha: string,
+  path: string,
+  options?: { buildVersion?: string; publicationMode?: "build_only" | "publish_inline" }
+): Promise<void> {
   const content = await getFileContentAtCommit(registration, path, commitSha);
   await indexDocumentContent({
     registration,
+    knowledgeSpace,
     branch,
     commitSha,
+    buildVersion: options?.buildVersion,
+    publicationMode: options?.publicationMode,
     path,
     content
   });
@@ -1247,12 +1747,16 @@ async function indexDocument(registration: RepoRegistration, branch: string, com
 
 async function indexDocumentContent(input: {
   registration: RepoRegistration;
+  knowledgeSpace: KbKnowledgeSpace;
   branch: string;
   commitSha: string;
+  buildVersion?: string;
+  publicationMode?: "build_only" | "publish_inline";
   path: string;
   content: string;
 }): Promise<void> {
-  const { registration, branch, commitSha, path, content } = input;
+  const { registration, knowledgeSpace, branch, commitSha, path, content } = input;
+  const buildVersion = input.buildVersion?.trim() || commitSha;
   const normalizedContent = enrichIndexableContent(path, content);
   const contentHash = sha256(content);
   const repoSourceUrl = buildSourceUrl(registration, path, commitSha);
@@ -1265,6 +1769,7 @@ async function indexDocumentContent(input: {
       title = buildOpenApiTitle(apiDoc, path);
     }
   }
+  const sourceClassification = classifySourceFamily(path, normalizedContent);
   const docSupportEvidence = extractSupportEvidenceMetadata({
     path,
     title,
@@ -1273,8 +1778,10 @@ async function indexDocumentContent(input: {
   });
   const doc = await repo.upsertDocument({
     repoId: registration.id,
+    knowledgeSpace,
     branch,
     path,
+    buildVersion,
     title,
     sourceUrl: publicSourceUrl ?? repoSourceUrl,
     repoSourceUrl,
@@ -1288,17 +1795,37 @@ async function indexDocumentContent(input: {
       publicSourceUrlResolved: Boolean(publicSourceUrl),
       includePaths: registration.include_paths,
       excludePaths: registration.exclude_paths,
+      sourceFamily: sourceClassification.sourceFamily,
+      sourceFamilyQuality: sourceClassification.quality,
+      sourceFamilyReason: sourceClassification.reason,
       supportEvidence: docSupportEvidence
     }
   });
 
-  await repo.deactivateChunksByDocument(doc.id);
+  const knowledgeContext = {
+    knowledgeSpace,
+    repoId: registration.id,
+    branch,
+    buildVersion,
+    commitSha,
+    docId: doc.id,
+    path,
+    title,
+    content: normalizedContent,
+    metadata: {
+      supportEvidence: docSupportEvidence,
+      source_family: sourceClassification.sourceFamily
+    }
+  } as const;
+  const knowledgeArtifacts = buildRepositoryKnowledgeArtifacts(knowledgeContext);
 
-  const sections = parseMarkdownSections(normalizedContent);
-  const chunks = buildChunks(doc.doc_key, sections, {
-    targetTokens: env.GITHUB_KB_CHUNK_TARGET_TOKENS,
-    overlapTokens: env.GITHUB_KB_CHUNK_OVERLAP_TOKENS
+  await repo.deactivateChunksByDocument(doc.id);
+  await repo.deleteKnowledgeArtifactsForDocument({
+    sourceDocId: doc.id,
+    knowledgeSpace,
+    buildVersion
   });
+
   const persistedChunks: Array<{
     id: string;
     headingPath: string;
@@ -1306,60 +1833,462 @@ async function indexDocumentContent(input: {
     content: string;
     metadata: Record<string, unknown>;
   }> = [];
-
-  for (const chunk of chunks) {
-    const chunkSupportEvidence = extractSupportEvidenceMetadata({
-      path,
-      title: String(chunk.metadata.sectionTitle ?? title),
-      content: chunk.content,
-      apiDoc,
-      inherited: docSupportEvidence
+  if (
+    knowledgeArtifacts.classification.sourceFamily === "doc_page" ||
+    knowledgeArtifacts.classification.sourceFamily === "runbook_file" ||
+    knowledgeArtifacts.classification.sourceFamily === "openapi_spec"
+  ) {
+    const sections = parseMarkdownSections(normalizedContent);
+    const chunks = buildChunks(doc.doc_key, sections, {
+      targetTokens: env.GITHUB_KB_CHUNK_TARGET_TOKENS,
+      overlapTokens: env.GITHUB_KB_CHUNK_OVERLAP_TOKENS
     });
-    const embedded = await embedChunkBestEffort(chunk.content);
-    await repo.upsertChunk({
-      id: chunk.id,
-      docId: doc.id,
+    for (const chunk of chunks) {
+      const chunkSupportEvidence = extractSupportEvidenceMetadata({
+        path,
+        title: String(chunk.metadata.sectionTitle ?? title),
+        content: chunk.content,
+        apiDoc,
+        inherited: docSupportEvidence
+      });
+      const embedded = await embedChunkBestEffort(chunk.content);
+      await repo.upsertChunk({
+        id: chunk.id,
+        docId: doc.id,
+        repoId: registration.id,
+        knowledgeSpace,
+        branch,
+        path,
+        buildVersion,
+        commitSha,
+        headingPath: chunk.headingPath,
+        ordinal: chunk.ordinal,
+        content: chunk.content,
+        contentHash: chunk.contentHash,
+        tokenCount: chunk.tokenCount,
+        metadata: {
+          ...chunk.metadata,
+          sourceFamily: knowledgeArtifacts.classification.sourceFamily,
+          supportEvidence: chunkSupportEvidence,
+          embeddingState: embedded ? "ready" : "missing"
+        },
+        embedding: embedded?.vectorLiteral ?? null,
+        embeddingModel: embedded?.model ?? null,
+        embeddingVersion: embedded?.version ?? null
+      });
+      persistedChunks.push({
+        id: chunk.id,
+        headingPath: chunk.headingPath,
+        ordinal: chunk.ordinal,
+        content: chunk.content,
+        metadata: {
+          ...chunk.metadata,
+          sourceFamily: knowledgeArtifacts.classification.sourceFamily,
+          supportEvidence: chunkSupportEvidence,
+          embeddingState: embedded ? "ready" : "missing"
+        }
+      });
+    }
+  }
+
+  for (const operation of knowledgeArtifacts.openApiOperations) {
+    await repo.upsertOpenApiOperation({
+      id: operation.id,
+      knowledgeSpace,
       repoId: registration.id,
       branch,
-      path,
-      commitSha,
-      headingPath: chunk.headingPath,
-      ordinal: chunk.ordinal,
-      content: chunk.content,
-      contentHash: chunk.contentHash,
-      tokenCount: chunk.tokenCount,
-      metadata: {
-        ...chunk.metadata,
-        supportEvidence: chunkSupportEvidence,
-        embeddingState: embedded ? "ready" : "missing"
-      },
+      buildVersion,
+      sourceDocId: doc.id,
+      path: operation.path,
+      method: operation.method,
+      routePath: operation.routePath,
+      operationId: operation.operationId,
+      summary: operation.summary,
+      description: operation.description,
+      requestSchema: operation.requestSchema,
+      responseSchema: operation.responseSchema,
+      authScopes: operation.authScopes,
+      tags: operation.tags,
+      errorShapes: operation.errorShapes,
+      sourceLocation: operation.sourceLocation,
+      metadata: operation.metadata
+    });
+  }
+  for (const symbol of knowledgeArtifacts.codeSymbols) {
+    await repo.upsertCodeSymbol({
+      id: symbol.id,
+      knowledgeSpace,
+      repoId: registration.id,
+      branch,
+      buildVersion,
+      sourceDocId: doc.id,
+      path: symbol.path,
+      language: symbol.language,
+      symbolKind: symbol.symbolKind,
+      symbolName: symbol.symbolName,
+      qualifiedName: symbol.qualifiedName,
+      parentSymbol: symbol.parentSymbol,
+      startLine: symbol.startLine,
+      endLine: symbol.endLine,
+      signatureText: symbol.signatureText,
+      docComment: symbol.docComment,
+      bodySummary: symbol.bodySummary,
+      dependencyRefs: symbol.dependencyRefs,
+      metadata: symbol.metadata
+    });
+  }
+  for (const surface of knowledgeArtifacts.configSurfaces) {
+    await repo.upsertConfigSurface({
+      id: surface.id,
+      knowledgeSpace,
+      repoId: registration.id,
+      branch,
+      buildVersion,
+      sourceDocId: doc.id,
+      path: surface.path,
+      configKind: surface.configKind,
+      configKey: surface.configKey,
+      normalizedKey: surface.normalizedKey,
+      defaultValue: surface.defaultValue,
+      description: surface.description,
+      requiredFor: surface.requiredFor,
+      relatedComponents: surface.relatedComponents,
+      sourceLocation: surface.sourceLocation,
+      metadata: surface.metadata
+    });
+  }
+  for (const object of knowledgeArtifacts.schemaObjects) {
+    await repo.upsertSchemaObject({
+      id: object.id,
+      knowledgeSpace,
+      repoId: registration.id,
+      branch,
+      buildVersion,
+      sourceDocId: doc.id,
+      path: object.path,
+      objectKind: object.objectKind,
+      schemaName: object.schemaName,
+      objectName: object.objectName,
+      normalizedName: object.normalizedName,
+      definitionSummary: object.definitionSummary,
+      relatedTables: object.relatedTables,
+      sourceLocation: object.sourceLocation,
+      metadata: object.metadata
+    });
+  }
+  for (const behavior of knowledgeArtifacts.testBehaviors) {
+    await repo.upsertTestBehavior({
+      id: behavior.id,
+      knowledgeSpace,
+      repoId: registration.id,
+      branch,
+      buildVersion,
+      sourceDocId: doc.id,
+      path: behavior.path,
+      behaviorKey: behavior.behaviorKey,
+      title: behavior.title,
+      summary: behavior.summary,
+      assertions: behavior.assertions,
+      signals: behavior.signals,
+      sourceLocation: behavior.sourceLocation,
+      metadata: behavior.metadata
+    });
+  }
+
+  const docChunkCitations = buildDocChunkCitations(
+    knowledgeContext,
+    persistedChunks,
+    knowledgeArtifacts.classification.sourceFamily === "openapi_spec"
+      ? "openapi_spec"
+      : knowledgeArtifacts.classification.sourceFamily === "runbook_file"
+      ? "runbook_file"
+      : "doc_page"
+  );
+  const allCitations = [...docChunkCitations, ...knowledgeArtifacts.citationUnits];
+  for (const citation of allCitations) {
+    const embedded = await embedChunkBestEffort(citation.embeddingText ?? citation.snippetText);
+    await repo.upsertCitationUnit({
+      id: citation.id,
+      knowledgeSpace,
+      repoId: registration.id,
+      branch,
+      buildVersion,
+      sourceDocId: doc.id,
+      citationFamily: citation.citationFamily,
+      sourceFamily: citation.sourceFamily,
+      sourceArtifactType: citation.sourceArtifactType,
+      sourceArtifactId: citation.sourceArtifactId,
+      citationKey: citation.citationKey,
+      path: citation.path,
+      title: citation.title,
+      headingPath: citation.headingPath,
+      snippetText: citation.snippetText,
+      sourceLocation: citation.sourceLocation,
+      authority: citation.authority,
+      metadata: citation.metadata,
       embedding: embedded?.vectorLiteral ?? null,
       embeddingModel: embedded?.model ?? null,
       embeddingVersion: embedded?.version ?? null
     });
-    persistedChunks.push({
-      id: chunk.id,
-      headingPath: chunk.headingPath,
-      ordinal: chunk.ordinal,
-      content: chunk.content,
-      metadata: {
-        ...chunk.metadata,
-        supportEvidence: chunkSupportEvidence,
-        embeddingState: embedded ? "ready" : "missing"
-      }
-    });
   }
 
+  const docCitationByHeading = new Map(
+    docChunkCitations.map((citation) => [citation.headingPath ?? "ROOT", citation.id] as const)
+  );
+  const docRetrievalUnits =
+    knowledgeArtifacts.docPage && docChunkCitations.length
+      ? buildDocumentRetrievalUnits({
+          sections: knowledgeArtifacts.docPage.sections,
+          docKind: knowledgeArtifacts.docPage.docKind,
+          productArea: knowledgeArtifacts.docPage.productArea,
+          deploymentModel: knowledgeArtifacts.docPage.deploymentModel,
+          citationByHeading: docCitationByHeading,
+          title
+        })
+      : [];
+  const structuredMemoryEntries = [
+    ...generateMemoryEntriesFromRetrievalUnits(
+      {
+        ...knowledgeContext,
+        metadata: {
+          ...knowledgeContext.metadata,
+          source_family: knowledgeArtifacts.classification.sourceFamily
+        }
+      },
+      docRetrievalUnits
+    ),
+    ...knowledgeArtifacts.memoryEntries
+  ];
+
   await syncDocumentMemoryGraph({
+    knowledgeSpace,
     repoId: registration.id,
     branch,
     commitSha,
+    buildVersion,
+    activationMode: input.publicationMode === "publish_inline" ? "immediate" : "staged",
     docId: doc.id,
     path,
     title,
     docSupportEvidence,
-    chunks: persistedChunks
+    chunks: persistedChunks,
+    memoryEntries: structuredMemoryEntries
   });
+}
+
+async function maybeFinalizeDocsComFullSyncRun(runId: string): Promise<void> {
+  const run = await repo.tryStartSyncRunFinalization(runId);
+  if (!run) return;
+  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
+  try {
+    const buildVersion = buildFullRunBuildVersion(run.target_head, run.id);
+    const requestedFromEnv = resolveRequestedFromEnv();
+    await finalizeAndPublishBuild({
+      knowledgeSpace,
+      repoId: run.repo_id,
+      branch: run.branch,
+      buildVersion,
+      targetHead: run.target_head,
+      buildKind: "full",
+      requestedBy: "docs-com-full-sync",
+      requestedFromEnv,
+      sourceSnapshotTotal: run.source_snapshot_total,
+      requiredPrefixes: DOCS_COM_REQUIRED_PREFIXES
+    });
+    await repo.finalizeSyncRunSuccess({
+      runId: run.id,
+      repoId: run.repo_id,
+      branch: run.branch,
+      buildVersion,
+      targetHead: run.target_head
+    });
+    await repo.recordMetric({
+      repoId: run.repo_id,
+      metricName: "kb_full_run_finalized",
+      metricValue: 1,
+      tags: { runId: run.id, branch: run.branch, head: run.target_head }
+    });
+  } catch (error) {
+    await repo.markSyncRunFinalizationFailed(run.id, (error as Error).message);
+    throw error;
+  } finally {
+    await repo.releaseIngestLease(buildKnowledgeSpaceLeaseKey(knowledgeSpace, run.repo_id, run.branch), run.id).catch(() => undefined);
+  }
+}
+
+async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
+  const knowledgeSpace = resolveJobKnowledgeSpace(job);
+  const requestedFromEnv = resolveRequestedFromEnv();
+  const payload = getFullRunPayload(job);
+  if (!payload) {
+    throw new Error(`Missing docs-com full run payload on job ${job.id}`);
+  }
+
+  const run = await repo.getSyncRun(payload.runId);
+  if (!run) {
+    throw new Error(`Full sync run not found: ${payload.runId}`);
+  }
+  if (run.status === "succeeded" || run.status === "failed" || run.status === "cancelled") {
+    return { indexed: 0, head: run.target_head, finished: true, nextCursor: null };
+  }
+  if (run.target_head !== payload.targetHead) {
+    throw new Error(`Run ${run.id} target head mismatch: expected ${run.target_head}, got ${payload.targetHead}`);
+  }
+
+  await ensureBuildRecord({
+    knowledgeSpace,
+    repoId: registration.id,
+    branch: run.branch,
+    buildVersion: payload.buildVersion,
+    targetHead: run.target_head,
+    buildKind: "full",
+    requestedBy: job.source,
+    requestedFromEnv,
+    sourceSnapshotTotal: run.source_snapshot_total
+  });
+
+  await repo.heartbeatSyncRunShard(run.id, payload.shardKey, "running");
+
+  const limit = env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE;
+  const manifestItems = await repo.listPendingManifestItemsForShard({
+    runId: run.id,
+    shardKey: payload.shardKey,
+    cursor: payload.cursor,
+    limit
+  });
+
+  if (!manifestItems.length) {
+    await repo.advanceSyncRunShard({
+      runId: run.id,
+      shardKey: payload.shardKey,
+      completedDelta: 0,
+      reusableDelta: 0,
+      rebuiltDelta: 0,
+      failedDelta: 0,
+      nextCursor: null,
+      status: "succeeded"
+    });
+    await maybeFinalizeDocsComFullSyncRun(run.id);
+    return { indexed: 0, head: run.target_head, finished: true, nextCursor: null };
+  }
+
+  let rebuilt = 0;
+  let reused = 0;
+
+  try {
+    if (payload.sourceMode === "local_mirror") {
+      const localMirror = await getLocalDocsMirrorState(registration);
+      if (!localMirror) {
+        throw new Error(`Local mirror is unavailable for run ${run.id}`);
+      }
+      for (const item of manifestItems) {
+        if (!item.needs_rebuild) {
+          await withTransientDbRetry(() => repo.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "reused" }));
+          reused += 1;
+          continue;
+        }
+        const absolutePath = path.join(localMirror.rootDir, item.path);
+        const content = await readFile(absolutePath, "utf8").catch(() => "");
+        if (!content.trim()) {
+          throw new Error(`Manifest path is missing or empty in local mirror: ${item.path}`);
+        }
+        await withTransientDbRetry(async () => {
+          await indexDocumentContent({
+            registration,
+            knowledgeSpace,
+            branch: run.branch,
+            commitSha: run.target_head,
+            buildVersion: payload.buildVersion,
+            publicationMode: "build_only",
+            path: item.path,
+            content
+          });
+          await repo.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "rebuilt" });
+        });
+        rebuilt += 1;
+      }
+    } else {
+      for (const item of manifestItems) {
+        if (!item.needs_rebuild) {
+          await withTransientDbRetry(() => repo.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "reused" }));
+          reused += 1;
+          continue;
+        }
+        await withTransientDbRetry(async () => {
+          await indexDocument(registration, knowledgeSpace, run.branch, run.target_head, item.path, {
+            buildVersion: payload.buildVersion,
+            publicationMode: "build_only"
+          });
+          await repo.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "rebuilt" });
+        });
+        
+        rebuilt += 1;
+      }
+    }
+  } catch (error) {
+    if (isTransientDbError(error)) {
+      await repo.heartbeatSyncRunShard(run.id, payload.shardKey, "queued").catch(() => undefined);
+      throw error;
+    }
+    const failingPath = manifestItems[rebuilt + reused]?.path;
+    if (failingPath) {
+      await repo.updateManifestItemBuildStatus({
+        runId: run.id,
+        path: failingPath,
+        status: "failed",
+        errorMessage: (error as Error).message
+      });
+    }
+    await repo.markSyncRunShardFailed(run.id, payload.shardKey, (error as Error).message);
+    await repo.markSyncRunFailed(run.id, (error as Error).message);
+    await repo.releaseIngestLease(buildKnowledgeSpaceLeaseKey(knowledgeSpace, registration.id, run.branch), run.id).catch(() => undefined);
+    throw error;
+  }
+
+  const nextCursor = manifestItems[manifestItems.length - 1]?.path ?? null;
+  const remaining = nextCursor
+    ? await repo.listPendingManifestItemsForShard({
+        runId: run.id,
+        shardKey: payload.shardKey,
+        cursor: nextCursor,
+        limit: 1
+      })
+    : [];
+  const finished = remaining.length === 0;
+  await repo.advanceSyncRunShard({
+    runId: run.id,
+    shardKey: payload.shardKey,
+    completedDelta: rebuilt + reused,
+    reusableDelta: reused,
+    rebuiltDelta: rebuilt,
+    failedDelta: 0,
+    nextCursor: finished ? null : nextCursor,
+    status: finished ? "succeeded" : "queued"
+  });
+
+  if (!finished && nextCursor) {
+    await enqueueSyncJob({
+      repoId: registration.id,
+      branch: run.branch,
+      mode: "full",
+      source: job.source,
+      afterCommitSha: run.target_head,
+      payload: {
+        ...job.payload_json,
+        cursor: nextCursor
+      },
+      idempotencyKey: `sync-continuation:full:${run.id}:${payload.shardKey}:${run.target_head}:${nextCursor}`
+    });
+  } else {
+    await maybeFinalizeDocsComFullSyncRun(run.id);
+  }
+
+  return {
+    indexed: rebuilt + reused,
+    head: run.target_head,
+    finished,
+    nextCursor: finished ? null : nextCursor
+  };
 }
 
 async function runLocalMirrorFullSync(
@@ -1368,10 +2297,14 @@ async function runLocalMirrorFullSync(
   localMirror: LocalDocsMirrorState
 ): Promise<LocalMirrorBatchResult> {
   const branch = job.branch || localMirror.branch || registration.default_branch;
+  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
+  const buildVersion = String(job.payload_json?.buildVersion ?? "").trim() || localMirror.head;
   return runLocalMirrorSyncBatch({
     registration,
+    knowledgeSpace,
     branch,
     localMirror,
+    buildVersion,
     cursor: getLocalMirrorCursor(job),
     limit: env.GITHUB_KB_LOCAL_MIRROR_BATCH_SIZE
   });
@@ -1379,8 +2312,10 @@ async function runLocalMirrorFullSync(
 
 async function runLocalMirrorSyncBatch(input: {
   registration: RepoRegistration;
+  knowledgeSpace: KbKnowledgeSpace;
   branch: string;
   localMirror: LocalDocsMirrorState;
+  buildVersion: string;
   cursor?: string;
   limit: number;
 }): Promise<LocalMirrorBatchResult> {
@@ -1388,9 +2323,12 @@ async function runLocalMirrorSyncBatch(input: {
   const window = sliceSnapshotForBackfill(markdownFiles, input.cursor, input.limit);
   const indexed = await indexLocalMirrorPaths({
     registration: input.registration,
+    knowledgeSpace: input.knowledgeSpace,
     branch: input.branch,
     commitSha: input.localMirror.head,
     rootDir: input.localMirror.rootDir,
+    buildVersion: input.buildVersion,
+    publicationMode: "build_only",
     paths: window.files
   });
 
@@ -1399,7 +2337,26 @@ async function runLocalMirrorSyncBatch(input: {
     if (!isValidGitCommitSha(input.localMirror.head)) {
       throw new Error(`Refusing to checkpoint invalid local docs-com mirror head: ${input.localMirror.head || "<empty>"}`);
     }
-    deactivated = await repo.deactivateDocumentsMissingFromSnapshot(input.registration.id, input.branch, markdownFiles);
+    deactivated = await repo.deactivateDocumentsMissingFromSnapshot(
+      input.registration.id,
+      input.branch,
+      input.knowledgeSpace,
+      markdownFiles
+    );
+    await finalizeAndPublishBuild({
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.registration.id,
+      branch: input.branch,
+      buildVersion: input.buildVersion,
+      targetHead: input.localMirror.head,
+      buildKind: "full",
+      requestedBy: "sync_worker",
+      requestedFromEnv: resolveRequestedFromEnv()
+    });
+    await repo.releaseIngestLease(
+      buildKnowledgeSpaceLeaseKey(input.knowledgeSpace, input.registration.id, input.branch),
+      input.buildVersion
+    ).catch(() => undefined);
     await repo.upsertCheckpoint({
       repoId: input.registration.id,
       branch: input.branch,
@@ -1421,14 +2378,16 @@ async function runLocalMirrorSyncBatch(input: {
 
 async function runRemoteSnapshotBatch(input: {
   registration: RepoRegistration;
+  knowledgeSpace: KbKnowledgeSpace;
   branch: string;
   head: string;
+  buildVersion: string;
   cursor?: string;
   limit: number;
 }): Promise<RemoteBatchResult> {
   const files = await listFilesAtCommit(input.registration, input.head);
   const markdownFiles = files
-    .filter((file) => /\.(md|mdx)$/i.test(file.path))
+    .filter((file) => isSupportedKnowledgePath(file.path))
     .filter((file) => isPathIncluded(file.path, input.registration.include_paths, input.registration.exclude_paths))
     .map((file) => file.path)
     .sort(compareSnapshotPaths);
@@ -1436,13 +2395,35 @@ async function runRemoteSnapshotBatch(input: {
   const window = sliceSnapshotForBackfill(markdownFiles, input.cursor, input.limit);
   let indexed = 0;
   for (const relativePath of window.files) {
-    await indexDocument(input.registration, input.branch, input.head, relativePath);
+    await indexDocument(input.registration, input.knowledgeSpace, input.branch, input.head, relativePath, {
+      buildVersion: input.buildVersion,
+      publicationMode: "build_only"
+    });
     indexed += 1;
   }
 
   let deactivated = 0;
   if (window.finished) {
-    deactivated = await repo.deactivateDocumentsMissingFromSnapshot(input.registration.id, input.branch, markdownFiles);
+    deactivated = await repo.deactivateDocumentsMissingFromSnapshot(
+      input.registration.id,
+      input.branch,
+      input.knowledgeSpace,
+      markdownFiles
+    );
+    await finalizeAndPublishBuild({
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.registration.id,
+      branch: input.branch,
+      buildVersion: input.buildVersion,
+      targetHead: input.head,
+      buildKind: "full",
+      requestedBy: "sync_worker",
+      requestedFromEnv: resolveRequestedFromEnv()
+    });
+    await repo.releaseIngestLease(
+      buildKnowledgeSpaceLeaseKey(input.knowledgeSpace, input.registration.id, input.branch),
+      input.buildVersion
+    ).catch(() => undefined);
     await repo.upsertCheckpoint({
       repoId: input.registration.id,
       branch: input.branch,
@@ -1492,82 +2473,67 @@ function buildSyntheticSyncJob(input: {
 }
 
 async function runFullSync(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
+  const knowledgeSpace = resolveJobKnowledgeSpace(job);
+  const requestedFromEnv = resolveRequestedFromEnv();
   const localMirror = await getLocalDocsMirrorState(registration);
   if (localMirror) {
+    const buildVersion = String(job.payload_json?.buildVersion ?? "").trim() || localMirror.head;
+    await repo.acquireIngestLease({
+      leaseKey: buildKnowledgeSpaceLeaseKey(knowledgeSpace, registration.id, job.branch || localMirror.branch || registration.default_branch),
+      ownerId: buildVersion,
+      ownerEnv: requestedFromEnv,
+      ttlSeconds: 300,
+      metadata: { buildVersion, source: "local_mirror" }
+    });
+    await ensureBuildRecord({
+      knowledgeSpace,
+      repoId: registration.id,
+      branch: job.branch || localMirror.branch || registration.default_branch,
+      buildVersion,
+      targetHead: localMirror.head,
+      buildKind: "full",
+      requestedBy: job.source,
+      requestedFromEnv
+    });
     return runLocalMirrorFullSync(job, registration, localMirror);
   }
   const resolved = await resolveRegistrationBranch(registration, job.branch, "sync_worker");
   const branch = resolved.branch;
   const effectiveRegistration = resolved.registration;
   const head = job.after_commit_sha ?? (await getBranchHead(effectiveRegistration, branch));
+  const buildVersion = String(job.payload_json?.buildVersion ?? "").trim() || head;
+  await repo.acquireIngestLease({
+    leaseKey: buildKnowledgeSpaceLeaseKey(knowledgeSpace, effectiveRegistration.id, branch),
+    ownerId: buildVersion,
+    ownerEnv: requestedFromEnv,
+    ttlSeconds: 300,
+    metadata: { buildVersion, source: "remote" }
+  });
+  await ensureBuildRecord({
+    knowledgeSpace,
+    repoId: effectiveRegistration.id,
+    branch,
+    buildVersion,
+    targetHead: head,
+    buildKind: "full",
+    requestedBy: job.source,
+    requestedFromEnv
+  });
   const cursor = getLocalMirrorCursor(job);
   return runRemoteSnapshotBatch({
     registration: effectiveRegistration,
+    knowledgeSpace,
     branch,
     head,
+    buildVersion,
     cursor,
     limit: env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE
   });
 }
 
 async function runIncrementalSync(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
-  const localMirror = await getLocalDocsMirrorState(registration);
-  if (localMirror) {
-    const branch = job.branch || localMirror.branch || registration.default_branch;
-    const checkpoint = await repo.getCheckpoint(registration.id, branch);
-    if (checkpoint?.last_synced_commit_sha && checkpoint.last_synced_commit_sha === localMirror.head) {
-      return { indexed: 0, removed: 0, head: localMirror.head, finished: true, nextCursor: null };
-    }
-    const full = await runLocalMirrorFullSync({ ...job, branch }, registration, localMirror);
-    return { indexed: full.indexed, removed: full.deactivated, head: full.head, finished: full.finished, nextCursor: full.nextCursor };
-  }
-  const resolved = await resolveRegistrationBranch(registration, job.branch, "sync_worker");
-  const branch = resolved.branch;
-  const effectiveRegistration = resolved.registration;
-  const checkpoint = await repo.getCheckpoint(effectiveRegistration.id, branch);
-  const before = job.before_commit_sha ?? checkpoint?.last_synced_commit_sha ?? null;
-  const after = job.after_commit_sha ?? (await getBranchHead(effectiveRegistration, branch));
-
-  if (!before) {
-    const full = await runFullSync({ ...job, branch }, effectiveRegistration);
-    return { indexed: full.indexed, removed: full.deactivated, head: full.head, finished: full.finished, nextCursor: full.nextCursor };
-  }
-
-  if (before === after) {
-    return { indexed: 0, removed: 0, head: after, finished: true, nextCursor: null };
-  }
-
-  const changed = await compareCommits(effectiveRegistration, before, after);
-  const toIndex = new Set<string>();
-  let removed = 0;
-
-  for (const file of changed) {
-    if (!/\.(md|mdx)$/i.test(file.filename)) continue;
-    if (file.status === "removed") {
-      await repo.deactivateDocumentByPath(effectiveRegistration.id, branch, file.filename);
-      removed += 1;
-      continue;
-    }
-    if (file.status === "renamed" && file.previous_filename) {
-      await repo.deactivateDocumentByPath(effectiveRegistration.id, branch, file.previous_filename);
-    }
-    if (isPathIncluded(file.filename, registration.include_paths, registration.exclude_paths)) {
-      toIndex.add(file.filename);
-    }
-  }
-
-  for (const path of toIndex) {
-    await indexDocument(effectiveRegistration, branch, after, path);
-  }
-
-  await repo.upsertCheckpoint({
-    repoId: effectiveRegistration.id,
-    branch,
-    lastSyncedCommitSha: after,
-    fullSync: false
-  });
-
-  return { indexed: toIndex.size, removed, head: after, finished: true, nextCursor: null };
+  // Conservative Part 02 implementation: until patch-build safety is proven, all incremental work falls back to a new full build.
+  return runFullSync({ ...job, sync_mode: "full" }, registration);
 }
 
 async function runReindex(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
@@ -1609,6 +2575,12 @@ export async function runRepositorySyncDirect(input: {
 
 async function enqueueSyncContinuation(job: SyncJob, registration: RepoRegistration, result: SyncExecutionResult): Promise<void> {
   if (result.finished || !result.nextCursor) return;
+  const continuationPayload = {
+    ...job.payload_json,
+    cursor: result.nextCursor,
+    buildVersion: String(job.payload_json?.buildVersion ?? "").trim() || result.head,
+    knowledgeSpace: String(job.payload_json?.knowledgeSpace ?? "").trim() || resolveRuntimeKnowledgeSpace()
+  };
   await enqueueSyncJob({
     repoId: registration.id,
     branch: job.branch,
@@ -1616,10 +2588,7 @@ async function enqueueSyncContinuation(job: SyncJob, registration: RepoRegistrat
     source: job.source,
     beforeCommitSha: job.before_commit_sha ?? undefined,
     afterCommitSha: result.head,
-    payload: {
-      ...job.payload_json,
-      cursor: result.nextCursor
-    },
+    payload: continuationPayload,
     idempotencyKey: `sync-continuation:${job.sync_mode}:${registration.id}:${job.branch}:${result.head}:${result.nextCursor}`
   });
 }
@@ -1736,6 +2705,117 @@ export async function getDocsComStatus(options?: { recentJobLimit?: number }) {
   };
 }
 
+async function createDocsComFullSyncRun(input: {
+  registration: RepoRegistration;
+  actor: string;
+  branch?: string;
+  runReason?: string;
+}): Promise<{
+  run: KbSyncRun;
+  shards: KbSyncRunShard[];
+  created: boolean;
+  sourceMode: "local_mirror" | "remote";
+}> {
+  const existing = await repo.findActiveFullSyncRun(input.registration.id, input.branch?.trim() || input.registration.default_branch);
+  if (existing) {
+    return {
+      run: existing,
+      shards: await repo.listSyncRunShards(existing.id),
+      created: false,
+      sourceMode: "remote"
+    };
+  }
+
+  const snapshot = await freezeDocsComSourceSnapshot(input.registration, input.branch);
+  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
+  const requestedFromEnv = resolveRequestedFromEnv();
+  const manifestItems = snapshot.files
+    .map((file) => {
+      const shardKey = classifyDocsComShard(file.path);
+      if (!shardKey) return null;
+      return {
+        path: file.path,
+        shardKey,
+        blobSha: file.sha,
+        sizeBytes: file.size,
+        needsRebuild: true,
+        reuseReason: null
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item));
+
+  const { run, shards } = await repo.createFullSyncRun({
+    repoId: input.registration.id,
+    branch: snapshot.branch,
+    targetHead: snapshot.head,
+    requestedBy: input.actor,
+    runReason: input.runReason,
+    sourceSnapshotTotal: manifestItems.length,
+    manifestItems
+  });
+
+  const buildVersion = buildFullRunBuildVersion(run.target_head, run.id);
+  await repo.acquireIngestLease({
+    leaseKey: buildKnowledgeSpaceLeaseKey(knowledgeSpace, input.registration.id, snapshot.branch),
+    ownerId: run.id,
+    ownerEnv: requestedFromEnv,
+    ttlSeconds: 600,
+    metadata: {
+      buildVersion,
+      targetHead: snapshot.head,
+      actor: input.actor
+    }
+  });
+  await ensureBuildRecord({
+    knowledgeSpace,
+    repoId: input.registration.id,
+    branch: snapshot.branch,
+    buildVersion,
+    targetHead: snapshot.head,
+    buildKind: "full",
+    requestedBy: input.actor,
+    requestedFromEnv,
+    sourceSnapshotTotal: manifestItems.length
+  });
+  for (const shard of shards) {
+    if (shard.total_docs === 0) {
+      await repo.advanceSyncRunShard({
+        runId: run.id,
+        shardKey: shard.shard_key,
+        completedDelta: 0,
+        reusableDelta: 0,
+        rebuiltDelta: 0,
+        failedDelta: 0,
+        nextCursor: null,
+        status: "succeeded"
+      });
+      continue;
+    }
+    await enqueueSyncJob({
+      repoId: input.registration.id,
+      branch: snapshot.branch,
+      mode: "full",
+      source: "system",
+      afterCommitSha: snapshot.head,
+      payload: {
+        runId: run.id,
+        shardKey: shard.shard_key,
+        targetHead: snapshot.head,
+        buildVersion,
+        sourceMode: snapshot.mode
+      },
+      idempotencyKey: `sync-continuation:full:${run.id}:${shard.shard_key}:${snapshot.head}:start`
+    });
+  }
+
+  return {
+    run,
+    shards: await repo.listSyncRunShards(run.id),
+    created: true,
+    sourceMode: snapshot.mode
+  };
+}
+
 export async function ensureDocsComKnowledgeBase(input?: {
   actor?: string;
   mode?: "incremental" | "full" | "reindex";
@@ -1749,22 +2829,63 @@ export async function ensureDocsComKnowledgeBase(input?: {
   const beforeStatus = beforeRegistration ? await summarizeDocsComCorpus(beforeRegistration, 5) : null;
 
   const { registration, validation } = await registerRepository(registrationInput);
+  let enqueuedJob:
+    | {
+        id: string;
+        mode: string;
+        status: string;
+        branch: string;
+        idempotencyKey: string;
+      }
+    | null = null;
+  let runSummary:
+    | {
+        id: string;
+        targetHead: string;
+        status: string;
+        created: boolean;
+        shardCount: number;
+      }
+    | null = null;
 
-  const idempotencyKey = [
-    "docs-com",
-    mode,
-    registration.id,
-    registration.default_branch,
-    input?.idempotencySeed?.trim() || new Date().toISOString().slice(0, 16)
-  ].join(":");
+  if (mode === "full" && isDocsComRegistration(registration)) {
+    const run = await createDocsComFullSyncRun({
+      registration,
+      actor,
+      branch: registration.default_branch,
+      runReason: `docs-com ensure ${input?.idempotencySeed?.trim() || new Date().toISOString()}`
+    });
+    runSummary = {
+      id: run.run.id,
+      targetHead: run.run.target_head,
+      status: run.run.status,
+      created: run.created,
+      shardCount: run.shards.length
+    };
+  } else {
+    const idempotencyKey = [
+      "docs-com",
+      mode,
+      registration.id,
+      registration.default_branch,
+      input?.idempotencySeed?.trim() || new Date().toISOString().slice(0, 16)
+    ].join(":");
 
-  const job = await enqueueSyncJob({
-    repoId: registration.id,
-    branch: registration.default_branch,
-    mode,
-    source: "system",
-    idempotencyKey
-  });
+    const job = await enqueueSyncJob({
+      repoId: registration.id,
+      branch: registration.default_branch,
+      mode,
+      source: "system",
+      idempotencyKey
+    });
+    enqueuedJob = {
+      id: job.id,
+      mode: job.sync_mode,
+      status: job.status,
+      branch: job.branch,
+      idempotencyKey: job.idempotency_key
+    };
+  }
   const runLimit = Math.max(0, Math.min(20, input?.runLimit ?? 0));
   const runResult = runLimit > 0 ? await runDueSyncJobs(runLimit) : { processed: 0, succeeded: 0, failed: 0, deadLetter: 0 };
   const afterStatus = await summarizeDocsComCorpus(registration, 10);
@@ -1778,17 +2899,169 @@ export async function ensureDocsComKnowledgeBase(input?: {
       JSON.stringify(beforeRegistration.include_paths) !== JSON.stringify(registration.include_paths) ||
       JSON.stringify(beforeRegistration.exclude_paths) !== JSON.stringify(registration.exclude_paths),
     validation,
-    enqueuedJob: {
-      id: job.id,
-      mode: job.sync_mode,
-      status: job.status,
-      branch: job.branch,
-      idempotencyKey: job.idempotency_key
-    },
+    enqueuedJob,
+    fullRun: runSummary,
     runResult,
     beforeStatus,
     afterStatus
   };
+}
+
+export async function startKnowledgeBaseFullBuild(input: {
+  repoId: string;
+  branch?: string;
+  actor: string;
+  knowledgeSpace?: KbKnowledgeSpace;
+}): Promise<{
+  knowledgeSpace: KbKnowledgeSpace;
+  job?: Awaited<ReturnType<typeof enqueueSyncJob>>;
+  build?: KbBuild | null;
+  fullRun?: { id: string; targetHead: string; created: boolean };
+}> {
+  const runtimeKnowledgeSpace = resolveRuntimeKnowledgeSpace();
+  if (input.knowledgeSpace && input.knowledgeSpace !== runtimeKnowledgeSpace) {
+    throw new Error(`Cross-space full build start requires operator override support. Requested ${input.knowledgeSpace}, runtime ${runtimeKnowledgeSpace}`);
+  }
+  const registration = await repo.getRepoRegistrationById(input.repoId);
+  if (!registration || !registration.is_active) {
+    throw new Error(`Repository registration not found or inactive: ${input.repoId}`);
+  }
+  const knowledgeSpace = input.knowledgeSpace ?? runtimeKnowledgeSpace;
+  if (isDocsComRegistration(registration)) {
+    const run = await createDocsComFullSyncRun({
+      registration,
+      actor: input.actor,
+      branch: input.branch ?? registration.default_branch,
+      runReason: `api full build ${new Date().toISOString()}`
+    });
+    const buildVersion = buildFullRunBuildVersion(run.run.target_head, run.run.id);
+    const build = await repo.getBuildByVersion({
+      knowledgeSpace,
+      repoId: registration.id,
+      branch: run.run.branch,
+      buildVersion
+    });
+    return {
+      knowledgeSpace,
+      build,
+      fullRun: {
+        id: run.run.id,
+        targetHead: run.run.target_head,
+        created: run.created
+      }
+    };
+  }
+
+  const job = await enqueueSyncJob({
+    repoId: registration.id,
+    branch: input.branch ?? registration.default_branch,
+    mode: "full",
+    source: "manual",
+    payload: {
+      knowledgeSpace
+    }
+  });
+  return {
+    knowledgeSpace,
+    job
+  };
+}
+
+export async function startKnowledgeBaseIncrementalBuild(input: {
+  repoId: string;
+  branch?: string;
+  actor: string;
+  knowledgeSpace?: KbKnowledgeSpace;
+}): Promise<{
+  knowledgeSpace: KbKnowledgeSpace;
+  fallbackMode: "full_rebuild";
+  job: Awaited<ReturnType<typeof enqueueSyncJob>>;
+}> {
+  const runtimeKnowledgeSpace = resolveRuntimeKnowledgeSpace();
+  if (input.knowledgeSpace && input.knowledgeSpace !== runtimeKnowledgeSpace) {
+    throw new Error(
+      `Cross-space incremental build start requires operator override support. Requested ${input.knowledgeSpace}, runtime ${runtimeKnowledgeSpace}`
+    );
+  }
+  const knowledgeSpace = input.knowledgeSpace ?? runtimeKnowledgeSpace;
+  const job = await enqueueSyncJob({
+    repoId: input.repoId,
+    branch: input.branch,
+    mode: "incremental",
+    source: "manual",
+    payload: {
+      knowledgeSpace
+    }
+  });
+  return {
+    knowledgeSpace,
+    fallbackMode: "full_rebuild",
+    job
+  };
+}
+
+export async function promoteValidatedBuild(input: {
+  buildId: string;
+  actor: string;
+}): Promise<{
+  build: KbBuild;
+  publication: Awaited<ReturnType<typeof repo.getPublication>>;
+}> {
+  const build = await repo.getBuildById(input.buildId);
+  if (!build) throw new Error(`Build not found: ${input.buildId}`);
+  const registration = await repo.getRepoRegistrationById(build.repo_id);
+  const requestedFromEnv = resolveRequestedFromEnv();
+  const validation = await validateBuildForPublication({
+    knowledgeSpace: build.knowledge_space,
+    repoId: build.repo_id,
+    branch: build.branch,
+    buildVersion: build.build_version,
+    buildId: build.id,
+    requiredPrefixes: registration && isDocsComRegistration(registration) ? DOCS_COM_REQUIRED_PREFIXES : undefined
+  });
+  if (!validation.passed) {
+    throw new Error(`Build ${build.build_version} is not publishable`);
+  }
+  if (!canPublishToKnowledgeSpace(requestedFromEnv, build.knowledge_space)) {
+    throw new Error(`Environment ${requestedFromEnv} cannot promote build ${build.build_version} into ${build.knowledge_space}`);
+  }
+  await publishValidatedBuild({
+    knowledgeSpace: build.knowledge_space,
+    repoId: build.repo_id,
+    branch: build.branch,
+    buildId: build.id,
+    buildVersion: build.build_version,
+    targetHead: build.target_head,
+    publishedBy: input.actor,
+    publishedFromEnv: requestedFromEnv
+  });
+  return {
+    build: (await repo.getBuildById(build.id)) ?? build,
+    publication: await repo.getPublication({
+      knowledgeSpace: build.knowledge_space,
+      repoId: build.repo_id,
+      branch: build.branch
+    })
+  };
+}
+
+export async function getKnowledgeBasePublicationStatus(input?: {
+  repoId?: string;
+  branch?: string;
+  knowledgeSpace?: KbKnowledgeSpace;
+}) {
+  return repo.listPublications({
+    repoId: input?.repoId,
+    branch: input?.branch,
+    knowledgeSpace: input?.knowledgeSpace
+  });
+}
+
+export async function getKnowledgeBaseBuildDetails(buildId: string) {
+  const build = await repo.getBuildById(buildId);
+  if (!build) return null;
+  const validations = await repo.listBuildValidationResults(buildId);
+  return { build, validations };
 }
 
 export async function enqueueSyncJob(input: {
@@ -1812,6 +3085,12 @@ export async function enqueueSyncJob(input: {
   const idempotencyKey =
     input.idempotencyKey ??
     `${input.mode}:${resolved.registration.id}:${resolved.branch}:${input.beforeCommitSha ?? "none"}:${input.afterCommitSha ?? Date.now()}`;
+  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
+  const payload = {
+    ...(input.payload ?? {}),
+    knowledgeSpace,
+    ...(input.mode === "full" && input.afterCommitSha ? { buildVersion: String(input.payload?.buildVersion ?? "").trim() || input.afterCommitSha } : {})
+  };
 
   return repo.enqueueSyncJob({
     repoId: resolved.registration.id,
@@ -1821,11 +3100,12 @@ export async function enqueueSyncJob(input: {
     idempotencyKey,
     beforeCommitSha: input.beforeCommitSha,
     afterCommitSha: input.afterCommitSha,
-    payload: input.payload
+    payload
   });
 }
 
 export async function runDueSyncJobs(limit: number): Promise<{ processed: number; succeeded: number; failed: number; deadLetter: number }> {
+  await repo.requeueStaleRunningJobs(10);
   const jobs = await repo.claimDueSyncJobs(limit);
   let succeeded = 0;
   let failed = 0;
@@ -1849,7 +3129,16 @@ export async function runDueSyncJobs(limit: number): Promise<{ processed: number
 
       let executionResult: SyncExecutionResult;
       if (job.sync_mode === "full") {
-        const result = await runFullSync(job, registration);
+        const fullRunPayload = getFullRunPayload(job);
+        const activeDocsComFullRun =
+          !fullRunPayload && isDocsComRegistration(registration)
+            ? await repo.findActiveFullSyncRun(registration.id, job.branch)
+            : null;
+        const result = fullRunPayload
+          ? await runDocsComFullSyncShardJob(job, registration)
+          : activeDocsComFullRun
+            ? { indexed: 0, head: activeDocsComFullRun.target_head, finished: true, nextCursor: null }
+            : await runFullSync(job, registration);
         executionResult = result;
         await repo.recordMetric({
           repoId: registration.id,
@@ -1877,7 +3166,9 @@ export async function runDueSyncJobs(limit: number): Promise<{ processed: number
         });
       }
 
-      await enqueueSyncContinuation(job, registration, executionResult);
+      if (!getFullRunPayload(job)) {
+        await enqueueSyncContinuation(job, registration, executionResult);
+      }
 
       await repo.markSyncJobSucceeded(job.id);
       await repo.recordMetric({
@@ -1997,8 +3288,10 @@ export async function backfillRepositoryFromLocalMirror(
   const branch = registration.default_branch;
   const batch = await runLocalMirrorSyncBatch({
     registration,
+    knowledgeSpace: resolveRuntimeKnowledgeSpace(),
     branch,
     localMirror,
+    buildVersion: localMirror.head,
     cursor: options?.cursor,
     limit: options?.limit ?? env.GITHUB_KB_LOCAL_MIRROR_BATCH_SIZE
   });
@@ -2326,11 +3619,41 @@ export async function retrieveKnowledge(input: {
   requiredDocKinds?: string[];
 }): Promise<RetrievalResponse> {
   const topK = input.topK ?? getProfileConfig(input.profile).topK;
+  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
+  const effectiveBranch =
+    input.branch?.trim() ||
+    (input.repoId ? ((await repo.getRepoRegistrationById(input.repoId))?.default_branch ?? undefined) : undefined);
+  const publicationCount = await repo.countPublications({
+    knowledgeSpace,
+    repoId: input.repoId,
+    branch: effectiveBranch
+  });
+  if (publicationCount === 0) {
+    return {
+      query: input.query,
+      profile: input.profile,
+      answerLanguage: input.answerLanguage ?? detectQueryLanguage(input.query),
+      answer:
+        (input.answerLanguage ?? detectQueryLanguage(input.query)) === "zh"
+          ? "当前知识库不可用，无法给出可靠引用答案。请先完成对应 knowledge space 的发布，再重试。"
+          : "The knowledge base is currently unavailable. Publish a validated build for this knowledge space before retrying.",
+      resolvedQueries: [input.query],
+      confidence: 0,
+      fallbackUsed: false,
+      hits: [],
+      debug: {
+        vectorCandidates: 0,
+        keywordCandidates: 0,
+        mergedCandidates: 0,
+        rewrittenQueries: [input.query]
+      }
+    };
+  }
   const cacheKey = buildRetrievalCacheKey({
     query: input.query,
     profile: input.profile,
     repoId: input.repoId,
-    branch: input.branch,
+    branch: effectiveBranch,
     topK,
     includeFallback: input.includeFallback
   });
@@ -2350,8 +3673,9 @@ export async function retrieveKnowledge(input: {
     retrieveGroundedMemoryHits({
       query: input.query,
       rewrites: queryVariants,
+      knowledgeSpace,
       repoId: input.repoId,
-      branch: input.branch,
+      branch: effectiveBranch,
       supportSignals: input.supportSignals,
       caseFrame: input.caseFrame,
       requiredDocKinds: input.requiredDocKinds,
@@ -2389,8 +3713,9 @@ export async function retrieveKnowledge(input: {
       queryVariants.map(async (variant) => {
       const lexicalPromise = repo
         .searchKeywordCandidates({
+          knowledgeSpace,
           repoId: input.repoId,
-          branch: input.branch,
+          branch: effectiveBranch,
           query: variant,
           limit: effectiveTopK * 4
         })
@@ -2400,8 +3725,9 @@ export async function retrieveKnowledge(input: {
         try {
           const embedded = await embedWithRetry(variant);
           return await repo.searchVectorCandidates({
+            knowledgeSpace,
             repoId: input.repoId,
-            branch: input.branch,
+            branch: effectiveBranch,
             vectorLiteral: embedded.vectorLiteral,
             limit: effectiveTopK * 4
           });
@@ -2426,8 +3752,9 @@ export async function retrieveKnowledge(input: {
   if (input.includeFallback && confidence < cfg.threshold) {
     const fallbackDocs = await repo
       .listCandidateDocumentsForFallback({
+        knowledgeSpace,
         repoId: input.repoId,
-        branch: input.branch,
+        branch: effectiveBranch,
         query: input.query,
         limit: Math.max(2, Math.ceil(effectiveTopK / 2))
       })

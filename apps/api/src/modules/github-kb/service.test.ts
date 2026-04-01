@@ -5,7 +5,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { test } from "node:test";
 import { env } from "../../config/env.js";
 import type { RepoRegistration } from "./types.js";
-import { buildQueryAnchoredSnippet, getLocalDocsMirrorState, resolveBootstrapIncludePaths, sliceSnapshotForBackfill } from "./service.js";
+import {
+  buildDocsComIncludePaths,
+  buildQueryAnchoredSnippet,
+  ensureMarkdownCoverage,
+  getLocalDocsMirrorState,
+  resolveBootstrapIncludePaths,
+  sliceSnapshotForBackfill
+} from "./service.js";
 
 const localMirrorRegistration: RepoRegistration = {
   id: "docs-com-test",
@@ -29,6 +36,98 @@ const localMirrorRegistration: RepoRegistration = {
 test("resolveBootstrapIncludePaths falls back to markdown and mdx coverage", () => {
   assert.deepEqual(resolveBootstrapIncludePaths(""), ["**/*.md", "**/*.mdx"]);
   assert.deepEqual(resolveBootstrapIncludePaths("docs/**/*.mdx"), ["docs/**/*.mdx"]);
+});
+
+test("resolveBootstrapIncludePaths keeps docs-com open-docs and deploy-docs coverage for long env lists", () => {
+  const includePaths = resolveBootstrapIncludePaths(
+    [
+      "AGENTS.md",
+      "README.md",
+      "CONTRIBUTING.md",
+      "REGION_FILTER_GUIDE.md",
+      "docs/*.md",
+      "docs/*.mdx",
+      "docs/**/*.md",
+      "docs/**/*.mdx",
+      "open-docs/*.md",
+      "open-docs/*.mdx",
+      "open-docs/**/*.md",
+      "open-docs/**/*.mdx",
+      "deploy-docs/*.md",
+      "deploy-docs/*.mdx",
+      "deploy-docs/**/*.md",
+      "deploy-docs/**/*.mdx",
+      "scripts/**/*.md",
+      "src/**/README.md"
+    ].join(",")
+  );
+
+  assert.equal(includePaths.includes("open-docs/**/*.md"), true);
+  assert.equal(includePaths.includes("open-docs/**/*.mdx"), true);
+  assert.equal(includePaths.includes("deploy-docs/**/*.md"), true);
+  assert.equal(includePaths.includes("deploy-docs/**/*.mdx"), true);
+  assert.equal(includePaths.length, 18);
+});
+
+test("ensureMarkdownCoverage does not truncate long docs-com include lists", () => {
+  const includePaths = ensureMarkdownCoverage([
+    "AGENTS.md",
+    "README.md",
+    "CONTRIBUTING.md",
+    "REGION_FILTER_GUIDE.md",
+    "docs/*.md",
+    "docs/*.mdx",
+    "docs/**/*.md",
+    "docs/**/*.mdx",
+    "open-docs/*.md",
+    "open-docs/*.mdx",
+    "open-docs/**/*.md",
+    "open-docs/**/*.mdx",
+    "deploy-docs/*.md",
+    "deploy-docs/*.mdx",
+    "deploy-docs/**/*.md",
+    "deploy-docs/**/*.mdx",
+    "scripts/**/*.md",
+    "src/**/README.md"
+  ]);
+
+  assert.equal(includePaths.includes("open-docs/**/*.md"), true);
+  assert.equal(includePaths.includes("open-docs/**/*.mdx"), true);
+  assert.equal(includePaths.includes("deploy-docs/**/*.md"), true);
+  assert.equal(includePaths.includes("deploy-docs/**/*.mdx"), true);
+  assert.equal(includePaths.length, 18);
+});
+
+test("buildDocsComIncludePaths strips non-docs repo metadata patterns", () => {
+  const includePaths = buildDocsComIncludePaths(
+    [
+      "AGENTS.md",
+      "README.md",
+      "CONTRIBUTING.md",
+      "REGION_FILTER_GUIDE.md",
+      "docs/*.md",
+      "docs/*.mdx",
+      "docs/**/*.md",
+      "docs/**/*.mdx",
+      "open-docs/*.md",
+      "open-docs/*.mdx",
+      "open-docs/**/*.md",
+      "open-docs/**/*.mdx",
+      "deploy-docs/*.md",
+      "deploy-docs/*.mdx",
+      "deploy-docs/**/*.md",
+      "deploy-docs/**/*.mdx",
+      "scripts/**/*.md",
+      "src/**/README.md"
+    ].join(",")
+  );
+
+  assert.equal(includePaths.includes("AGENTS.md"), false);
+  assert.equal(includePaths.includes("README.md"), false);
+  assert.equal(includePaths.includes("scripts/**/*.md"), false);
+  assert.equal(includePaths.includes("docs/**/*.md"), true);
+  assert.equal(includePaths.includes("open-docs/**/*.mdx"), true);
+  assert.equal(includePaths.includes("deploy-docs/**/*.md"), true);
 });
 
 test("buildQueryAnchoredSnippet exposes later callback evidence instead of chunk prefix", () => {

@@ -4,6 +4,7 @@ import type {
   KbMemoryEntry,
   MemoryAliasDraft,
   MemoryCaseFrame,
+  MemoryCitationDraft,
   MemoryEntryDraft,
   MemoryProfileDraft,
   MemoryProfileHit,
@@ -11,9 +12,11 @@ import type {
   MemoryRelationHit,
   MemoryRetrievalHit,
   MemorySignalDraft,
+  MemorySourceCitationHit,
   MemorySourceChunkHit,
   MemorySourceDraft
 } from "./memory-types.js";
+import type { KbKnowledgeSpace } from "./types.js";
 
 function toJson(value: unknown): string {
   return JSON.stringify(value ?? {});
@@ -35,9 +38,14 @@ function normalizeSignalRows(input: Array<{ signalType?: string; value: string }
   return [...deduped.values()];
 }
 
-function buildMemoryWhere(filters: { repoId?: string; branch?: string }) {
-  const clauses = ["entry.status = 'active'", "entry.is_latest = true"];
-  const values: unknown[] = [];
+function buildMemoryWhere(filters: { repoId?: string; branch?: string; knowledgeSpace: KbKnowledgeSpace }) {
+  const clauses = [
+    `pub.knowledge_space = $1`,
+    `entry.knowledge_space = pub.knowledge_space`,
+    `entry.status = 'active'`,
+    `entry.build_version = pub.published_build_version`
+  ];
+  const values: unknown[] = [filters.knowledgeSpace];
   if (filters.repoId) {
     values.push(filters.repoId);
     clauses.push(`entry.repo_id = $${values.length}`);
@@ -52,17 +60,18 @@ function buildMemoryWhere(filters: { repoId?: string; branch?: string }) {
 export async function upsertMemoryEntry(input: MemoryEntryDraft): Promise<KbMemoryEntry> {
   const result = await pool.query<KbMemoryEntry>(
     `INSERT INTO kb_memory_entries (
-      id, repo_id, branch, doc_id, path, memory_kind, title, canonical_claim, summary,
+      id, repo_id, knowledge_space, branch, doc_id, path, memory_kind, title, canonical_claim, summary,
       product_area, doc_kind, action_type, deployment_model, object_type,
       is_static, is_latest, status, build_version, metadata_json, search_text, search_vector
     ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,
-      $10,$11,$12,$13,$14,
-      $15,true,'active',$16,$17::jsonb,$18,to_tsvector('english', $18)
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+      $11,$12,$13,$14,$15,
+      $16,true,'active',$17,$18::jsonb,$19,to_tsvector('english', $19)
     )
     ON CONFLICT (id)
     DO UPDATE SET
       repo_id = EXCLUDED.repo_id,
+      knowledge_space = EXCLUDED.knowledge_space,
       branch = EXCLUDED.branch,
       doc_id = EXCLUDED.doc_id,
       path = EXCLUDED.path,
@@ -87,6 +96,7 @@ export async function upsertMemoryEntry(input: MemoryEntryDraft): Promise<KbMemo
     [
       input.id,
       input.repo_id,
+      input.knowledge_space,
       input.branch,
       input.doc_id,
       input.path,
@@ -109,13 +119,28 @@ export async function upsertMemoryEntry(input: MemoryEntryDraft): Promise<KbMemo
 }
 
 export async function replaceMemoryAliases(memoryId: string, aliases: MemoryAliasDraft[]): Promise<void> {
-  await pool.query(`DELETE FROM kb_memory_aliases WHERE memory_id = $1`, [memoryId]);
-  for (const alias of aliases) {
-    await pool.query(
-      `INSERT INTO kb_memory_aliases (id, memory_id, alias, alias_type, weight, metadata_json)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-      [uuidv4(), memoryId, alias.alias, alias.alias_type, alias.weight, toJson(alias.metadata_json ?? {})]
-    );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [memoryId]);
+    await client.query(`DELETE FROM kb_memory_aliases WHERE memory_id = $1`, [memoryId]);
+    for (const alias of aliases) {
+      await client.query(
+        `INSERT INTO kb_memory_aliases (id, memory_id, alias, alias_type, weight, metadata_json)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+         ON CONFLICT (memory_id, alias, alias_type)
+         DO UPDATE SET
+           weight = EXCLUDED.weight,
+           metadata_json = EXCLUDED.metadata_json`,
+        [uuidv4(), memoryId, alias.alias, alias.alias_type, alias.weight, toJson(alias.metadata_json ?? {})]
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -124,7 +149,11 @@ export async function replaceMemorySignals(memoryId: string, signals: MemorySign
   for (const signal of signals) {
     await pool.query(
       `INSERT INTO kb_memory_signals (id, memory_id, signal_type, signal_value, weight, metadata_json)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+       ON CONFLICT (memory_id, signal_type, signal_value)
+       DO UPDATE SET
+         weight = GREATEST(kb_memory_signals.weight, EXCLUDED.weight),
+         metadata_json = EXCLUDED.metadata_json`,
       [uuidv4(), memoryId, signal.signal_type, signal.signal_value, signal.weight, toJson(signal.metadata_json ?? {})]
     );
   }
@@ -135,8 +164,29 @@ export async function replaceMemorySources(memoryId: string, sources: MemorySour
   for (const source of sources) {
     await pool.query(
       `INSERT INTO kb_memory_sources (memory_id, doc_id, chunk_id, heading_path, source_score, source_metadata_json)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+       ON CONFLICT (memory_id, chunk_id)
+       DO UPDATE SET
+         doc_id = EXCLUDED.doc_id,
+         heading_path = EXCLUDED.heading_path,
+         source_score = GREATEST(kb_memory_sources.source_score, EXCLUDED.source_score),
+         source_metadata_json = EXCLUDED.source_metadata_json`,
       [memoryId, source.doc_id, source.chunk_id, source.heading_path, source.source_score, toJson(source.source_metadata_json ?? {})]
+    );
+  }
+}
+
+export async function replaceMemoryCitations(memoryId: string, citations: MemoryCitationDraft[]): Promise<void> {
+  await pool.query(`DELETE FROM kb_memory_citations WHERE memory_id = $1`, [memoryId]);
+  for (const citation of citations) {
+    await pool.query(
+      `INSERT INTO kb_memory_citations (memory_id, citation_id, source_score, source_metadata_json)
+       VALUES ($1, $2, $3, $4::jsonb)
+       ON CONFLICT (memory_id, citation_id)
+       DO UPDATE SET
+         source_score = GREATEST(kb_memory_citations.source_score, EXCLUDED.source_score),
+         source_metadata_json = EXCLUDED.source_metadata_json`,
+      [memoryId, citation.citation_id, citation.source_score, toJson(citation.source_metadata_json ?? {})]
     );
   }
 }
@@ -147,6 +197,15 @@ export async function deactivateMemoryArtifactsByDocument(docId: string): Promis
      WHERE doc_id = $1
        AND status = 'inactive'`,
     [docId]
+  );
+}
+
+export async function deleteBuildScopedMemoryEntriesForDocument(docId: string, buildVersion: string): Promise<void> {
+  await pool.query(
+    `DELETE FROM kb_memory_entries
+     WHERE doc_id = $1
+       AND build_version = $2`,
+    [docId, buildVersion]
   );
 }
 
@@ -178,6 +237,7 @@ export async function markPriorBuildVersionInactive(repoId: string, branch: stri
 }
 
 export async function searchMemoryEntries(input: {
+  knowledgeSpace: KbKnowledgeSpace;
   repoId?: string;
   branch?: string;
   query: string;
@@ -236,6 +296,9 @@ export async function searchMemoryEntries(input: {
       )::text AS heading_title_score,
       COALESCE(ts_rank_cd(entry.search_vector, websearch_to_tsquery('english', $${queryParam})), 0)::text AS lexical_score
     FROM kb_memory_entries entry
+    INNER JOIN kb_publications pub
+      ON pub.repo_id = entry.repo_id
+     AND pub.branch = entry.branch
     WHERE ${where.clause}
       AND (
         entry.search_vector @@ websearch_to_tsquery('english', $${queryParam})
@@ -293,6 +356,7 @@ export async function searchMemoryEntries(input: {
 }
 
 export async function searchMemoryAliases(input: {
+  knowledgeSpace: KbKnowledgeSpace;
   repoId?: string;
   branch?: string;
   query: string;
@@ -347,6 +411,9 @@ export async function searchMemoryAliases(input: {
       alias.weight::text
     FROM kb_memory_aliases alias
     INNER JOIN kb_memory_entries entry ON entry.id = alias.memory_id
+    INNER JOIN kb_publications pub
+      ON pub.repo_id = entry.repo_id
+     AND pub.branch = entry.branch
     WHERE ${where.clause}
       AND (
         similarity(alias.alias, $${queryParam}) >= 0.2
@@ -395,6 +462,7 @@ export async function searchMemoryAliases(input: {
 }
 
 export async function searchMemorySignals(input: {
+  knowledgeSpace: KbKnowledgeSpace;
   repoId?: string;
   branch?: string;
   signals: Array<{ signalType?: string; value: string }>;
@@ -468,6 +536,9 @@ export async function searchMemorySignals(input: {
         )
       )
     INNER JOIN kb_memory_entries entry ON entry.id = signal.memory_id
+    INNER JOIN kb_publications pub
+      ON pub.repo_id = entry.repo_id
+     AND pub.branch = entry.branch
     WHERE ${where.clause}
     ORDER BY
       GREATEST(
@@ -511,14 +582,19 @@ export async function searchMemorySignals(input: {
 }
 
 export async function searchMemoryProfiles(input: {
+  knowledgeSpace: KbKnowledgeSpace;
   repoId?: string;
   branch?: string;
   query: string;
   caseFrame?: MemoryCaseFrame;
   limit: number;
 }): Promise<MemoryProfileHit[]> {
-  const conditions = ["profile.is_active = true"];
-  const values: unknown[] = [];
+  const conditions = [
+    `pub.knowledge_space = $1`,
+    `profile.knowledge_space = pub.knowledge_space`,
+    `profile.build_version = pub.published_build_version`
+  ];
+  const values: unknown[] = [input.knowledgeSpace];
   if (input.repoId) {
     values.push(input.repoId);
     conditions.push(`profile.repo_id = $${values.length}`);
@@ -564,6 +640,9 @@ export async function searchMemoryProfiles(input: {
         + CASE WHEN $${objectParam} <> '' AND profile.profile_key ILIKE '%' || $${objectParam} || '%' THEN 0.15 ELSE 0 END
       )::text AS score
     FROM kb_memory_profiles profile
+    INNER JOIN kb_publications pub
+      ON pub.repo_id = profile.repo_id
+     AND pub.branch = profile.branch
     WHERE ${conditions.join(" AND ")}
       AND (
         similarity(profile.title, $${queryParam}) >= 0.16
@@ -588,6 +667,7 @@ export async function searchMemoryProfiles(input: {
 }
 
 export async function expandMemoryRelations(input: {
+  knowledgeSpace: KbKnowledgeSpace;
   memoryIds: string[];
   limitPerMemory: number;
 }): Promise<MemoryRelationHit[]> {
@@ -636,12 +716,17 @@ export async function expandMemoryRelations(input: {
       FROM kb_memory_relations rel
       INNER JOIN kb_memory_entries target
         ON target.id = rel.to_memory_id
+      INNER JOIN kb_publications pub
+        ON pub.repo_id = target.repo_id
+       AND pub.branch = target.branch
+       AND pub.knowledge_space = $2
+       AND target.knowledge_space = pub.knowledge_space
        AND target.status = 'active'
-       AND target.is_latest = true
+       AND target.build_version = pub.published_build_version
       WHERE rel.from_memory_id = ANY($1::uuid[])
     )
-    SELECT * FROM ranked WHERE rn <= $2`,
-    [memoryIds, input.limitPerMemory]
+    SELECT * FROM ranked WHERE rn <= $3`,
+    [memoryIds, input.knowledgeSpace, input.limitPerMemory]
   );
 
   return result.rows.map((row) => ({
@@ -671,6 +756,7 @@ export async function expandMemoryRelations(input: {
 }
 
 export async function resolveMemorySourcesToChunks(input: {
+  knowledgeSpace: KbKnowledgeSpace;
   memoryIds: string[];
   limitPerMemory: number;
 }): Promise<MemorySourceChunkHit[]> {
@@ -718,15 +804,24 @@ export async function resolveMemorySourcesToChunks(input: {
         ROW_NUMBER() OVER (PARTITION BY src.memory_id ORDER BY src.source_score DESC, chunk.ordinal ASC) AS rn
       FROM kb_memory_sources src
       INNER JOIN kb_memory_entries entry ON entry.id = src.memory_id
-      INNER JOIN kb_chunks chunk ON chunk.id = src.chunk_id AND chunk.is_active = true
-      INNER JOIN kb_documents doc ON doc.id = chunk.doc_id AND doc.is_active = true
+      INNER JOIN kb_chunks chunk ON chunk.id = src.chunk_id
+      INNER JOIN kb_documents doc ON doc.id = chunk.doc_id
       INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
+      INNER JOIN kb_publications pub
+        ON pub.repo_id = doc.repo_id
+       AND pub.branch = doc.branch
       WHERE src.memory_id = ANY($1::uuid[])
+        AND pub.knowledge_space = $2
+        AND entry.knowledge_space = pub.knowledge_space
+        AND chunk.knowledge_space = pub.knowledge_space
+        AND doc.knowledge_space = pub.knowledge_space
         AND entry.status = 'active'
-        AND entry.is_latest = true
+        AND entry.build_version = pub.published_build_version
+        AND chunk.build_version = pub.published_build_version
+        AND doc.build_version = pub.published_build_version
     )
-    SELECT * FROM ranked WHERE rn <= $2`,
-    [memoryIds, input.limitPerMemory]
+    SELECT * FROM ranked WHERE rn <= $3`,
+    [memoryIds, input.knowledgeSpace, input.limitPerMemory]
   );
 
   return result.rows.map((row) => ({
@@ -750,15 +845,113 @@ export async function resolveMemorySourcesToChunks(input: {
   }));
 }
 
+export async function resolveMemorySourcesToCitations(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  memoryIds: string[];
+  limitPerMemory: number;
+}): Promise<MemorySourceCitationHit[]> {
+  const memoryIds = [...new Set(input.memoryIds.filter(Boolean))];
+  if (!memoryIds.length) return [];
+  const result = await pool.query<{
+    memory_id: string;
+    citation_id: string;
+    document_id: string;
+    repo_id: string;
+    repo: string;
+    branch: string;
+    path: string;
+    source_url: string;
+    repo_source_url: string;
+    commit_sha: string;
+    title: string;
+    heading_path: string | null;
+    snippet: string;
+    source_score: string;
+    citation_family: string;
+    source_family: string;
+    citation_metadata_json: Record<string, unknown> | null;
+    doc_metadata_json: Record<string, unknown> | null;
+    memory_metadata_json: Record<string, unknown> | null;
+    rn: string;
+  }>(
+    `WITH ranked AS (
+      SELECT
+        mc.memory_id,
+        cu.id AS citation_id,
+        COALESCE(cu.source_artifact_id::text, cu.id::text) AS document_id,
+        doc.repo_id,
+        reg.repo_owner || '/' || reg.repo_name AS repo,
+        doc.branch,
+        cu.path,
+        doc.source_url,
+        doc.repo_source_url,
+        doc.commit_sha,
+        cu.title,
+        cu.heading_path,
+        cu.snippet_text AS snippet,
+        mc.source_score::text,
+        cu.citation_family,
+        cu.source_family,
+        cu.metadata_json AS citation_metadata_json,
+        doc.metadata_json AS doc_metadata_json,
+        entry.metadata_json AS memory_metadata_json,
+        ROW_NUMBER() OVER (PARTITION BY mc.memory_id ORDER BY mc.source_score DESC, cu.updated_at DESC) AS rn
+      FROM kb_memory_citations mc
+      INNER JOIN kb_memory_entries entry ON entry.id = mc.memory_id
+      INNER JOIN kb_citation_units cu ON cu.id = mc.citation_id
+      INNER JOIN kb_documents doc ON doc.id = cu.source_doc_id
+      INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
+      INNER JOIN kb_publications pub
+        ON pub.repo_id = doc.repo_id
+       AND pub.branch = doc.branch
+      WHERE mc.memory_id = ANY($1::uuid[])
+        AND pub.knowledge_space = $2
+        AND entry.knowledge_space = pub.knowledge_space
+        AND cu.knowledge_space = pub.knowledge_space
+        AND doc.knowledge_space = pub.knowledge_space
+        AND entry.status = 'active'
+        AND entry.build_version = pub.published_build_version
+        AND cu.build_version = pub.published_build_version
+        AND doc.build_version = pub.published_build_version
+    )
+    SELECT * FROM ranked WHERE rn <= $3`,
+    [memoryIds, input.knowledgeSpace, input.limitPerMemory]
+  );
+
+  return result.rows.map((row) => ({
+    memoryId: row.memory_id,
+    citationId: row.citation_id,
+    documentId: row.document_id,
+    repoId: row.repo_id,
+    repo: row.repo,
+    branch: row.branch,
+    path: row.path,
+    sourceUrl: row.source_url,
+    repoSourceUrl: row.repo_source_url,
+    commitSha: row.commit_sha,
+    title: row.title,
+    headingPath: row.heading_path ?? "ROOT",
+    snippet: row.snippet,
+    sourceScore: Number(row.source_score),
+    citationFamily: row.citation_family,
+    sourceFamily: row.source_family,
+    citationMetadata: row.citation_metadata_json ?? undefined,
+    docMetadata: row.doc_metadata_json ?? undefined,
+    memoryMetadata: row.memory_metadata_json ?? undefined
+  }));
+}
+
 export async function listActiveMemoryEntriesForScope(input: {
+  knowledgeSpace: KbKnowledgeSpace;
   repoId: string;
   branch: string;
   path?: string;
   productArea?: string;
+  buildVersion?: string;
   limit?: number;
 }): Promise<KbMemoryEntry[]> {
-  const clauses = ["repo_id = $1", "branch = $2", "status = 'active'", "is_latest = true"];
-  const values: unknown[] = [input.repoId, input.branch];
+  const clauses = ["repo_id = $1", "knowledge_space = $2", "branch = $3", "status = 'active'"];
+  const values: unknown[] = [input.repoId, input.knowledgeSpace, input.branch];
   if (input.path) {
     values.push(input.path);
     clauses.push(`path = $${values.length}`);
@@ -766,6 +959,12 @@ export async function listActiveMemoryEntriesForScope(input: {
   if (input.productArea) {
     values.push(input.productArea);
     clauses.push(`product_area = $${values.length}`);
+  }
+  if (input.buildVersion) {
+    values.push(input.buildVersion);
+    clauses.push(`build_version = $${values.length}`);
+  } else {
+    clauses.push("is_latest = true");
   }
   values.push(input.limit ?? 200);
   const limitParam = values.length;
@@ -809,11 +1008,12 @@ export async function upsertMemoryProfiles(profiles: MemoryProfileDraft[]): Prom
   for (const profile of profiles) {
     await pool.query(
       `INSERT INTO kb_memory_profiles (
-        id, repo_id, branch, profile_key, profile_kind, title,
+        id, repo_id, knowledge_space, branch, profile_key, profile_kind, title,
         static_summary, dynamic_summary, build_version, metadata_json, is_active
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,true)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,true)
       ON CONFLICT (repo_id, branch, profile_key, build_version)
       DO UPDATE SET
+        knowledge_space = EXCLUDED.knowledge_space,
         profile_kind = EXCLUDED.profile_kind,
         title = EXCLUDED.title,
         static_summary = EXCLUDED.static_summary,
@@ -824,6 +1024,7 @@ export async function upsertMemoryProfiles(profiles: MemoryProfileDraft[]): Prom
       [
         profile.id,
         profile.repo_id,
+        profile.knowledge_space,
         profile.branch,
         profile.profile_key,
         profile.profile_kind,

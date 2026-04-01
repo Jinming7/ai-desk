@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+const kbKnowledgeSpaceSchema = z.enum(["support-prod", "support-preview", "support-local", "support-shadow", "support-eval"]);
+
 export const kbRepoRegistrationSchema = z.object({
   repoUrl: z.string().min(1),
   publicBaseUrl: z.string().url().optional(),
@@ -33,6 +35,31 @@ export const kbDocsComEnsureSchema = z.object({
 
 export const kbDocsComStatusQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(50).default(10)
+});
+
+export const kbBuildsFullSchema = z.object({
+  repoId: z.string().uuid(),
+  branch: z.string().min(1).optional(),
+  actor: z.string().min(1).default("internal_operator"),
+  knowledgeSpace: kbKnowledgeSpaceSchema.optional()
+});
+
+export const kbBuildsIncrementalSchema = z.object({
+  repoId: z.string().uuid(),
+  branch: z.string().min(1).optional(),
+  actor: z.string().min(1).default("internal_operator"),
+  knowledgeSpace: kbKnowledgeSpaceSchema.optional()
+});
+
+export const kbPublicationPromoteSchema = z.object({
+  buildId: z.string().uuid(),
+  actor: z.string().min(1).default("internal_operator")
+});
+
+export const kbPublicationStatusQuerySchema = z.object({
+  repoId: z.string().uuid().optional(),
+  branch: z.string().min(1).optional(),
+  knowledgeSpace: kbKnowledgeSpaceSchema.optional()
 });
 
 export const kbRetrievalQuerySchema = z.object({
