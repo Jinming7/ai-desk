@@ -165,7 +165,34 @@ Those items must be captured later using the sequence defined in `docs/29_AI_Sup
 
 ---
 
-## 7. Stage Judgment
+## 7. Runtime Environment Availability Gap
+
+Additional environment probes were executed after the automated verification snapshot.
+
+Observed facts:
+
+- repository root in the current workspace does not contain a real `.env`
+- repository root contains `.env.test` only
+- `.env.test` points to `NODE_ENV=test`
+- `.env.test` does not contain OpenClaw edge or gateway credentials
+- the current shell session does not inject `DATABASE_URL`, `OPENCLAW_WS_URL`, `OPENCLAW_BASIC_USER`, `OPENCLAW_BASIC_PASS`, or `OPENCLAW_GATEWAY_TOKEN`
+- no API service was reachable on `http://127.0.0.1:4000`
+- therefore `GET /api/v1/health` and `GET /api/v1/integrations/openclaw/health` could not be executed against a real running environment in this workspace
+
+Operational meaning:
+
+- the current evidence proves the test harness and rollout-readiness preflight state of the code revision
+- it does not prove that a real credentialed runtime environment is already configured and ready for direct use
+- it does not prove live OpenClaw reachability for this workspace
+- it does not prove customer-facing behavior in a running environment outside `NODE_ENV=test`
+
+Therefore the following statement is still not yet justified by evidence:
+
+- `I can directly use the feature in the real environment and its effect already matches expectation`
+
+---
+
+## 8. Stage Judgment
 
 Current stage judgment for the revision under review:
 
@@ -179,7 +206,7 @@ Not claimed by this record:
 
 ---
 
-## 8. Required Next Evidence
+## 9. Required Next Evidence
 
 Before any real promotion decision, the following still must be executed and recorded against an approved target scope:
 
