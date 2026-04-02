@@ -1,0 +1,37 @@
+{
+  "version": "2026-04-01",
+  "cases": [
+    {
+      "kind": "retrieval",
+      "case": {
+        "id": "regression_wrong_family_onesql",
+        "query": "Does ONESQL support ORDER BY and GROUP BY?",
+        "answerLanguage": "en",
+        "expectedPrimaryFamily": "doc_page",
+        "acceptablePaths": ["docs/onesql/query-language.md"],
+        "acceptableArtifactIds": [],
+        "acceptableCitationTargets": ["docs/onesql/query-language.md#order-by"],
+        "expectedExactSignals": ["onesql", "order by", "group by"],
+        "forbiddenFamilies": ["config_file"],
+        "requireGroundableCandidate": true,
+        "expectKbUnavailable": false
+      }
+    },
+    {
+      "kind": "answer",
+      "case": {
+        "id": "regression_missing_citation_scope",
+        "query": "What scope is required to create an issue comment via OpenAPI?",
+        "answerLanguage": "en",
+        "expectedAnswerType": "api",
+        "requiredClaims": ["scope", "issue comment"],
+        "minimumNextSteps": ["Confirm the token scope before retrying."],
+        "minimumCitationCount": 1,
+        "requiredCitationTargets": ["openapi", "comment"],
+        "forbiddenHallucinations": ["admin:all"],
+        "requireDirectAnswer": true,
+        "maximumStillNeedToConfirm": 1
+      }
+    }
+  ]
+}

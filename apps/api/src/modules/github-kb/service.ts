@@ -39,6 +39,7 @@ import type {
   KbKnowledgeSpace,
   KbPublication,
   KbRequestedFromEnv,
+  KbSyncJobStatus,
   SyncCheckpoint,
   KbSyncManifestItem,
   KbSyncRun,
@@ -75,6 +76,15 @@ const REMOTE_MANIFEST_CHECKSUM_CONCURRENCY = 4;
 export const githubKbServiceDeps = {
   updateManifestItemBuildStatus(input: Parameters<typeof repo.updateManifestItemBuildStatus>[0]) {
     return repo.updateManifestItemBuildStatus(input);
+  },
+  getBuildByVersion(input: Parameters<typeof repo.getBuildByVersion>[0]) {
+    return repo.getBuildByVersion(input);
+  },
+  updateBuildStatus(input: Parameters<typeof repo.updateBuildStatus>[0]) {
+    return repo.updateBuildStatus(input);
+  },
+  releaseIngestLease(leaseKey: string, ownerId?: string) {
+    return repo.releaseIngestLease(leaseKey, ownerId);
   }
 };
 
@@ -814,6 +824,50 @@ function getFullRunPayload(job: SyncJob): null | {
   if (!["deploy-docs", "docs", "open-docs"].includes(shardKey)) return null;
   if (sourceMode !== "local_mirror" && sourceMode !== "remote") return null;
   return { runId, shardKey, targetHead, buildVersion, sourceMode, cursor };
+}
+
+function resolveGenericSyncJobBuildVersion(job: SyncJob): string | null {
+  const explicit = String(job.payload_json?.buildVersion ?? "").trim();
+  if (explicit) return explicit;
+  const targetHead = String(job.after_commit_sha ?? "").trim();
+  if (!targetHead) return null;
+  return buildExecutionScopedBuildVersion(targetHead, resolveSyncExecutionId(job.payload_json, job.id));
+}
+
+export async function handleTerminalGenericSyncJobFailure(input: {
+  job: SyncJob;
+  status: KbSyncJobStatus;
+  errorMessage: string;
+}): Promise<void> {
+  if (input.status !== "dead_letter" || getFullRunPayload(input.job)) {
+    return;
+  }
+
+  const knowledgeSpace = resolveJobKnowledgeSpace(input.job);
+  const buildVersion = resolveGenericSyncJobBuildVersion(input.job);
+  if (buildVersion) {
+    const build = await githubKbServiceDeps.getBuildByVersion({
+      knowledgeSpace,
+      repoId: input.job.repo_id,
+      branch: input.job.branch,
+      buildVersion
+    });
+    if (build && (build.status === "building" || build.status === "built")) {
+      await githubKbServiceDeps.updateBuildStatus({
+        buildId: build.id,
+        status: "failed",
+        errorMessage: input.errorMessage,
+        finished: true
+      });
+    }
+  }
+
+  await githubKbServiceDeps
+    .releaseIngestLease(
+      buildKnowledgeSpaceLeaseKey(knowledgeSpace, input.job.repo_id, input.job.branch),
+      resolveSyncExecutionId(input.job.payload_json, input.job.id)
+    )
+    .catch(() => undefined);
 }
 
 async function summarizeDocsComSourceCorpus(registration: RepoRegistration): Promise<DocsComSourceCorpusSnapshot> {
@@ -3603,11 +3657,17 @@ export async function runDueSyncJobs(limit: number): Promise<{ processed: number
       });
       succeeded += 1;
     } catch (error) {
+      const errorMessage = (error as Error).message;
       const fullRunPayload = getFullRunPayload(job);
       if (fullRunPayload && isTransientDbError(error)) {
         await repo.heartbeatSyncRunShard(fullRunPayload.runId, fullRunPayload.shardKey, "queued").catch(() => undefined);
       }
-      const status = await repo.markSyncJobFailed(job, (error as Error).message);
+      const status = await repo.markSyncJobFailed(job, errorMessage);
+      await handleTerminalGenericSyncJobFailure({
+        job,
+        status,
+        errorMessage
+      });
       failed += 1;
       if (status === "dead_letter") {
         deadLetter += 1;

@@ -340,3 +340,14 @@ Scopes:
     await rm(rootDir, { recursive: true, force: true });
   }
 });
+
+test("search keeps explicit kb retrieval failures as kb_unavailable", async () => {
+  const searchKnowledgeCalls = { count: 0 };
+  const orchestrator = new SearchOrchestrator(createAdapter(searchKnowledgeCalls));
+
+  const result = await orchestrator.search("simulate_support_agent_failure", "search-orchestrator-kb-unavailable");
+
+  assert.equal(result.references.length, 0);
+  assert.equal(result.retrievalStatus, "kb_unavailable");
+  assert.equal(result.unresolvedReasonCode, "KB_RETRIEVAL_UNAVAILABLE");
+});

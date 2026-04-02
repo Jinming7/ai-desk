@@ -29,12 +29,20 @@ const mockRepoSnapshots: Record<string, Record<string, MockSnapshot>> = {
       "deploy-docs/troubleshooting/infra/k3s-alert-handler.md":
         "---\nid: alert-handler\nsidebar_label: Alert故障处理\n---\n\n# Alert故障处理\n\n本文介绍关于 k3s/k8s 常见告警主题处理及解决方案。\n\n## KubeVersionMismatch\n\n- 优先级: P4\n- 描述: There are $value different semantic versions of Kubernetes components running.\n- 解决方法: 立即处理，联系 ONES 进行处理。"
     }
+  },
+  "BangWork/docs-com": {
+    mockc2: {
+      "docs/api.md": "# API Access\n\n401 usually means token scope mismatch or expired secret."
+    }
   }
 };
 
 const mockRepoHeads: Record<string, Record<string, string>> = {
   "acme/ticket-kb": {
     main: "mockc3"
+  },
+  "BangWork/docs-com": {
+    master: "mockc2"
   }
 };
 
@@ -350,11 +358,11 @@ export async function listFilesAtCommit(registration: RepoRegistration, commitSh
   return walkedFiles;
 }
 
-export async function getFileContentAtCommit(
+export async function getFileContentBufferAtCommit(
   registration: RepoRegistration,
   filePath: string,
   commitSha: string
-): Promise<string> {
+): Promise<Buffer> {
   const repo = parseRepoIdentity(registration.repo_url);
   if (repo.mock) {
     const snapshot = mockGetSnapshot(repo, commitSha);
@@ -362,7 +370,7 @@ export async function getFileContentAtCommit(
     if (typeof content !== "string") {
       throw new Error(`Mock file not found: ${filePath} at ${commitSha}`);
     }
-    return content;
+    return Buffer.from(content, "utf8");
   }
 
   const encodedPath = filePath.split("/").map(encodeURIComponent).join("/");
@@ -377,9 +385,18 @@ export async function getFileContentAtCommit(
     throw new Error(`File payload missing content: ${filePath}`);
   }
   if (payload.encoding === "base64") {
-    return Buffer.from(payload.content, "base64").toString("utf8");
+    return Buffer.from(payload.content, "base64");
   }
-  return payload.content;
+  return Buffer.from(payload.content, "utf8");
+}
+
+export async function getFileContentAtCommit(
+  registration: RepoRegistration,
+  filePath: string,
+  commitSha: string
+): Promise<string> {
+  const content = await getFileContentBufferAtCommit(registration, filePath, commitSha);
+  return content.toString("utf8");
 }
 
 export async function compareCommits(

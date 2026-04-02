@@ -1,0 +1,57 @@
+{
+  "version": "2026-04-01",
+  "cases": [
+    {
+      "id": "zh_api_token_reset",
+      "query": "怎么重置 API token 访问权限？",
+      "answerLanguage": "zh",
+      "expectedPrimaryFamily": "doc_page",
+      "acceptablePaths": ["docs/openapi/api-token.md"],
+      "acceptableArtifactIds": [],
+      "acceptableCitationTargets": ["docs/openapi/api-token.md#reset-token"],
+      "expectedExactSignals": ["api token"],
+      "forbiddenFamilies": ["config_file"],
+      "requireGroundableCandidate": true,
+      "expectKbUnavailable": false
+    },
+    {
+      "id": "zh_github_callback_404",
+      "query": "GitHub 集成授权后回调页面显示 page not found，怎么排查？",
+      "answerLanguage": "zh",
+      "expectedPrimaryFamily": "runbook_file",
+      "acceptablePaths": ["docs/integrations/github-callback.md"],
+      "acceptableArtifactIds": [],
+      "acceptableCitationTargets": ["docs/integrations/github-callback.md#callback-404"],
+      "expectedExactSignals": ["callback", "redirect uri"],
+      "forbiddenFamilies": ["openapi_spec"],
+      "requireGroundableCandidate": true,
+      "expectKbUnavailable": false
+    },
+    {
+      "id": "en_openapi_comment_scope",
+      "query": "What scope is required to create an issue comment via OpenAPI?",
+      "answerLanguage": "en",
+      "expectedPrimaryFamily": "openapi_spec",
+      "acceptablePaths": ["open-docs/openapi/comments.md"],
+      "acceptableArtifactIds": [],
+      "acceptableCitationTargets": ["open-docs/openapi/comments.md#issue-comment"],
+      "expectedExactSignals": ["scope", "issue comment"],
+      "forbiddenFamilies": ["config_file"],
+      "requireGroundableCandidate": true,
+      "expectKbUnavailable": false
+    },
+    {
+      "id": "en_onesql_order_by",
+      "query": "Does ONESQL support ORDER BY and GROUP BY?",
+      "answerLanguage": "en",
+      "expectedPrimaryFamily": "doc_page",
+      "acceptablePaths": ["docs/onesql/query-language.md"],
+      "acceptableArtifactIds": [],
+      "acceptableCitationTargets": ["docs/onesql/query-language.md#order-by"],
+      "expectedExactSignals": ["onesql", "order by", "group by"],
+      "forbiddenFamilies": ["config_file"],
+      "requireGroundableCandidate": true,
+      "expectKbUnavailable": false
+    }
+  ]
+}

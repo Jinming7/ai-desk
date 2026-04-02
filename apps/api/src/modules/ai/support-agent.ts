@@ -11,11 +11,11 @@ import type {
   DraftSupportAnswer,
   SearchDialogState,
   SearchModeResult,
-  SearchReference,
   SpecialistDraftAnswer,
   StructuredSearchAnswer,
   SupportAnswer,
   SupportAgentStageTiming,
+  SupportAgentStageTraceEntry,
   SupportAgentStageTimings,
   SupportCaseFrame,
   SupportEvidenceBundle,
@@ -25,6 +25,7 @@ import type {
   SupportVerificationResult,
   TriageSupportInsight
 } from "./types.js";
+import { resolveSearchReferenceEvidenceId, type SearchReference } from "./types.js";
 import { SearchOrchestrator } from "./search-orchestrator.js";
 import { resolveStageSpecificAgent } from "./agent-router.js";
 
@@ -77,6 +78,45 @@ function stageTiming(
 
 function skippedStageTiming(): SupportAgentStageTiming {
   return { duration_ms: 0, status: "skipped" };
+}
+
+function mergeStageTimings(timings: SupportAgentStageTiming[]): SupportAgentStageTiming {
+  if (timings.length === 0) {
+    return skippedStageTiming();
+  }
+  const duration_ms = timings.reduce((sum, item) => sum + item.duration_ms, 0);
+  const status: SupportAgentStageTiming["status"] = timings.some((item) => item.status === "fallback")
+    ? "fallback"
+    : timings.every((item) => item.status === "skipped")
+    ? "skipped"
+    : "completed";
+  const query_count = timings.reduce((sum, item) => sum + (item.query_count ?? 0), 0);
+  const reference_count = timings.reduce((sum, item) => sum + (item.reference_count ?? 0), 0);
+  return {
+    duration_ms,
+    status,
+    ...(query_count > 0 ? { query_count } : {}),
+    ...(reference_count > 0 ? { reference_count } : {})
+  };
+}
+
+function stageTraceEntry(input: {
+  stage: SupportAgentStageTraceEntry["stage"];
+  timing: SupportAgentStageTiming;
+  runtimeStage?: NonNullable<OpenClawRuntimeContext["stage"]>;
+  idempotencyKey?: string;
+}): SupportAgentStageTraceEntry {
+  const resolved = input.runtimeStage ? resolveStageSpecificAgent(input.runtimeStage) : null;
+  return {
+    stage: input.stage,
+    status: input.timing.status,
+    duration_ms: input.timing.duration_ms,
+    agent_id: resolved?.agentId,
+    model: resolved?.model ?? null,
+    idempotency_key: input.idempotencyKey,
+    query_count: input.timing.query_count,
+    reference_count: input.timing.reference_count
+  };
 }
 
 function remainingBudgetMs(runtime?: OpenClawRuntimeContext): number | null {
@@ -771,7 +811,7 @@ function buildEvidenceBundle(input: {
 }): SupportEvidenceBundle {
   const reranked = rerankReferencesForCaseFrame(input.references, input.query, input.caseFrame);
   const candidateReferences = filterReferencesByEvidencePolicy(reranked, input.caseFrame);
-  const byId = new Map(candidateReferences.map((reference) => [reference.documentId, reference] as const));
+  const byId = new Map(candidateReferences.map((reference) => [resolveSearchReferenceEvidenceId(reference), reference] as const));
   const selectedPrimary =
     input.selection?.primary_ids
       .map((id) => byId.get(id))
@@ -781,13 +821,16 @@ function buildEvidenceBundle(input: {
       .map((id) => byId.get(id))
       .filter(
         (item): item is SearchReference =>
-          Boolean(item) && !selectedPrimary.some((primary) => primary.documentId === (item as SearchReference).documentId)
+          Boolean(item) &&
+          !selectedPrimary.some(
+            (primary) => resolveSearchReferenceEvidenceId(primary) === resolveSearchReferenceEvidenceId(item as SearchReference)
+          )
       ) ?? [];
   const primary = uniqueStrings(
     [
-      ...selectedPrimary.map((item) => item.documentId),
+      ...selectedPrimary.map((item) => resolveSearchReferenceEvidenceId(item)),
       ...collectProcedureCompanionChunkIds(candidateReferences, selectedPrimary, input.caseFrame),
-      ...candidateReferences.slice(0, 3).map((item) => item.documentId)
+      ...candidateReferences.slice(0, 3).map((item) => resolveSearchReferenceEvidenceId(item))
     ],
     3
   )
@@ -796,13 +839,18 @@ function buildEvidenceBundle(input: {
     .map((item) => hydrateReferenceEvidence(item));
   const supplemental = uniqueStrings(
     [
-      ...selectedSupplemental.map((item) => item.documentId),
+      ...selectedSupplemental.map((item) => resolveSearchReferenceEvidenceId(item)),
       ...collectProcedureCompanionChunkIds(candidateReferences, primary, input.caseFrame),
       ...collectApiCompanionChunkIds(candidateReferences, primary, input.caseFrame),
       ...candidateReferences
-        .filter((item) => !primary.some((primaryRef) => primaryRef.documentId === item.documentId))
+        .filter(
+          (item) =>
+            !primary.some(
+              (primaryRef) => resolveSearchReferenceEvidenceId(primaryRef) === resolveSearchReferenceEvidenceId(item)
+            )
+        )
         .slice(0, 5)
-        .map((item) => item.documentId)
+        .map((item) => resolveSearchReferenceEvidenceId(item))
     ],
     5
   )
@@ -834,11 +882,11 @@ function collectProcedureCompanionChunkIds(
     if (String(item.headingPath ?? "").toUpperCase() === "ROOT") continue;
     const companion = references.find(
       (candidate) =>
-        candidate.documentId !== item.documentId &&
+        resolveSearchReferenceEvidenceId(candidate) !== resolveSearchReferenceEvidenceId(item) &&
         canonicalDocsPath(candidate.path) === canonicalPath &&
         String(candidate.headingPath ?? "").toUpperCase() === "ROOT"
     );
-    if (companion) ids.push(companion.documentId);
+    if (companion) ids.push(resolveSearchReferenceEvidenceId(companion));
   }
   return uniqueStrings(ids, 3);
 }
@@ -856,12 +904,12 @@ function collectApiCompanionChunkIds(
     if (String(item.headingPath ?? "").toUpperCase() !== "ROOT") continue;
     const companion = references.find(
       (candidate) =>
-        candidate.documentId !== item.documentId &&
+        resolveSearchReferenceEvidenceId(candidate) !== resolveSearchReferenceEvidenceId(item) &&
         isReferenceEligibleForCaseFrame(candidate, caseFrame) &&
         canonicalDocsPath(candidate.path) === canonicalPath &&
         String(candidate.headingPath ?? "").toUpperCase() !== "ROOT"
     );
-    if (companion) ids.push(companion.documentId);
+    if (companion) ids.push(resolveSearchReferenceEvidenceId(companion));
   }
   return uniqueStrings(ids, 3);
 }
@@ -870,9 +918,16 @@ function fallbackEvidenceSelection(references: SearchReference[], query: string,
   const reranked = rerankReferencesForCaseFrame(references, query, caseFrame);
   const candidateReferences = filterReferencesByEvidencePolicy(reranked, caseFrame);
   return {
-    primary_ids: candidateReferences.slice(0, 3).map((item) => item.documentId),
-    supplemental_ids: candidateReferences.slice(3, 6).map((item) => item.documentId),
-    rejected_ids: reranked.filter((item) => !candidateReferences.some((candidate) => candidate.documentId === item.documentId)).map((item) => item.documentId)
+    primary_ids: candidateReferences.slice(0, 3).map((item) => resolveSearchReferenceEvidenceId(item)),
+    supplemental_ids: candidateReferences.slice(3, 6).map((item) => resolveSearchReferenceEvidenceId(item)),
+    rejected_ids: reranked
+      .filter(
+        (item) =>
+          !candidateReferences.some(
+            (candidate) => resolveSearchReferenceEvidenceId(candidate) === resolveSearchReferenceEvidenceId(item)
+          )
+      )
+      .map((item) => resolveSearchReferenceEvidenceId(item))
   };
 }
 
@@ -1319,7 +1374,7 @@ function sanitizeVerification(input: {
   const evidenceById = new Map(
     [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental]
       .filter((item) => item.authority === "canonical_visible")
-      .map((item) => [item.documentId, item] as const)
+      .map((item) => [resolveSearchReferenceEvidenceId(item), item] as const)
   );
   const sanitizedClaims = input.verification.claim_to_citation_map.map((claim) => {
     const validCitationIds = uniqueStrings(
@@ -1386,8 +1441,9 @@ function buildCitations(input: {
   const bestById = new Map<string, SearchReference>();
   for (const item of input.references) {
     if (!item.sourceUrl || item.authority !== "canonical_visible") continue;
-    const previous = bestById.get(item.documentId);
-    if (!previous || item.score > previous.score) bestById.set(item.documentId, item);
+    const evidenceId = resolveSearchReferenceEvidenceId(item);
+    const previous = bestById.get(evidenceId);
+    if (!previous || item.score > previous.score) bestById.set(evidenceId, item);
   }
   const selected: SearchReference[] = [];
   const seenCanonicalKeys = new Set<string>();
@@ -1401,7 +1457,7 @@ function buildCitations(input: {
     if (selected.length >= 3) break;
   }
   return selected.map((item) => ({
-    id: item.documentId,
+    id: resolveSearchReferenceEvidenceId(item),
     title: item.title,
     excerpt: item.snippet,
     score: item.score,
@@ -1520,7 +1576,7 @@ function scoreVerificationCandidate(
   const evidenceById = new Map(
     [...evidenceBundle.primary, ...evidenceBundle.supplemental]
       .filter((item) => item.authority === "canonical_visible")
-      .map((item) => [item.documentId, item] as const)
+      .map((item) => [resolveSearchReferenceEvidenceId(item), item] as const)
   );
   const focusTerms = collectFocusTerms(query, caseFrame);
   let score = 0;
@@ -1790,7 +1846,7 @@ function hasGroundedDraftClaims(draft: SpecialistDraftAnswer): boolean {
 
 function hasGroundedDraftClaimsInEvidence(draft: SpecialistDraftAnswer, evidenceBundle: SupportEvidenceBundle): boolean {
   const evidenceIds = new Set(
-    [...evidenceBundle.primary, ...evidenceBundle.supplemental].map((reference) => reference.documentId)
+    [...evidenceBundle.primary, ...evidenceBundle.supplemental].map((reference) => resolveSearchReferenceEvidenceId(reference))
   );
   return draft.claims.some(
     (claim) =>
@@ -2079,8 +2135,16 @@ function recoverEvidenceAnchoredHowToDraft(input: {
   const actionCandidate = analyzed.find((item) => item.blocks.steps.length > 0) ?? analyzed[0];
   if (!actionCandidate) return null;
   const noteCandidate =
-    analyzed.find((item) => item.reference.documentId !== actionCandidate.reference.documentId && item.blocks.notes.length > 0) ??
-    analyzed.find((item) => item.reference.documentId !== actionCandidate.reference.documentId && item.blocks.steps.length > 0) ??
+    analyzed.find(
+      (item) =>
+        resolveSearchReferenceEvidenceId(item.reference) !== resolveSearchReferenceEvidenceId(actionCandidate.reference) &&
+        item.blocks.notes.length > 0
+    ) ??
+    analyzed.find(
+      (item) =>
+        resolveSearchReferenceEvidenceId(item.reference) !== resolveSearchReferenceEvidenceId(actionCandidate.reference) &&
+        item.blocks.steps.length > 0
+    ) ??
     null;
   const actionReference = actionCandidate.reference;
   const noteReference = noteCandidate?.reference;
@@ -2120,7 +2184,7 @@ function recoverEvidenceAnchoredHowToDraft(input: {
         {
           text: `《${actionReference.title}》中的“${actionHeading}”提供了与当前问题直接相关的操作步骤或处理要求。`,
           kind: "verified_fact",
-          evidence_ids: [actionReference.documentId],
+          evidence_ids: [resolveSearchReferenceEvidenceId(actionReference)],
           authority: "canonical"
         },
         ...(noteReference
@@ -2128,7 +2192,7 @@ function recoverEvidenceAnchoredHowToDraft(input: {
               {
                 text: `《${noteReference.title}》补充说明了“${noteHeading}”相关的限制、前提或验证信息。`,
                 kind: "verified_fact" as const,
-                evidence_ids: [noteReference.documentId],
+                evidence_ids: [resolveSearchReferenceEvidenceId(noteReference)],
                 authority: "canonical" as const
               }
             ]
@@ -2161,7 +2225,7 @@ function recoverEvidenceAnchoredHowToDraft(input: {
       {
         text: `"${actionReference.title}" contains "${actionHeading}", which provides directly relevant procedure steps or requirements.`,
         kind: "verified_fact",
-        evidence_ids: [actionReference.documentId],
+        evidence_ids: [resolveSearchReferenceEvidenceId(actionReference)],
         authority: "canonical"
       },
       ...(noteReference
@@ -2169,7 +2233,7 @@ function recoverEvidenceAnchoredHowToDraft(input: {
             {
               text: `"${noteReference.title}" adds "${noteHeading}" details that are relevant for prerequisites, limits, or validation.`,
               kind: "verified_fact" as const,
-              evidence_ids: [noteReference.documentId],
+              evidence_ids: [resolveSearchReferenceEvidenceId(noteReference)],
               authority: "canonical" as const
             }
           ]
@@ -2258,7 +2322,7 @@ function recoverEvidenceAnchoredDeploymentBehaviorDraft(input: {
           ? `《${primary.title}》显示当前私有部署文档描述的是统一部署或合设架构。`
           : `"${primary.title}" describes the current self-hosted deployment as a unified or colocated architecture.`,
       kind: "verified_fact",
-      evidence_ids: [primary.documentId],
+      evidence_ids: [resolveSearchReferenceEvidenceId(primary)],
       authority: "canonical"
     }
   ];
@@ -2270,7 +2334,7 @@ function recoverEvidenceAnchoredDeploymentBehaviorDraft(input: {
           ? `《${externalizationRef.title}》说明部分基础设施组件可以外置或单独调整，例如数据库或存储。`
           : `"${externalizationRef.title}" shows that some infrastructure components can be externalized or adjusted separately, such as database or storage components.`,
       kind: "verified_fact",
-      evidence_ids: [externalizationRef.documentId],
+      evidence_ids: [resolveSearchReferenceEvidenceId(externalizationRef)],
       authority: "canonical"
     });
   }
@@ -2281,7 +2345,10 @@ function recoverEvidenceAnchoredDeploymentBehaviorDraft(input: {
         ? "基于当前命中的部署文档，我无法确认需求与工作项存在分别独立的服务、数据库和查询路径部署方式。"
         : "Based on the currently retrieved deployment docs, I cannot confirm a separately deployable service/database/query-path topology for requirements versus issues.",
     kind: "grounded_inference",
-    evidence_ids: uniqueStrings([primary.documentId, externalizationRef?.documentId], 2),
+    evidence_ids: uniqueStrings(
+      [resolveSearchReferenceEvidenceId(primary), externalizationRef ? resolveSearchReferenceEvidenceId(externalizationRef) : undefined],
+      2
+    ),
     authority: "canonical"
   });
 
@@ -2412,7 +2479,7 @@ function extractApiFieldCandidates(reference: SearchReference, language: "zh" | 
         language === "zh"
           ? `该接口的字段 ${fieldName} 在文档中说明为“${description}”。`
           : `The documentation describes field ${fieldName} as "${description}".`,
-      evidenceId: reference.documentId,
+      evidenceId: resolveSearchReferenceEvidenceId(reference),
       kind: "verified_fact",
       authority: "canonical",
       score: 0,
@@ -2438,7 +2505,7 @@ function extractApiNarrativeCandidates(reference: SearchReference, language: "zh
         language === "zh"
           ? `《${reference.title}》说明：${fragment.replace(/^[-•]\s*/, "")}。`
           : `"${reference.title}" states: ${fragment.replace(/^[-•]\s*/, "")}.`,
-      evidenceId: reference.documentId,
+      evidenceId: resolveSearchReferenceEvidenceId(reference),
       kind: "verified_fact",
       authority: "canonical",
       score: 0
@@ -2584,7 +2651,7 @@ function recoverEvidenceAnchoredApiDraft(input: {
           input.language === "zh"
             ? `当前应优先调用 ${operation.method} ${operation.path}。`
             : `The primary operation to use here is ${operation.method} ${operation.path}.`,
-        evidenceId: reference.documentId,
+        evidenceId: resolveSearchReferenceEvidenceId(reference),
         kind: "verified_fact",
         authority: "canonical",
         score: 0,
@@ -2783,6 +2850,7 @@ function combineRetrievalQueries(
 
 async function writeSpecialistDraft(input: {
   adapter: OpenClawAdapter;
+  contextType: "search" | "triage";
   route: SupportQuestionRoute;
   language: "zh" | "en";
   query: string;
@@ -2793,7 +2861,7 @@ async function writeSpecialistDraft(input: {
   idempotencyKey: string;
 }): Promise<SpecialistDraftAnswer> {
   const specialistInput = {
-    contextType: "search" as const,
+    contextType: input.contextType,
     language: input.language,
     query: input.query,
     route: input.route,
@@ -2858,7 +2926,15 @@ export async function runSupportSearchAgent(input: {
   adapter: OpenClawAdapter;
   runtime?: OpenClawRuntimeContext;
   attachments?: string[];
+  repoId?: string;
+  branch?: string;
   idempotencyKey: string;
+  contextType?: "search" | "triage";
+  ticketContext?: {
+    priority: string;
+    customerMeta: Record<string, unknown>;
+    history: Array<{ author: string; body: string; at: string }>;
+  };
 }): Promise<{
   result: SearchModeResult;
   caseFrame: SupportCaseFrame;
@@ -2870,13 +2946,14 @@ export async function runSupportSearchAgent(input: {
   const orchestrator = new SearchOrchestrator(input.adapter);
   const allowMultiPassRetrieval = input.runtime?.allowMultiPassRetrieval !== false;
   const allowRefinement = input.runtime?.allowRefinement !== false;
+  const contextType = input.contextType ?? "search";
 
-  const plannerStartedAt = performance.now();
+  const routeStartedAt = performance.now();
   const routerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 32000, 5000, 12000), "router", `${input.idempotencyKey}:router`);
   const routeResult = await input.adapter
     .routeSupportQuestion(
       {
-        contextType: "search",
+        contextType,
         language: input.language,
         query: input.query,
         conversationHistory: input.conversationHistory
@@ -2884,8 +2961,9 @@ export async function runSupportSearchAgent(input: {
       `${input.idempotencyKey}:route`,
       routerRuntime
     )
-    .then((value) => ({ route: value, timing: stageTiming("completed", elapsedMs(plannerStartedAt)) }))
-    .catch(() => ({ route: fallbackQuestionRoute(input.query), timing: stageTiming("fallback", elapsedMs(plannerStartedAt)) }));
+    .then((value) => ({ route: value, timing: stageTiming("completed", elapsedMs(routeStartedAt)) }))
+    .catch(() => ({ route: fallbackQuestionRoute(input.query), timing: stageTiming("fallback", elapsedMs(routeStartedAt)) }));
+  const evidencePlanStartedAt = performance.now();
   const evidencePlannerRuntime = withStageRuntime(
     buildStageRuntime(input.runtime, 26000, 4000, 10000),
     "evidence-planner",
@@ -2894,7 +2972,7 @@ export async function runSupportSearchAgent(input: {
   const evidencePlanResult = await input.adapter
     .planSupportEvidence(
       {
-        contextType: "search",
+        contextType,
         language: input.language,
         query: input.query,
         route: routeResult.route,
@@ -2903,22 +2981,24 @@ export async function runSupportSearchAgent(input: {
       `${input.idempotencyKey}:evidence-plan`,
       evidencePlannerRuntime
     )
-    .then((value) => ({ plan: value }))
-    .catch(() => ({ plan: fallbackEvidencePlan(input.query) }));
+    .then((value) => ({ plan: value, timing: stageTiming("completed", elapsedMs(evidencePlanStartedAt)) }))
+    .catch(() => ({ plan: fallbackEvidencePlan(input.query), timing: stageTiming("fallback", elapsedMs(evidencePlanStartedAt)) }));
+  const casePlanStartedAt = performance.now();
   const plannerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 22000, 5000, 14000), "planner", `${input.idempotencyKey}:planner`);
   const plannerPromise = input.adapter
     .planSupportCase(
       {
-        contextType: "search",
+        contextType,
         language: input.language,
         query: input.query,
-        conversationHistory: input.conversationHistory
+        conversationHistory: input.conversationHistory,
+        ticketContext: input.ticketContext
       },
       `${input.idempotencyKey}:plan`,
       plannerRuntime
     )
-    .then((value) => ({ value }))
-    .catch(() => ({ value: null }));
+    .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(casePlanStartedAt)) }))
+    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(casePlanStartedAt)) }));
   const plannerResult = await plannerPromise;
   const mergedCaseFrame = mergeRouteAndEvidencePlan(plannerResult.value ?? fallbackCaseFrame(input.query), routeResult.route, evidencePlanResult.plan);
   const stabilized = stabilizeSupportRouteAndCaseFrame({
@@ -2941,7 +3021,9 @@ export async function runSupportSearchAgent(input: {
       runtime: input.runtime,
       answerLanguage: input.language,
       attachments: input.attachments,
-      caseFrame
+      caseFrame,
+      repoId: input.repoId,
+      branch: input.branch
     })
     .then((value) => ({
       value,
@@ -2981,7 +3063,9 @@ export async function runSupportSearchAgent(input: {
             runtime: input.runtime,
             answerLanguage: input.language,
             attachments: input.attachments,
-            caseFrame
+            caseFrame,
+            repoId: input.repoId,
+            branch: input.branch
           })
           .catch(() => null)
       : null;
@@ -3024,12 +3108,13 @@ export async function runSupportSearchAgent(input: {
     "support-evidence-selector",
     `${input.idempotencyKey}:evidence-selector`
   );
+  const evidenceSelectionStartedAt = performance.now();
   const evidenceSelection =
     evidenceCollection.references.length > 0 && hasEnoughBudget(input.runtime, 5000)
       ? await input.adapter
           .selectSupportEvidence(
             {
-              contextType: "search",
+              contextType,
               language: input.language,
               query: input.query,
               caseFrame,
@@ -3038,8 +3123,15 @@ export async function runSupportSearchAgent(input: {
             `${input.idempotencyKey}:evidence-selector`,
             selectionRuntime
           )
-          .catch(() => fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame))
-      : fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame);
+          .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(evidenceSelectionStartedAt), { reference_count: value.primary_ids.length + value.supplemental_ids.length }) }))
+          .catch(() => ({
+            value: fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame),
+            timing: stageTiming("fallback", elapsedMs(evidenceSelectionStartedAt), { reference_count: 0 })
+          }))
+      : {
+          value: fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame),
+          timing: stageTiming("skipped", elapsedMs(evidenceSelectionStartedAt), { reference_count: 0 })
+        };
 
   const evidenceBundle = buildEvidenceBundle({
     references: evidenceCollection.references,
@@ -3049,9 +3141,11 @@ export async function runSupportSearchAgent(input: {
     caseFrame,
     query: input.query,
     selection: evidenceSelection
+      .value
   });
+  const shouldSkipWriterFamily = stageBudget.specialist_budget === 0;
   const shouldSkipSpecialist =
-    stageBudget.specialist_budget === 0 ||
+    shouldSkipWriterFamily ||
     (stageBudget.stop_after_grounded_evidence &&
       evidenceBundle.primary.length > 0 &&
       evidenceBundle.confidence >= env.AI_SEARCH_ANSWER_CONFIDENCE_THRESHOLD);
@@ -3065,6 +3159,7 @@ export async function runSupportSearchAgent(input: {
   const specialistResult = !shouldSkipSpecialist && hasEnoughBudget(input.runtime, 6000)
     ? await writeSpecialistDraft({
         adapter: input.adapter,
+        contextType,
         route,
         language: input.language,
         query: input.query,
@@ -3086,18 +3181,20 @@ export async function runSupportSearchAgent(input: {
     model: resolveStageSpecificAgent(route.specialist_agent).model
   });
   const genericWriterResult =
+    !shouldSkipWriterFamily &&
     evidenceBundle.primary.length > 0 &&
     hasEnoughBudget(input.runtime, 5000) &&
     (!specialistResult.value || !hasGroundedDraftClaims(specialistResult.value))
       ? await input.adapter
           .writeSupportAnswer(
             {
-              contextType: "search",
+              contextType,
               language: input.language,
               query: input.query,
               caseFrame,
               evidenceBundle,
-              conversationHistory: input.conversationHistory
+              conversationHistory: input.conversationHistory,
+              ticketContext: input.ticketContext
             },
             `${input.idempotencyKey}:support-writer`,
             genericWriterRuntime
@@ -3225,7 +3322,7 @@ export async function runSupportSearchAgent(input: {
           ? input.adapter
               .judgeSupportAnswer(
                 {
-                  contextType: "search",
+                  contextType,
                   language: input.language,
                   query: input.query,
                   caseFrame,
@@ -3277,13 +3374,14 @@ export async function runSupportSearchAgent(input: {
     "support-citation-binder",
     `${input.idempotencyKey}:support-citation-binder`
   );
+  const citationBinderStartedAt = performance.now();
   const reboundVerification =
     useFastAgentPath || !draftSupportAnswer.claims.length || !evidenceBundle.primary.length || !hasEnoughBudget(input.runtime, 5000)
       ? null
       : await input.adapter
           .bindSupportCitations(
             {
-              contextType: "search",
+              contextType,
               language: input.language,
               query: input.query,
               caseFrame,
@@ -3294,6 +3392,12 @@ export async function runSupportSearchAgent(input: {
             citationBinderRuntime
           )
           .catch(() => null);
+  const citationBinderTiming =
+    useFastAgentPath || !draftSupportAnswer.claims.length || !evidenceBundle.primary.length || !hasEnoughBudget(input.runtime, 5000)
+      ? skippedStageTiming()
+      : stageTiming(reboundVerification ? "completed" : "fallback", elapsedMs(citationBinderStartedAt), {
+          reference_count: reboundVerification?.verified_citation_ids.length ?? 0
+        });
   const reboundSanitized = reboundVerification
     ? sanitizeVerification({
         verification: reboundVerification,
@@ -3314,12 +3418,13 @@ export async function runSupportSearchAgent(input: {
     useFastAgentPath ? "support-citation-selector" : "citation-curator",
     `${input.idempotencyKey}:${useFastAgentPath ? "support-citation-selector" : "citation-curator"}`
   );
+  const citationSelectionStartedAt = performance.now();
   const selectedDisplayCitations =
     supportedVerificationClaims(preselectedVerification).length > 0 && hasEnoughBudget(input.runtime, 4500)
       ? await (useFastAgentPath
           ? input.adapter.selectDisplayCitations(
-              {
-                contextType: "search",
+                {
+                contextType,
                 language: input.language,
                 query: input.query,
                 caseFrame,
@@ -3330,8 +3435,8 @@ export async function runSupportSearchAgent(input: {
               displayCitationSelectorRuntime
             )
           : input.adapter.curateSupportCitations(
-              {
-                contextType: "search",
+                {
+                contextType,
                 language: input.language,
                 query: input.query,
                 caseFrame,
@@ -3343,6 +3448,12 @@ export async function runSupportSearchAgent(input: {
             ))
           .catch(() => null)
       : null;
+  const citationSelectionTiming =
+    supportedVerificationClaims(preselectedVerification).length > 0 && hasEnoughBudget(input.runtime, 4500)
+      ? stageTiming(selectedDisplayCitations ? "completed" : "fallback", elapsedMs(citationSelectionStartedAt), {
+          reference_count: selectedDisplayCitations?.display_citation_ids.length ?? 0
+        })
+      : skippedStageTiming();
 
   const finalVerification = sanitizeVerification({
     verification: selectedDisplayCitations
@@ -3366,6 +3477,7 @@ export async function runSupportSearchAgent(input: {
     "answer-composer",
     `${input.idempotencyKey}:answer-composer`
   );
+  const answerComposerStartedAt = performance.now();
   const shouldComposeCustomerAnswer =
     !useFastAgentPath &&
     hasEnoughBudget(input.runtime, 4500) &&
@@ -3377,7 +3489,7 @@ export async function runSupportSearchAgent(input: {
       ? await input.adapter
           .composeCustomerAnswer(
             {
-              contextType: "search",
+              contextType,
               language: input.language,
               query: input.query,
               mode,
@@ -3393,6 +3505,10 @@ export async function runSupportSearchAgent(input: {
           )
           .catch(() => null)
       : null;
+  const answerComposerTiming =
+    shouldComposeCustomerAnswer
+      ? stageTiming(composedSupportAnswer ? "completed" : "fallback", elapsedMs(answerComposerStartedAt))
+      : skippedStageTiming();
   const supportAnswer = buildSupportAnswerFromDraft({
     language: input.language,
     mode,
@@ -3437,12 +3553,84 @@ export async function runSupportSearchAgent(input: {
       : "LOW_CONFIDENCE";
   const stageTimings: SupportAgentStageTimings = {
     total_ms: elapsedMs(runStartedAt),
-    planner: routeResult.timing,
+    planner: mergeStageTimings([routeResult.timing, evidencePlanResult.timing, plannerResult.timing]),
     retrieval_base: baseEvidenceResult.timing,
     retrieval_extra: additionalTiming,
-    writer: specialistResult.timing,
-    verifier: verificationResult.timing
+    writer: mergeStageTimings([specialistResult.timing, genericWriterResult.timing]),
+    verifier: mergeStageTimings([verificationResult.timing, citationBinderTiming, citationSelectionTiming])
   };
+  const stageTrace: SupportAgentStageTraceEntry[] = [
+    stageTraceEntry({
+      stage: "route",
+      timing: routeResult.timing,
+      runtimeStage: "router",
+      idempotencyKey: `${input.idempotencyKey}:route`
+    }),
+    stageTraceEntry({
+      stage: "evidence_plan",
+      timing: evidencePlanResult.timing,
+      runtimeStage: "evidence-planner",
+      idempotencyKey: `${input.idempotencyKey}:evidence-plan`
+    }),
+    stageTraceEntry({
+      stage: "case_plan",
+      timing: plannerResult.timing,
+      runtimeStage: "planner",
+      idempotencyKey: `${input.idempotencyKey}:plan`
+    }),
+    stageTraceEntry({
+      stage: "retrieval",
+      timing: baseEvidenceResult.timing,
+      idempotencyKey: `${input.idempotencyKey}:evidence`
+    }),
+    stageTraceEntry({
+      stage: "retrieval_refine",
+      timing: additionalTiming,
+      idempotencyKey: `${input.idempotencyKey}:evidence:extra`
+    }),
+    stageTraceEntry({
+      stage: "evidence_selection",
+      timing: evidenceSelection.timing,
+      runtimeStage: "support-evidence-selector",
+      idempotencyKey: `${input.idempotencyKey}:evidence-selector`
+    }),
+    stageTraceEntry({
+      stage: "specialist",
+      timing: specialistResult.timing,
+      runtimeStage: route.specialist_agent,
+      idempotencyKey: `${input.idempotencyKey}:specialist`
+    }),
+    stageTraceEntry({
+      stage: "generic_writer",
+      timing: genericWriterResult.timing,
+      runtimeStage: "support-writer",
+      idempotencyKey: `${input.idempotencyKey}:support-writer`
+    }),
+    stageTraceEntry({
+      stage: "verification",
+      timing: verificationResult.timing,
+      runtimeStage: "evidence-judge",
+      idempotencyKey: `${input.idempotencyKey}:judge`
+    }),
+    stageTraceEntry({
+      stage: "citation_binding",
+      timing: citationBinderTiming,
+      runtimeStage: "support-citation-binder",
+      idempotencyKey: `${input.idempotencyKey}:support-citation-binder`
+    }),
+    stageTraceEntry({
+      stage: "citation_selection",
+      timing: citationSelectionTiming,
+      runtimeStage: useFastAgentPath ? "support-citation-selector" : "citation-curator",
+      idempotencyKey: `${input.idempotencyKey}:${useFastAgentPath ? "support-citation-selector" : "citation-curator"}`
+    }),
+    stageTraceEntry({
+      stage: "answer_composition",
+      timing: answerComposerTiming,
+      runtimeStage: "answer-composer",
+      idempotencyKey: `${input.idempotencyKey}:answer-composer`
+    })
+  ];
 
   return {
     caseFrame,
@@ -3496,12 +3684,79 @@ export async function runSupportSearchAgent(input: {
         ),
         fast_path_used: useFastAgentPath,
         confirmed_facts: uniqueStrings(draftSupportAnswer.confirmed_facts ?? [], 4),
+        stage_trace: stageTrace,
         orchestration_trace: buildOrchestrationTrace({
           route,
           specialistSkipped: shouldSkipSpecialist
         })
       }
     }
+  };
+}
+
+function buildTriageCustomerReply(input: {
+  language: "zh" | "en";
+  action: TriageSupportInsight["recommended_action"];
+  supportAnswer: SupportAnswer;
+  missingInfo: string[];
+}): string {
+  if (input.action === "escalate") {
+    return input.language === "zh"
+      ? "感谢反馈。当前证据不足以给出可靠自助结论，建议升级给研发继续排查。"
+      : "Thanks for the report. The current evidence is not strong enough for a reliable self-serve conclusion, so this should be escalated to engineering.";
+  }
+
+  if (input.action === "ask_user") {
+    const missing = input.missingInfo[0] ?? input.supportAnswer.still_need_to_confirm[0];
+    if (missing) {
+      return input.language === "zh" ? `为继续处理，请先补充：${missing}` : `To continue, please share: ${missing}.`;
+    }
+    return input.language === "zh"
+      ? "为继续处理，请补充当前失败步骤、预期结果、实际结果和报错原文。"
+      : "To continue, please share the failing step, expected result, actual result, and the exact error message.";
+  }
+
+  return uniqueStrings([input.supportAnswer.direct_answer, ...input.supportAnswer.what_to_do_now], 3).join("\n");
+}
+
+function buildTriageInsightFromSupportRuntime(input: {
+  language: "zh" | "en";
+  supportAnswer: SupportAnswer;
+  verification: SupportVerificationResult;
+  evidenceBundle: SupportEvidenceBundle;
+  citations: SearchModeResult["citations"];
+}): TriageSupportInsight {
+  const missingInfo = uniqueStrings(
+    [...input.supportAnswer.still_need_to_confirm, ...input.verification.missing_info],
+    3
+  );
+  const recommended_action: TriageSupportInsight["recommended_action"] =
+    input.supportAnswer.mode === "handoff"
+      ? "escalate"
+      : input.supportAnswer.mode === "clarification"
+      ? "ask_user"
+      : input.verification.verdict === "verified" && input.evidenceBundle.primary.length > 0
+      ? "resolve"
+      : "ask_user";
+
+  return {
+    direct_answer: input.supportAnswer.direct_answer,
+    recommended_action,
+    customer_reply: buildTriageCustomerReply({
+      language: input.language,
+      action: recommended_action,
+      supportAnswer: input.supportAnswer,
+      missingInfo
+    }),
+    customer_reply_policy: recommended_action === "escalate" ? "no_send" : "send_now",
+    support_summary: input.supportAnswer.direct_answer,
+    verified_evidence:
+      input.citations.length > 0
+        ? input.citations.map((item) => item.title).slice(0, 3)
+        : uniqueStrings(input.evidenceBundle.primary.map((item) => item.title), 3),
+    risk_flags: recommended_action === "escalate" ? ["needs_rnd"] : [],
+    missing_info: missingInfo,
+    verifier_verdict: input.verification.verdict
   };
 }
 
@@ -3515,6 +3770,8 @@ export async function runSupportTriageAgent(input: {
   customerMeta: Record<string, unknown>;
   history: Array<{ author: string; body: string; at: string }>;
   attachments?: string[];
+  repoId?: string;
+  branch?: string;
 }): Promise<{
   analyzeOutput: OpenClawAnalyzeOutput & Record<string, unknown>;
   caseFrame: SupportCaseFrame;
@@ -3522,225 +3779,63 @@ export async function runSupportTriageAgent(input: {
   verification: SupportVerificationResult;
   stageTimings: SupportAgentStageTimings;
 }> {
-  const runStartedAt = performance.now();
-  const orchestrator = new SearchOrchestrator(input.adapter);
-  const allowMultiPassRetrieval = input.runtime?.allowMultiPassRetrieval !== false;
-  const allowRefinement = input.runtime?.allowRefinement !== false;
   const conversationHistory = input.history
     .slice(-6)
     .map((item) => ({ role: "user" as const, content: `${item.author}: ${item.body}` }));
-
-  const plannerStartedAt = performance.now();
-  const plannerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 22000, 5000, 14000), "planner", `${input.idempotencyKey}:planner`);
-  const plannerPromise = input.adapter
-    .planSupportCase(
-      {
-        contextType: "triage",
-        language: input.language,
-        query: input.query,
-        conversationHistory,
-        ticketContext: {
-          priority: input.priority,
-          customerMeta: input.customerMeta,
-          history: input.history
-        }
-      },
-      `${input.idempotencyKey}:plan`,
-      plannerRuntime
-    )
-    .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(plannerStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(plannerStartedAt)) }));
-  const plannerResult = await plannerPromise;
-  const caseFrame = plannerResult.value ?? fallbackCaseFrame(input.query);
-  const baseQueries = buildInitialRetrievalQueries(input.query, caseFrame, orchestrator);
-  const baseEvidenceStartedAt = performance.now();
-  const baseEvidenceResult = await orchestrator.collectEvidence({
-    queries: baseQueries,
-    idempotencyKey: `${input.idempotencyKey}:evidence`,
-    runtime: input.runtime,
-    answerLanguage: input.language,
-    attachments: input.attachments,
-    caseFrame
-  }).then((value) => ({
-    value,
-    timing: stageTiming("completed", elapsedMs(baseEvidenceStartedAt), {
-      query_count: baseQueries.length,
-      reference_count: value.references.length
-    })
-  }));
-  const baseEvidence = baseEvidenceResult.value;
-  const additionalQueries = combineRetrievalQueries(input.query, caseFrame, orchestrator, baseQueries);
-  const additionalStartedAt = performance.now();
-  const additionalEvidence =
-    allowMultiPassRetrieval && additionalQueries.length > 0 && hasEnoughBudget(input.runtime, 9000)
-      ? await orchestrator.collectEvidence({
-          queries: additionalQueries,
-          idempotencyKey: `${input.idempotencyKey}:evidence:extra`,
-          runtime: input.runtime,
-          answerLanguage: input.language,
-          attachments: input.attachments,
-          caseFrame
-        })
-      : null;
-  const preRefinedEvidence = additionalEvidence
-    ? orchestrator.combineEvidenceCollections([baseEvidence, additionalEvidence])
-    : baseEvidence;
-  const refinementEvidence =
-    allowRefinement && preRefinedEvidence.references.length > 0 && hasEnoughBudget(input.runtime, 7000)
-      ? await orchestrator.refineEvidence({
-          baseQuery: input.query,
-          references: preRefinedEvidence.references,
-          idempotencyKey: `${input.idempotencyKey}:evidence`,
-          runtime: input.runtime,
-          answerLanguage: input.language,
-          attachments: input.attachments,
-          caseFrame
-        })
-      : null;
-  const evidenceCollection =
-    refinementEvidence && refinementEvidence.references.length > 0
-      ? orchestrator.combineEvidenceCollections([preRefinedEvidence, refinementEvidence])
-      : preRefinedEvidence;
-  const secondRoundQueryCount = (additionalEvidence ? additionalQueries.length : 0) + (refinementEvidence?.resolvedQueries.length ?? 0);
-  const additionalTiming =
-    secondRoundQueryCount > 0
-      ? stageTiming("completed", elapsedMs(additionalStartedAt), {
-          query_count: secondRoundQueryCount,
-          reference_count: evidenceCollection.references.length
-        })
-      : skippedStageTiming();
-
-  const selectionRuntime = withStageRuntime(
-    buildStageRuntime(input.runtime, 14000, 3500, 9000),
-    "support-evidence-selector",
-    `${input.idempotencyKey}:evidence-selector`
-  );
-  const evidenceSelection =
-    evidenceCollection.references.length > 0 && hasEnoughBudget(input.runtime, 4000)
-      ? await input.adapter
-          .selectSupportEvidence(
-            {
-              contextType: "triage",
-              language: input.language,
-              query: input.query,
-              caseFrame,
-              references: evidenceCollection.references
-            },
-            `${input.idempotencyKey}:evidence-selector`,
-            selectionRuntime
-          )
-          .catch(() => fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame))
-      : fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame);
-
-  const evidenceBundle = buildEvidenceBundle({
-    references: evidenceCollection.references,
-    confidence: evidenceCollection.confidence,
-    fallbackUsed: evidenceCollection.fallbackUsed,
-    resolvedQueries: evidenceCollection.resolvedQueries,
-    caseFrame,
+  const supportExecution = await runSupportSearchAgent({
     query: input.query,
-    selection: evidenceSelection
+    language: input.language,
+    currentRound: 0,
+    conversationHistory,
+    adapter: input.adapter,
+    runtime: input.runtime,
+    attachments: input.attachments,
+    repoId: input.repoId,
+    branch: input.branch,
+    idempotencyKey: input.idempotencyKey,
+    contextType: "triage",
+    ticketContext: {
+      priority: input.priority,
+      customerMeta: input.customerMeta,
+      history: input.history
+    }
   });
-
-  const writerStartedAt = performance.now();
-  const writerRuntime = withStageRuntime(
-    buildStageRuntime(input.runtime, 7000, 4000, 12000),
-    "triage-writer",
-    `${input.idempotencyKey}:triage-writer`
-  );
-  const writtenResult = hasEnoughBudget(input.runtime, 5000)
-    ? await input.adapter
-    .writeTriageInsight(
-      {
-        contextType: "triage",
-        language: input.language,
-        query: input.query,
-        caseFrame,
-        evidenceBundle,
-        conversationHistory,
-        ticketContext: {
-          priority: input.priority,
-          customerMeta: input.customerMeta,
-          history: input.history
-        }
-      },
-      `${input.idempotencyKey}:write`,
-      writerRuntime
-    )
-    .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(writerStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(writerStartedAt)) }))
-    : { value: null, timing: stageTiming("skipped", elapsedMs(writerStartedAt)) };
-  const written =
-    writtenResult.value ??
-    fallbackTriageInsight(input.language, caseFrame, evidenceCollection.references.length ? "escalate" : "ask_user");
-
-  const verifierStartedAt = performance.now();
-  const verifierRuntime = withStageRuntime(
-    buildStageRuntime(input.runtime, 2500, 3500, 9000),
-    "triage-verifier",
-    `${input.idempotencyKey}:triage-verifier`
-  );
-  const verificationResult = hasEnoughBudget(input.runtime, 3500)
-    ? await input.adapter
-    .verifyTriageInsight(
-      {
-        contextType: "triage",
-        language: input.language,
-        query: input.query,
-        caseFrame,
-        evidenceBundle,
-        triageInsight: written
-      },
-      `${input.idempotencyKey}:verify`,
-      verifierRuntime
-    )
-    .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(verifierStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(verifierStartedAt)) }))
-    : { value: null, timing: stageTiming("skipped", elapsedMs(verifierStartedAt)) };
-  const verification =
-    verificationResult.value ??
-    fallbackVerification(input.language, written.verifier_verdict, caseFrame.missing_critical_info);
-
-  const action =
-    written.recommended_action === "resolve" && verification.verdict === "verified" && evidenceCollection.references.length > 0
-      ? "resolve"
-      : written.recommended_action === "escalate" && verification.verdict !== "unsupported"
-      ? "escalate"
-      : "ask_user";
-  const insight: TriageSupportInsight = {
-    ...written,
-    recommended_action: action,
-    customer_reply_policy: action === "escalate" ? "no_send" : "send_now",
-    verifier_verdict: verification.verdict
-  };
-  const stageTimings: SupportAgentStageTimings = {
-    total_ms: elapsedMs(runStartedAt),
-    planner: plannerResult.timing,
-    retrieval_base: baseEvidenceResult.timing,
-    retrieval_extra: additionalTiming,
-    writer: writtenResult.timing,
-    verifier: verificationResult.timing
-  };
+  const supportAnswer =
+    supportExecution.result.support_answer ??
+    fallbackSupportAnswer({
+      language: input.language,
+      mode: "handoff",
+      missingInfo: supportExecution.caseFrame.missing_critical_info
+    });
+  const insight = buildTriageInsightFromSupportRuntime({
+    language: input.language,
+    supportAnswer,
+    verification: supportExecution.verification,
+    evidenceBundle: supportExecution.evidenceBundle,
+    citations: supportExecution.result.citations
+  });
+  const action = insight.recommended_action;
 
   return {
-    caseFrame,
-    evidenceBundle,
-    verification,
-    stageTimings,
+    caseFrame: supportExecution.caseFrame,
+    evidenceBundle: supportExecution.evidenceBundle,
+    verification: supportExecution.verification,
+    stageTimings: supportExecution.stageTimings,
     analyzeOutput: {
       action,
-      confidence: evidenceCollection.confidence,
+      confidence: supportExecution.result.confidence,
       reply: insight.customer_reply_policy === "send_now" ? insight.customer_reply : "",
       reasoning_summary: insight.support_summary,
       evidence: insight.verified_evidence.length
         ? insight.verified_evidence
-        : uniqueStrings(evidenceBundle.primary.map((item) => item.title), 4),
+        : uniqueStrings(supportExecution.evidenceBundle.primary.map((item) => item.title), 4),
       risk_flags: insight.risk_flags,
       support_insight: insight,
-      verification_summary: verification,
-      case_frame: caseFrame,
-      evidence_bundle_digest: digestEvidenceBundle(evidenceBundle),
-      stage_timings: stageTimings
+      verification_summary: supportExecution.verification,
+      case_frame: supportExecution.caseFrame,
+      evidence_bundle_digest: digestEvidenceBundle(supportExecution.evidenceBundle),
+      stage_timings: supportExecution.stageTimings,
+      stage_trace: supportExecution.result.internal_diagnostics?.stage_trace ?? []
     }
   };
 }

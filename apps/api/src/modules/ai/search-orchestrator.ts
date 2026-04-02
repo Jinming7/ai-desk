@@ -3,6 +3,9 @@ import type { OpenClawAdapter, OpenClawRuntimeContext } from "../../infrastructu
 import { extractSupportSignals } from "../github-kb/memory-extractor.js";
 import type { SupportExactSignals } from "../github-kb/memory-types.js";
 import * as githubKbService from "../github-kb/service.js";
+import { resolveRuntimeKnowledgeSpace } from "../github-kb/runtime-space.js";
+import { DefaultHybridRetrievalProvider } from "./hybrid-retrieval-provider.js";
+import { buildHybridRetrievalRequest, HybridRetrievalRuntime } from "./hybrid-retrieval.js";
 import { searchLocalDocs } from "./local-docs.js";
 import type { SearchReference, SearchResponseEnvelope, SupportCaseFrame } from "./types.js";
 
@@ -12,7 +15,12 @@ type SearchEvidenceCollection = SearchResponseEnvelope & {
 };
 
 export class SearchOrchestrator {
-  constructor(private readonly adapter: OpenClawAdapter) {}
+  constructor(
+    private readonly adapter: OpenClawAdapter,
+    private readonly hybridRuntime: Pick<HybridRetrievalRuntime, "retrieve"> = new HybridRetrievalRuntime(
+      new DefaultHybridRetrievalProvider()
+    )
+  ) {}
 
   private getMetadataList(reference: SearchReference, key: string): string[] {
     const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
@@ -393,6 +401,8 @@ export class SearchOrchestrator {
     answerLanguage?: "zh" | "en";
     attachments?: string[];
     caseFrame?: SupportCaseFrame;
+    repoId?: string;
+    branch?: string;
   }): Promise<SearchEvidenceCollection> {
     const normalizedBaseQuery = this.normalizeQuery(input.baseQuery);
     const refinementQueries = this.mergeReferences(input.references)
@@ -410,7 +420,9 @@ export class SearchOrchestrator {
       runtime: input.runtime,
       answerLanguage: input.answerLanguage,
       attachments: input.attachments,
-      caseFrame: input.caseFrame
+      caseFrame: input.caseFrame,
+      repoId: input.repoId,
+      branch: input.branch
     });
   }
 
@@ -479,6 +491,8 @@ export class SearchOrchestrator {
     answerLanguage?: "zh" | "en";
     attachments?: string[];
     caseFrame?: SupportCaseFrame;
+    repoId?: string;
+    branch?: string;
   }): Promise<SearchEvidenceCollection> {
     const queryLimit = Math.max(1, Math.min(4, input.runtime?.queryLimit ?? 4));
     const topK = Math.max(1, Math.min(env.GITHUB_KB_PROFILE_AGENT_TOPK, input.runtime?.kbTopK ?? env.GITHUB_KB_PROFILE_AGENT_TOPK));
@@ -489,6 +503,32 @@ export class SearchOrchestrator {
     }
     if (!normalizedQueries.length) {
       return this.buildNoResults("", false);
+    }
+
+    if (env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL) {
+      const hybrid = await this.hybridRuntime.retrieve(
+        buildHybridRetrievalRequest({
+          query: normalizedQueries[0],
+          rewrites: normalizedQueries.slice(1),
+          answerLanguage: lang,
+          caseFrame: input.caseFrame,
+          conversationHistory: [],
+          repoId: input.repoId,
+          branch: input.branch,
+          knowledgeSpace: resolveRuntimeKnowledgeSpace(),
+          topK
+        })
+      );
+      return {
+        query: hybrid.query,
+        answer: "",
+        confidence: hybrid.confidence,
+        references: hybrid.references,
+        retrievalStatus: hybrid.retrievalStatus,
+        unresolvedReasonCode: hybrid.unresolvedReasonCode,
+        resolvedQueries: hybrid.diagnostics.rewrites,
+        fallbackUsed: false
+      };
     }
 
     const retrieveOnce = async (query: string) => {
@@ -509,8 +549,8 @@ export class SearchOrchestrator {
         };
       }
       const retrievedAt = new Date().toISOString();
+      const allowLocalDocsAsPrimaryEvidence = !input.runtime?.disableLocalDocs;
       const toLocalDocsResult = async () => {
-        if (input.runtime?.disableLocalDocs) return null;
         const localDocsHits = await searchLocalDocs(query, lang, topK).catch(() => []);
         if (!localDocsHits.length) return null;
         return {
@@ -538,58 +578,95 @@ export class SearchOrchestrator {
           )
         };
       };
-
-      const [localDocsResult, kbResult] = await Promise.all([
-        toLocalDocsResult().catch(() => null),
-        githubKbService
-          .retrieveKnowledgeWithRetry({
+      const kbSearchInput = {
+        query,
+        answerLanguage: lang,
+        profile: "agent" as const,
+        topK,
+        includeFallback: true,
+        rewrites: memoryQueries,
+        supportSignals,
+        caseFrame: input.caseFrame
+          ? {
+              question_type: input.caseFrame.question_type,
+              product_area: input.caseFrame.product_area,
+              action_type: input.caseFrame.action_type,
+              deployment_model: input.caseFrame.deployment_model,
+              object: input.caseFrame.object,
+              required_doc_kinds: input.caseFrame.required_doc_kinds
+            }
+          : undefined,
+        requiredDocKinds: input.caseFrame?.required_doc_kinds
+      };
+      const toGithubKbResult = async () => {
+        const kb = await githubKbService.retrieveKnowledgeWithRetry(kbSearchInput);
+        const docsComHits = kb.hits
+          .map((hit) =>
+            this.toReference(
+              {
+                ...hit,
+                supportMetadata: { ...(hit.supportMetadata ?? {}), authority: "canonical_visible", source_type: "github_kb" }
+              },
+              retrievedAt
+            )
+          )
+          .filter((hit) => this.isDocsComVisibleReference(hit));
+        return {
+          confidence: docsComHits.length ? kb.confidence : 0,
+          fallbackUsed: false,
+          resolvedQueries: kb.resolvedQueries ?? [query],
+          references: docsComHits
+        };
+      };
+      const toAdapterFallbackResult = async () => {
+        const kb = await this.adapter.searchKnowledge(
+          {
             query,
-            answerLanguage: lang,
-            profile: "agent",
             topK,
-            includeFallback: true,
-            rewrites: memoryQueries,
-            supportSignals,
-            caseFrame: input.caseFrame
-              ? {
-                  question_type: input.caseFrame.question_type,
-                  product_area: input.caseFrame.product_area,
-                  action_type: input.caseFrame.action_type,
-                  deployment_model: input.caseFrame.deployment_model,
-                  object: input.caseFrame.object,
-                  required_doc_kinds: input.caseFrame.required_doc_kinds
-                }
-              : undefined,
-            requiredDocKinds: input.caseFrame?.required_doc_kinds
-          })
-          .then((kb) => {
-            const docsComHits = kb.hits
-              .map((hit) =>
-                this.toReference(
-                  {
-                    ...hit,
-                    supportMetadata: { ...(hit.supportMetadata ?? {}), authority: "canonical_visible", source_type: "github_kb" }
-                  },
-                  retrievedAt
-                )
-              )
-              .filter((hit) => this.isDocsComVisibleReference(hit));
-            return {
-              confidence: docsComHits.length ? kb.confidence : 0,
-              fallbackUsed: false,
-              resolvedQueries: kb.resolvedQueries ?? [query],
-              references: docsComHits
-            };
-          })
-          .catch(() => null)
-      ]);
+            index: "support-kb",
+            attachments: input.attachments
+          },
+          `${input.idempotencyKey}:search-fallback`,
+          input.runtime
+        );
+        return {
+          confidence: kb.hits.length ? kb.confidence : 0,
+          fallbackUsed: true,
+          resolvedQueries: [query],
+          references: kb.hits.map((hit) =>
+            this.toReference(
+              {
+                documentId: hit.id,
+                title: hit.title,
+                snippet: hit.snippet,
+                sourceUrl: hit.sourceUrl,
+                supportMetadata: {
+                  authority: "canonical_visible",
+                  source_type: "adapter_fallback"
+                },
+                score: hit.score
+              },
+              retrievedAt
+            )
+          )
+        };
+      };
+      const [localDocsResultSettled, kbResultSettled] = await Promise.allSettled([toLocalDocsResult(), toGithubKbResult()]);
+      const localDocsResult = localDocsResultSettled.status === "fulfilled" ? localDocsResultSettled.value : null;
+      const kbResult =
+        kbResultSettled.status === "fulfilled"
+          ? kbResultSettled.value
+          : !localDocsResult
+          ? await toAdapterFallbackResult().catch(() => null)
+          : null;
 
       const kbReferences = kbResult?.references ?? [];
       const localDocsReferences = localDocsResult?.references ?? [];
+      const primaryLocalDocsReferences = allowLocalDocsAsPrimaryEvidence ? localDocsReferences : [];
       const mergedReferences = this.mergeReferences(
-        input.runtime?.disableLocalDocs
+        !allowLocalDocsAsPrimaryEvidence
           ? this.enrichGithubKbReferencesWithLocalDocs(kbReferences, localDocsReferences)
-          : [...localDocsReferences, ...this.enrichGithubKbReferencesWithLocalDocs(kbReferences, localDocsReferences)],
+          : [...primaryLocalDocsReferences, ...this.enrichGithubKbReferencesWithLocalDocs(kbReferences, localDocsReferences)],
         { query }
       );
       const rerankedReferences = this.rerankReferencesForRoute(mergedReferences, {

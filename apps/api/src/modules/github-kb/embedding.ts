@@ -40,8 +40,12 @@ export async function embedText(text: string): Promise<{ vector: number[]; model
     };
   }
 
+  if (provider !== "openai" && provider !== "custom") {
+    throw new Error(`Unsupported embedding provider: ${provider}`);
+  }
+
   if (!env.GITHUB_KB_EMBEDDING_API_KEY) {
-    throw new Error("GITHUB_KB_EMBEDDING_API_KEY is required when embedding provider is openai");
+    throw new Error("GITHUB_KB_EMBEDDING_API_KEY is required when embedding provider is not mock");
   }
 
   const controller = new AbortController();
@@ -83,6 +87,9 @@ export async function embedText(text: string): Promise<{ vector: number[]; model
   const vector = payload.data[0]?.embedding;
   if (!Array.isArray(vector) || vector.length === 0) {
     throw new Error("Embedding API returned empty vector");
+  }
+  if (vector.length !== dimensions) {
+    throw new Error(`Embedding API returned ${vector.length} dimensions, expected ${dimensions}`);
   }
 
   return {

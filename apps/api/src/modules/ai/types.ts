@@ -1,5 +1,6 @@
 export interface SearchReference {
   documentId: string;
+  evidenceId?: string;
   title: string;
   snippet: string;
   sourceUrl: string;
@@ -16,6 +17,11 @@ export interface SearchReference {
   sourceType?: "local_docs" | "github_kb" | "official_docs" | "adapter_fallback";
   score: number;
   retrievedAt: string;
+}
+
+export function resolveSearchReferenceEvidenceId(reference: Pick<SearchReference, "documentId" | "evidenceId">): string {
+  const evidenceId = String(reference.evidenceId ?? "").trim();
+  return evidenceId || reference.documentId;
 }
 
 export interface ConversationTurn {
@@ -214,6 +220,31 @@ export interface SupportAgentStageTimings {
   verifier: SupportAgentStageTiming;
 }
 
+export type SupportAgentRuntimeStage =
+  | "route"
+  | "evidence_plan"
+  | "case_plan"
+  | "retrieval"
+  | "retrieval_refine"
+  | "evidence_selection"
+  | "specialist"
+  | "generic_writer"
+  | "verification"
+  | "citation_binding"
+  | "citation_selection"
+  | "answer_composition";
+
+export interface SupportAgentStageTraceEntry {
+  stage: SupportAgentRuntimeStage;
+  status: SupportAgentStageTiming["status"];
+  duration_ms: number;
+  agent_id?: string;
+  model?: string | null;
+  idempotency_key?: string;
+  query_count?: number;
+  reference_count?: number;
+}
+
 export interface TriageSupportInsight {
   direct_answer: string;
   recommended_action: "resolve" | "ask_user" | "escalate";
@@ -310,6 +341,7 @@ export interface SearchModeResult {
       agent_id: string;
       session_key: string;
     }>;
+    stage_trace?: SupportAgentStageTraceEntry[];
     orchestration_trace?: Array<{
       stage: string;
       agent_id: string;
