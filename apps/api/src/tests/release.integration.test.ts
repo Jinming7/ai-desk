@@ -259,6 +259,61 @@ test("internal ai release decision endpoint reports db-backed verification block
           },
           failures: []
         },
+        baseline: {
+          retrievalSummary: {
+            metrics: {
+              retrieval_hit_at_1: 0.9,
+              retrieval_hit_at_3: 0.9,
+              retrieval_hit_at_5: 0.9,
+              retrieval_hit_at_10: 0.9,
+              family_hit_at_3: 0.9,
+              exact_signal_capture_rate: 0.9,
+              wrong_family_top_3_rate: 0,
+              groundable_candidate_rate: 1,
+              kb_unavailable_false_positive_rate: 0,
+              publication_scoped_read_rate: 1
+            },
+            scoreCounts: {
+              exact_top_3: 1,
+              acceptable_family_top_3: 0,
+              low_credit_late_hit: 0,
+              wrong_family_penalty: 0,
+              no_useful_candidate: 0
+            },
+            failures: []
+          },
+          runtimeSummary: {
+            metrics: {
+              route_accuracy: 1,
+              specialist_selection_accuracy: 1,
+              clarification_precision: 1,
+              clarification_recall: 1,
+              stage_timeout_rate: 0,
+              stage_fallback_rate: 0,
+              stage_contract_violation_count: 0,
+              verification_overturn_rate: 0
+            },
+            failures: []
+          },
+          answerSummary: {
+            metrics: {
+              answer_mode_accuracy: 1,
+              direct_answer_correctness: 1,
+              customer_actionability_score: 1,
+              citation_presence_rate: 1,
+              hallucination_rate: 0,
+              handoff_appropriateness: 1,
+              minimum_missing_info_quality: 1
+            },
+            labelCounts: {
+              pass: 1,
+              pass_with_minor_issue: 0,
+              needs_improvement: 0,
+              fail: 0
+            },
+            failures: []
+          }
+        },
         executionMode: "production",
         shadowValidationStable: true,
         rollbackReady: true,
@@ -594,6 +649,353 @@ test("internal release status keeps publication truth scoped by knowledge space 
     assert.equal(previewScope?.serving?.source, "compatibility_metadata");
     assert.equal(previewScope?.serving?.comparisonToPublication, "ambiguous_across_knowledge_spaces");
     assert.equal(previewScope?.serving?.consistentWithPublication, null);
+  });
+});
+
+test("operator rollout preflight drill keeps release status, promotion preview, rollback runbook, release decision, and shadow compare mutually consistent", async (t) => {
+  await withDbHarness(t, async ({ baseUrl }) => {
+    env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL = true;
+    env.FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING = false;
+
+    const registration = await createRegistration();
+    const previousBuild = await createBuild({
+      repoId: registration.id,
+      knowledgeSpace: "support-local",
+      buildVersion: "build-prev-drill",
+      targetHead: "sha-prev-drill",
+      status: "superseded"
+    });
+    const currentBuild = await createBuild({
+      repoId: registration.id,
+      knowledgeSpace: "support-local",
+      buildVersion: "build-current-drill",
+      targetHead: "sha-current-drill",
+      status: "published"
+    });
+    const candidateBuild = await createBuild({
+      repoId: registration.id,
+      knowledgeSpace: "support-local",
+      buildVersion: "build-candidate-drill",
+      targetHead: "sha-candidate-drill",
+      status: "validated"
+    });
+
+    await githubRepo.upsertPublication({
+      knowledgeSpace: "support-local",
+      repoId: registration.id,
+      branch: "main",
+      publishedBuildVersion: currentBuild.build_version,
+      publishedHead: currentBuild.target_head,
+      publishedBy: "test",
+      publishedFromEnv: "local"
+    });
+    await githubRepo.upsertServingVersion({
+      repoId: registration.id,
+      branch: "main",
+      activeBuildVersion: currentBuild.build_version,
+      activeHead: currentBuild.target_head
+    });
+
+    const releaseStatusResponse = await requestJson(
+      `${baseUrl}/api/v1/internal/kb/release/status?repoId=${registration.id}&branch=main&knowledgeSpace=support-local`,
+      {
+        headers: {
+          authorization: "Bearer ",
+          "x-portal-surface": "internal"
+        }
+      }
+    );
+    assert.equal(releaseStatusResponse.status, 200);
+    const releaseStatus = releaseStatusResponse.json.result as {
+      featureFlags: {
+        FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: boolean;
+        FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: boolean;
+      };
+      scopes: Array<{
+        publication: { publishedBuildVersion: string } | null;
+        rollback: { publicationTarget: { buildVersion: string } | null };
+      }>;
+    };
+    assert.equal(releaseStatus.scopes[0]?.publication?.publishedBuildVersion, currentBuild.build_version);
+    assert.equal(releaseStatus.scopes[0]?.rollback.publicationTarget?.buildVersion, previousBuild.build_version);
+
+    const promotePreviewResponse = await requestJson(`${baseUrl}/api/v1/internal/kb/publications/promote/dry-run`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer ",
+        "content-type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        buildId: candidateBuild.id,
+        actor: "internal_operator",
+        evaluationRecorded: true,
+        shadowValidationStable: true,
+        rollbackReviewed: true
+      })
+    });
+    assert.equal(promotePreviewResponse.status, 200);
+    const promotePreview = promotePreviewResponse.json.result as {
+      eligible: boolean;
+      rollbackTarget: { buildVersion: string } | null;
+      action: { endpoint: string; body: { buildId: string } };
+    };
+    assert.equal(promotePreview.eligible, true);
+    assert.equal(promotePreview.rollbackTarget?.buildVersion, currentBuild.build_version);
+    assert.equal(promotePreview.action.endpoint, "/api/v1/internal/kb/publications/promote");
+    assert.equal(promotePreview.action.body.buildId, candidateBuild.id);
+
+    const rollbackRunbookResponse = await requestJson(`${baseUrl}/api/v1/internal/kb/release/rollback-runbook`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer ",
+        "content-type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        repoId: registration.id,
+        branch: "main",
+        knowledgeSpace: "support-local",
+        actor: "internal_operator",
+        priorFlagState: {
+          FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: false,
+          FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: false
+        }
+      })
+    });
+    assert.equal(rollbackRunbookResponse.status, 200);
+    const rollbackRunbook = rollbackRunbookResponse.json.result as {
+      currentPublication: { publishedBuildVersion: string } | null;
+      rollbackPublicationTarget: { buildVersion: string } | null;
+      recommendedRollbackFlagState: {
+        FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: boolean;
+        FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: boolean;
+      };
+    };
+    assert.equal(rollbackRunbook.currentPublication?.publishedBuildVersion, currentBuild.build_version);
+    assert.equal(rollbackRunbook.rollbackPublicationTarget?.buildVersion, previousBuild.build_version);
+    assert.deepEqual(rollbackRunbook.recommendedRollbackFlagState, {
+      FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: false,
+      FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: false
+    });
+
+    const releaseDecisionResponse = await requestJson(`${baseUrl}/api/v1/internal/ai/release/decision`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer ",
+        "content-type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        buildSummary: {
+          metrics: {
+            build_success_rate: 1,
+            build_validation_pass_rate: 1,
+            duplicate_active_path_rate: 0,
+            artifact_count_delta_by_family: {},
+            citation_count_delta: 0,
+            memory_entry_count_delta: 0,
+            embedding_missing_rate: 0,
+            cross_build_reference_violation_count: 0
+          },
+          publishable: true,
+          failures: []
+        },
+        retrievalSummary: {
+          metrics: {
+            retrieval_hit_at_1: 0.9,
+            retrieval_hit_at_3: 0.9,
+            retrieval_hit_at_5: 0.9,
+            retrieval_hit_at_10: 0.9,
+            family_hit_at_3: 0.9,
+            exact_signal_capture_rate: 0.9,
+            wrong_family_top_3_rate: 0,
+            groundable_candidate_rate: 1,
+            kb_unavailable_false_positive_rate: 0,
+            publication_scoped_read_rate: 1
+          },
+          scoreCounts: {
+            exact_top_3: 1,
+            acceptable_family_top_3: 0,
+            low_credit_late_hit: 0,
+            wrong_family_penalty: 0,
+            no_useful_candidate: 0
+          },
+          failures: []
+        },
+        runtimeSummary: {
+          metrics: {
+            route_accuracy: 1,
+            specialist_selection_accuracy: 1,
+            clarification_precision: 1,
+            clarification_recall: 1,
+            stage_timeout_rate: 0,
+            stage_fallback_rate: 0,
+            stage_contract_violation_count: 0,
+            verification_overturn_rate: 0
+          },
+          failures: []
+        },
+        answerSummary: {
+          metrics: {
+            answer_mode_accuracy: 1,
+            direct_answer_correctness: 1,
+            customer_actionability_score: 1,
+            citation_presence_rate: 1,
+            hallucination_rate: 0,
+            handoff_appropriateness: 1,
+            minimum_missing_info_quality: 1
+          },
+          labelCounts: {
+            pass: 1,
+            pass_with_minor_issue: 0,
+            needs_improvement: 0,
+            fail: 0
+          },
+          failures: []
+        },
+        baseline: {
+          retrievalSummary: {
+            metrics: {
+              retrieval_hit_at_1: 0.9,
+              retrieval_hit_at_3: 0.9,
+              retrieval_hit_at_5: 0.9,
+              retrieval_hit_at_10: 0.9,
+              family_hit_at_3: 0.9,
+              exact_signal_capture_rate: 0.9,
+              wrong_family_top_3_rate: 0,
+              groundable_candidate_rate: 1,
+              kb_unavailable_false_positive_rate: 0,
+              publication_scoped_read_rate: 1
+            },
+            scoreCounts: {
+              exact_top_3: 1,
+              acceptable_family_top_3: 0,
+              low_credit_late_hit: 0,
+              wrong_family_penalty: 0,
+              no_useful_candidate: 0
+            },
+            failures: []
+          },
+          runtimeSummary: {
+            metrics: {
+              route_accuracy: 1,
+              specialist_selection_accuracy: 1,
+              clarification_precision: 1,
+              clarification_recall: 1,
+              stage_timeout_rate: 0,
+              stage_fallback_rate: 0,
+              stage_contract_violation_count: 0,
+              verification_overturn_rate: 0
+            },
+            failures: []
+          },
+          answerSummary: {
+            metrics: {
+              answer_mode_accuracy: 1,
+              direct_answer_correctness: 1,
+              customer_actionability_score: 1,
+              citation_presence_rate: 1,
+              hallucination_rate: 0,
+              handoff_appropriateness: 1,
+              minimum_missing_info_quality: 1
+            },
+            labelCounts: {
+              pass: 1,
+              pass_with_minor_issue: 0,
+              needs_improvement: 0,
+              fail: 0
+            },
+            failures: []
+          }
+        },
+        executionMode: "production",
+        shadowValidationStable: true,
+        rollbackReady: true,
+        diagnosticsAvailable: true,
+        verificationSuites: [
+          {
+            name: "release.integration",
+            kind: "db_backed",
+            requiredForRollout: true,
+            status: "passed"
+          },
+          {
+            name: "github-kb-cleanup.dry-run.integration",
+            kind: "db_backed",
+            requiredForRollout: true,
+            status: "passed"
+          },
+          {
+            name: "github-kb.integration",
+            kind: "db_backed",
+            requiredForRollout: true,
+            status: "passed"
+          }
+        ]
+      })
+    });
+    assert.equal(releaseDecisionResponse.status, 200);
+    const releaseDecision = releaseDecisionResponse.json.result as {
+      decision: { releaseDecision: string };
+      featureFlags: {
+        FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: boolean;
+        FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: boolean;
+      };
+      recommendation: string;
+      verificationEvidence: {
+        dbBacked: { status: string; ready: boolean };
+      };
+    };
+    assert.equal(releaseDecision.decision.releaseDecision, "ready");
+    assert.equal(releaseDecision.verificationEvidence.dbBacked.status, "ready");
+    assert.equal(releaseDecision.verificationEvidence.dbBacked.ready, true);
+    assert.equal(releaseDecision.recommendation, "production_rollout_can_proceed");
+
+    const shadowCompareResponse = await requestJson(`${baseUrl}/api/v1/internal/ai/release/shadow-compare`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer ",
+        "content-type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        baseline: [
+          {
+            requestId: "drill-1",
+            retrievalStatus: "grounded",
+            route: "troubleshooting",
+            specialistFamily: "troubleshooting",
+            answerMode: "grounded",
+            citationCount: 2,
+            unsupportedClaimCount: 0,
+            latencyMs: 120,
+            stageTrace: [{ stage: "retrieval", status: "completed", durationMs: 50 }]
+          }
+        ],
+        candidate: [
+          {
+            requestId: "drill-1",
+            retrievalStatus: "grounded",
+            route: "troubleshooting",
+            specialistFamily: "troubleshooting",
+            answerMode: "grounded",
+            citationCount: 2,
+            unsupportedClaimCount: 0,
+            latencyMs: 118,
+            stageTrace: [{ stage: "retrieval", status: "completed", durationMs: 48 }]
+          }
+        ]
+      })
+    });
+    assert.equal(shadowCompareResponse.status, 200);
+    const shadowCompare = shadowCompareResponse.json.result as {
+      rollbackRecommendation: { class: string; reasonCodes: string[] };
+    };
+    assert.equal(shadowCompare.rollbackRecommendation.class, "none");
+    assert.deepEqual(shadowCompare.rollbackRecommendation.reasonCodes, []);
+
+    assert.deepEqual(releaseStatus.featureFlags, releaseDecision.featureFlags);
   });
 });
 
