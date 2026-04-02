@@ -72,6 +72,9 @@ const DOCS_COM_REPO_URL = "https://github.com/BangWork/docs-com";
 const DOCS_COM_PUBLIC_BASE_URL = "https://docs.ones.com";
 const DEFAULT_EMBEDDING_MODE: KbEmbeddingMode = "best_effort";
 const REMOTE_MANIFEST_CHECKSUM_CONCURRENCY = 4;
+const DOCUMENT_MUTATION_LOCK_TTL_SECONDS = 300;
+const DOCUMENT_MUTATION_LOCK_RETRY_MS = 100;
+const DOCUMENT_MUTATION_LOCK_MAX_WAIT_MS = 300_000;
 
 export const githubKbServiceDeps = {
   updateManifestItemBuildStatus(input: Parameters<typeof repo.updateManifestItemBuildStatus>[0]) {
@@ -317,6 +320,117 @@ function buildKnowledgeSpaceLeaseKey(knowledgeSpace: KbKnowledgeSpace, repoId: s
 
 function buildPublicationLeaseKey(knowledgeSpace: KbKnowledgeSpace, repoId: string, branch: string): string {
   return `publish:${knowledgeSpace}:${repoId}:${branch}`;
+}
+
+function buildDocumentMutationLockKey(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  buildVersion: string;
+  path: string;
+}): string {
+  return `document:${input.knowledgeSpace}:${input.repoId}:${input.branch}:${input.buildVersion}:${input.path}`;
+}
+
+function buildGenericBuildBatchLockKey(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  buildVersion: string;
+}): string {
+  return `build-batch:${input.knowledgeSpace}:${input.repoId}:${input.branch}:${input.buildVersion}`;
+}
+
+async function withLeaseMutex<T>(input: {
+  leaseKey: string;
+  ownerPrefix: string;
+  metadata: Record<string, unknown>;
+}, work: () => Promise<T>): Promise<T> {
+  const lockKey = input.leaseKey;
+  const ownerId = `${input.ownerPrefix}:${crypto.randomUUID()}`;
+  const ownerEnv = resolveRequestedFromEnv();
+  const leaseInput = {
+    leaseKey: lockKey,
+    ownerId,
+    ownerEnv,
+    ttlSeconds: DOCUMENT_MUTATION_LOCK_TTL_SECONDS,
+    metadata: input.metadata
+  };
+  const startedAt = Date.now();
+
+  while (true) {
+    try {
+      await githubKbServiceDeps.acquireIngestLease(leaseInput);
+      break;
+    } catch (error) {
+      const message = (error as Error).message;
+      if (!/lease is already held/i.test(message)) {
+        throw error;
+      }
+      if (Date.now() - startedAt >= DOCUMENT_MUTATION_LOCK_MAX_WAIT_MS) {
+        throw new Error(`Timed out waiting for document mutation lock ${lockKey}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, DOCUMENT_MUTATION_LOCK_RETRY_MS));
+    }
+  }
+
+  const renewTimer = setInterval(() => {
+    void githubKbServiceDeps.acquireIngestLease(leaseInput).catch(() => undefined);
+  }, Math.max(30_000, Math.floor((DOCUMENT_MUTATION_LOCK_TTL_SECONDS * 1000) / 2)));
+  renewTimer.unref?.();
+
+  try {
+    return await work();
+  } finally {
+    clearInterval(renewTimer);
+    await githubKbServiceDeps.releaseIngestLease(lockKey, ownerId).catch(() => undefined);
+  }
+}
+
+export async function withBuildDocumentMutationLock<T>(
+  input: {
+    knowledgeSpace: KbKnowledgeSpace;
+    repoId: string;
+    branch: string;
+    buildVersion: string;
+    path: string;
+  },
+  work: () => Promise<T>
+): Promise<T> {
+  return withLeaseMutex(
+    {
+      leaseKey: buildDocumentMutationLockKey(input),
+      ownerPrefix: "document-lock",
+      metadata: {
+        buildVersion: input.buildVersion,
+        path: input.path,
+        scope: "document_mutation"
+      }
+    },
+    work
+  );
+}
+
+export async function withGenericBuildBatchLock<T>(
+  input: {
+    knowledgeSpace: KbKnowledgeSpace;
+    repoId: string;
+    branch: string;
+    buildVersion: string;
+  },
+  work: () => Promise<T>
+): Promise<T> {
+  return withLeaseMutex(
+    {
+      leaseKey: buildGenericBuildBatchLockKey(input),
+      ownerPrefix: "build-batch-lock",
+      metadata: {
+        buildVersion: input.buildVersion,
+        scope: "generic_build_batch"
+      }
+    },
+    work
+  );
 }
 
 function parseKnowledgeSpace(value: unknown): KbKnowledgeSpace | null {
@@ -2172,284 +2286,295 @@ async function indexDocumentContent(input: {
   } as const;
   const knowledgeArtifacts = buildRepositoryKnowledgeArtifacts(knowledgeContext);
 
-  await repo.deactivateChunksByDocument(doc.id);
-  await repo.deleteKnowledgeArtifactsForDocument({
-    sourceDocId: doc.id,
-    knowledgeSpace,
-    buildVersion
-  });
-
-  const persistedChunks: Array<{
-    id: string;
-    headingPath: string;
-    ordinal: number;
-    content: string;
-    metadata: Record<string, unknown>;
-  }> = [];
-  if (
-    knowledgeArtifacts.classification.sourceFamily === "doc_page" ||
-    knowledgeArtifacts.classification.sourceFamily === "runbook_file" ||
-    knowledgeArtifacts.classification.sourceFamily === "openapi_spec"
-  ) {
-    const sections = parseMarkdownSections(normalizedContent);
-    const chunks = buildChunks(doc.doc_key, sections, {
-      targetTokens: env.GITHUB_KB_CHUNK_TARGET_TOKENS,
-      overlapTokens: env.GITHUB_KB_CHUNK_OVERLAP_TOKENS
-    });
-    for (const chunk of chunks) {
-      const chunkSupportEvidence = extractSupportEvidenceMetadata({
-        path,
-        title: String(chunk.metadata.sectionTitle ?? title),
-        content: chunk.content,
-        apiDoc,
-        inherited: docSupportEvidence
-      });
-      const embedded = await embedTextForBuild(chunk.content, embeddingMode);
-      await repo.upsertChunk({
-        id: chunk.id,
-        docId: doc.id,
-        repoId: registration.id,
+  await withBuildDocumentMutationLock(
+    {
+      knowledgeSpace,
+      repoId: registration.id,
+      branch,
+      buildVersion,
+      path
+    },
+    async () => {
+      await repo.deactivateChunksByDocument(doc.id);
+      await repo.deleteKnowledgeArtifactsForDocument({
+        sourceDocId: doc.id,
         knowledgeSpace,
-        branch,
-        path,
-        buildVersion,
-        commitSha,
-        headingPath: chunk.headingPath,
-        ordinal: chunk.ordinal,
-        content: chunk.content,
-        contentHash: chunk.contentHash,
-        tokenCount: chunk.tokenCount,
-        metadata: {
-          ...chunk.metadata,
-          sourceFamily: knowledgeArtifacts.classification.sourceFamily,
-          supportEvidence: chunkSupportEvidence,
-          embeddingState: embedded ? "ready" : "missing"
-        },
-        embedding: embedded?.vectorLiteral ?? null,
-        embeddingModel: embedded?.model ?? null,
-        embeddingVersion: embedded?.version ?? null
+        buildVersion
       });
-      persistedChunks.push({
-        id: chunk.id,
-        headingPath: chunk.headingPath,
-        ordinal: chunk.ordinal,
-        content: chunk.content,
-        metadata: {
-          ...chunk.metadata,
-          sourceFamily: knowledgeArtifacts.classification.sourceFamily,
-          supportEvidence: chunkSupportEvidence,
-          embeddingState: embedded ? "ready" : "missing"
+
+      const persistedChunks: Array<{
+        id: string;
+        headingPath: string;
+        ordinal: number;
+        content: string;
+        metadata: Record<string, unknown>;
+      }> = [];
+      if (
+        knowledgeArtifacts.classification.sourceFamily === "doc_page" ||
+        knowledgeArtifacts.classification.sourceFamily === "runbook_file" ||
+        knowledgeArtifacts.classification.sourceFamily === "openapi_spec"
+      ) {
+        const sections = parseMarkdownSections(normalizedContent);
+        const chunks = buildChunks(doc.doc_key, sections, {
+          targetTokens: env.GITHUB_KB_CHUNK_TARGET_TOKENS,
+          overlapTokens: env.GITHUB_KB_CHUNK_OVERLAP_TOKENS
+        });
+        for (const chunk of chunks) {
+          const chunkSupportEvidence = extractSupportEvidenceMetadata({
+            path,
+            title: String(chunk.metadata.sectionTitle ?? title),
+            content: chunk.content,
+            apiDoc,
+            inherited: docSupportEvidence
+          });
+          const embedded = await embedTextForBuild(chunk.content, embeddingMode);
+          await repo.upsertChunk({
+            id: chunk.id,
+            docId: doc.id,
+            repoId: registration.id,
+            knowledgeSpace,
+            branch,
+            path,
+            buildVersion,
+            commitSha,
+            headingPath: chunk.headingPath,
+            ordinal: chunk.ordinal,
+            content: chunk.content,
+            contentHash: chunk.contentHash,
+            tokenCount: chunk.tokenCount,
+            metadata: {
+              ...chunk.metadata,
+              sourceFamily: knowledgeArtifacts.classification.sourceFamily,
+              supportEvidence: chunkSupportEvidence,
+              embeddingState: embedded ? "ready" : "missing"
+            },
+            embedding: embedded?.vectorLiteral ?? null,
+            embeddingModel: embedded?.model ?? null,
+            embeddingVersion: embedded?.version ?? null
+          });
+          persistedChunks.push({
+            id: chunk.id,
+            headingPath: chunk.headingPath,
+            ordinal: chunk.ordinal,
+            content: chunk.content,
+            metadata: {
+              ...chunk.metadata,
+              sourceFamily: knowledgeArtifacts.classification.sourceFamily,
+              supportEvidence: chunkSupportEvidence,
+              embeddingState: embedded ? "ready" : "missing"
+            }
+          });
         }
+      }
+
+      for (const operation of knowledgeArtifacts.openApiOperations) {
+        await repo.upsertOpenApiOperation({
+          id: operation.id,
+          knowledgeSpace,
+          repoId: registration.id,
+          branch,
+          buildVersion,
+          sourceDocId: doc.id,
+          path: operation.path,
+          method: operation.method,
+          routePath: operation.routePath,
+          operationId: operation.operationId,
+          summary: operation.summary,
+          description: operation.description,
+          requestSchema: operation.requestSchema,
+          responseSchema: operation.responseSchema,
+          authScopes: operation.authScopes,
+          tags: operation.tags,
+          errorShapes: operation.errorShapes,
+          sourceLocation: operation.sourceLocation,
+          metadata: operation.metadata
+        });
+      }
+      for (const symbol of knowledgeArtifacts.codeSymbols) {
+        await repo.upsertCodeSymbol({
+          id: symbol.id,
+          knowledgeSpace,
+          repoId: registration.id,
+          branch,
+          buildVersion,
+          sourceDocId: doc.id,
+          path: symbol.path,
+          language: symbol.language,
+          symbolKind: symbol.symbolKind,
+          symbolName: symbol.symbolName,
+          qualifiedName: symbol.qualifiedName,
+          parentSymbol: symbol.parentSymbol,
+          startLine: symbol.startLine,
+          endLine: symbol.endLine,
+          signatureText: symbol.signatureText,
+          docComment: symbol.docComment,
+          bodySummary: symbol.bodySummary,
+          dependencyRefs: symbol.dependencyRefs,
+          metadata: symbol.metadata
+        });
+      }
+      for (const surface of knowledgeArtifacts.configSurfaces) {
+        await repo.upsertConfigSurface({
+          id: surface.id,
+          knowledgeSpace,
+          repoId: registration.id,
+          branch,
+          buildVersion,
+          sourceDocId: doc.id,
+          path: surface.path,
+          configKind: surface.configKind,
+          configKey: surface.configKey,
+          normalizedKey: surface.normalizedKey,
+          defaultValue: surface.defaultValue,
+          description: surface.description,
+          requiredFor: surface.requiredFor,
+          relatedComponents: surface.relatedComponents,
+          sourceLocation: surface.sourceLocation,
+          metadata: surface.metadata
+        });
+      }
+      for (const object of knowledgeArtifacts.schemaObjects) {
+        await repo.upsertSchemaObject({
+          id: object.id,
+          knowledgeSpace,
+          repoId: registration.id,
+          branch,
+          buildVersion,
+          sourceDocId: doc.id,
+          path: object.path,
+          objectKind: object.objectKind,
+          schemaName: object.schemaName,
+          objectName: object.objectName,
+          normalizedName: object.normalizedName,
+          definitionSummary: object.definitionSummary,
+          relatedTables: object.relatedTables,
+          sourceLocation: object.sourceLocation,
+          metadata: object.metadata
+        });
+      }
+      for (const behavior of knowledgeArtifacts.testBehaviors) {
+        await repo.upsertTestBehavior({
+          id: behavior.id,
+          knowledgeSpace,
+          repoId: registration.id,
+          branch,
+          buildVersion,
+          sourceDocId: doc.id,
+          path: behavior.path,
+          behaviorKey: behavior.behaviorKey,
+          title: behavior.title,
+          summary: behavior.summary,
+          assertions: behavior.assertions,
+          signals: behavior.signals,
+          sourceLocation: behavior.sourceLocation,
+          metadata: behavior.metadata
+        });
+      }
+
+      const docChunkCitations = buildDocChunkCitations(
+        knowledgeContext,
+        persistedChunks,
+        knowledgeArtifacts.classification.sourceFamily === "openapi_spec"
+          ? "openapi_spec"
+          : knowledgeArtifacts.classification.sourceFamily === "runbook_file"
+          ? "runbook_file"
+          : "doc_page"
+      );
+      const allCitations = [...docChunkCitations, ...knowledgeArtifacts.citationUnits];
+      for (const citation of allCitations) {
+        const embedded = await embedTextForBuild(citation.embeddingText ?? citation.snippetText, embeddingMode);
+        await repo.upsertCitationUnit({
+          id: citation.id,
+          knowledgeSpace,
+          repoId: registration.id,
+          branch,
+          buildVersion,
+          sourceDocId: doc.id,
+          citationFamily: citation.citationFamily,
+          sourceFamily: citation.sourceFamily,
+          sourceArtifactType: citation.sourceArtifactType,
+          sourceArtifactId: citation.sourceArtifactId,
+          citationKey: citation.citationKey,
+          path: citation.path,
+          title: citation.title,
+          headingPath: citation.headingPath,
+          snippetText: citation.snippetText,
+          sourceLocation: citation.sourceLocation,
+          authority: citation.authority,
+          metadata: citation.metadata,
+          embedding: embedded?.vectorLiteral ?? null,
+          embeddingModel: embedded?.model ?? null,
+          embeddingVersion: embedded?.version ?? null
+        });
+      }
+
+      const docCitationByHeading = new Map(
+        docChunkCitations.map((citation) => [citation.headingPath ?? "ROOT", citation.id] as const)
+      );
+      const chunkByHeading = new Map(
+        persistedChunks.map((chunk) => [chunk.headingPath ?? "ROOT", chunk] as const)
+      );
+      const docRetrievalUnits =
+        knowledgeArtifacts.docPage && docChunkCitations.length
+          ? buildDocumentRetrievalUnits({
+              sections: knowledgeArtifacts.docPage.sections,
+              docKind: knowledgeArtifacts.docPage.docKind,
+              productArea: knowledgeArtifacts.docPage.productArea,
+              deploymentModel: knowledgeArtifacts.docPage.deploymentModel,
+              citationByHeading: docCitationByHeading,
+              title
+            })
+          : [];
+      const structuredMemoryEntries = [
+        ...generateMemoryEntriesFromRetrievalUnits(
+          {
+            ...knowledgeContext,
+            metadata: {
+              ...knowledgeContext.metadata,
+              source_family: knowledgeArtifacts.classification.sourceFamily
+            }
+          },
+          docRetrievalUnits
+        ).map((entry) => {
+          if (entry.sources.length > 0) return entry;
+          const headingPath = String(entry.metadata_json?.heading_path ?? "").trim() || "ROOT";
+          const sourceChunk = chunkByHeading.get(headingPath) ?? chunkByHeading.get("ROOT");
+          if (!sourceChunk) return entry;
+          return {
+            ...entry,
+            sources: [
+              {
+                doc_id: doc.id,
+                chunk_id: sourceChunk.id,
+                heading_path: sourceChunk.headingPath,
+                source_score: 1,
+                source_metadata_json: {
+                  source_family: "doc_chunk",
+                  generated_from: "document_retrieval_unit"
+                }
+              }
+            ]
+          };
+        }),
+        ...knowledgeArtifacts.memoryEntries
+      ];
+
+      await syncDocumentMemoryGraph({
+        knowledgeSpace,
+        repoId: registration.id,
+        branch,
+        commitSha,
+        buildVersion,
+        activationMode: input.publicationMode === "publish_inline" ? "immediate" : "staged",
+        docId: doc.id,
+        path,
+        title,
+        docSupportEvidence,
+        chunks: persistedChunks,
+        memoryEntries: structuredMemoryEntries
       });
     }
-  }
-
-  for (const operation of knowledgeArtifacts.openApiOperations) {
-    await repo.upsertOpenApiOperation({
-      id: operation.id,
-      knowledgeSpace,
-      repoId: registration.id,
-      branch,
-      buildVersion,
-      sourceDocId: doc.id,
-      path: operation.path,
-      method: operation.method,
-      routePath: operation.routePath,
-      operationId: operation.operationId,
-      summary: operation.summary,
-      description: operation.description,
-      requestSchema: operation.requestSchema,
-      responseSchema: operation.responseSchema,
-      authScopes: operation.authScopes,
-      tags: operation.tags,
-      errorShapes: operation.errorShapes,
-      sourceLocation: operation.sourceLocation,
-      metadata: operation.metadata
-    });
-  }
-  for (const symbol of knowledgeArtifacts.codeSymbols) {
-    await repo.upsertCodeSymbol({
-      id: symbol.id,
-      knowledgeSpace,
-      repoId: registration.id,
-      branch,
-      buildVersion,
-      sourceDocId: doc.id,
-      path: symbol.path,
-      language: symbol.language,
-      symbolKind: symbol.symbolKind,
-      symbolName: symbol.symbolName,
-      qualifiedName: symbol.qualifiedName,
-      parentSymbol: symbol.parentSymbol,
-      startLine: symbol.startLine,
-      endLine: symbol.endLine,
-      signatureText: symbol.signatureText,
-      docComment: symbol.docComment,
-      bodySummary: symbol.bodySummary,
-      dependencyRefs: symbol.dependencyRefs,
-      metadata: symbol.metadata
-    });
-  }
-  for (const surface of knowledgeArtifacts.configSurfaces) {
-    await repo.upsertConfigSurface({
-      id: surface.id,
-      knowledgeSpace,
-      repoId: registration.id,
-      branch,
-      buildVersion,
-      sourceDocId: doc.id,
-      path: surface.path,
-      configKind: surface.configKind,
-      configKey: surface.configKey,
-      normalizedKey: surface.normalizedKey,
-      defaultValue: surface.defaultValue,
-      description: surface.description,
-      requiredFor: surface.requiredFor,
-      relatedComponents: surface.relatedComponents,
-      sourceLocation: surface.sourceLocation,
-      metadata: surface.metadata
-    });
-  }
-  for (const object of knowledgeArtifacts.schemaObjects) {
-    await repo.upsertSchemaObject({
-      id: object.id,
-      knowledgeSpace,
-      repoId: registration.id,
-      branch,
-      buildVersion,
-      sourceDocId: doc.id,
-      path: object.path,
-      objectKind: object.objectKind,
-      schemaName: object.schemaName,
-      objectName: object.objectName,
-      normalizedName: object.normalizedName,
-      definitionSummary: object.definitionSummary,
-      relatedTables: object.relatedTables,
-      sourceLocation: object.sourceLocation,
-      metadata: object.metadata
-    });
-  }
-  for (const behavior of knowledgeArtifacts.testBehaviors) {
-    await repo.upsertTestBehavior({
-      id: behavior.id,
-      knowledgeSpace,
-      repoId: registration.id,
-      branch,
-      buildVersion,
-      sourceDocId: doc.id,
-      path: behavior.path,
-      behaviorKey: behavior.behaviorKey,
-      title: behavior.title,
-      summary: behavior.summary,
-      assertions: behavior.assertions,
-      signals: behavior.signals,
-      sourceLocation: behavior.sourceLocation,
-      metadata: behavior.metadata
-    });
-  }
-
-  const docChunkCitations = buildDocChunkCitations(
-    knowledgeContext,
-    persistedChunks,
-    knowledgeArtifacts.classification.sourceFamily === "openapi_spec"
-      ? "openapi_spec"
-      : knowledgeArtifacts.classification.sourceFamily === "runbook_file"
-      ? "runbook_file"
-      : "doc_page"
   );
-  const allCitations = [...docChunkCitations, ...knowledgeArtifacts.citationUnits];
-  for (const citation of allCitations) {
-    const embedded = await embedTextForBuild(citation.embeddingText ?? citation.snippetText, embeddingMode);
-    await repo.upsertCitationUnit({
-      id: citation.id,
-      knowledgeSpace,
-      repoId: registration.id,
-      branch,
-      buildVersion,
-      sourceDocId: doc.id,
-      citationFamily: citation.citationFamily,
-      sourceFamily: citation.sourceFamily,
-      sourceArtifactType: citation.sourceArtifactType,
-      sourceArtifactId: citation.sourceArtifactId,
-      citationKey: citation.citationKey,
-      path: citation.path,
-      title: citation.title,
-      headingPath: citation.headingPath,
-      snippetText: citation.snippetText,
-      sourceLocation: citation.sourceLocation,
-      authority: citation.authority,
-      metadata: citation.metadata,
-      embedding: embedded?.vectorLiteral ?? null,
-      embeddingModel: embedded?.model ?? null,
-      embeddingVersion: embedded?.version ?? null
-    });
-  }
-
-  const docCitationByHeading = new Map(
-    docChunkCitations.map((citation) => [citation.headingPath ?? "ROOT", citation.id] as const)
-  );
-  const chunkByHeading = new Map(
-    persistedChunks.map((chunk) => [chunk.headingPath ?? "ROOT", chunk] as const)
-  );
-  const docRetrievalUnits =
-    knowledgeArtifacts.docPage && docChunkCitations.length
-      ? buildDocumentRetrievalUnits({
-          sections: knowledgeArtifacts.docPage.sections,
-          docKind: knowledgeArtifacts.docPage.docKind,
-          productArea: knowledgeArtifacts.docPage.productArea,
-          deploymentModel: knowledgeArtifacts.docPage.deploymentModel,
-          citationByHeading: docCitationByHeading,
-          title
-        })
-      : [];
-  const structuredMemoryEntries = [
-    ...generateMemoryEntriesFromRetrievalUnits(
-      {
-        ...knowledgeContext,
-        metadata: {
-          ...knowledgeContext.metadata,
-          source_family: knowledgeArtifacts.classification.sourceFamily
-        }
-      },
-      docRetrievalUnits
-    ).map((entry) => {
-      if (entry.sources.length > 0) return entry;
-      const headingPath = String(entry.metadata_json?.heading_path ?? "").trim() || "ROOT";
-      const sourceChunk = chunkByHeading.get(headingPath) ?? chunkByHeading.get("ROOT");
-      if (!sourceChunk) return entry;
-      return {
-        ...entry,
-        sources: [
-          {
-            doc_id: doc.id,
-            chunk_id: sourceChunk.id,
-            heading_path: sourceChunk.headingPath,
-            source_score: 1,
-            source_metadata_json: {
-              source_family: "doc_chunk",
-              generated_from: "document_retrieval_unit"
-            }
-          }
-        ]
-      };
-    }),
-    ...knowledgeArtifacts.memoryEntries
-  ];
-
-  await syncDocumentMemoryGraph({
-    knowledgeSpace,
-    repoId: registration.id,
-    branch,
-    commitSha,
-    buildVersion,
-    activationMode: input.publicationMode === "publish_inline" ? "immediate" : "staged",
-    docId: doc.id,
-    path,
-    title,
-    docSupportEvidence,
-    chunks: persistedChunks,
-    memoryEntries: structuredMemoryEntries
-  });
 }
 
 async function maybeFinalizeDocsComFullSyncRun(runId: string, publicationMode: KbBuildPublicationMode): Promise<void> {
@@ -2935,7 +3060,15 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
       requestedBy: job.source,
       requestedFromEnv
     });
-    return runLocalMirrorFullSync(job, registration, localMirror, leaseOwnerId, buildVersion);
+    return withGenericBuildBatchLock(
+      {
+        knowledgeSpace,
+        repoId: registration.id,
+        branch: job.branch || localMirror.branch || registration.default_branch,
+        buildVersion
+      },
+      () => runLocalMirrorFullSync(job, registration, localMirror, leaseOwnerId, buildVersion)
+    );
   }
   const resolved = await resolveRegistrationBranch(registration, job.branch, "sync_worker");
   const branch = resolved.branch;
@@ -2963,18 +3096,27 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
     requestedFromEnv
   });
   const cursor = getLocalMirrorCursor(job);
-  return runRemoteSnapshotBatch({
-    registration: effectiveRegistration,
-    knowledgeSpace,
-    branch,
-    head,
-    leaseOwnerId,
-    buildVersion,
-    publicationMode,
-    embeddingMode,
-    cursor,
-    limit: env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE
-  });
+  return withGenericBuildBatchLock(
+    {
+      knowledgeSpace,
+      repoId: effectiveRegistration.id,
+      branch,
+      buildVersion
+    },
+    () =>
+      runRemoteSnapshotBatch({
+        registration: effectiveRegistration,
+        knowledgeSpace,
+        branch,
+        head,
+        leaseOwnerId,
+        buildVersion,
+        publicationMode,
+        embeddingMode,
+        cursor,
+        limit: env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE
+      })
+  );
 }
 
 async function runIncrementalSync(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {

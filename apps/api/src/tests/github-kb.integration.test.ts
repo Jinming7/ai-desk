@@ -13,6 +13,7 @@ import { buildChunks } from "../modules/github-kb/chunker.js";
 import { toVectorLiteral } from "../modules/github-kb/embedding.js";
 import { parseMarkdownSections } from "../modules/github-kb/markdown.js";
 import * as githubRepo from "../modules/github-kb/repository.js";
+import * as serviceModule from "../modules/github-kb/service.js";
 import { buildDocsComIncludePaths, githubKbServiceDeps, promoteValidatedBuild, runDueSyncJobs } from "../modules/github-kb/service.js";
 import { formatLocalDbBlockedMessage, probeLocalDbReadiness, type LocalDbReadiness } from "./helpers/local-db-readiness.js";
 
@@ -24,6 +25,16 @@ let localDbReadiness: LocalDbReadiness = { kind: "ready" };
 
 function stripHighlightMarkup(value: string): string {
   return value.replace(/<[^>]+>/g, "");
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((innerResolve, innerReject) => {
+    resolve = innerResolve;
+    reject = innerReject;
+  });
+  return { promise, resolve, reject };
 }
 
 function assertSafeTestDatabase() {
@@ -130,6 +141,139 @@ async function createIsolationRegistration() {
     createdBy: "test"
   });
 }
+
+test("withBuildDocumentMutationLock serializes concurrent mutations for the same build document", async () => {
+  const withBuildDocumentMutationLock = (serviceModule as Record<string, unknown>).withBuildDocumentMutationLock as
+    | ((
+        input: {
+          knowledgeSpace: "support-local";
+          repoId: string;
+          branch: string;
+          buildVersion: string;
+          path: string;
+        },
+        work: () => Promise<string>
+      ) => Promise<string>)
+    | undefined;
+
+  assert.equal(typeof withBuildDocumentMutationLock, "function");
+  const lockMutation = withBuildDocumentMutationLock!;
+  const order: string[] = [];
+  const firstEntered = createDeferred<void>();
+  const releaseFirst = createDeferred<void>();
+  const secondEntered = createDeferred<void>();
+
+  const first = lockMutation(
+    {
+      knowledgeSpace: "support-local",
+      repoId: "repo-lock",
+      branch: "main",
+      buildVersion: "build-lock",
+      path: "docs/auth.md"
+    },
+    async () => {
+      order.push("first-enter");
+      firstEntered.resolve();
+      await releaseFirst.promise;
+      order.push("first-exit");
+      return "first";
+    }
+  );
+
+  await firstEntered.promise;
+
+  const second = lockMutation(
+    {
+      knowledgeSpace: "support-local",
+      repoId: "repo-lock",
+      branch: "main",
+      buildVersion: "build-lock",
+      path: "docs/auth.md"
+    },
+    async () => {
+      order.push("second-enter");
+      secondEntered.resolve();
+      return "second";
+    }
+  );
+
+  const secondBeforeRelease = await Promise.race([
+    secondEntered.promise.then(() => "entered"),
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 50))
+  ]);
+  assert.equal(secondBeforeRelease, "timeout");
+
+  releaseFirst.resolve();
+
+  const results = await Promise.all([first, second]);
+  assert.deepEqual(results, ["first", "second"]);
+  assert.deepEqual(order, ["first-enter", "first-exit", "second-enter"]);
+});
+
+test("withGenericBuildBatchLock serializes concurrent generic full-sync batches for the same build version", async () => {
+  const withGenericBuildBatchLock = (serviceModule as Record<string, unknown>).withGenericBuildBatchLock as
+    | ((
+        input: {
+          knowledgeSpace: "support-local";
+          repoId: string;
+          branch: string;
+          buildVersion: string;
+        },
+        work: () => Promise<string>
+      ) => Promise<string>)
+    | undefined;
+
+  assert.equal(typeof withGenericBuildBatchLock, "function");
+  const lockBatch = withGenericBuildBatchLock!;
+  const order: string[] = [];
+  const firstEntered = createDeferred<void>();
+  const releaseFirst = createDeferred<void>();
+  const secondEntered = createDeferred<void>();
+
+  const first = lockBatch(
+    {
+      knowledgeSpace: "support-local",
+      repoId: "repo-lock",
+      branch: "main",
+      buildVersion: "build-lock"
+    },
+    async () => {
+      order.push("first-enter");
+      firstEntered.resolve();
+      await releaseFirst.promise;
+      order.push("first-exit");
+      return "first";
+    }
+  );
+
+  await firstEntered.promise;
+
+  const second = lockBatch(
+    {
+      knowledgeSpace: "support-local",
+      repoId: "repo-lock",
+      branch: "main",
+      buildVersion: "build-lock"
+    },
+    async () => {
+      order.push("second-enter");
+      secondEntered.resolve();
+      return "second";
+    }
+  );
+
+  const secondBeforeRelease = await Promise.race([
+    secondEntered.promise.then(() => "entered"),
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 50))
+  ]);
+  assert.equal(secondBeforeRelease, "timeout");
+
+  releaseFirst.resolve();
+
+  const results = await Promise.all([first, second]);
+  assert.deepEqual(results, ["first", "second"]);
+  assert.deepEqual(order, ["first-enter", "first-exit", "second-enter"]);
+});
 
 async function createBuildScopedDocAndChunk(input: {
   repoId: string;
