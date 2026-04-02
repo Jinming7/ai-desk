@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { env } from "../../config/env.js";
 import type { KbBuild, RepoRegistration, SyncJob } from "./types.js";
 import { buildDocsComSourceManifest } from "./source/manifest-builder.js";
+import * as serviceModule from "./service.js";
 import {
   buildEnqueuedSyncPayload,
   buildDocsComIncludePaths,
@@ -188,6 +189,104 @@ test("buildEnqueuedSyncPayload preserves the explicit build version for full-syn
 
   assert.equal(payload.executionId, "sync-exec:abc123");
   assert.equal(payload.buildVersion, "shared-head:sync-exec:abc123");
+});
+
+test("legacy generic full-sync continuations keep a stable execution owner", () => {
+  const buildContinuationPayload = (serviceModule as Record<string, unknown>).buildGenericSyncContinuationPayload as
+    | ((job: SyncJob, result: { head: string; nextCursor: string }) => Record<string, unknown>)
+    | undefined;
+
+  assert.equal(typeof buildContinuationPayload, "function");
+  const buildContinuationPayloadFn = buildContinuationPayload!;
+
+  const job = buildSyncJob({
+    id: "legacy-job-1",
+    payload_json: {
+      knowledgeSpace: "support-local",
+      buildVersion: "shared-head"
+    }
+  });
+  const payload = buildContinuationPayloadFn(job, {
+    head: "shared-head",
+    nextCursor: "docs/next.md"
+  });
+
+  assert.equal(payload?.executionId, resolveSyncExecutionId(job.payload_json, job.id));
+  assert.equal(payload?.buildVersion, "shared-head");
+  assert.equal(payload?.cursor, "docs/next.md");
+  assert.equal(payload?.knowledgeSpace, "support-local");
+});
+
+test("renewBuildIngestLease reacquires the same owner and surfaces lease loss", async (t) => {
+  const renewBuildIngestLease = (serviceModule as Record<string, unknown>).renewBuildIngestLease as
+    | ((input: {
+        knowledgeSpace: "support-local";
+        repoId: string;
+        branch: string;
+        ownerId: string;
+        ownerEnv: "local";
+        buildVersion: string;
+        source: "remote";
+      }) => Promise<void>)
+    | undefined;
+
+  assert.equal(typeof renewBuildIngestLease, "function");
+  const renewBuildIngestLeaseFn = renewBuildIngestLease!;
+
+  let firstCall = true;
+  const leaseCalls: Array<Record<string, unknown>> = [];
+  t.mock.method(
+    githubKbServiceDeps,
+    "acquireIngestLease",
+    async (input: {
+      leaseKey: string;
+      ownerId: string;
+      ownerEnv: "local";
+      ttlSeconds: number;
+      metadata?: Record<string, unknown>;
+    }) => {
+      leaseCalls.push(input);
+      if (!firstCall) {
+        throw new Error("Lease is already held: build:support-local:repo-1:main");
+      }
+      firstCall = false;
+      return {
+        lease_key: input.leaseKey,
+        owner_id: input.ownerId,
+        owner_env: input.ownerEnv,
+        expires_at: new Date(Date.now() + 300_000).toISOString(),
+        metadata_json: input.metadata ?? {},
+        updated_at: new Date().toISOString()
+      };
+    }
+  );
+
+  await renewBuildIngestLeaseFn({
+    knowledgeSpace: "support-local",
+    repoId: "repo-1",
+    branch: "main",
+    ownerId: "exec-1",
+    ownerEnv: "local",
+    buildVersion: "shared-head:exec-1",
+    source: "remote"
+  });
+
+  await assert.rejects(
+    renewBuildIngestLeaseFn({
+      knowledgeSpace: "support-local",
+      repoId: "repo-1",
+      branch: "main",
+      ownerId: "exec-1",
+      ownerEnv: "local",
+      buildVersion: "shared-head:exec-1",
+      source: "remote"
+    }),
+    /lost build ingest lease/i
+  );
+
+  assert.equal(leaseCalls.length, 2);
+  assert.equal(leaseCalls[0]?.ownerId, "exec-1");
+  assert.equal(leaseCalls[1]?.ownerId, "exec-1");
 });
 
 function buildSyncJob(overrides: Partial<SyncJob> = {}): SyncJob {

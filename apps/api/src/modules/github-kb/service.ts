@@ -83,6 +83,9 @@ export const githubKbServiceDeps = {
   updateBuildStatus(input: Parameters<typeof repo.updateBuildStatus>[0]) {
     return repo.updateBuildStatus(input);
   },
+  acquireIngestLease(input: Parameters<typeof repo.acquireIngestLease>[0]) {
+    return repo.acquireIngestLease(input);
+  },
   releaseIngestLease(leaseKey: string, ownerId?: string) {
     return repo.releaseIngestLease(leaseKey, ownerId);
   }
@@ -354,6 +357,51 @@ function resolveJobKnowledgeSpace(job: SyncJob): KbKnowledgeSpace {
 
 export function shouldAdvanceFullSyncCheckpoint(publicationMode: KbBuildPublicationMode): boolean {
   return publicationMode === "publish_inline";
+}
+
+export function buildGenericSyncContinuationPayload(
+  job: SyncJob,
+  result: Pick<SyncExecutionResult, "head" | "nextCursor">
+): Record<string, unknown> {
+  return {
+    ...job.payload_json,
+    cursor: result.nextCursor,
+    buildVersion: String(job.payload_json?.buildVersion ?? "").trim() || result.head,
+    knowledgeSpace: String(job.payload_json?.knowledgeSpace ?? "").trim() || resolveRuntimeKnowledgeSpace(),
+    executionId: resolveSyncExecutionId(job.payload_json, job.id)
+  };
+}
+
+export async function renewBuildIngestLease(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  ownerId: string;
+  ownerEnv: KbRequestedFromEnv;
+  buildVersion: string;
+  source: "local_mirror" | "remote";
+}): Promise<void> {
+  try {
+    await githubKbServiceDeps.acquireIngestLease({
+      leaseKey: buildKnowledgeSpaceLeaseKey(input.knowledgeSpace, input.repoId, input.branch),
+      ownerId: input.ownerId,
+      ownerEnv: input.ownerEnv,
+      ttlSeconds: 300,
+      metadata: {
+        buildVersion: input.buildVersion,
+        source: input.source,
+        executionId: input.ownerId
+      }
+    });
+  } catch (error) {
+    const message = (error as Error).message;
+    if (/lease is already held/i.test(message)) {
+      throw new Error(
+        `Lost build ingest lease for ${input.knowledgeSpace}/${input.repoId}/${input.branch}/${input.buildVersion}: ${message}`
+      );
+    }
+    throw error;
+  }
 }
 
 export function resolvePublicationAwareIncrementalBase(input: {
@@ -2682,6 +2730,15 @@ async function runLocalMirrorSyncBatch(input: {
 
   let deactivated = 0;
   if (window.finished) {
+    await renewBuildIngestLease({
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.registration.id,
+      branch: input.branch,
+      ownerId: input.leaseOwnerId,
+      ownerEnv: resolveRequestedFromEnv(),
+      buildVersion: input.buildVersion,
+      source: "local_mirror"
+    });
     if (!isValidGitCommitSha(input.localMirror.head)) {
       throw new Error(`Refusing to checkpoint invalid local docs-com mirror head: ${input.localMirror.head || "<empty>"}`);
     }
@@ -2749,6 +2806,15 @@ async function runRemoteSnapshotBatch(input: {
   const window = sliceSnapshotForBackfill(markdownFiles, input.cursor, input.limit);
   let indexed = 0;
   for (const relativePath of window.files) {
+    await renewBuildIngestLease({
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.registration.id,
+      branch: input.branch,
+      ownerId: input.leaseOwnerId,
+      ownerEnv: resolveRequestedFromEnv(),
+      buildVersion: input.buildVersion,
+      source: "remote"
+    });
     await indexDocument(input.registration, input.knowledgeSpace, input.branch, input.head, relativePath, {
       buildVersion: input.buildVersion,
       publicationMode: "build_only",
@@ -2759,6 +2825,15 @@ async function runRemoteSnapshotBatch(input: {
 
   let deactivated = 0;
   if (window.finished) {
+    await renewBuildIngestLease({
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.registration.id,
+      branch: input.branch,
+      ownerId: input.leaseOwnerId,
+      ownerEnv: resolveRequestedFromEnv(),
+      buildVersion: input.buildVersion,
+      source: "remote"
+    });
     deactivated = await repo.deactivateDocumentsMissingFromSnapshot(
       input.registration.id,
       input.branch,
@@ -2841,12 +2916,14 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
   if (localMirror) {
     const buildVersion =
       String(job.payload_json?.buildVersion ?? "").trim() || buildExecutionScopedBuildVersion(localMirror.head, leaseOwnerId);
-    await repo.acquireIngestLease({
-      leaseKey: buildKnowledgeSpaceLeaseKey(knowledgeSpace, registration.id, job.branch || localMirror.branch || registration.default_branch),
+    await renewBuildIngestLease({
+      knowledgeSpace,
+      repoId: registration.id,
+      branch: job.branch || localMirror.branch || registration.default_branch,
       ownerId: leaseOwnerId,
       ownerEnv: requestedFromEnv,
-      ttlSeconds: 300,
-      metadata: { buildVersion, source: "local_mirror", executionId: leaseOwnerId }
+      buildVersion,
+      source: "local_mirror"
     });
     await ensureBuildRecord({
       knowledgeSpace,
@@ -2866,12 +2943,14 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
   const head = job.after_commit_sha ?? (await getBranchHead(effectiveRegistration, branch));
   const buildVersion =
     String(job.payload_json?.buildVersion ?? "").trim() || buildExecutionScopedBuildVersion(head, leaseOwnerId);
-  await repo.acquireIngestLease({
-    leaseKey: buildKnowledgeSpaceLeaseKey(knowledgeSpace, effectiveRegistration.id, branch),
+  await renewBuildIngestLease({
+    knowledgeSpace,
+    repoId: effectiveRegistration.id,
+    branch,
     ownerId: leaseOwnerId,
     ownerEnv: requestedFromEnv,
-    ttlSeconds: 300,
-    metadata: { buildVersion, source: "remote", executionId: leaseOwnerId }
+    buildVersion,
+    source: "remote"
   });
   await ensureBuildRecord({
     knowledgeSpace,
@@ -2947,12 +3026,7 @@ export async function runRepositorySyncDirect(input: {
 
 async function enqueueSyncContinuation(job: SyncJob, registration: RepoRegistration, result: SyncExecutionResult): Promise<void> {
   if (result.finished || !result.nextCursor) return;
-  const continuationPayload = {
-    ...job.payload_json,
-    cursor: result.nextCursor,
-    buildVersion: String(job.payload_json?.buildVersion ?? "").trim() || result.head,
-    knowledgeSpace: String(job.payload_json?.knowledgeSpace ?? "").trim() || resolveRuntimeKnowledgeSpace()
-  };
+  const continuationPayload = buildGenericSyncContinuationPayload(job, result);
   await enqueueSyncJob({
     repoId: registration.id,
     branch: job.branch,
