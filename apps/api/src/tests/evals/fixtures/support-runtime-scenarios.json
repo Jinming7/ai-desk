@@ -1,0 +1,48 @@
+{
+  "version": "2026-04-01",
+  "cases": [
+    {
+      "id": "runtime_callback_troubleshooting",
+      "query": "GitHub 集成授权后回调页面显示 page not found，怎么排查？",
+      "answerLanguage": "zh",
+      "conversation": [
+        {
+          "role": "user",
+          "content": "我们是通过公网域名做的 GitHub OAuth 集成。"
+        }
+      ],
+      "expectedRoute": "troubleshooting",
+      "expectedSpecialistFamily": "troubleshooting",
+      "expectClarification": false,
+      "expectedAnswerMode": "grounded",
+      "requiredStages": ["route", "evidence_plan", "retrieval", "verification", "answer_composition"],
+      "forbiddenStages": [],
+      "allowedFallbackStages": ["citation_selection"]
+    },
+    {
+      "id": "runtime_api_scope",
+      "query": "What scope is required to create an issue comment via OpenAPI?",
+      "answerLanguage": "en",
+      "conversation": [],
+      "expectedRoute": "api_scope_auth",
+      "expectedSpecialistFamily": "api",
+      "expectClarification": false,
+      "expectedAnswerMode": "grounded",
+      "requiredStages": ["route", "evidence_plan", "retrieval", "verification", "answer_composition"],
+      "forbiddenStages": [],
+      "allowedFallbackStages": ["citation_selection"]
+    },
+    {
+      "id": "runtime_minimum_clarification",
+      "query": "It does not work after I changed it.",
+      "answerLanguage": "en",
+      "conversation": [],
+      "expectedSpecialistFamily": "troubleshooting",
+      "expectClarification": true,
+      "expectedAnswerMode": "clarification",
+      "requiredStages": ["route", "answer_composition"],
+      "forbiddenStages": [],
+      "allowedFallbackStages": ["route", "verification"]
+    }
+  ]
+}

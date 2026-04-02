@@ -24,6 +24,7 @@ type RoutedSupportStage =
   | "behavior-specialist"
   | "troubleshooting-specialist"
   | "evidence-judge"
+  | "support-citation-binder"
   | "citation-curator"
   | "support-citation-selector"
   | "answer-composer";
@@ -33,7 +34,7 @@ type StageBinding = {
   agentId: string;
   model: string | null;
   dedicated: boolean;
-  fallback: "stage_binding" | "runtime_override" | "default_topology" | "global_default";
+  fallback: "stage_binding" | "stage_level_fallback" | "runtime_override" | "default_topology" | "global_default";
 };
 
 type SearchStage = "retrieval" | "clarify" | "execution";
@@ -81,10 +82,19 @@ const DEFAULT_SUPPORT_STAGE_AGENT_IDS: Record<RoutedSupportStage, string> = {
   "behavior-specialist": "support-behavior-specialist",
   "troubleshooting-specialist": "support-troubleshooting-specialist",
   "evidence-judge": "support-evidence-judge",
+  "support-citation-binder": "support-citation-curator",
   "citation-curator": "support-citation-curator",
   "support-citation-selector": "support-citation-selector",
   "answer-composer": "support-answer-composer"
 };
+
+function citationBinderFallbackAgentId() {
+  return env.OPENCLAW_AGENT_ID_CITATION_CURATOR.trim() || DEFAULT_SUPPORT_STAGE_AGENT_IDS["citation-curator"];
+}
+
+function citationBinderFallbackModel() {
+  return env.OPENCLAW_AGENT_MODEL_CITATION_CURATOR.trim() || globalDefaultModel();
+}
 
 function globalDefaultAgentId() {
   return env.OPENCLAW_AGENT_ID.trim() || "main";
@@ -189,6 +199,11 @@ export function resolveStageSpecificAgent(stage: SupportStage, runtime?: OpenCla
           agentId: env.OPENCLAW_AGENT_ID_EVIDENCE_JUDGE.trim(),
           model: env.OPENCLAW_AGENT_MODEL_EVIDENCE_JUDGE.trim()
         };
+      case "support-citation-binder":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_SUPPORT_CITATION_BINDER.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_SUPPORT_CITATION_BINDER.trim()
+        };
       case "citation-curator":
         return {
           agentId: env.OPENCLAW_AGENT_ID_CITATION_CURATOR.trim(),
@@ -213,9 +228,11 @@ export function resolveStageSpecificAgent(stage: SupportStage, runtime?: OpenCla
   })();
 
   const defaultTopologyAgentId = stage in DEFAULT_SUPPORT_STAGE_AGENT_IDS ? DEFAULT_SUPPORT_STAGE_AGENT_IDS[stage as RoutedSupportStage] : "";
+  const stageLevelFallbackAgentId = stage === "support-citation-binder" ? citationBinderFallbackAgentId() : "";
+  const stageLevelFallbackModel = stage === "support-citation-binder" ? citationBinderFallbackModel() : undefined;
   return {
-    agentId: stageBinding.agentId || explicitRuntimeAgentId || defaultTopologyAgentId || globalDefaultAgentId(),
-    model: stageBinding.model || explicitRuntimeModel || globalDefaultModel()
+    agentId: stageBinding.agentId || explicitRuntimeAgentId || stageLevelFallbackAgentId || defaultTopologyAgentId || globalDefaultAgentId(),
+    model: stageBinding.model || explicitRuntimeModel || stageLevelFallbackModel || globalDefaultModel()
   };
 }
 
@@ -240,6 +257,8 @@ function resolveStageBinding(stage: RoutedSupportStage): StageBinding {
         return env.OPENCLAW_AGENT_ID_TROUBLESHOOTING_SPECIALIST.trim();
       case "evidence-judge":
         return env.OPENCLAW_AGENT_ID_EVIDENCE_JUDGE.trim();
+      case "support-citation-binder":
+        return env.OPENCLAW_AGENT_ID_SUPPORT_CITATION_BINDER.trim();
       case "citation-curator":
         return env.OPENCLAW_AGENT_ID_CITATION_CURATOR.trim();
       case "support-citation-selector":
@@ -268,6 +287,8 @@ function resolveStageBinding(stage: RoutedSupportStage): StageBinding {
         return env.OPENCLAW_AGENT_MODEL_TROUBLESHOOTING_SPECIALIST.trim();
       case "evidence-judge":
         return env.OPENCLAW_AGENT_MODEL_EVIDENCE_JUDGE.trim();
+      case "support-citation-binder":
+        return env.OPENCLAW_AGENT_MODEL_SUPPORT_CITATION_BINDER.trim();
       case "citation-curator":
         return env.OPENCLAW_AGENT_MODEL_CITATION_CURATOR.trim();
       case "support-citation-selector":
@@ -277,6 +298,15 @@ function resolveStageBinding(stage: RoutedSupportStage): StageBinding {
     }
   })();
   const runtime = resolveStageSpecificAgent(stage);
+  if (stage === "support-citation-binder" && !envAgentId) {
+    return {
+      stage,
+      agentId: runtime.agentId,
+      model: runtime.model ?? envModel ?? citationBinderFallbackModel() ?? null,
+      dedicated: false,
+      fallback: "stage_level_fallback"
+    };
+  }
   const defaultAgentId = DEFAULT_SUPPORT_STAGE_AGENT_IDS[stage];
   const dedicated = runtime.agentId !== executionFallbackAgentId();
   const fallback: StageBinding["fallback"] = envAgentId
@@ -363,7 +393,12 @@ export function resolveExecutionRuntime(sessionId: string): OpenClawRuntimeConte
 
 function buildTopologyConflicts(searchStages: SearchStageBinding[], supportStages: StageBinding[]): AiTopologyConflict[] {
   const stageByAgent = new Map<string, string[]>();
-  for (const stage of [...searchStages, ...supportStages]) {
+  for (const stage of searchStages) {
+    const agentId = stage.agentId.trim();
+    if (!agentId) continue;
+    stageByAgent.set(agentId, [...(stageByAgent.get(agentId) ?? []), stage.stage]);
+  }
+  for (const stage of supportStages.filter((item) => item.fallback !== "stage_level_fallback")) {
     const agentId = stage.agentId.trim();
     if (!agentId) continue;
     stageByAgent.set(agentId, [...(stageByAgent.get(agentId) ?? []), stage.stage]);
@@ -397,6 +432,7 @@ export function getAiTopology(): AiTopologySnapshot {
     resolveStageBinding("behavior-specialist"),
     resolveStageBinding("troubleshooting-specialist"),
     resolveStageBinding("evidence-judge"),
+    resolveStageBinding("support-citation-binder"),
     resolveStageBinding("citation-curator"),
     resolveStageBinding("support-citation-selector"),
     resolveStageBinding("answer-composer")

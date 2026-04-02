@@ -167,6 +167,7 @@ export async function countDocumentsByPathPrefixes(input: {
   repoId: string;
   branch?: string;
   knowledgeSpace?: KbKnowledgeSpace;
+  buildVersion?: string;
   prefixes: string[];
 }): Promise<Array<{ prefix: string; total: number; active: number }>> {
   const prefixes = input.prefixes.map((item) => String(item ?? "").trim()).filter(Boolean);
@@ -174,6 +175,7 @@ export async function countDocumentsByPathPrefixes(input: {
 
   const branch = input.branch?.trim() || null;
   const knowledgeSpace = normalizeKnowledgeSpace(input.knowledgeSpace);
+  const buildVersion = input.buildVersion?.trim() || null;
   const result = await pool.query<{ prefix: string; total: string; active: string }>(
     `WITH prefixes(prefix) AS (
        SELECT UNNEST($3::text[])
@@ -188,17 +190,23 @@ export async function countDocumentsByPathPrefixes(input: {
       AND ($2::text IS NULL OR doc.branch = $2)
       AND doc.path LIKE prefixes.prefix || '%'
       AND doc.knowledge_space = $4
-      AND EXISTS (
-        SELECT 1
-        FROM kb_publications pub
-        WHERE pub.knowledge_space = $4
-          AND pub.repo_id = doc.repo_id
-          AND pub.branch = doc.branch
-          AND pub.published_build_version = doc.build_version
+      AND (
+        ($5::text IS NOT NULL AND doc.build_version = $5)
+        OR (
+          $5::text IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM kb_publications pub
+            WHERE pub.knowledge_space = $4
+              AND pub.repo_id = doc.repo_id
+              AND pub.branch = doc.branch
+              AND pub.published_build_version = doc.build_version
+          )
+        )
       )
      GROUP BY prefixes.prefix
      ORDER BY prefixes.prefix`,
-    [input.repoId, branch, prefixes, knowledgeSpace]
+    [input.repoId, branch, prefixes, knowledgeSpace, buildVersion]
   );
 
   return result.rows.map((row) => ({
@@ -235,6 +243,31 @@ export async function getBuildByVersion(input: {
     [input.knowledgeSpace, input.repoId, input.branch, input.buildVersion]
   );
   return result.rows[0] ?? null;
+}
+
+export async function listRecentBuildsForScope(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  limit?: number;
+  excludeBuildVersion?: string;
+}): Promise<KbBuild[]> {
+  const values: unknown[] = [input.knowledgeSpace, input.repoId, input.branch];
+  const clauses = ["knowledge_space = $1", "repo_id = $2", "branch = $3"];
+  if (input.excludeBuildVersion) {
+    values.push(input.excludeBuildVersion);
+    clauses.push(`build_version <> $${values.length}`);
+  }
+  values.push(Math.max(1, Math.min(input.limit ?? 10, 50)));
+  const result = await pool.query<KbBuild>(
+    `SELECT *
+     FROM kb_builds
+     WHERE ${clauses.join(" AND ")}
+     ORDER BY updated_at DESC, created_at DESC
+     LIMIT $${values.length}`,
+    values
+  );
+  return result.rows;
 }
 
 export async function ensureBuild(input: {
@@ -642,6 +675,138 @@ export async function getBuildValidationSnapshot(input: {
     totalDocuments: Number(row?.total_documents ?? "0"),
     totalChunks: Number(row?.total_chunks ?? "0"),
     totalMemoryEntries: Number(row?.total_memory_entries ?? "0")
+  };
+}
+
+export async function getBuildArtifactSummary(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  buildVersion: string;
+}): Promise<{
+  artifactCountsByFamily: Record<string, number>;
+  parserDegradation: {
+    totalDocuments: number;
+    degradedDocuments: number;
+    degradedFamilies: Record<string, number>;
+  };
+  embeddingSummary: {
+    chunkEmbeddings: { total: number; ready: number; missing: number };
+    citationEmbeddings: { total: number; ready: number; missing: number };
+  };
+}> {
+  const docRows = await pool.query<{ family: string | null; total: string; degraded: string }>(
+    `SELECT
+       NULLIF(metadata_json->>'sourceFamily', '') AS family,
+       COUNT(*)::text AS total,
+       COUNT(*) FILTER (WHERE COALESCE(metadata_json->>'sourceFamilyQuality', 'canonical') <> 'canonical')::text AS degraded
+     FROM kb_documents
+     WHERE knowledge_space = $1
+       AND repo_id = $2
+       AND branch = $3
+       AND build_version = $4
+     GROUP BY NULLIF(metadata_json->>'sourceFamily', '')`,
+    [input.knowledgeSpace, input.repoId, input.branch, input.buildVersion]
+  );
+
+  const counts = {
+    doc_page: 0,
+    runbook_file: 0,
+    openapi_spec: 0,
+    code_file: 0,
+    config_file: 0,
+    schema_file: 0,
+    test_file: 0,
+    openapi_operations: 0,
+    code_symbols: 0,
+    config_surfaces: 0,
+    schema_objects: 0,
+    test_behaviors: 0,
+    citation_units: 0,
+    chunks: 0,
+    memory_entries: 0
+  } as Record<string, number>;
+
+  let degradedDocuments = 0;
+  const degradedFamilies: Record<string, number> = {};
+  for (const row of docRows.rows) {
+    const family = row.family ?? "unknown";
+    counts[family] = Number(row.total);
+    const degraded = Number(row.degraded);
+    degradedDocuments += degraded;
+    if (degraded > 0) degradedFamilies[family] = degraded;
+  }
+
+  const scalarCounts = await pool.query<{
+    openapi_operations: string;
+    code_symbols: string;
+    config_surfaces: string;
+    schema_objects: string;
+    test_behaviors: string;
+    citation_units: string;
+    chunks: string;
+    memory_entries: string;
+  }>(
+    `SELECT
+       (SELECT COUNT(*)::text FROM kb_openapi_operations WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS openapi_operations,
+       (SELECT COUNT(*)::text FROM kb_code_symbols WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS code_symbols,
+       (SELECT COUNT(*)::text FROM kb_config_surfaces WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS config_surfaces,
+       (SELECT COUNT(*)::text FROM kb_schema_objects WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS schema_objects,
+       (SELECT COUNT(*)::text FROM kb_test_behaviors WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS test_behaviors,
+       (SELECT COUNT(*)::text FROM kb_citation_units WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS citation_units,
+       (SELECT COUNT(*)::text FROM kb_chunks WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS chunks,
+       (SELECT COUNT(*)::text FROM kb_memory_entries WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS memory_entries`,
+    [input.knowledgeSpace, input.repoId, input.branch, input.buildVersion]
+  );
+
+  const scalar = scalarCounts.rows[0];
+  counts.openapi_operations = Number(scalar?.openapi_operations ?? "0");
+  counts.code_symbols = Number(scalar?.code_symbols ?? "0");
+  counts.config_surfaces = Number(scalar?.config_surfaces ?? "0");
+  counts.schema_objects = Number(scalar?.schema_objects ?? "0");
+  counts.test_behaviors = Number(scalar?.test_behaviors ?? "0");
+  counts.citation_units = Number(scalar?.citation_units ?? "0");
+  counts.chunks = Number(scalar?.chunks ?? "0");
+  counts.memory_entries = Number(scalar?.memory_entries ?? "0");
+
+  const embeddingCounts = await pool.query<{
+    chunk_total: string;
+    chunk_ready: string;
+    citation_total: string;
+    citation_ready: string;
+  }>(
+    `SELECT
+       (SELECT COUNT(*)::text FROM kb_chunks WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS chunk_total,
+       (SELECT COUNT(*)::text FROM kb_chunks WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4 AND embedding IS NOT NULL) AS chunk_ready,
+       (SELECT COUNT(*)::text FROM kb_citation_units WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS citation_total,
+       (SELECT COUNT(*)::text FROM kb_citation_units WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4 AND embedding IS NOT NULL) AS citation_ready`,
+    [input.knowledgeSpace, input.repoId, input.branch, input.buildVersion]
+  );
+  const embeddings = embeddingCounts.rows[0];
+  const chunkTotal = Number(embeddings?.chunk_total ?? "0");
+  const chunkReady = Number(embeddings?.chunk_ready ?? "0");
+  const citationTotal = Number(embeddings?.citation_total ?? "0");
+  const citationReady = Number(embeddings?.citation_ready ?? "0");
+
+  return {
+    artifactCountsByFamily: counts,
+    parserDegradation: {
+      totalDocuments: docRows.rows.reduce((sum, row) => sum + Number(row.total), 0),
+      degradedDocuments,
+      degradedFamilies
+    },
+    embeddingSummary: {
+      chunkEmbeddings: {
+        total: chunkTotal,
+        ready: chunkReady,
+        missing: Math.max(0, chunkTotal - chunkReady)
+      },
+      citationEmbeddings: {
+        total: citationTotal,
+        ready: citationReady,
+        missing: Math.max(0, citationTotal - citationReady)
+      }
+    }
   };
 }
 
@@ -1565,11 +1730,14 @@ export async function searchVectorCandidates(input: {
   repoId?: string;
   branch?: string;
   vectorLiteral: string;
+  embeddingModel?: string;
   limit: number;
 }): Promise<RetrievalHit[]> {
   const where = buildWhereClause({ repoId: input.repoId, branch: input.branch, knowledgeSpace: input.knowledgeSpace });
-  const vectorParam = where.values.length + 1;
-  const limitParam = where.values.length + 2;
+  const modelParam = input.embeddingModel ? where.values.length + 1 : null;
+  const vectorParam = where.values.length + (input.embeddingModel ? 2 : 1);
+  const limitParam = where.values.length + (input.embeddingModel ? 3 : 2);
+  const embeddingModelFilter = modelParam ? `AND chunk.embedding_model = $${modelParam}` : "";
   const result = await pool.query<{
     chunk_id: string;
     document_id: string;
@@ -1580,6 +1748,7 @@ export async function searchVectorCandidates(input: {
     source_url: string;
     repo_source_url: string;
     commit_sha: string;
+    build_version: string;
     title: string;
     heading_path: string;
     snippet: string;
@@ -1597,6 +1766,7 @@ export async function searchVectorCandidates(input: {
       doc.source_url,
       doc.repo_source_url,
       chunk.commit_sha,
+      chunk.build_version::text,
       doc.title,
       chunk.heading_path,
       LEFT(chunk.content, 2400) AS snippet,
@@ -1615,9 +1785,10 @@ export async function searchVectorCandidates(input: {
        AND chunk.build_version = pub.published_build_version
        AND doc.build_version = pub.published_build_version
        AND chunk.embedding IS NOT NULL
+       ${embeddingModelFilter}
      ORDER BY chunk.embedding <=> $${vectorParam}::vector
      LIMIT $${limitParam}`,
-    [...where.values, input.vectorLiteral, input.limit]
+    [...where.values, ...(input.embeddingModel ? [input.embeddingModel] : []), input.vectorLiteral, input.limit]
   );
 
   return result.rows.map((row) => ({
@@ -1636,7 +1807,7 @@ export async function searchVectorCandidates(input: {
     score: Number(row.vector_score),
     vectorScore: Number(row.vector_score),
     chunkMetadata: row.chunk_metadata_json ?? undefined,
-    docMetadata: row.doc_metadata_json ?? undefined,
+    docMetadata: { build_version: row.build_version, ...(row.doc_metadata_json ?? {}) },
     supportMetadata:
       ((row.chunk_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined ??
       ((row.doc_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined
@@ -1719,6 +1890,7 @@ export async function searchKeywordCandidates(input: {
     source_url: string;
     repo_source_url: string;
     commit_sha: string;
+    build_version: string;
     title: string;
     heading_path: string;
     snippet: string;
@@ -1736,6 +1908,7 @@ export async function searchKeywordCandidates(input: {
       doc.source_url,
       doc.repo_source_url,
       chunk.commit_sha,
+      chunk.build_version::text,
       doc.title,
       chunk.heading_path,
       ${
@@ -1793,7 +1966,7 @@ export async function searchKeywordCandidates(input: {
     score: Number(row.lexical_score),
     lexicalScore: Number(row.lexical_score),
     chunkMetadata: row.chunk_metadata_json ?? undefined,
-    docMetadata: row.doc_metadata_json ?? undefined,
+    docMetadata: { build_version: row.build_version, ...(row.doc_metadata_json ?? {}) },
     supportMetadata:
       ((row.chunk_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined ??
       ((row.doc_metadata_json ?? {}) as Record<string, unknown>).supportEvidence as Record<string, unknown> | undefined
@@ -1883,6 +2056,416 @@ export async function listCandidateDocumentsForFallback(input: {
     repo: row.repo,
     content: row.content
   }));
+}
+
+export async function searchStructuredArtifactCandidates(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId?: string;
+  branch?: string;
+  query: string;
+  likeTerms: string[];
+  exactTerms?: string[];
+  limit: number;
+  exactOnly?: boolean;
+}): Promise<
+  Array<{
+    artifact_id: string;
+    artifact_family: string;
+    build_version: string;
+    title: string;
+    path: string;
+    heading_path: string | null;
+    snippet: string;
+    source_url: string;
+    repo_source_url: string;
+    commit_sha: string;
+    repo: string;
+    branch: string;
+    product_area: string | null;
+    deployment_model: string | null;
+    doc_kind: string | null;
+    object_type: string | null;
+    support_metadata_json: Record<string, unknown> | null;
+    score: number;
+  }>
+> {
+  const likeTerms = [...new Set(input.likeTerms.filter(Boolean))];
+  const exactTerms = [...new Set((input.exactTerms ?? []).filter(Boolean))];
+  if (!likeTerms.length && !exactTerms.length) return [];
+
+  const conditions: string[] = ["pub.knowledge_space = $1"];
+  const values: unknown[] = [input.knowledgeSpace];
+  if (input.repoId) {
+    values.push(input.repoId);
+    conditions.push(`doc.repo_id = $${values.length}`);
+  }
+  if (input.branch) {
+    values.push(input.branch);
+    conditions.push(`doc.branch = $${values.length}`);
+  }
+
+  const queryParam = values.push(input.query);
+  const likeParam = values.push(likeTerms.map((item) => `%${item}%`));
+  const exactParam = values.push(exactTerms);
+  const limitParam = values.push(input.limit);
+  const exactOnlyFilter = input.exactOnly ? " AND exact_score > 0 " : "";
+
+  const result = await pool.query<{
+    artifact_id: string;
+    artifact_family: string;
+    build_version: string;
+    title: string;
+    path: string;
+    heading_path: string | null;
+    snippet: string;
+    source_url: string;
+    repo_source_url: string;
+    commit_sha: string;
+    repo: string;
+    branch: string;
+    product_area: string | null;
+    deployment_model: string | null;
+    doc_kind: string | null;
+    object_type: string | null;
+    support_metadata_json: Record<string, unknown> | null;
+    exact_score: string;
+    fuzzy_score: string;
+  }>(
+    `WITH artifact_hits AS (
+      SELECT
+        op.id::text AS artifact_id,
+        'api_operation'::text AS artifact_family,
+        op.build_version,
+        COALESCE(op.summary, op.operation_id, op.route_path) AS title,
+        doc.path,
+        NULL::text AS heading_path,
+        LEFT(TRIM(CONCAT_WS(' ', op.method, op.route_path, op.operation_id, op.summary, op.description)), 1200) AS snippet,
+        doc.source_url,
+        doc.repo_source_url,
+        doc.commit_sha,
+        reg.repo_owner || '/' || reg.repo_name AS repo,
+        doc.branch,
+        'openapi'::text AS product_area,
+        NULL::text AS deployment_model,
+        'openapi/api'::text AS doc_kind,
+        op.route_path AS object_type,
+        (doc.metadata_json -> 'supportEvidence')::jsonb AS support_metadata_json,
+        (
+          CASE WHEN op.method = ANY($${exactParam}::text[]) THEN 0.9 ELSE 0 END +
+          CASE WHEN op.route_path = ANY($${exactParam}::text[]) THEN 1 ELSE 0 END +
+          CASE WHEN COALESCE(op.operation_id, '') = ANY($${exactParam}::text[]) THEN 0.95 ELSE 0 END +
+          CASE WHEN op.route_path ILIKE ANY($${likeParam}::text[]) THEN 0.7 ELSE 0 END +
+          CASE WHEN COALESCE(op.operation_id, '') ILIKE ANY($${likeParam}::text[]) THEN 0.55 ELSE 0 END
+        )::text AS exact_score,
+        GREATEST(
+          similarity(TRIM(CONCAT_WS(' ', op.method, op.route_path, op.operation_id, op.summary, op.description)), $${queryParam}),
+          CASE WHEN COALESCE(op.summary, '') ILIKE ANY($${likeParam}::text[]) THEN 0.45 ELSE 0 END
+        )::text AS fuzzy_score
+      FROM kb_openapi_operations op
+      INNER JOIN kb_documents doc ON doc.id = op.source_doc_id
+      INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
+      INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      WHERE ${conditions.join(" AND ")}
+        AND op.knowledge_space = pub.knowledge_space
+        AND doc.knowledge_space = pub.knowledge_space
+        AND op.build_version = pub.published_build_version
+        AND doc.build_version = pub.published_build_version
+        AND (
+          op.method = ANY($${exactParam}::text[])
+          OR op.route_path = ANY($${exactParam}::text[])
+          OR COALESCE(op.operation_id, '') = ANY($${exactParam}::text[])
+          OR op.route_path ILIKE ANY($${likeParam}::text[])
+          OR COALESCE(op.operation_id, '') ILIKE ANY($${likeParam}::text[])
+          OR COALESCE(op.summary, '') ILIKE ANY($${likeParam}::text[])
+          OR similarity(TRIM(CONCAT_WS(' ', op.method, op.route_path, op.operation_id, op.summary, op.description)), $${queryParam}) >= 0.14
+        )
+      UNION ALL
+      SELECT
+        cfg.id::text AS artifact_id,
+        'config_surface'::text AS artifact_family,
+        cfg.build_version,
+        cfg.config_key AS title,
+        doc.path,
+        NULL::text AS heading_path,
+        LEFT(TRIM(CONCAT_WS(' ', cfg.config_key, cfg.normalized_key, cfg.description, cfg.default_value)), 1200) AS snippet,
+        doc.source_url,
+        doc.repo_source_url,
+        doc.commit_sha,
+        reg.repo_owner || '/' || reg.repo_name AS repo,
+        doc.branch,
+        COALESCE((doc.metadata_json -> 'supportEvidence' ->> 'product_area'), 'deployment') AS product_area,
+        (doc.metadata_json -> 'supportEvidence' ->> 'deployment_model') AS deployment_model,
+        'deployment_runbook'::text AS doc_kind,
+        cfg.normalized_key AS object_type,
+        (doc.metadata_json -> 'supportEvidence')::jsonb AS support_metadata_json,
+        (
+          CASE WHEN cfg.normalized_key = ANY($${exactParam}::text[]) THEN 1 ELSE 0 END +
+          CASE WHEN cfg.config_key = ANY($${exactParam}::text[]) THEN 0.95 ELSE 0 END +
+          CASE WHEN cfg.normalized_key ILIKE ANY($${likeParam}::text[]) THEN 0.72 ELSE 0 END +
+          CASE WHEN cfg.config_key ILIKE ANY($${likeParam}::text[]) THEN 0.6 ELSE 0 END
+        )::text AS exact_score,
+        GREATEST(
+          similarity(TRIM(CONCAT_WS(' ', cfg.config_key, cfg.normalized_key, cfg.description, cfg.default_value)), $${queryParam}),
+          CASE WHEN COALESCE(cfg.description, '') ILIKE ANY($${likeParam}::text[]) THEN 0.42 ELSE 0 END
+        )::text AS fuzzy_score
+      FROM kb_config_surfaces cfg
+      INNER JOIN kb_documents doc ON doc.id = cfg.source_doc_id
+      INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
+      INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      WHERE ${conditions.join(" AND ")}
+        AND cfg.knowledge_space = pub.knowledge_space
+        AND doc.knowledge_space = pub.knowledge_space
+        AND cfg.build_version = pub.published_build_version
+        AND doc.build_version = pub.published_build_version
+        AND (
+          cfg.normalized_key = ANY($${exactParam}::text[])
+          OR cfg.config_key = ANY($${exactParam}::text[])
+          OR cfg.normalized_key ILIKE ANY($${likeParam}::text[])
+          OR cfg.config_key ILIKE ANY($${likeParam}::text[])
+          OR COALESCE(cfg.description, '') ILIKE ANY($${likeParam}::text[])
+          OR similarity(TRIM(CONCAT_WS(' ', cfg.config_key, cfg.normalized_key, cfg.description, cfg.default_value)), $${queryParam}) >= 0.14
+        )
+      UNION ALL
+      SELECT
+        sym.id::text AS artifact_id,
+        'code_symbol'::text AS artifact_family,
+        sym.build_version,
+        COALESCE(sym.qualified_name, sym.symbol_name) AS title,
+        doc.path,
+        CONCAT('L', sym.start_line, '-L', sym.end_line) AS heading_path,
+        LEFT(TRIM(CONCAT_WS(' ', sym.symbol_name, sym.qualified_name, sym.signature_text, sym.body_summary, sym.doc_comment)), 1200) AS snippet,
+        doc.source_url,
+        doc.repo_source_url,
+        doc.commit_sha,
+        reg.repo_owner || '/' || reg.repo_name AS repo,
+        doc.branch,
+        COALESCE((doc.metadata_json -> 'supportEvidence' ->> 'product_area'), 'general') AS product_area,
+        (doc.metadata_json -> 'supportEvidence' ->> 'deployment_model') AS deployment_model,
+        COALESCE((doc.metadata_json -> 'supportEvidence' ->> 'doc_kind'), 'troubleshooting') AS doc_kind,
+        sym.symbol_name AS object_type,
+        (doc.metadata_json -> 'supportEvidence')::jsonb AS support_metadata_json,
+        (
+          CASE WHEN sym.symbol_name = ANY($${exactParam}::text[]) THEN 1 ELSE 0 END +
+          CASE WHEN sym.qualified_name = ANY($${exactParam}::text[]) THEN 0.95 ELSE 0 END +
+          CASE WHEN sym.symbol_name ILIKE ANY($${likeParam}::text[]) THEN 0.7 ELSE 0 END +
+          CASE WHEN sym.qualified_name ILIKE ANY($${likeParam}::text[]) THEN 0.64 ELSE 0 END
+        )::text AS exact_score,
+        GREATEST(
+          similarity(TRIM(CONCAT_WS(' ', sym.symbol_name, sym.qualified_name, sym.signature_text, sym.body_summary, sym.doc_comment)), $${queryParam}),
+          CASE WHEN COALESCE(sym.body_summary, '') ILIKE ANY($${likeParam}::text[]) THEN 0.36 ELSE 0 END
+        )::text AS fuzzy_score
+      FROM kb_code_symbols sym
+      INNER JOIN kb_documents doc ON doc.id = sym.source_doc_id
+      INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
+      INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      WHERE ${conditions.join(" AND ")}
+        AND sym.knowledge_space = pub.knowledge_space
+        AND doc.knowledge_space = pub.knowledge_space
+        AND sym.build_version = pub.published_build_version
+        AND doc.build_version = pub.published_build_version
+        AND (
+          sym.symbol_name = ANY($${exactParam}::text[])
+          OR sym.qualified_name = ANY($${exactParam}::text[])
+          OR sym.symbol_name ILIKE ANY($${likeParam}::text[])
+          OR sym.qualified_name ILIKE ANY($${likeParam}::text[])
+          OR similarity(TRIM(CONCAT_WS(' ', sym.symbol_name, sym.qualified_name, sym.signature_text, sym.body_summary, sym.doc_comment)), $${queryParam}) >= 0.14
+        )
+      UNION ALL
+      SELECT
+        sch.id::text AS artifact_id,
+        'schema_object'::text AS artifact_family,
+        sch.build_version,
+        sch.object_name AS title,
+        doc.path,
+        NULL::text AS heading_path,
+        LEFT(TRIM(CONCAT_WS(' ', sch.object_name, sch.normalized_name, sch.definition_summary)), 1200) AS snippet,
+        doc.source_url,
+        doc.repo_source_url,
+        doc.commit_sha,
+        reg.repo_owner || '/' || reg.repo_name AS repo,
+        doc.branch,
+        COALESCE((doc.metadata_json -> 'supportEvidence' ->> 'product_area'), 'general') AS product_area,
+        (doc.metadata_json -> 'supportEvidence' ->> 'deployment_model') AS deployment_model,
+        COALESCE((doc.metadata_json -> 'supportEvidence' ->> 'doc_kind'), 'troubleshooting') AS doc_kind,
+        sch.normalized_name AS object_type,
+        (doc.metadata_json -> 'supportEvidence')::jsonb AS support_metadata_json,
+        (
+          CASE WHEN sch.normalized_name = ANY($${exactParam}::text[]) THEN 1 ELSE 0 END +
+          CASE WHEN sch.object_name = ANY($${exactParam}::text[]) THEN 0.95 ELSE 0 END +
+          CASE WHEN sch.normalized_name ILIKE ANY($${likeParam}::text[]) THEN 0.72 ELSE 0 END +
+          CASE WHEN sch.object_name ILIKE ANY($${likeParam}::text[]) THEN 0.6 ELSE 0 END
+        )::text AS exact_score,
+        GREATEST(
+          similarity(TRIM(CONCAT_WS(' ', sch.object_name, sch.normalized_name, sch.definition_summary)), $${queryParam}),
+          CASE WHEN sch.definition_summary ILIKE ANY($${likeParam}::text[]) THEN 0.42 ELSE 0 END
+        )::text AS fuzzy_score
+      FROM kb_schema_objects sch
+      INNER JOIN kb_documents doc ON doc.id = sch.source_doc_id
+      INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
+      INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      WHERE ${conditions.join(" AND ")}
+        AND sch.knowledge_space = pub.knowledge_space
+        AND doc.knowledge_space = pub.knowledge_space
+        AND sch.build_version = pub.published_build_version
+        AND doc.build_version = pub.published_build_version
+        AND (
+          sch.normalized_name = ANY($${exactParam}::text[])
+          OR sch.object_name = ANY($${exactParam}::text[])
+          OR sch.normalized_name ILIKE ANY($${likeParam}::text[])
+          OR sch.object_name ILIKE ANY($${likeParam}::text[])
+          OR sch.definition_summary ILIKE ANY($${likeParam}::text[])
+          OR similarity(TRIM(CONCAT_WS(' ', sch.object_name, sch.normalized_name, sch.definition_summary)), $${queryParam}) >= 0.14
+        )
+      UNION ALL
+      SELECT
+        beh.id::text AS artifact_id,
+        'test_behavior'::text AS artifact_family,
+        beh.build_version,
+        beh.title,
+        doc.path,
+        NULL::text AS heading_path,
+        LEFT(TRIM(CONCAT_WS(' ', beh.behavior_key, beh.title, beh.summary)), 1200) AS snippet,
+        doc.source_url,
+        doc.repo_source_url,
+        doc.commit_sha,
+        reg.repo_owner || '/' || reg.repo_name AS repo,
+        doc.branch,
+        COALESCE((doc.metadata_json -> 'supportEvidence' ->> 'product_area'), 'general') AS product_area,
+        (doc.metadata_json -> 'supportEvidence' ->> 'deployment_model') AS deployment_model,
+        COALESCE((doc.metadata_json -> 'supportEvidence' ->> 'doc_kind'), 'troubleshooting') AS doc_kind,
+        beh.behavior_key AS object_type,
+        (doc.metadata_json -> 'supportEvidence')::jsonb AS support_metadata_json,
+        (
+          CASE WHEN beh.behavior_key = ANY($${exactParam}::text[]) THEN 1 ELSE 0 END +
+          CASE WHEN beh.title = ANY($${exactParam}::text[]) THEN 0.9 ELSE 0 END +
+          CASE WHEN beh.behavior_key ILIKE ANY($${likeParam}::text[]) THEN 0.68 ELSE 0 END +
+          CASE WHEN beh.title ILIKE ANY($${likeParam}::text[]) THEN 0.58 ELSE 0 END
+        )::text AS exact_score,
+        GREATEST(
+          similarity(TRIM(CONCAT_WS(' ', beh.behavior_key, beh.title, beh.summary)), $${queryParam}),
+          CASE WHEN beh.summary ILIKE ANY($${likeParam}::text[]) THEN 0.42 ELSE 0 END
+        )::text AS fuzzy_score
+      FROM kb_test_behaviors beh
+      INNER JOIN kb_documents doc ON doc.id = beh.source_doc_id
+      INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
+      INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      WHERE ${conditions.join(" AND ")}
+        AND beh.knowledge_space = pub.knowledge_space
+        AND doc.knowledge_space = pub.knowledge_space
+        AND beh.build_version = pub.published_build_version
+        AND doc.build_version = pub.published_build_version
+        AND (
+          beh.behavior_key = ANY($${exactParam}::text[])
+          OR beh.title = ANY($${exactParam}::text[])
+          OR beh.behavior_key ILIKE ANY($${likeParam}::text[])
+          OR beh.title ILIKE ANY($${likeParam}::text[])
+          OR beh.summary ILIKE ANY($${likeParam}::text[])
+          OR similarity(TRIM(CONCAT_WS(' ', beh.behavior_key, beh.title, beh.summary)), $${queryParam}) >= 0.14
+        )
+    )
+    SELECT *
+    FROM artifact_hits
+    WHERE (exact_score::numeric > 0 OR fuzzy_score::numeric > 0)${exactOnlyFilter}
+    ORDER BY (exact_score::numeric * 0.72 + fuzzy_score::numeric * 0.28) DESC, title ASC
+    LIMIT $${limitParam}`,
+    values
+  );
+
+  return result.rows.map((row) => ({
+    ...row,
+    score: Number(row.exact_score) * 0.72 + Number(row.fuzzy_score) * 0.28
+  }));
+}
+
+export async function resolveArtifactCitations(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  artifactIds: string[];
+  limitPerArtifact: number;
+}): Promise<
+  Array<{
+    artifact_id: string;
+    citation_id: string;
+    document_id: string;
+    repo_id: string;
+    repo: string;
+    branch: string;
+    path: string;
+    source_url: string;
+    repo_source_url: string;
+    commit_sha: string;
+    title: string;
+    heading_path: string | null;
+    snippet: string;
+    build_version: string;
+    knowledge_space: KbKnowledgeSpace;
+    citation_family: string;
+    source_family: string;
+    citation_metadata_json: Record<string, unknown> | null;
+    doc_metadata_json: Record<string, unknown> | null;
+  }>
+> {
+  const artifactIds = [...new Set(input.artifactIds.filter(Boolean))];
+  if (!artifactIds.length) return [];
+  const result = await pool.query<{
+    artifact_id: string;
+    citation_id: string;
+    document_id: string;
+    repo_id: string;
+    repo: string;
+    branch: string;
+    path: string;
+    source_url: string;
+    repo_source_url: string;
+    commit_sha: string;
+    title: string;
+    heading_path: string | null;
+    snippet: string;
+    build_version: string;
+    knowledge_space: KbKnowledgeSpace;
+    citation_family: string;
+    source_family: string;
+    citation_metadata_json: Record<string, unknown> | null;
+    doc_metadata_json: Record<string, unknown> | null;
+    rn: string;
+  }>(
+    `WITH ranked AS (
+      SELECT
+        cu.source_artifact_id::text AS artifact_id,
+        cu.id::text AS citation_id,
+        COALESCE(cu.source_artifact_id::text, cu.id::text) AS document_id,
+        doc.repo_id,
+        reg.repo_owner || '/' || reg.repo_name AS repo,
+        doc.branch,
+        cu.path,
+        doc.source_url,
+        doc.repo_source_url,
+        doc.commit_sha,
+        cu.title,
+        cu.heading_path,
+        cu.snippet_text AS snippet,
+        cu.build_version,
+        cu.knowledge_space,
+        cu.citation_family,
+        cu.source_family,
+        cu.metadata_json AS citation_metadata_json,
+        doc.metadata_json AS doc_metadata_json,
+        ROW_NUMBER() OVER (PARTITION BY cu.source_artifact_id ORDER BY cu.updated_at DESC) AS rn
+      FROM kb_citation_units cu
+      INNER JOIN kb_documents doc ON doc.id = cu.source_doc_id
+      INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
+      INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      WHERE cu.source_artifact_id::text = ANY($1::text[])
+        AND pub.knowledge_space = $2
+        AND cu.knowledge_space = pub.knowledge_space
+        AND doc.knowledge_space = pub.knowledge_space
+        AND cu.build_version = pub.published_build_version
+        AND doc.build_version = pub.published_build_version
+    )
+    SELECT * FROM ranked WHERE rn <= $3`,
+    [artifactIds, input.knowledgeSpace, input.limitPerArtifact]
+  );
+
+  return result.rows;
 }
 
 export async function getDocumentByPath(
@@ -2006,11 +2589,16 @@ export async function createFullSyncRun(input: {
   sourceSnapshotTotal: number;
   manifestItems: Array<{
     path: string;
-    shardKey: KbFullSyncShardKey;
+    shardKey: KbFullSyncShardKey | null;
+    sourceFamily?: KbSyncManifestItem["source_family"];
+    contentChecksum?: string | null;
+    sourceAcquisitionMode?: KbSyncManifestItem["source_acquisition_mode"];
     blobSha: string;
     sizeBytes: number;
     needsRebuild: boolean;
     reuseReason?: string | null;
+    skipReason?: string | null;
+    buildStatus?: KbManifestBuildStatus;
   }>;
 }): Promise<{ run: KbSyncRun; shards: KbSyncRunShard[] }> {
   const shardPrefixes: Record<KbFullSyncShardKey, string> = {
@@ -2033,7 +2621,7 @@ export async function createFullSyncRun(input: {
 
     const shards: KbSyncRunShard[] = [];
     for (const shardKey of ["deploy-docs", "docs", "open-docs"] as KbFullSyncShardKey[]) {
-      const totalDocs = input.manifestItems.filter((item) => item.shardKey === shardKey).length;
+      const totalDocs = input.manifestItems.filter((item) => item.shardKey === shardKey && item.buildStatus !== "skipped").length;
       const shardResult = await client.query<KbSyncRunShard>(
         `INSERT INTO kb_sync_run_shards (
           id, run_id, repo_id, branch, shard_key, prefix, total_docs, status
@@ -2047,9 +2635,10 @@ export async function createFullSyncRun(input: {
     for (const item of input.manifestItems) {
       await client.query(
         `INSERT INTO kb_sync_manifest_items (
-          id, run_id, repo_id, branch, target_head, path, shard_key, blob_sha, size_bytes,
-          needs_rebuild, reuse_reason, build_status
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending')`,
+          id, run_id, repo_id, branch, target_head, path, shard_key, source_family,
+          content_checksum, source_acquisition_mode, blob_sha, size_bytes,
+          needs_rebuild, reuse_reason, skip_reason, build_status
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
         [
           uuidv4(),
           run.id,
@@ -2058,10 +2647,15 @@ export async function createFullSyncRun(input: {
           input.targetHead,
           item.path,
           item.shardKey,
+          item.sourceFamily ?? null,
+          item.contentChecksum ?? null,
+          item.sourceAcquisitionMode ?? "remote",
           item.blobSha,
           item.sizeBytes,
           item.needsRebuild,
-          item.reuseReason ?? null
+          item.reuseReason ?? null,
+          item.skipReason ?? null,
+          item.buildStatus ?? "pending"
         ]
       );
     }
@@ -2187,7 +2781,7 @@ export async function getSyncRunManifestSummary(runId: string): Promise<Record<K
       acc[row.build_status] = Number(row.total);
       return acc;
     },
-    { pending: 0, reused: 0, rebuilt: 0, failed: 0 }
+    { pending: 0, reused: 0, rebuilt: 0, failed: 0, skipped: 0 }
   );
 }
 
@@ -2258,6 +2852,7 @@ export async function finalizeSyncRunSuccess(input: {
   branch: string;
   buildVersion: string;
   targetHead: string;
+  publicationMode: "build_only" | "publish_inline";
 }): Promise<void> {
   const client = await pool.connect();
   try {
@@ -2274,33 +2869,35 @@ export async function finalizeSyncRunSuccess(input: {
       throw new Error(`Run ${input.runId} cannot finalize because manifest is incomplete`);
     }
 
-    await client.query(
-      `INSERT INTO kb_serving_versions (
-        repo_id, branch, active_build_version, active_head, activated_at, updated_at
-      ) VALUES ($1,$2,$3,$4,NOW(),NOW())
-      ON CONFLICT (repo_id, branch)
-      DO UPDATE SET
-        active_build_version = EXCLUDED.active_build_version,
-        active_head = EXCLUDED.active_head,
-        activated_at = NOW(),
-        updated_at = NOW()`,
-      [input.repoId, input.branch, input.buildVersion, input.targetHead]
-    );
+    if (input.publicationMode === "publish_inline") {
+      await client.query(
+        `INSERT INTO kb_serving_versions (
+          repo_id, branch, active_build_version, active_head, activated_at, updated_at
+        ) VALUES ($1,$2,$3,$4,NOW(),NOW())
+        ON CONFLICT (repo_id, branch)
+        DO UPDATE SET
+          active_build_version = EXCLUDED.active_build_version,
+          active_head = EXCLUDED.active_head,
+          activated_at = NOW(),
+          updated_at = NOW()`,
+        [input.repoId, input.branch, input.buildVersion, input.targetHead]
+      );
 
-    await client.query(
-      `INSERT INTO kb_sync_checkpoints (
-        repo_id, branch, last_synced_commit_sha, last_synced_at,
-        last_full_synced_commit_sha, last_full_synced_at
-      ) VALUES ($1,$2,$3,NOW(),$3,NOW())
-      ON CONFLICT (repo_id, branch)
-      DO UPDATE SET
-        last_synced_commit_sha = EXCLUDED.last_synced_commit_sha,
-        last_synced_at = NOW(),
-        last_full_synced_commit_sha = EXCLUDED.last_full_synced_commit_sha,
-        last_full_synced_at = NOW(),
-        updated_at = NOW()`,
-      [input.repoId, input.branch, input.targetHead]
-    );
+      await client.query(
+        `INSERT INTO kb_sync_checkpoints (
+          repo_id, branch, last_synced_commit_sha, last_synced_at,
+          last_full_synced_commit_sha, last_full_synced_at
+        ) VALUES ($1,$2,$3,NOW(),$3,NOW())
+        ON CONFLICT (repo_id, branch)
+        DO UPDATE SET
+          last_synced_commit_sha = EXCLUDED.last_synced_commit_sha,
+          last_synced_at = NOW(),
+          last_full_synced_commit_sha = EXCLUDED.last_full_synced_commit_sha,
+          last_full_synced_at = NOW(),
+          updated_at = NOW()`,
+        [input.repoId, input.branch, input.targetHead]
+      );
+    }
 
     await client.query(
       `UPDATE kb_sync_runs

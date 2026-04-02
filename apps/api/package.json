@@ -11,6 +11,7 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed:mock": "tsx src/db/seed-mock.ts",
     "test:ai-support-agent:smoke": "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/nexusflow NODE_ENV=test tsx src/tests/ai-support-agent.smoke.ts",
+    "test:ai-support-agent:evals:unit": "tsx --test src/tests/evals/evaluation-framework.test.ts",
     "test:ai-support-agent:business": "tsx src/tests/ai-support-agent.business-eval.ts",
     "test:ai-support-agent:business:real": "tsx src/tests/ai-support-agent.business-eval.ts",
     "test:ai-support-agent:business:mock": "NODE_ENV=test tsx src/tests/ai-support-agent.business-eval.ts",

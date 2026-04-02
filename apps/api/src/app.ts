@@ -24,6 +24,7 @@ import {
 import {
   kbBuildsFullSchema,
   kbBuildsIncrementalSchema,
+  kbCleanupDryRunQuerySchema,
   kbDocsComEnsureSchema,
   kbDocsComStatusQuerySchema,
   kbEnqueueSyncSchema,
@@ -34,16 +35,26 @@ import {
   kbRunJobsSchema,
   kbWebhookHeadersSchema
 } from "./contracts/github-kb.js";
+import {
+  aiReleaseDecisionSchema,
+  aiShadowComparisonSchema,
+  kbPromotionDryRunSchema,
+  kbReleaseStatusQuerySchema,
+  kbRollbackRunbookSchema
+} from "./contracts/release.js";
 import * as ticketService from "./modules/tickets/service.js";
 import * as agentService from "./modules/agent/service.js";
 import * as aiService from "./modules/ai/service.js";
 import * as aiRepo from "./modules/ai/repository.js";
+import * as aiReleaseService from "./modules/ai/release/service.js";
 import * as escalationService from "./modules/escalation/service.js";
 import * as workflowService from "./modules/workflow/service.js";
 import * as settingsService from "./modules/settings/service.js";
 import * as onesSyncService from "./modules/ones-sync/service.js";
 import * as supportUxService from "./modules/support-ux/service.js";
 import * as githubKbService from "./modules/github-kb/service.js";
+import * as kbCleanupService from "./modules/github-kb/cleanup/service.js";
+import * as kbReleaseService from "./modules/github-kb/release/service.js";
 import { getAiTopology } from "./modules/ai/agent-router.js";
 import { preloadLocalDocsIndex } from "./modules/ai/local-docs.js";
 import { getAiCapabilities } from "./modules/ai/multimodal.js";
@@ -984,6 +995,66 @@ app.get(
   })
 );
 
+app.post(
+  "/api/v1/internal/kb/publications/promote/dry-run",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const body = kbPromotionDryRunSchema.parse(req.body ?? {});
+    const result = await kbReleaseService.previewKbPromotion(body);
+    res.json({ result });
+  })
+);
+
+app.get(
+  "/api/v1/internal/kb/cleanup/dry-run",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const query = kbCleanupDryRunQuerySchema.parse(req.query);
+    const result = await kbCleanupService.getKnowledgeBaseCleanupDryRunReport(query);
+    res.json({ result });
+  })
+);
+
+app.get(
+  "/api/v1/internal/kb/release/status",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const query = kbReleaseStatusQuerySchema.parse(req.query);
+    const result = await kbReleaseService.getKbReleaseStatus(query);
+    res.json({ result });
+  })
+);
+
+app.post(
+  "/api/v1/internal/kb/release/rollback-runbook",
+  requireInternalRequest,
+  asyncHandler(async (req, res) => {
+    const body = kbRollbackRunbookSchema.parse(req.body ?? {});
+    const result = await kbReleaseService.buildKbRollbackRunbook(body);
+    res.json({ result });
+  })
+);
+
+app.post(
+  "/api/v1/internal/ai/release/decision",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const body = aiReleaseDecisionSchema.parse(req.body ?? {});
+    const result = aiReleaseService.buildRolloutDecision(body);
+    res.json({ result });
+  })
+);
+
+app.post(
+  "/api/v1/internal/ai/release/shadow-compare",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const body = aiShadowComparisonSchema.parse(req.body ?? {});
+    const result = aiReleaseService.compareShadowObservations(body);
+    res.json({ result });
+  })
+);
+
 app.get(
   "/api/v1/internal/kb/docs-com/status",
   requireInternalOrAutomationRequest,
@@ -1003,6 +1074,8 @@ app.post(
       actor: body.actor,
       mode: body.mode,
       runLimit: body.runLimit,
+      publicationMode: body.publicationMode,
+      embeddingMode: body.embeddingMode,
       idempotencySeed: req.header("x-vercel-deployment-url") ?? req.header("x-deployment-id") ?? undefined
     });
     res.status(202).json({ result });

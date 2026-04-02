@@ -5,19 +5,26 @@ import path from "node:path";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { after, before, beforeEach, test } from "node:test";
 import type { AddressInfo } from "node:net";
+import "./helpers/fetch-polyfill.js";
 import { app } from "../app.js";
 import { pool } from "../db/client.js";
 import { env, isSafeTestDatabaseUrl } from "../config/env.js";
 import { buildChunks } from "../modules/github-kb/chunker.js";
-import * as githubClient from "../modules/github-kb/github-client.js";
+import { toVectorLiteral } from "../modules/github-kb/embedding.js";
 import { parseMarkdownSections } from "../modules/github-kb/markdown.js";
 import * as githubRepo from "../modules/github-kb/repository.js";
-import { promoteValidatedBuild, runDueSyncJobs } from "../modules/github-kb/service.js";
+import { buildDocsComIncludePaths, githubKbServiceDeps, promoteValidatedBuild, runDueSyncJobs } from "../modules/github-kb/service.js";
+import { formatLocalDbBlockedMessage, probeLocalDbReadiness, type LocalDbReadiness } from "./helpers/local-db-readiness.js";
 
 let baseUrl = "";
 let server: ReturnType<typeof app.listen>;
 const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
 const originalVercelEnv = process.env.VERCEL_ENV;
+let localDbReadiness: LocalDbReadiness = { kind: "ready" };
+
+function stripHighlightMarkup(value: string): string {
+  return value.replace(/<[^>]+>/g, "");
+}
 
 function assertSafeTestDatabase() {
   const url = process.env.DATABASE_URL ?? env.DATABASE_URL;
@@ -67,21 +74,45 @@ async function writeFixture(rootDir: string, relativePath: string, content: stri
 }
 
 before(async () => {
-  assertSafeTestDatabase();
+  localDbReadiness = await probeLocalDbReadiness({
+    pool,
+    databaseUrl: process.env.DATABASE_URL ?? env.DATABASE_URL,
+    isSafeTestDatabaseUrl
+  });
+  if (localDbReadiness.kind === "blocked") {
+    if (localDbReadiness.reason === "unsafe_database") {
+      throw new Error(localDbReadiness.detail);
+    }
+    return;
+  }
   server = app.listen(0);
   await new Promise<void>((resolve) => server.once("listening", () => resolve()));
   const { port } = server.address() as AddressInfo;
   baseUrl = `http://127.0.0.1:${port}`;
 });
 
-beforeEach(async () => {
+beforeEach(async (t) => {
+  if (localDbReadiness.kind === "blocked") {
+    if ("skip" in t && typeof t.skip === "function") {
+      t.skip(formatLocalDbBlockedMessage("github-kb.integration", localDbReadiness));
+    }
+    return;
+  }
+  if (!baseUrl && server) {
+    const address = server.address() as AddressInfo | null;
+    if (address) {
+      baseUrl = `http://127.0.0.1:${address.port}`;
+    }
+  }
   await resetKbDb();
   env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
   process.env.VERCEL_ENV = originalVercelEnv;
 });
 
 after(async () => {
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  if (server) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
   env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
   process.env.VERCEL_ENV = originalVercelEnv;
   await pool.end();
@@ -157,6 +188,108 @@ async function createBuildScopedDocAndChunk(input: {
   return { doc, chunks };
 }
 
+test("kb_chunks.embedding uses variable vector dimensions so custom providers can rebuild safely", async () => {
+  const result = await pool.query<{ type: string }>(
+    `SELECT format_type(a.atttypid, a.atttypmod) AS type
+       FROM pg_attribute a
+       INNER JOIN pg_class c ON c.oid = a.attrelid
+       INNER JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public'
+        AND c.relname = 'kb_chunks'
+        AND a.attname = 'embedding'
+        AND a.attnum > 0
+        AND NOT a.attisdropped`
+  );
+
+  assert.equal(result.rows[0]?.type, "vector");
+});
+
+test("vector candidate search ignores chunks from other embedding models in the same published build", async () => {
+  const registration = await createIsolationRegistration();
+  const knowledgeSpace = "support-local";
+  const buildVersion = "build-vector-model-safety";
+  const commitSha = "abc1234";
+  const doc = await githubRepo.upsertDocument({
+    repoId: registration.id,
+    knowledgeSpace,
+    branch: "main",
+    path: "docs/vector-model-safety.md",
+    buildVersion,
+    title: "Vector Model Safety",
+    sourceUrl: "https://example.com/docs/vector-model-safety",
+    repoSourceUrl: "https://github.com/acme/ticket-kb/blob/abc1234/docs/vector-model-safety.md",
+    publicSourceUrl: null,
+    commitSha,
+    contentHash: "vector-model-safety",
+    content: "# Vector model safety\n\nPublished builds may contain different embedding models over time.",
+    metadata: {}
+  });
+
+  await githubRepo.upsertChunk({
+    id: "chunk-2d",
+    docId: doc.id,
+    repoId: registration.id,
+    knowledgeSpace,
+    branch: "main",
+    path: "docs/vector-model-safety.md",
+    buildVersion,
+    commitSha,
+    headingPath: "ROOT",
+    ordinal: 1,
+    content: "Dense recall should use the same embedding model as the query.",
+    contentHash: "chunk-2d",
+    tokenCount: 12,
+    metadata: {},
+    embedding: toVectorLiteral([1, 0]),
+    embeddingModel: "model-2d",
+    embeddingVersion: "v1"
+  });
+
+  await githubRepo.upsertChunk({
+    id: "chunk-3d",
+    docId: doc.id,
+    repoId: registration.id,
+    knowledgeSpace,
+    branch: "main",
+    path: "docs/vector-model-safety.md",
+    buildVersion,
+    commitSha,
+    headingPath: "Other",
+    ordinal: 2,
+    content: "This chunk belongs to a different embedding model and dimension.",
+    contentHash: "chunk-3d",
+    tokenCount: 11,
+    metadata: {},
+    embedding: toVectorLiteral([0, 1, 0]),
+    embeddingModel: "model-3d",
+    embeddingVersion: "v1"
+  });
+
+  await githubRepo.upsertPublication({
+    knowledgeSpace,
+    repoId: registration.id,
+    branch: "main",
+    publishedBuildVersion: buildVersion,
+    publishedHead: commitSha,
+    publishedBy: "test",
+    publishedFromEnv: "local"
+  });
+
+  const hits = await githubRepo.searchVectorCandidates({
+    knowledgeSpace,
+    repoId: registration.id,
+    branch: "main",
+    vectorLiteral: toVectorLiteral([1, 0]),
+    embeddingModel: "model-2d",
+    limit: 5
+  });
+
+  assert.deepEqual(
+    hits.map((hit) => hit.chunkId),
+    ["chunk-2d"]
+  );
+});
+
 test("full sync builds index and retrieval returns source citation", async () => {
   const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
     method: "POST",
@@ -186,7 +319,10 @@ test("full sync builds index and retrieval returns source citation", async () =>
       repoId: regPayload.registration.id,
       branch: regPayload.registration.default_branch,
       afterCommitSha: "mockc2",
-      idempotencyKey: "test-full-sync"
+      idempotencyKey: "test-full-sync",
+      payload: {
+        publicationMode: "publish_inline"
+      }
     })
   });
   assert.equal(enqueue.status, 202);
@@ -224,6 +360,135 @@ test("full sync builds index and retrieval returns source citation", async () =>
   assert.equal(body.result.hits[0].path.startsWith("docs/"), true);
   assert.equal(body.result.hits[0].sourceUrl.includes("github.com"), true);
   assert.equal(typeof body.result.hits[0].commitSha, "string");
+});
+
+test("build API creates a validated build without implicit publication", async () => {
+  const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({
+      repoUrl: "mock://acme/ticket-kb",
+      defaultBranch: "main",
+      includePaths: ["docs/*.md", "docs/**/*.md"],
+      excludePaths: [],
+      pollingIntervalSeconds: 60,
+      actor: "test"
+    })
+  });
+  assert.equal(register.status, 201);
+  const regPayload = (await register.json()) as { registration: { id: string; default_branch: string } };
+
+  const buildStart = await fetch(`${baseUrl}/api/v1/internal/kb/builds/full`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({
+      repoId: regPayload.registration.id,
+      branch: regPayload.registration.default_branch,
+      actor: "test"
+    })
+  });
+  assert.equal(buildStart.status, 202);
+
+  const run = await fetch(`${baseUrl}/api/v1/internal/kb/sync/run`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({ limit: 20 })
+  });
+  assert.equal(run.status, 200);
+
+  const builds = await pool.query<{ id: string; status: string }>(
+    `SELECT id, status
+     FROM kb_builds
+     WHERE repo_id = $1
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [regPayload.registration.id]
+  );
+  assert.equal(builds.rowCount, 1);
+  assert.equal(builds.rows[0].status, "validated");
+
+  const publications = await fetch(
+    `${baseUrl}/api/v1/internal/kb/publications/status?repoId=${encodeURIComponent(regPayload.registration.id)}`,
+    {
+      headers: { "x-portal-surface": "internal" }
+    }
+  );
+  assert.equal(publications.status, 200);
+  const publicationBody = (await publications.json()) as { result: Array<{ repo_id: string }> };
+  assert.equal(publicationBody.result.length, 0);
+});
+
+test("legacy /sync/full defaults to validated build without implicit publication", async () => {
+  const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({
+      repoUrl: "mock://acme/ticket-kb",
+      defaultBranch: "main",
+      includePaths: ["docs/*.md", "docs/**/*.md"],
+      excludePaths: [],
+      pollingIntervalSeconds: 60,
+      actor: "test"
+    })
+  });
+  assert.equal(register.status, 201);
+  const regPayload = (await register.json()) as { registration: { id: string; default_branch: string } };
+
+  const enqueue = await fetch(`${baseUrl}/api/v1/internal/kb/sync/full`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({
+      repoId: regPayload.registration.id,
+      branch: regPayload.registration.default_branch,
+      afterCommitSha: "mockc2",
+      idempotencyKey: "test-legacy-sync-no-inline-publish"
+    })
+  });
+  assert.equal(enqueue.status, 202);
+
+  const run = await fetch(`${baseUrl}/api/v1/internal/kb/sync/run`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({ limit: 20 })
+  });
+  assert.equal(run.status, 200);
+
+  const builds = await pool.query<{ status: string }>(
+    `SELECT status
+       FROM kb_builds
+      WHERE repo_id = $1
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [regPayload.registration.id]
+  );
+  assert.equal(builds.rowCount, 1);
+  assert.equal(builds.rows[0].status, "validated");
+
+  const publications = await pool.query<{ total: string }>(
+    `SELECT COUNT(*)::text AS total
+       FROM kb_publications
+      WHERE repo_id = $1`,
+    [regPayload.registration.id]
+  );
+  assert.equal(publications.rows[0]?.total, "0");
 });
 
 test("knowledge_space document isolation keeps same path/build rows separate across spaces", async () => {
@@ -444,9 +709,9 @@ test("publication isolation across spaces keeps prod read path independent from 
   assert.equal(prodHits.length > 0, true);
   assert.equal(previewHits.length > 0, true);
   assert.equal(localHits.length > 0, true);
-  assert.match(prodHits[0].snippet, /prod-only phrase/i);
-  assert.match(previewHits[0].snippet, /preview-only phrase/i);
-  assert.match(localHits[0].snippet, /local-only phrase/i);
+  assert.match(stripHighlightMarkup(prodHits[0].snippet), /prod-only phrase/i);
+  assert.match(stripHighlightMarkup(previewHits[0].snippet), /preview-only phrase/i);
+  assert.match(stripHighlightMarkup(localHits[0].snippet), /local-only phrase/i);
 });
 
 test("deactivation isolation only mutates rows inside the requested knowledge space", async () => {
@@ -611,7 +876,10 @@ test("remote full sync continues in batches until all docs are indexed", async (
         repoId: regPayload.registration.id,
         branch: regPayload.registration.default_branch,
         afterCommitSha: "mockc2",
-        idempotencyKey: "test-remote-full-batch"
+        idempotencyKey: "test-remote-full-batch",
+        payload: {
+          publicationMode: "publish_inline"
+        }
       })
     });
     assert.equal(enqueue.status, 202);
@@ -676,7 +944,7 @@ test("docs-com full shard retries transient DB timeout without failing the full 
     const registration = await githubRepo.upsertRepoRegistration({
       repoOwner: "BangWork",
       repoName: "docs-com",
-      repoUrl: "https://github.com/BangWork/docs-com",
+      repoUrl: "mock://BangWork/docs-com",
       publicBaseUrl: "https://docs.ones.com",
       defaultBranch: "master",
       includePaths: ["docs/**/*.md", "docs/**/*.mdx", "open-docs/**/*.md", "open-docs/**/*.mdx", "deploy-docs/**/*.md", "deploy-docs/**/*.mdx"],
@@ -688,13 +956,13 @@ test("docs-com full shard retries transient DB timeout without failing the full 
     const { run } = await githubRepo.createFullSyncRun({
       repoId: registration.id,
       branch: "master",
-      targetHead: "mock-docs-head",
+      targetHead: "mockc2",
       requestedBy: "test",
       runReason: "transient-db-timeout",
       sourceSnapshotTotal: 1,
       manifestItems: [
         {
-          path: "docs/example/transient-timeout.mdx",
+          path: "docs/api.md",
           shardKey: "docs",
           blobSha: "blob-1",
           sizeBytes: 32,
@@ -731,24 +999,17 @@ test("docs-com full shard retries transient DB timeout without failing the full 
       syncMode: "full",
       source: "system",
       idempotencyKey: `test-transient-db-timeout:${run.id}`,
-      afterCommitSha: "mock-docs-head",
+      afterCommitSha: "mockc2",
       payload: {
         runId: run.id,
         shardKey: "docs",
-        targetHead: "mock-docs-head",
-        buildVersion: `mock-docs-head:${run.id}`,
+        targetHead: "mockc2",
+        buildVersion: `mockc2:${run.id}`,
         sourceMode: "remote"
       }
     });
 
-    t.mock.method(githubClient, "validateReadOnlyAccess", async () => ({
-      ok: true,
-      scopes: ["mock:readonly"],
-      message: "mocked"
-    }));
-    t.mock.method(githubClient, "getFileContentAtCommit", async () => "# Example\n\nTransient db timeout should retry.");
-
-    t.mock.method(githubRepo, "updateManifestItemBuildStatus", async () => {
+    t.mock.method(githubKbServiceDeps, "updateManifestItemBuildStatus", async () => {
       throw new Error("timeout exceeded when trying to connect");
     });
 
@@ -891,6 +1152,86 @@ test("claimDueSyncJobs only claims one queued job per full-run shard", async () 
   assert.equal(docsQueued.length, 1);
 });
 
+test("createFullSyncRun persists skipped manifest ledger including null shard items", async () => {
+  const registration = await githubRepo.upsertRepoRegistration({
+    repoOwner: "BangWork",
+    repoName: "docs-com",
+    repoUrl: "https://github.com/BangWork/docs-com",
+    publicBaseUrl: "https://docs.ones.com",
+    defaultBranch: "master",
+    includePaths: ["docs/**/*.mdx", "open-docs/**/*.mdx", "deploy-docs/**/*.mdx"],
+    excludePaths: ["docs/excluded/**"],
+    pollingIntervalSeconds: 60,
+    createdBy: "test"
+  });
+
+  const { run } = await githubRepo.createFullSyncRun({
+    repoId: registration.id,
+    branch: "master",
+    targetHead: "mock-ledger-head",
+    requestedBy: "test",
+    runReason: "manifest-ledger",
+    sourceSnapshotTotal: 3,
+    manifestItems: [
+      {
+        path: "docs/guides/setup.mdx",
+        shardKey: "docs",
+        sourceFamily: "doc_page",
+        contentChecksum: "checksum-doc",
+        sourceAcquisitionMode: "remote",
+        blobSha: "blob-doc",
+        sizeBytes: 12,
+        needsRebuild: true,
+        reuseReason: null,
+        buildStatus: "pending"
+      },
+      {
+        path: "docs/excluded/logo.png",
+        shardKey: "docs",
+        sourceFamily: null,
+        contentChecksum: "checksum-logo",
+        sourceAcquisitionMode: "remote",
+        blobSha: "blob-logo",
+        sizeBytes: 8,
+        needsRebuild: false,
+        reuseReason: null,
+        skipReason: "excluded_by_pattern",
+        buildStatus: "skipped"
+      },
+      {
+        path: "README.md",
+        shardKey: null,
+        sourceFamily: null,
+        contentChecksum: "checksum-readme",
+        sourceAcquisitionMode: "remote",
+        blobSha: "blob-readme",
+        sizeBytes: 20,
+        needsRebuild: false,
+        reuseReason: null,
+        skipReason: "outside_docs_com_scope",
+        buildStatus: "skipped"
+      }
+    ]
+  });
+
+  const manifest = await githubRepo.listSyncRunManifest(run.id, 10);
+  assert.equal(manifest.length, 3);
+  assert.deepEqual(
+    manifest
+      .map((item) => [item.path, item.shard_key, item.build_status, item.skip_reason] as const)
+      .sort((left, right) => left[0].localeCompare(right[0])),
+    [
+      ["docs/excluded/logo.png", "docs", "skipped", "excluded_by_pattern"],
+      ["docs/guides/setup.mdx", "docs", "pending", null],
+      ["README.md", null, "skipped", "outside_docs_com_scope"]
+    ]
+  );
+
+  const summary = await githubRepo.getSyncRunManifestSummary(run.id);
+  assert.equal(summary.pending, 1);
+  assert.equal(summary.skipped, 2);
+});
+
 test("sync cron lane drains one queued job via automation bearer token", async () => {
   const previousCronSecret = env.CRON_SECRET;
   env.CRON_SECRET = "test-cron-secret";
@@ -974,7 +1315,10 @@ test("retrieval prefers public docs url when repo registration configures docs b
       repoId: regPayload.registration.id,
       branch: regPayload.registration.default_branch,
       afterCommitSha: "mockc2",
-      idempotencyKey: "test-public-docs-url"
+      idempotencyKey: "test-public-docs-url",
+      payload: {
+        publicationMode: "publish_inline"
+      }
     })
   });
 
@@ -1041,7 +1385,10 @@ test("deploy docs public url honors frontmatter id instead of file name", async 
       repoId: regPayload.registration.id,
       branch: regPayload.registration.default_branch,
       afterCommitSha: "mockc2",
-      idempotencyKey: "test-deploy-docs-id-route"
+      idempotencyKey: "test-deploy-docs-id-route",
+      payload: {
+        publicationMode: "publish_inline"
+      }
     })
   });
 
@@ -1104,7 +1451,10 @@ test("incremental sync is idempotent and propagates deletion", async () => {
       repoId: regPayload.registration.id,
       branch: regPayload.registration.default_branch,
       afterCommitSha: "mockc2",
-      idempotencyKey: "full-c2"
+      idempotencyKey: "full-c2",
+      payload: {
+        publicationMode: "publish_inline"
+      }
     })
   });
   await fetch(`${baseUrl}/api/v1/internal/kb/sync/run`, {
@@ -1170,6 +1520,8 @@ test("incremental sync is idempotent and propagates deletion", async () => {
 
 test("docs-com ensure auto-fixes registration to include mdx and runs sync immediately", async () => {
   const rootDir = await createFixtureRoot();
+  const originalMirrorEnabled = env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR;
+  env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR = true;
   env.LOCAL_DOCS_COM_PATH = rootDir;
 
   try {
@@ -1197,6 +1549,18 @@ title: "GitHub 和公共 GitLab"
 如果授权完成后无法返回 ONES，或者回调页面显示 page not found，请检查 Redirect URI、Webhook 回调地址，以及 baseURL 配置是否一致。
 `
     );
+    await writeFixture(
+      rootDir,
+      "deploy-docs/troubleshooting/infra/callback-runbook.mdx",
+      `---
+title: "Callback Runbook"
+---
+
+# Callback Runbook
+
+When callback redirects fail, verify Redirect URI and baseURL deployment wiring before retrying.
+`
+    );
 
     const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
       method: "POST",
@@ -1205,7 +1569,7 @@ title: "GitHub 和公共 GitLab"
         "x-portal-surface": "internal"
       },
       body: JSON.stringify({
-        repoUrl: "https://github.com/BangWork/docs-com",
+        repoUrl: "mock://BangWork/docs-com",
         publicBaseUrl: "https://docs.ones.com",
         defaultBranch: "master",
         includePaths: ["**/*.md"],
@@ -1225,7 +1589,8 @@ title: "GitHub 和公共 GitLab"
       body: JSON.stringify({
         mode: "full",
         actor: "test",
-        runLimit: 4
+        runLimit: 4,
+        publicationMode: "publish_inline"
       })
     });
     assert.equal(ensure.status, 202);
@@ -1235,6 +1600,7 @@ title: "GitHub 和公共 GitLab"
         runResult: { processed: number; succeeded: number };
         afterStatus: {
           registration: { includePaths: string[] };
+          sourceSnapshot: { mode: string };
           corpus: Array<{ prefix: string; total: number; active: number }>;
         };
       };
@@ -1243,7 +1609,8 @@ title: "GitHub 和公共 GitLab"
     assert.equal(ensurePayload.result.registrationChanged, true);
     assert.equal(ensurePayload.result.runResult.processed >= 1, true);
     assert.equal(ensurePayload.result.runResult.succeeded >= 1, true);
-    assert.deepEqual(ensurePayload.result.afterStatus.registration.includePaths, ["**/*.md", "**/*.mdx"]);
+    assert.equal(ensurePayload.result.afterStatus.sourceSnapshot.mode, "local_mirror");
+    assert.deepEqual(ensurePayload.result.afterStatus.registration.includePaths, buildDocsComIncludePaths(env.GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS));
     const openDocs = ensurePayload.result.afterStatus.corpus.find((item) => item.prefix === "open-docs/");
     assert.equal(openDocs?.total, 1);
     assert.equal(openDocs?.active, 1);
@@ -1257,6 +1624,7 @@ title: "GitHub 和公共 GitLab"
         exists: boolean;
         status: {
           registration: { branch: string; includePaths: string[] };
+          sourceSnapshot: { mode: string };
           corpus: Array<{ prefix: string; total: number; active: number }>;
         };
       };
@@ -1264,10 +1632,114 @@ title: "GitHub 和公共 GitLab"
 
     assert.equal(statusPayload.result.exists, true);
     assert.equal(statusPayload.result.status.registration.branch, "master");
-    assert.deepEqual(statusPayload.result.status.registration.includePaths, ["**/*.md", "**/*.mdx"]);
+    assert.equal(statusPayload.result.status.sourceSnapshot.mode, "local_mirror");
+    assert.deepEqual(statusPayload.result.status.registration.includePaths, buildDocsComIncludePaths(env.GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS));
     const docsCorpus = statusPayload.result.status.corpus.find((item) => item.prefix === "docs/");
     assert.equal(docsCorpus?.total, 1);
   } finally {
+    env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR = originalMirrorEnabled;
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("docs-com ensure full defaults to build_only without implicit publication", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalMirrorEnabled = env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR;
+  env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR = true;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  try {
+    await writeFixture(
+      rootDir,
+      "docs/auth/callback.mdx",
+      `---
+title: "Callback Troubleshooting"
+---
+
+# Callback Troubleshooting
+
+Check Redirect URI, callback address, and baseURL consistency.
+`
+    );
+    await writeFixture(
+      rootDir,
+      "open-docs/docs/openapi/api/execute-onesql.api.mdx",
+      `---
+title: "Execute ONESQL query"
+---
+
+# Execute ONESQL query
+
+ONESQL supports ORDER BY and GROUP BY clauses in POST /onesql/query.
+`
+    );
+    await writeFixture(
+      rootDir,
+      "deploy-docs/troubleshooting/infra/callback-runbook.mdx",
+      `---
+title: "Callback Runbook"
+---
+
+# Callback Runbook
+
+When callback redirects fail, verify Redirect URI and baseURL deployment wiring before retrying.
+`
+    );
+
+    const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        repoUrl: "mock://BangWork/docs-com",
+        publicBaseUrl: "https://docs.ones.com",
+        defaultBranch: "master",
+        includePaths: ["**/*.md", "**/*.mdx"],
+        excludePaths: [],
+        pollingIntervalSeconds: 60,
+        actor: "test"
+      })
+    });
+    assert.equal(register.status, 201);
+    const regPayload = (await register.json()) as { registration: { id: string } };
+
+    const ensure = await fetch(`${baseUrl}/api/v1/internal/kb/docs-com/ensure`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        mode: "full",
+        actor: "test",
+        runLimit: 4
+      })
+    });
+    assert.equal(ensure.status, 202);
+
+    const builds = await pool.query<{ status: string }>(
+      `SELECT status
+         FROM kb_builds
+        WHERE repo_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [regPayload.registration.id]
+    );
+    assert.equal(builds.rowCount, 1);
+    assert.equal(builds.rows[0].status, "validated");
+
+    const publications = await pool.query<{ total: string }>(
+      `SELECT COUNT(*)::text AS total
+         FROM kb_publications
+        WHERE repo_id = $1`,
+      [regPayload.registration.id]
+    );
+    assert.equal(publications.rows[0]?.total, "0");
+  } finally {
+    env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR = originalMirrorEnabled;
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });
   }
@@ -1275,6 +1747,8 @@ title: "GitHub 和公共 GitLab"
 
 test("docs-com sync builds memory graph and grounds callback troubleshooting retrieval", async () => {
   const rootDir = await createFixtureRoot();
+  const originalMirrorEnabled = env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR;
+  env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR = true;
   env.LOCAL_DOCS_COM_PATH = rootDir;
 
   try {
@@ -1302,6 +1776,18 @@ title: "GitHub 和公共 GitLab"
 如果授权完成后无法返回 ONES，或者回调页面显示 page not found，请检查 Redirect URI、Webhook 回调地址，以及 baseURL 配置是否一致。
 `
     );
+    await writeFixture(
+      rootDir,
+      "deploy-docs/troubleshooting/infra/callback-runbook.mdx",
+      `---
+title: "Callback Runbook"
+---
+
+# Callback Runbook
+
+When callback redirects fail, verify Redirect URI and baseURL deployment wiring before retrying.
+`
+    );
 
     const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
       method: "POST",
@@ -1310,7 +1796,7 @@ title: "GitHub 和公共 GitLab"
         "x-portal-surface": "internal"
       },
       body: JSON.stringify({
-        repoUrl: "https://github.com/BangWork/docs-com",
+        repoUrl: "mock://BangWork/docs-com",
         publicBaseUrl: "https://docs.ones.com",
         defaultBranch: "master",
         includePaths: ["**/*.md", "**/*.mdx"],
@@ -1332,7 +1818,10 @@ title: "GitHub 和公共 GitLab"
         repoId: regPayload.registration.id,
         branch: regPayload.registration.default_branch,
         afterCommitSha: "local-memory-graph",
-        idempotencyKey: "docs-com-memory-graph"
+        idempotencyKey: "docs-com-memory-graph",
+        payload: {
+          publicationMode: "publish_inline"
+        }
       })
     });
     assert.equal(enqueue.status, 202);
@@ -1402,6 +1891,7 @@ title: "GitHub 和公共 GitLab"
     };
     assert.equal(onesqlBody.result.hits[0]?.path, "open-docs/docs/openapi/api/execute-onesql.api.mdx");
   } finally {
+    env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR = originalMirrorEnabled;
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });
   }

@@ -24,7 +24,7 @@ import type {
   OpenClawSupportVerifierInput,
   OpenClawSupportWriterInput
 } from "../../infrastructure/openclaw/types.js";
-import { runSupportSearchAgent } from "./support-agent.js";
+import { runSupportSearchAgent, runSupportTriageAgent } from "./support-agent.js";
 import type {
   DraftSupportAnswer,
   SpecialistDraftAnswer,
@@ -34,6 +34,7 @@ import type {
   SupportVerificationResult,
   TriageSupportInsight
 } from "./types.js";
+import { getAiTopology, resolveStageSpecificAgent } from "./agent-router.js";
 
 async function createFixtureRoot(): Promise<string> {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "support-agent-test-"));
@@ -336,6 +337,289 @@ function createAdapter(options: {
       return { ok: true as const, mode: "mock" as const };
     }
   };
+}
+
+function createStageRecordingAdapter(options?: {
+  failRoute?: boolean;
+  failEvidencePlan?: boolean;
+}): OpenClawAdapter & { calls: string[] } {
+  const calls: string[] = [];
+
+  const record = (name: string) => {
+    calls.push(name);
+  };
+
+  const adapter: OpenClawAdapter & { calls: string[] } = {
+    calls,
+    async analyzeTicket(_input: OpenClawAnalyzeInput): Promise<OpenClawAnalyzeOutput> {
+      record("analyzeTicket");
+      return {
+        action: "ask_user",
+        confidence: 0,
+        reply: "",
+        reasoning_summary: "",
+        evidence: [],
+        risk_flags: []
+      };
+    },
+    async searchKnowledge(_input: OpenClawSearchInput): Promise<OpenClawSearchOutput> {
+      record("searchKnowledge");
+      return {
+        confidence: 0.91,
+        hits: [
+          {
+            id: "kb-auth-001",
+            title: "Troubleshoot SSO Login Callback Failures",
+            snippet: "Verify callback URL and tenant mapping before escalation.",
+            score: 0.91,
+            sourceUrl:
+              "https://github.com/BangWork/docs-com/blob/8d8f2ee6875f2d146f8f0d3bd82f51a8cb4d0a11/docs/sso-callback.md"
+          }
+        ]
+      };
+    },
+    async answerSearchQuery(
+      _input: OpenClawSearchAnswerInput
+    ): Promise<OpenClawSearchAnswerOutput> {
+      record("answerSearchQuery");
+      return {
+        answer: "",
+        summary: "",
+        steps: [],
+        validation: []
+      };
+    },
+    async classifyIntent(
+      _input: OpenClawClassifyIntentInput
+    ): Promise<OpenClawClassifyIntentOutput> {
+      record("classifyIntent");
+      return {
+        intent: "general",
+        route: "kb_guidance",
+        confidence: 0.1,
+        reasoning: ""
+      };
+    },
+    async planSupportCase(input: OpenClawSupportPlannerInput): Promise<SupportCaseFrame> {
+      record("planSupportCase");
+      return {
+        goal: input.query,
+        symptom: input.query,
+        object: "oauth callback",
+        action_type: "troubleshooting",
+        deployment_model: "shared",
+        product_area: "integrations",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: [input.query],
+        query_plan: {
+          concept_queries: [input.query],
+          object_queries: ["oauth callback"],
+          behavior_queries: ["callback failure"]
+        }
+      };
+    },
+    async routeSupportQuestion(input: OpenClawSupportRouterInput): Promise<SupportQuestionRoute> {
+      record("routeSupportQuestion");
+      if (options?.failRoute) {
+        throw new Error("router failed");
+      }
+      return {
+        question_type: "troubleshooting",
+        user_goal: input.query,
+        answer_contract: "Give the most likely integration cause first.",
+        specialist_agent: "troubleshooting-specialist",
+        routing_confidence: 0.88
+      };
+    },
+    async planSupportEvidence(input: OpenClawSupportEvidencePlannerInput): Promise<SupportEvidencePlan> {
+      record("planSupportEvidence");
+      if (options?.failEvidencePlan) {
+        throw new Error("planner failed");
+      }
+      return {
+        query_plan: {
+          concept_queries: [input.query],
+          object_queries: ["oauth callback"],
+          behavior_queries: ["callback failure"]
+        },
+        evidence_priority: ["troubleshooting", "integrations"],
+        required_doc_kinds: ["troubleshooting", "product_guide"],
+        retrieval_rounds: 1,
+        allow_refinement: false,
+        stop_after_grounded_evidence: false
+      };
+    },
+    async selectSupportEvidence(input: OpenClawSupportEvidenceSelectorInput) {
+      record("selectSupportEvidence");
+      return {
+        primary_ids: input.references.slice(0, 1).map((item) => item.documentId),
+        supplemental_ids: [],
+        rejected_ids: []
+      };
+    },
+    async writeApiSpecialistAnswer(input: OpenClawSupportSpecialistInput): Promise<SpecialistDraftAnswer> {
+      record("writeApiSpecialistAnswer");
+      return {
+        question_type: input.route.question_type,
+        render_variant: "api",
+        direct_answer: "Use the documented API details first.",
+        claims: [],
+        next_actions: [],
+        unknowns: [],
+        escalation_needed: false
+      };
+    },
+    async writeHowToSpecialistAnswer(input: OpenClawSupportSpecialistInput): Promise<SpecialistDraftAnswer> {
+      record("writeHowToSpecialistAnswer");
+      return {
+        question_type: input.route.question_type,
+        render_variant: "how_to",
+        direct_answer: "Follow the documented steps.",
+        claims: [],
+        next_actions: [],
+        unknowns: [],
+        escalation_needed: false
+      };
+    },
+    async writeBehaviorSpecialistAnswer(input: OpenClawSupportSpecialistInput): Promise<SpecialistDraftAnswer> {
+      record("writeBehaviorSpecialistAnswer");
+      return {
+        question_type: input.route.question_type,
+        render_variant: "behavior",
+        direct_answer: "The current behavior matches the documented rule.",
+        claims: [],
+        next_actions: [],
+        unknowns: [],
+        escalation_needed: false
+      };
+    },
+    async writeTroubleshootingSpecialistAnswer(input: OpenClawSupportSpecialistInput): Promise<SpecialistDraftAnswer> {
+      record("writeTroubleshootingSpecialistAnswer");
+      return {
+        question_type: input.route.question_type,
+        render_variant: "troubleshooting",
+        direct_answer: "The callback configuration is the most likely issue.",
+        claims: [
+          {
+            text: "Callback and Redirect URI must be consistent.",
+            kind: "verified_fact",
+            evidence_ids: input.evidenceBundle.primary.map((item) => item.documentId).slice(0, 1),
+            authority: "canonical"
+          }
+        ],
+        next_actions: ["Check Redirect URI and callback URL consistency."],
+        unknowns: [],
+        escalation_needed: false,
+        most_likely_causes: ["Callback URL mismatch"],
+        recommended_checks: ["Compare Redirect URI, callback URL, and base URL."]
+      };
+    },
+    async writeSupportAnswer(_input: OpenClawSupportWriterInput): Promise<DraftSupportAnswer> {
+      record("writeSupportAnswer");
+      return {
+        direct_answer: "Fallback support answer",
+        claims: [],
+        next_actions: [],
+        unknowns: [],
+        escalation_needed: false
+      };
+    },
+    async judgeSupportAnswer(input: OpenClawSupportVerifierInput): Promise<SupportVerificationResult> {
+      record("judgeSupportAnswer");
+      const citationIds = input.evidenceBundle.primary.map((item) => item.documentId).slice(0, 1);
+      return {
+        verdict: citationIds.length ? "verified" : "unsupported",
+        summary: "verified",
+        unsupported_claims: [],
+        missing_info: [],
+        verified_citation_ids: citationIds,
+        display_citation_ids: citationIds,
+        verified_claims: input.draftSupportAnswer?.claims.map((item) => item.text) ?? [],
+        claim_to_citation_map:
+          input.draftSupportAnswer?.claims.map((item) => ({
+            text: item.text,
+            kind: item.kind,
+            verdict: item.kind === "grounded_inference" ? "supported_inference" : "verified",
+            citation_ids: citationIds
+          })) ?? []
+      };
+    },
+    async verifySupportAnswer(input: OpenClawSupportVerifierInput): Promise<SupportVerificationResult> {
+      record("verifySupportAnswer");
+      return this.judgeSupportAnswer(input, "", undefined);
+    },
+    async bindSupportCitations(input: OpenClawSupportVerifierInput): Promise<SupportVerificationResult> {
+      record("bindSupportCitations");
+      return this.judgeSupportAnswer(input, "", undefined);
+    },
+    async selectDisplayCitations(input) {
+      record("selectDisplayCitations");
+      return {
+        display_citation_ids: Array.from(new Set(input.supportedClaims.flatMap((item) => item.citation_ids))).slice(0, 3)
+      };
+    },
+    async curateSupportCitations(input) {
+      record("curateSupportCitations");
+      return {
+        display_citation_ids: Array.from(new Set(input.supportedClaims.flatMap((item) => item.citation_ids))).slice(0, 3)
+      };
+    },
+    async composeSupportAnswer(input) {
+      record("composeSupportAnswer");
+      return {
+        direct_answer: input.supportedClaims[0]?.text ?? "",
+        why: input.supportedClaims.map((item) => item.text).slice(0, 3),
+        what_to_do_now: input.nextActions.slice(0, 4),
+        still_need_to_confirm: input.unknowns.slice(0, 4)
+      };
+    },
+    async composeCustomerAnswer(input) {
+      record("composeCustomerAnswer");
+      return {
+        question_type: input.route.question_type,
+        render_variant: input.draftSupportAnswer?.render_variant ?? "troubleshooting",
+        direct_answer: input.supportedClaims[0]?.text ?? input.draftSupportAnswer?.direct_answer ?? "",
+        sections: [],
+        why: input.supportedClaims.map((item) => item.text).slice(0, 3),
+        what_to_do_now: input.nextActions.slice(0, 4),
+        still_need_to_confirm: input.unknowns.slice(0, 4)
+      };
+    },
+    async writeTriageInsight(_input: OpenClawSupportWriterInput): Promise<TriageSupportInsight> {
+      record("writeTriageInsight");
+      return {
+        direct_answer: "",
+        recommended_action: "ask_user",
+        customer_reply: "",
+        customer_reply_policy: "send_now",
+        support_summary: "",
+        verified_evidence: [],
+        risk_flags: [],
+        missing_info: [],
+        verifier_verdict: "unsupported"
+      };
+    },
+    async verifyTriageInsight(_input: OpenClawSupportVerifierInput): Promise<SupportVerificationResult> {
+      record("verifyTriageInsight");
+      return {
+        verdict: "unsupported",
+        summary: "",
+        unsupported_claims: [],
+        missing_info: [],
+        verified_citation_ids: [],
+        display_citation_ids: [],
+        verified_claims: [],
+        claim_to_citation_map: []
+      };
+    },
+    async healthCheck() {
+      record("healthCheck");
+      return { ok: true as const, mode: "mock" as const };
+    }
+  };
+
+  return adapter;
 }
 
 test("runSupportSearchAgent converts invalid uncited evidence into handoff when no blocking question exists", async () => {
@@ -1411,8 +1695,11 @@ The ONESQL syntax reference explicitly supports ORDER BY and GROUP BY clauses.
 
     const diagnostics = result.result.internal_diagnostics;
     assert.ok(diagnostics);
+    const stageTrace = diagnostics.stage_trace ?? [];
     assert.equal(result.stageTimings.writer.status, "skipped");
     assert.equal(diagnostics.specialist_skipped, true);
+    assert.equal(stageTrace.find((item) => item.stage === "specialist")?.status, "skipped");
+    assert.equal(stageTrace.find((item) => item.stage === "generic_writer")?.status, "skipped");
     assert.deepEqual(diagnostics.stage_budget, {
       retrieval_rounds: 1,
       allow_refinement: false,
@@ -1455,6 +1742,22 @@ test("runSupportSearchAgent reports dedicated selector stages in orchestration t
   const evidenceSelector = trace.find((item) => item.stage === "support-evidence-selector");
   assert.ok(evidenceSelector);
   assert.equal(evidenceSelector?.agent_id, "support-evidence-selector");
+});
+
+test("AI topology exposes support-citation-binder as an explicit routed support stage", () => {
+  const topology = getAiTopology();
+  const binder = topology.supportStages.stages.find((stage) => stage.stage === "support-citation-binder");
+
+  assert.ok(binder);
+  assert.equal(binder?.agentId, "support-citation-curator");
+  assert.equal(binder?.dedicated, false);
+  assert.equal(binder?.fallback, "stage_level_fallback");
+});
+
+test("support-citation-binder resolves to an explicit stage-level fallback instead of the global default agent", () => {
+  const binding = resolveStageSpecificAgent("support-citation-binder");
+
+  assert.equal(binding.agentId, "support-citation-curator");
 });
 
 test("runSupportSearchAgent recovers grounded API field claims from project list evidence when specialist claims are empty", async () => {
@@ -1913,6 +2216,110 @@ This page is unrelated to ONESQL semantics.
     assert.equal(result.result.citations.length, 1);
     assert.match(result.result.citations[0].title, /Execute ONESQL query/i);
     assert.doesNotMatch(result.result.citations[0].title, /baseURL/i);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportTriageAgent uses the shared support stages instead of legacy triage-only stages", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  const rootDir = await createFixtureRoot();
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+  const adapter = createStageRecordingAdapter();
+
+  try {
+    await writeFixture(
+      rootDir,
+      "docs/integrations/github-callback.mdx",
+      `---
+title: "GitHub callback troubleshooting"
+---
+
+# GitHub callback troubleshooting
+
+If authorization returns page not found, verify Redirect URI, callback URL, and baseURL are consistent.
+`
+    );
+    const result = await runSupportTriageAgent({
+      query: "GitHub callback page not found after authorization",
+      language: "en",
+      adapter,
+      idempotencyKey: "support-agent-triage-shared-runtime",
+      priority: "P2",
+      customerMeta: {},
+      history: [{ author: "customer", body: "Authorization callback fails with page not found", at: new Date().toISOString() }],
+      runtime: {
+        allowMultiPassRetrieval: false,
+        allowRefinement: false
+      }
+    });
+
+    assert.equal(adapter.calls.includes("routeSupportQuestion"), true);
+    assert.equal(adapter.calls.includes("planSupportEvidence"), true);
+    assert.equal(adapter.calls.includes("selectSupportEvidence"), true);
+    assert.equal(adapter.calls.includes("writeTroubleshootingSpecialistAnswer"), true);
+    assert.equal(adapter.calls.includes("judgeSupportAnswer"), true);
+    assert.equal(adapter.calls.includes("curateSupportCitations") || adapter.calls.includes("selectDisplayCitations"), true);
+    assert.equal(adapter.calls.includes("composeCustomerAnswer"), true);
+    assert.equal(adapter.calls.includes("writeTriageInsight"), false);
+    assert.equal(adapter.calls.includes("verifyTriageInsight"), false);
+    assert.equal(result.analyzeOutput.action, "resolve");
+    assert.equal(typeof result.analyzeOutput.reply, "string");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent records explicit stage statuses for fallback diagnostics", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  const rootDir = await createFixtureRoot();
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+  const adapter = createStageRecordingAdapter({
+    failRoute: true,
+    failEvidencePlan: true
+  });
+
+  try {
+    await writeFixture(
+      rootDir,
+      "docs/integrations/github-callback.mdx",
+      `---
+title: "GitHub callback troubleshooting"
+---
+
+# GitHub callback troubleshooting
+
+If authorization returns page not found, verify Redirect URI, callback URL, and baseURL are consistent.
+`
+    );
+    const result = await runSupportSearchAgent({
+      query: "GitHub callback page not found after authorization",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-stage-trace-fallback",
+      runtime: {
+        allowMultiPassRetrieval: false,
+        allowRefinement: false
+      }
+    });
+
+    const stageTrace = result.result.internal_diagnostics?.stage_trace ?? [];
+    const routeTrace = stageTrace.find((item) => item.stage === "route");
+    const evidencePlanTrace = stageTrace.find((item) => item.stage === "evidence_plan");
+    const retrievalTrace = stageTrace.find((item) => item.stage === "retrieval");
+
+    assert.ok(routeTrace);
+    assert.ok(evidencePlanTrace);
+    assert.ok(retrievalTrace);
+    assert.equal(routeTrace?.status, "fallback");
+    assert.equal(evidencePlanTrace?.status, "fallback");
+    assert.equal(retrievalTrace?.status, "completed");
+    assert.equal(typeof routeTrace?.duration_ms, "number");
+    assert.equal(typeof retrievalTrace?.reference_count, "number");
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

@@ -5,12 +5,15 @@ export type RetrievalProfile = "search" | "agent";
 export type KbFullSyncRunStatus = "planned" | "running" | "finalizing" | "succeeded" | "failed" | "cancelled";
 export type KbFullSyncShardStatus = "planned" | "queued" | "running" | "succeeded" | "failed";
 export type KbFullSyncShardKey = "deploy-docs" | "docs" | "open-docs";
-export type KbManifestBuildStatus = "pending" | "reused" | "rebuilt" | "failed";
+export type KbManifestBuildStatus = "pending" | "reused" | "rebuilt" | "failed" | "skipped";
 export type KbKnowledgeSpace = "support-prod" | "support-preview" | "support-local" | "support-shadow" | "support-eval";
 export type KbRequestedFromEnv = "local" | "preview" | "prod" | "operator";
 export type KbBuildKind = "full" | "incremental" | "repair" | "reindex";
 export type KbBuildStatus = "building" | "built" | "validated" | "published" | "failed" | "abandoned" | "superseded";
 export type KbValidationSeverity = "info" | "warn" | "error";
+export type KbBuildPublicationMode = "build_only" | "publish_inline";
+export type KbEmbeddingMode = "disabled" | "best_effort" | "required";
+export type KbSourceAcquisitionMode = "remote" | "local_mirror";
 export type KbSourceFamily =
   | "doc_page"
   | "openapi_spec"
@@ -312,6 +315,7 @@ export interface RetrievalResponse {
   answerLanguage?: "zh" | "en";
   answer?: string;
   resolvedQueries?: string[];
+  retrievalStatus?: "grounded" | "no_results" | "kb_unavailable";
   confidence: number;
   fallbackUsed: boolean;
   hits: RetrievalHit[];
@@ -329,6 +333,7 @@ export interface RetrievalResponse {
 export interface GitHubTreeFile {
   path: string;
   sha: string;
+  contentChecksum?: string | null;
   size: number;
   type: "blob";
 }
@@ -445,11 +450,15 @@ export interface KbSyncManifestItem {
   branch: string;
   target_head: string;
   path: string;
-  shard_key: KbFullSyncShardKey;
+  shard_key: KbFullSyncShardKey | null;
+  source_family: KbSourceFamily | null;
+  content_checksum: string | null;
+  source_acquisition_mode: KbSourceAcquisitionMode;
   blob_sha: string;
   size_bytes: number;
   needs_rebuild: boolean;
   reuse_reason: string | null;
+  skip_reason: string | null;
   build_status: KbManifestBuildStatus;
   error_message: string | null;
   created_at: string;

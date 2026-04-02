@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 const kbKnowledgeSpaceSchema = z.enum(["support-prod", "support-preview", "support-local", "support-shadow", "support-eval"]);
+const kbPublicationModeSchema = z.enum(["build_only", "publish_inline"]);
+const kbEmbeddingModeSchema = z.enum(["disabled", "best_effort", "required"]);
 
 export const kbRepoRegistrationSchema = z.object({
   repoUrl: z.string().min(1),
@@ -30,7 +32,9 @@ export const kbRunJobsSchema = z.object({
 export const kbDocsComEnsureSchema = z.object({
   mode: z.enum(["incremental", "full", "reindex"]).default("incremental"),
   actor: z.string().min(1).default("internal_operator"),
-  runLimit: z.coerce.number().int().min(0).max(20).default(0)
+  runLimit: z.coerce.number().int().min(0).max(20).default(0),
+  publicationMode: kbPublicationModeSchema.default("build_only"),
+  embeddingMode: kbEmbeddingModeSchema.default("best_effort")
 });
 
 export const kbDocsComStatusQuerySchema = z.object({
@@ -41,14 +45,18 @@ export const kbBuildsFullSchema = z.object({
   repoId: z.string().uuid(),
   branch: z.string().min(1).optional(),
   actor: z.string().min(1).default("internal_operator"),
-  knowledgeSpace: kbKnowledgeSpaceSchema.optional()
+  knowledgeSpace: kbKnowledgeSpaceSchema.optional(),
+  publicationMode: kbPublicationModeSchema.default("build_only"),
+  embeddingMode: kbEmbeddingModeSchema.default("best_effort")
 });
 
 export const kbBuildsIncrementalSchema = z.object({
   repoId: z.string().uuid(),
   branch: z.string().min(1).optional(),
   actor: z.string().min(1).default("internal_operator"),
-  knowledgeSpace: kbKnowledgeSpaceSchema.optional()
+  knowledgeSpace: kbKnowledgeSpaceSchema.optional(),
+  publicationMode: kbPublicationModeSchema.default("build_only"),
+  embeddingMode: kbEmbeddingModeSchema.default("best_effort")
 });
 
 export const kbPublicationPromoteSchema = z.object({
@@ -60,6 +68,13 @@ export const kbPublicationStatusQuerySchema = z.object({
   repoId: z.string().uuid().optional(),
   branch: z.string().min(1).optional(),
   knowledgeSpace: kbKnowledgeSpaceSchema.optional()
+});
+
+export const kbCleanupDryRunQuerySchema = z.object({
+  repoId: z.string().uuid().optional(),
+  branch: z.string().min(1).optional(),
+  knowledgeSpace: kbKnowledgeSpaceSchema.optional(),
+  staleAgeHours: z.coerce.number().int().min(1).max(24 * 365).default(72)
 });
 
 export const kbRetrievalQuerySchema = z.object({
