@@ -275,6 +275,7 @@ export async function getKbReleaseStatus(input?: {
 export async function previewKbPromotion(input: {
   buildId: string;
   actor: string;
+  operatorOverride?: boolean;
   evaluationRecorded: boolean;
   shadowValidationStable: boolean;
   rollbackReviewed: boolean;
@@ -284,7 +285,7 @@ export async function previewKbPromotion(input: {
     throw new Error(`Build not found: ${input.buildId}`);
   }
 
-  const requestedFromEnv = resolveRequestedFromEnv();
+  const requestedFromEnv = input.operatorOverride ? "operator" : resolveRequestedFromEnv();
   const currentPublication = await repo.getPublication({
     knowledgeSpace: build.knowledge_space,
     repoId: build.repo_id,
@@ -395,7 +396,8 @@ export async function previewKbPromotion(input: {
       endpoint: "/api/v1/internal/kb/publications/promote",
       body: {
         buildId: build.id,
-        actor: input.actor
+        actor: input.actor,
+        ...(input.operatorOverride ? { operatorOverride: true } : {})
       }
     }
   };

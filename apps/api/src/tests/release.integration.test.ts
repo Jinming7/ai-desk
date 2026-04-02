@@ -455,6 +455,91 @@ test("previewKbPromotion allows first non-production bootstrap without rollback 
   });
 });
 
+test("previewKbPromotion allows explicit operator override for isolated shadow promotion", async (t) => {
+  await withDbHarness(t, async () => {
+    const registration = await createRegistration();
+    const candidateBuild = await createBuild({
+      repoId: registration.id,
+      knowledgeSpace: "support-shadow",
+      buildVersion: "build-shadow-bootstrap",
+      targetHead: "sha-shadow-bootstrap",
+      status: "validated"
+    });
+
+    const result = await previewKbPromotion({
+      buildId: candidateBuild.id,
+      actor: "internal_operator",
+      evaluationRecorded: true,
+      shadowValidationStable: true,
+      rollbackReviewed: true,
+      operatorOverride: true
+    });
+
+    assert.equal(result.eligible, true);
+    assert.equal(result.requestedFromEnv, "operator");
+    assert.deepEqual(result.action.body, {
+      buildId: candidateBuild.id,
+      actor: "internal_operator",
+      operatorOverride: true
+    });
+  });
+});
+
+test("internal publication promote allows explicit operator override for support-shadow", async (t) => {
+  await withDbHarness(t, async ({ baseUrl }) => {
+    const registration = await createRegistration();
+    const candidateBuild = await createBuild({
+      repoId: registration.id,
+      knowledgeSpace: "support-shadow",
+      buildVersion: "build-shadow-publish",
+      targetHead: "sha-shadow-publish",
+      status: "validated"
+    });
+    await githubRepo.upsertDocument({
+      repoId: registration.id,
+      knowledgeSpace: "support-shadow",
+      branch: "main",
+      path: "docs/shadow-ready.md",
+      buildVersion: candidateBuild.build_version,
+      title: "Shadow Ready",
+      sourceUrl: "https://example.test/docs/shadow-ready",
+      repoSourceUrl: "https://github.com/acme/ticket-kb/blob/main/docs/shadow-ready.md",
+      publicSourceUrl: null,
+      commitSha: candidateBuild.target_head,
+      contentHash: `hash:${candidateBuild.build_version}`,
+      content: "shadow publication readiness",
+      metadata: {}
+    });
+
+    const response = await requestJson(`${baseUrl}/api/v1/internal/kb/publications/promote`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        buildId: candidateBuild.id,
+        actor: "internal_operator",
+        operatorOverride: true
+      })
+    });
+
+    assert.equal(response.status, 200);
+    const publication = await githubRepo.getPublication({
+      knowledgeSpace: "support-shadow",
+      repoId: registration.id,
+      branch: "main"
+    });
+    const serving = await githubRepo.getServingVersion(registration.id, "main");
+    const updatedBuild = await githubRepo.getBuildById(candidateBuild.id);
+
+    assert.equal(publication?.published_build_version, candidateBuild.build_version);
+    assert.equal(publication?.published_from_env, "operator");
+    assert.equal(serving?.active_build_version, candidateBuild.build_version);
+    assert.equal(updatedBuild?.status, "published");
+  });
+});
+
 test("previewKbPromotion still requires rollback target for production scope", async (t) => {
   await withDbHarness(t, async () => {
     const registration = await createRegistration();

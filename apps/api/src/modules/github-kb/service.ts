@@ -264,6 +264,7 @@ export function buildEnqueuedSyncPayload(input: {
   mode: "full" | "incremental" | "reindex";
   idempotencyKey: string;
   knowledgeSpace: KbKnowledgeSpace;
+  requestedFromEnv?: KbRequestedFromEnv;
   afterCommitSha?: string;
   payload?: Record<string, unknown>;
 }): Record<string, unknown> {
@@ -271,6 +272,7 @@ export function buildEnqueuedSyncPayload(input: {
   return {
     ...(input.payload ?? {}),
     knowledgeSpace: input.knowledgeSpace,
+    requestedFromEnv: input.requestedFromEnv ?? resolveRequestedFromEnv(),
     executionId,
     ...(input.mode === "full" && input.afterCommitSha
       ? {
@@ -464,6 +466,13 @@ function parseKnowledgeSpace(value: unknown): KbKnowledgeSpace | null {
   return null;
 }
 
+function parseRequestedFromEnv(value: unknown): KbRequestedFromEnv | null {
+  if (value === "local" || value === "preview" || value === "prod" || value === "operator") {
+    return value;
+  }
+  return null;
+}
+
 function parsePublicationMode(value: unknown): KbBuildPublicationMode | null {
   return value === "build_only" || value === "publish_inline" ? value : null;
 }
@@ -500,8 +509,17 @@ export function buildGenericSyncContinuationPayload(
     cursor: result.nextCursor,
     buildVersion: String(job.payload_json?.buildVersion ?? "").trim() || result.head,
     knowledgeSpace: String(job.payload_json?.knowledgeSpace ?? "").trim() || resolveRuntimeKnowledgeSpace(),
+    requestedFromEnv: String(job.payload_json?.requestedFromEnv ?? "").trim() || resolveRequestedFromEnv(),
     executionId: resolveSyncExecutionId(job.payload_json, job.id)
   };
+}
+
+function resolveRequestedFromEnvForOperation(operatorOverride = false): KbRequestedFromEnv {
+  return operatorOverride ? "operator" : resolveRequestedFromEnv();
+}
+
+function resolveRequestedFromEnvFromPayload(payload: Record<string, unknown> | null | undefined): KbRequestedFromEnv {
+  return parseRequestedFromEnv(payload?.requestedFromEnv) ?? resolveRequestedFromEnv();
 }
 
 export async function renewBuildIngestLease(input: {
@@ -2595,13 +2613,16 @@ async function indexDocumentContent(input: {
   );
 }
 
-async function maybeFinalizeDocsComFullSyncRun(runId: string, publicationMode: KbBuildPublicationMode): Promise<void> {
+async function maybeFinalizeDocsComFullSyncRun(
+  runId: string,
+  knowledgeSpace: KbKnowledgeSpace,
+  requestedFromEnv: KbRequestedFromEnv,
+  publicationMode: KbBuildPublicationMode
+): Promise<void> {
   const run = await repo.tryStartSyncRunFinalization(runId);
   if (!run) return;
-  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
   try {
     const buildVersion = buildFullRunBuildVersion(run.target_head, run.id);
-    const requestedFromEnv = resolveRequestedFromEnv();
     await finalizeBuild({
       knowledgeSpace,
       repoId: run.repo_id,
@@ -2639,7 +2660,7 @@ async function maybeFinalizeDocsComFullSyncRun(runId: string, publicationMode: K
 
 async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
   const knowledgeSpace = resolveJobKnowledgeSpace(job);
-  const requestedFromEnv = resolveRequestedFromEnv();
+  const requestedFromEnv = resolveRequestedFromEnvFromPayload(job.payload_json);
   const publicationMode = resolvePublicationModeFromPayload(job.payload_json, "build_only");
   const embeddingMode = resolveEmbeddingModeFromPayload(job.payload_json);
   const payload = getFullRunPayload(job);
@@ -2691,7 +2712,7 @@ async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegist
       nextCursor: null,
       status: "succeeded"
     });
-    await maybeFinalizeDocsComFullSyncRun(run.id, publicationMode);
+    await maybeFinalizeDocsComFullSyncRun(run.id, knowledgeSpace, requestedFromEnv, publicationMode);
     return { indexed: 0, head: run.target_head, finished: true, nextCursor: null };
   }
 
@@ -2801,6 +2822,8 @@ async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegist
       branch: run.branch,
       mode: "full",
       source: job.source,
+      knowledgeSpace,
+      requestedFromEnv,
       afterCommitSha: run.target_head,
       payload: {
         ...job.payload_json,
@@ -2809,7 +2832,7 @@ async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegist
       idempotencyKey: `sync-continuation:full:${run.id}:${payload.shardKey}:${run.target_head}:${nextCursor}`
     });
   } else {
-    await maybeFinalizeDocsComFullSyncRun(run.id, publicationMode);
+    await maybeFinalizeDocsComFullSyncRun(run.id, knowledgeSpace, requestedFromEnv, publicationMode);
   }
 
   return {
@@ -2825,15 +2848,17 @@ async function runLocalMirrorFullSync(
   registration: RepoRegistration,
   localMirror: LocalDocsMirrorState,
   leaseOwnerId: string,
-  buildVersion: string
+  buildVersion: string,
+  requestedFromEnv: KbRequestedFromEnv
 ): Promise<LocalMirrorBatchResult> {
   const branch = job.branch || localMirror.branch || registration.default_branch;
-  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
+  const knowledgeSpace = resolveJobKnowledgeSpace(job);
   const publicationMode = resolvePublicationModeFromPayload(job.payload_json, "build_only");
   const embeddingMode = resolveEmbeddingModeFromPayload(job.payload_json);
   return runLocalMirrorSyncBatch({
     registration,
     knowledgeSpace,
+    requestedFromEnv,
     branch,
     localMirror,
     leaseOwnerId,
@@ -2848,6 +2873,7 @@ async function runLocalMirrorFullSync(
 async function runLocalMirrorSyncBatch(input: {
   registration: RepoRegistration;
   knowledgeSpace: KbKnowledgeSpace;
+  requestedFromEnv: KbRequestedFromEnv;
   branch: string;
   localMirror: LocalDocsMirrorState;
   leaseOwnerId: string;
@@ -2878,7 +2904,7 @@ async function runLocalMirrorSyncBatch(input: {
       repoId: input.registration.id,
       branch: input.branch,
       ownerId: input.leaseOwnerId,
-      ownerEnv: resolveRequestedFromEnv(),
+      ownerEnv: input.requestedFromEnv,
       buildVersion: input.buildVersion,
       source: "local_mirror"
     });
@@ -2899,7 +2925,7 @@ async function runLocalMirrorSyncBatch(input: {
       targetHead: input.localMirror.head,
       buildKind: "full",
       requestedBy: "sync_worker",
-      requestedFromEnv: resolveRequestedFromEnv(),
+      requestedFromEnv: input.requestedFromEnv,
       publicationMode: input.publicationMode
     });
     await repo.releaseIngestLease(
@@ -2930,6 +2956,7 @@ async function runLocalMirrorSyncBatch(input: {
 async function runRemoteSnapshotBatch(input: {
   registration: RepoRegistration;
   knowledgeSpace: KbKnowledgeSpace;
+  requestedFromEnv: KbRequestedFromEnv;
   branch: string;
   head: string;
   leaseOwnerId: string;
@@ -2954,7 +2981,7 @@ async function runRemoteSnapshotBatch(input: {
       repoId: input.registration.id,
       branch: input.branch,
       ownerId: input.leaseOwnerId,
-      ownerEnv: resolveRequestedFromEnv(),
+      ownerEnv: input.requestedFromEnv,
       buildVersion: input.buildVersion,
       source: "remote"
     });
@@ -2980,7 +3007,7 @@ async function runRemoteSnapshotBatch(input: {
       repoId: input.registration.id,
       branch: input.branch,
       ownerId: input.leaseOwnerId,
-      ownerEnv: resolveRequestedFromEnv(),
+      ownerEnv: input.requestedFromEnv,
       buildVersion: input.buildVersion,
       source: "remote"
     });
@@ -2998,7 +3025,7 @@ async function runRemoteSnapshotBatch(input: {
       targetHead: input.head,
       buildKind: "full",
       requestedBy: "sync_worker",
-      requestedFromEnv: resolveRequestedFromEnv(),
+      requestedFromEnv: input.requestedFromEnv,
       publicationMode: input.publicationMode
     });
     await repo.releaseIngestLease(
@@ -3058,7 +3085,7 @@ function buildSyntheticSyncJob(input: {
 
 async function runFullSync(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
   const knowledgeSpace = resolveJobKnowledgeSpace(job);
-  const requestedFromEnv = resolveRequestedFromEnv();
+  const requestedFromEnv = resolveRequestedFromEnvFromPayload(job.payload_json);
   const publicationMode = resolvePublicationModeFromPayload(job.payload_json, "build_only");
   const embeddingMode = resolveEmbeddingModeFromPayload(job.payload_json);
   const leaseOwnerId = resolveSyncExecutionId(job.payload_json, job.id);
@@ -3092,7 +3119,7 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
         branch: job.branch || localMirror.branch || registration.default_branch,
         buildVersion
       },
-      () => runLocalMirrorFullSync(job, registration, localMirror, leaseOwnerId, buildVersion)
+      () => runLocalMirrorFullSync(job, registration, localMirror, leaseOwnerId, buildVersion, requestedFromEnv)
     );
   }
   const resolved = await resolveRegistrationBranch(registration, job.branch, "sync_worker");
@@ -3132,6 +3159,7 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
       runRemoteSnapshotBatch({
         registration: effectiveRegistration,
         knowledgeSpace,
+        requestedFromEnv,
         branch,
         head,
         leaseOwnerId,
@@ -3159,6 +3187,8 @@ export async function runRepositorySyncDirect(input: {
   branch?: string;
   mode: "full" | "incremental" | "reindex";
   source?: KbSyncSource;
+  knowledgeSpace?: KbKnowledgeSpace;
+  operatorOverride?: boolean;
   cursor?: string;
   executionId?: string;
 }): Promise<SyncExecutionResult> {
@@ -3169,6 +3199,7 @@ export async function runRepositorySyncDirect(input: {
 
   const branch = input.branch?.trim() || registration.default_branch;
   const executionId = String(input.executionId ?? "").trim() || deriveSyncExecutionId(`direct:${registration.id}:${branch}:${input.mode}`);
+  const requestedFromEnv = resolveRequestedFromEnvForOperation(Boolean(input.operatorOverride));
   const syntheticJob: SyncJob = {
     ...buildSyntheticSyncJob({
       repoId: registration.id,
@@ -3176,6 +3207,8 @@ export async function runRepositorySyncDirect(input: {
       mode: input.mode,
       source: input.source ?? "manual",
       payload: {
+        ...(input.knowledgeSpace ? { knowledgeSpace: input.knowledgeSpace } : {}),
+        requestedFromEnv,
         ...(input.cursor ? { cursor: input.cursor } : {}),
         executionId
       }
@@ -3199,6 +3232,8 @@ async function enqueueSyncContinuation(job: SyncJob, registration: RepoRegistrat
     branch: job.branch,
     mode: job.sync_mode,
     source: job.source,
+    knowledgeSpace: resolveJobKnowledgeSpace(job),
+    requestedFromEnv: resolveRequestedFromEnvFromPayload(job.payload_json),
     beforeCommitSha: job.before_commit_sha ?? undefined,
     afterCommitSha: result.head,
     payload: continuationPayload,
@@ -3323,6 +3358,8 @@ async function createDocsComFullSyncRun(input: {
   actor: string;
   branch?: string;
   runReason?: string;
+  knowledgeSpace?: KbKnowledgeSpace;
+  requestedFromEnv?: KbRequestedFromEnv;
   publicationMode: KbBuildPublicationMode;
   embeddingMode: KbEmbeddingMode;
 }): Promise<{
@@ -3342,8 +3379,8 @@ async function createDocsComFullSyncRun(input: {
   }
 
   const snapshot = await freezeDocsComSourceSnapshot(input.registration, input.branch);
-  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
-  const requestedFromEnv = resolveRequestedFromEnv();
+  const knowledgeSpace = input.knowledgeSpace ?? resolveRuntimeKnowledgeSpace();
+  const requestedFromEnv = input.requestedFromEnv ?? resolveRequestedFromEnv();
   const manifest = buildDocsComSourceManifest({
     sourceMode: snapshot.mode,
     includePaths: input.registration.include_paths,
@@ -3425,6 +3462,8 @@ async function createDocsComFullSyncRun(input: {
       branch: snapshot.branch,
       mode: "full",
       source: "system",
+      knowledgeSpace,
+      requestedFromEnv,
       afterCommitSha: snapshot.head,
       payload: {
         runId: run.id,
@@ -3547,6 +3586,7 @@ export async function startKnowledgeBaseFullBuild(input: {
   branch?: string;
   actor: string;
   knowledgeSpace?: KbKnowledgeSpace;
+  operatorOverride?: boolean;
   publicationMode?: KbBuildPublicationMode;
   embeddingMode?: KbEmbeddingMode;
 }): Promise<{
@@ -3556,9 +3596,10 @@ export async function startKnowledgeBaseFullBuild(input: {
   fullRun?: { id: string; targetHead: string; created: boolean };
 }> {
   const runtimeKnowledgeSpace = resolveRuntimeKnowledgeSpace();
-  if (input.knowledgeSpace && input.knowledgeSpace !== runtimeKnowledgeSpace) {
+  if (input.knowledgeSpace && input.knowledgeSpace !== runtimeKnowledgeSpace && !input.operatorOverride) {
     throw new Error(`Cross-space full build start requires operator override support. Requested ${input.knowledgeSpace}, runtime ${runtimeKnowledgeSpace}`);
   }
+  const requestedFromEnv = resolveRequestedFromEnvForOperation(Boolean(input.operatorOverride));
   const registration = await repo.getRepoRegistrationById(input.repoId);
   if (!registration || !registration.is_active) {
     throw new Error(`Repository registration not found or inactive: ${input.repoId}`);
@@ -3570,6 +3611,8 @@ export async function startKnowledgeBaseFullBuild(input: {
       actor: input.actor,
       branch: input.branch ?? registration.default_branch,
       runReason: `api full build ${new Date().toISOString()}`,
+      knowledgeSpace,
+      requestedFromEnv,
       publicationMode: input.publicationMode ?? "build_only",
       embeddingMode: input.embeddingMode ?? DEFAULT_EMBEDDING_MODE
     });
@@ -3596,8 +3639,11 @@ export async function startKnowledgeBaseFullBuild(input: {
     branch: input.branch ?? registration.default_branch,
     mode: "full",
     source: "manual",
+    knowledgeSpace,
+    requestedFromEnv,
     payload: {
       knowledgeSpace,
+      requestedFromEnv,
       publicationMode: input.publicationMode ?? "build_only",
       embeddingMode: input.embeddingMode ?? DEFAULT_EMBEDDING_MODE
     }
@@ -3613,6 +3659,7 @@ export async function startKnowledgeBaseIncrementalBuild(input: {
   branch?: string;
   actor: string;
   knowledgeSpace?: KbKnowledgeSpace;
+  operatorOverride?: boolean;
   publicationMode?: KbBuildPublicationMode;
   embeddingMode?: KbEmbeddingMode;
 }): Promise<{
@@ -3621,19 +3668,23 @@ export async function startKnowledgeBaseIncrementalBuild(input: {
   job: Awaited<ReturnType<typeof enqueueSyncJob>>;
 }> {
   const runtimeKnowledgeSpace = resolveRuntimeKnowledgeSpace();
-  if (input.knowledgeSpace && input.knowledgeSpace !== runtimeKnowledgeSpace) {
+  if (input.knowledgeSpace && input.knowledgeSpace !== runtimeKnowledgeSpace && !input.operatorOverride) {
     throw new Error(
       `Cross-space incremental build start requires operator override support. Requested ${input.knowledgeSpace}, runtime ${runtimeKnowledgeSpace}`
     );
   }
   const knowledgeSpace = input.knowledgeSpace ?? runtimeKnowledgeSpace;
+  const requestedFromEnv = resolveRequestedFromEnvForOperation(Boolean(input.operatorOverride));
   const job = await enqueueSyncJob({
     repoId: input.repoId,
     branch: input.branch,
     mode: "incremental",
     source: "manual",
+    knowledgeSpace,
+    requestedFromEnv,
     payload: {
       knowledgeSpace,
+      requestedFromEnv,
       publicationMode: input.publicationMode ?? "build_only",
       embeddingMode: input.embeddingMode ?? DEFAULT_EMBEDDING_MODE
     }
@@ -3648,6 +3699,7 @@ export async function startKnowledgeBaseIncrementalBuild(input: {
 export async function promoteValidatedBuild(input: {
   buildId: string;
   actor: string;
+  operatorOverride?: boolean;
 }): Promise<{
   build: KbBuild;
   publication: Awaited<ReturnType<typeof repo.getPublication>>;
@@ -3655,7 +3707,7 @@ export async function promoteValidatedBuild(input: {
   const build = await repo.getBuildById(input.buildId);
   if (!build) throw new Error(`Build not found: ${input.buildId}`);
   const registration = await repo.getRepoRegistrationById(build.repo_id);
-  const requestedFromEnv = resolveRequestedFromEnv();
+  const requestedFromEnv = resolveRequestedFromEnvForOperation(Boolean(input.operatorOverride));
   const validation = await validateBuildForPublication({
     knowledgeSpace: build.knowledge_space,
     repoId: build.repo_id,
@@ -3786,6 +3838,8 @@ export async function enqueueSyncJob(input: {
   branch?: string;
   mode: "full" | "incremental" | "reindex";
   source: KbSyncSource;
+  knowledgeSpace?: KbKnowledgeSpace;
+  requestedFromEnv?: KbRequestedFromEnv;
   beforeCommitSha?: string;
   afterCommitSha?: string;
   payload?: Record<string, unknown>;
@@ -3802,11 +3856,12 @@ export async function enqueueSyncJob(input: {
   const idempotencyKey =
     input.idempotencyKey ??
     `${input.mode}:${resolved.registration.id}:${resolved.branch}:${input.beforeCommitSha ?? "none"}:${input.afterCommitSha ?? Date.now()}`;
-  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
+  const knowledgeSpace = input.knowledgeSpace ?? resolveRuntimeKnowledgeSpace();
   const payload = buildEnqueuedSyncPayload({
     mode: input.mode,
     idempotencyKey,
     knowledgeSpace,
+    requestedFromEnv: input.requestedFromEnv ?? resolveRequestedFromEnv(),
     afterCommitSha: input.afterCommitSha,
     payload: input.payload
   });
@@ -4061,6 +4116,7 @@ export async function backfillRepositoryFromLocalMirror(
   const batch = await runLocalMirrorSyncBatch({
     registration,
     knowledgeSpace,
+    requestedFromEnv,
     branch,
     localMirror,
     leaseOwnerId,

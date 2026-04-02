@@ -571,6 +571,94 @@ test("build API creates a validated build without implicit publication", async (
   assert.equal(publicationBody.result.length, 0);
 });
 
+test("build API allows explicit internal operator override into support-shadow", async () => {
+  const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({
+      repoUrl: "mock://acme/ticket-kb",
+      defaultBranch: "main",
+      includePaths: ["docs/*.md", "docs/**/*.md"],
+      excludePaths: [],
+      pollingIntervalSeconds: 60,
+      actor: "test"
+    })
+  });
+  assert.equal(register.status, 201);
+  const regPayload = (await register.json()) as { registration: { id: string; default_branch: string } };
+
+  const buildStart = await fetch(`${baseUrl}/api/v1/internal/kb/builds/full`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({
+      repoId: regPayload.registration.id,
+      branch: regPayload.registration.default_branch,
+      actor: "internal_operator",
+      knowledgeSpace: "support-shadow",
+      operatorOverride: true
+    })
+  });
+  assert.equal(buildStart.status, 202);
+
+  const run = await fetch(`${baseUrl}/api/v1/internal/kb/sync/run`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify({ limit: 20 })
+  });
+  assert.equal(run.status, 200);
+
+  const builds = await pool.query<{ knowledge_space: string; requested_from_env: string; status: string }>(
+    `SELECT knowledge_space, requested_from_env, status
+     FROM kb_builds
+     WHERE repo_id = $1
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [regPayload.registration.id]
+  );
+  assert.equal(builds.rowCount, 1);
+  assert.equal(builds.rows[0].knowledge_space, "support-shadow");
+  assert.equal(builds.rows[0].requested_from_env, "operator");
+  assert.equal(builds.rows[0].status, "validated");
+});
+
+test("build API rejects operator override from automation-only callers", async () => {
+  const previousOpsToken = env.INTERNAL_OPS_TOKEN;
+  env.INTERNAL_OPS_TOKEN = "test-internal-ops-token";
+
+  try {
+    const registration = await createIsolationRegistration();
+    const buildStart = await fetch(`${baseUrl}/api/v1/internal/kb/builds/full`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${env.INTERNAL_OPS_TOKEN}`
+      },
+      body: JSON.stringify({
+        repoId: registration.id,
+        branch: "main",
+        actor: "internal_operator",
+        knowledgeSpace: "support-shadow",
+        operatorOverride: true
+      })
+    });
+
+    assert.equal(buildStart.status, 403);
+    const body = (await buildStart.json()) as { error: string };
+    assert.match(body.error, /internal portal access required/i);
+  } finally {
+    env.INTERNAL_OPS_TOKEN = previousOpsToken;
+  }
+});
+
 test("legacy /sync/full defaults to validated build without implicit publication", async () => {
   const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
     method: "POST",

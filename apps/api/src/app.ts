@@ -171,6 +171,13 @@ function requireInternalOrAutomationRequest(req: express.Request, res: express.R
   res.status(403).json({ error: "Forbidden: internal portal or automation token required" });
 }
 
+function requireExplicitOperatorPortalAccess(req: express.Request, res: express.Response, operatorOverride: boolean): boolean {
+  if (!operatorOverride) return true;
+  if (req.header("x-portal-surface") === "internal") return true;
+  res.status(403).json({ error: "Forbidden: internal portal access required for operator override" });
+  return false;
+}
+
 app.get(
   "/api/v1/health",
   asyncHandler(async (_req, res) => {
@@ -946,6 +953,7 @@ app.post(
   requireInternalOrAutomationRequest,
   asyncHandler(async (req, res) => {
     const body = kbBuildsFullSchema.parse(req.body ?? {});
+    if (!requireExplicitOperatorPortalAccess(req, res, body.operatorOverride)) return;
     const result = await githubKbService.startKnowledgeBaseFullBuild(body);
     res.status(202).json({ result });
   })
@@ -956,6 +964,7 @@ app.post(
   requireInternalOrAutomationRequest,
   asyncHandler(async (req, res) => {
     const body = kbBuildsIncrementalSchema.parse(req.body ?? {});
+    if (!requireExplicitOperatorPortalAccess(req, res, body.operatorOverride)) return;
     const result = await githubKbService.startKnowledgeBaseIncrementalBuild(body);
     res.status(202).json({ result });
   })

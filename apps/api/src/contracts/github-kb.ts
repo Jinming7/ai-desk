@@ -46,6 +46,7 @@ export const kbBuildsFullSchema = z.object({
   branch: z.string().min(1).optional(),
   actor: z.string().min(1).default("internal_operator"),
   knowledgeSpace: kbKnowledgeSpaceSchema.optional(),
+  operatorOverride: z.coerce.boolean().default(false),
   publicationMode: kbPublicationModeSchema.default("build_only"),
   embeddingMode: kbEmbeddingModeSchema.default("best_effort")
 });
@@ -55,13 +56,15 @@ export const kbBuildsIncrementalSchema = z.object({
   branch: z.string().min(1).optional(),
   actor: z.string().min(1).default("internal_operator"),
   knowledgeSpace: kbKnowledgeSpaceSchema.optional(),
+  operatorOverride: z.coerce.boolean().default(false),
   publicationMode: kbPublicationModeSchema.default("build_only"),
   embeddingMode: kbEmbeddingModeSchema.default("best_effort")
 });
 
 export const kbPublicationPromoteSchema = z.object({
   buildId: z.string().uuid(),
-  actor: z.string().min(1).default("internal_operator")
+  actor: z.string().min(1).default("internal_operator"),
+  operatorOverride: z.coerce.boolean().default(false)
 });
 
 export const kbPublicationStatusQuerySchema = z.object({
