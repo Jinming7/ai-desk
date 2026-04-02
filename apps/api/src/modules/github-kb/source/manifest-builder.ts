@@ -1,4 +1,5 @@
 import type { GitHubTreeFile, KbFullSyncShardKey, KbSourceAcquisitionMode, KbSourceFamily } from "../types.js";
+import { globToRegex } from "./path-glob.js";
 
 export interface DocsComManifestEligibleItem {
   path: string;
@@ -53,14 +54,6 @@ function classifyFamilyHint(pathname: string): KbSourceFamily | null {
     return "code_file";
   }
   return null;
-}
-
-function globToRegex(glob: string): RegExp {
-  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-  const withDoubleStar = escaped.replace(/\*\*/g, "::DOUBLE_STAR::");
-  const withSingleStar = withDoubleStar.replace(/\*/g, "[^/]*");
-  const pattern = withSingleStar.replace(/::DOUBLE_STAR::/g, ".*");
-  return new RegExp(`^${pattern}$`, "i");
 }
 
 function getInclusionDecision(pathname: string, includePaths: string[], excludePaths: string[]): {

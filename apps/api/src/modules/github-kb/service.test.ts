@@ -581,6 +581,28 @@ test("buildDocsComSourceManifest keeps content checksum stable across acquisitio
   assert.equal(localManifest.eligibleItems[0]?.contentChecksum, "sha256-same-content");
 });
 
+test("buildDocsComSourceManifest treats docs double-star patterns as matching direct child docs", () => {
+  const manifest = buildDocsComSourceManifest({
+    sourceMode: "remote",
+    includePaths: ["docs/**/*.md"],
+    excludePaths: [],
+    files: [
+      {
+        path: "docs/20_AI_Support_Agent_Rebuild_Part_01_System_Model_And_Single_DB_Publishing.md",
+        sha: "sha-doc",
+        contentChecksum: "checksum-doc",
+        size: 12,
+        type: "blob"
+      }
+    ]
+  });
+
+  assert.deepEqual(manifest.eligibleItems.map((item) => item.path), [
+    "docs/20_AI_Support_Agent_Rebuild_Part_01_System_Model_And_Single_DB_Publishing.md"
+  ]);
+  assert.equal(manifest.skippedItems.length, 0);
+});
+
 test("remote manifest checksum hydration fetches only eligible files and respects bounded concurrency", async () => {
   const manifest = buildDocsComSourceManifest({
     sourceMode: "remote",

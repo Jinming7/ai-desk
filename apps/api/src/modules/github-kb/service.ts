@@ -10,6 +10,7 @@ import { buildRepositoryKnowledgeArtifacts } from "./builders/repository-knowled
 import { buildDocumentRetrievalUnits } from "./builders/document-builder.js";
 import { classifySourceFamily } from "./parsers/source-classifier.js";
 import { buildDocsComSourceManifest, type DocsComSourceManifest } from "./source/manifest-builder.js";
+import { isPathIncluded } from "./source/path-glob.js";
 import {
   assertGithubReadOnlyMethod,
   buildSourceUrl,
@@ -1517,22 +1518,6 @@ function pickDefaultPublicBaseUrl(repoUrl: string, explicit?: string): string | 
     return explicit;
   }
   return explicit;
-}
-
-function globToRegex(glob: string): RegExp {
-  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-  const withDoubleStar = escaped.replace(/\*\*/g, "::DOUBLE_STAR::");
-  const withSingleStar = withDoubleStar.replace(/\*/g, "[^/]*");
-  const pattern = withSingleStar.replace(/::DOUBLE_STAR::/g, ".*");
-  return new RegExp(`^${pattern}$`, "i");
-}
-
-function isPathIncluded(path: string, includePaths: string[], excludePaths: string[]): boolean {
-  const includeRegex = includePaths.map(globToRegex);
-  const excludeRegex = excludePaths.map(globToRegex);
-  const included = includeRegex.some((regex) => regex.test(path));
-  const excluded = excludeRegex.some((regex) => regex.test(path));
-  return included && !excluded;
 }
 
 function isSupportedKnowledgePath(pathname: string): boolean {
