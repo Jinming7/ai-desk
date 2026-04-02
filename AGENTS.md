@@ -1,5 +1,93 @@
 # AGENTS.md
 
+## Repository Git Governance (Mandatory)
+- This Git governance applies to the entire repository. Nested `AGENTS.md` files may add stricter local rules, but they may not weaken this policy.
+- Protect existing valid content first: committed history on `main`, `staging`, and active topic branches; the current dirty worktree; canonical contracts and runbooks under `docs/`; CI/workflow files; DB migrations; and release/runtime coordination files.
+- Prefer low-risk, incremental governance upgrades. Do not "clean up" the repository by rewriting history, deleting untriaged work, or forcing artificial branch normalization.
+- Human-facing collaboration flow is defined in `CONTRIBUTING.md`. Every merge request must follow `.github/PULL_REQUEST_TEMPLATE.md`.
+
+### AI Git Working Model
+- It is valid for an AI to commit only the changes within its assigned scope.
+- A commit is a local preservation and review unit, not proof that the whole project has been integrated.
+- Full project convergence happens later during PR review, dependency resolution, merge into `staging` or `release/*`, and promotion into `main`.
+- This model becomes unsafe when the branch role, merge owner, dependency chain, high-conflict review, or "not included" boundary is missing. In that case, "I only committed my part" is not enough.
+
+### Branch Policy
+- `main`: released/stable trunk. No direct AI commits and no direct pushes. Merge only from reviewed `staging`, `release/*`, or an explicit emergency `fix/*` with a documented back-merge plan.
+- `staging`: integration branch for combining validated topic branches and checking cross-branch convergence before promotion to `main`. No direct AI pushes.
+- `feature/*`: net-new product behavior or capability. Branch from the latest `staging` unless the user explicitly requires another base.
+- `fix/*`: bug fix branch. Branch from the latest `staging` by default. Production hotfixes may branch from `main`, but the PR must declare the required back-merge or cherry-pick into `staging`.
+- `refactor/*`: structural cleanup with no intended behavior change. Do not mix new behavior into this branch type.
+- `chore/*`: tooling, docs, configuration, automation, or non-product housekeeping.
+- `release/*`: release convergence branch cut from `staging`. Only stabilization, release notes, migration validation, rollback-safe fixes, and release gating changes are allowed.
+- Existing `codex/*` branches are legacy topic branches. Do not rename them just for governance. Instead, map them to the normalized branch role in the PR or change note.
+
+### Commit Policy
+- AI may commit only owned, reviewed changes that match the branch purpose.
+- Stage files deliberately. In a dirty worktree, do not accidentally include other AI/user changes, temp files, local backups, or generated noise.
+- Use conventional commit subjects: `feat`, `fix`, `refactor`, `chore`, `docs`, `test`, `release`. `checkpoint:` is allowed only on topic branches to preserve a validated intermediate state and must never be used as the final merge title.
+- One commit or PR must not mix unrelated feature work, refactor work, migration changes, workflow changes, and ops changes without explicit user approval.
+
+### Required Handoff Before Merge Or Review
+- State what the branch or commit includes.
+- State what it intentionally does not include.
+- List the exact files or directories changed.
+- Name the target branch.
+- Declare whether shared or high-conflict files were touched.
+- Declare dependency branches, commits, or prerequisite PRs.
+- State what verification was run and what was not run.
+- State the merge risk.
+- State whether the branch is safe to merge directly.
+- If prerequisites exist, explicitly write `Depends on: <branch/commit/PR>`.
+- If the change is not independently mergeable, explicitly write `Do not merge directly` and name the blocker.
+
+### Integration Ownership
+- The branch author owns local scope correctness, staged diff hygiene, and handoff clarity.
+- The integrator owns merge order, dependency resolution, conflict resolution, and final convergence verification on the target branch.
+- The default integrator is the human repository owner unless another integrator is explicitly named in the PR or change note.
+- AI authors must not claim or imply that a scoped local commit equals full-project integration.
+
+### High-Conflict Areas
+- `apps/api/src/modules/ai/**`
+- `apps/api/src/modules/github-kb/**`
+- `apps/api/src/contracts/**`
+- `apps/api/src/db/migrations/**`
+- `apps/api/src/app.ts`
+- `package.json`
+- `apps/api/package.json`
+- `.env.example`
+- `.github/workflows/**`
+- `AGENTS.md`
+- `docs/agents/support-answer-composer.md`
+- `docs/20_AI_Support_Agent_Rebuild_Part_01_System_Model_And_Single_DB_Publishing.md`
+- `docs/2*_AI_Support_Agent_Rebuild_Part_*.md`
+- `sla-desk/**` when plugin routing, runtime, or platform callback behavior is involved
+- Any branch touching these areas must sync the latest target branch before final verification.
+- Any PR touching these areas must explain why the shared surface changed, what downstream areas need re-verification, and whether the merge must be serialized after another branch.
+- AI must not self-merge high-conflict changes.
+
+### Shared File Rules
+- Shared files include manifests, workflows, env examples, migrations, root contracts/runbooks, entrypoints, and cross-cutting modules.
+- Keep shared-file diffs minimal and explain why the shared surface had to change.
+- Do not perform repo-wide renames, reformatting, or sorting passes in the same branch as behavioral changes.
+- Do not delete or rewrite still-valid existing content purely to make the history look cleaner.
+
+### Multi-AI Parallel Development
+- One branch, one clearly defined scope, one responsible author.
+- Prefer disjoint write sets. If two AIs need the same shared file or module, serialize the work or assign an integrator before editing.
+- Stacked branches are allowed only when explicit. Every dependent branch must declare its prerequisite branch/commit and blocked merge condition.
+- If unexpected unrelated changes are present, preserve them. Work around them when safe. If safe isolation is not possible, stop and escalate instead of overwriting.
+
+### Prohibited Git Operations
+- `git reset --hard`
+- `git checkout -- <path>` or `git restore` that discards unreviewed work
+- `git clean -fd` on a dirty workspace
+- direct push to `main` or `staging`
+- force-pushing shared or reviewed branches
+- rebasing or rewriting someone else's open branch
+- resolving conflicts via `ours`/`theirs` strategy without content review
+- deleting branches or reverting someone else's unmerged work without explicit approval
+
 ## Default Frontend Rule (Mandatory)
 - For all frontend design and implementation tasks in this workspace, always follow:
   - `/Users/jeremypeng/Downloads/Workspace/TicketManagement/docs/03_Frontend_Design_Standards_Figma.md`
