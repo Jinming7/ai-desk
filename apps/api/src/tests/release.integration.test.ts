@@ -104,6 +104,21 @@ function resetReleaseFlags() {
   env.FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING = originalRuntimeTighteningFlag;
 }
 
+async function withAppHarness<T>(fn: (context: { baseUrl: string }) => Promise<T>): Promise<T> {
+  resetReleaseFlags();
+  const server = app.listen(0);
+  await new Promise<void>((resolve) => server.once("listening", () => resolve()));
+  const { port } = server.address() as AddressInfo;
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    return await fn({ baseUrl });
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    resetReleaseFlags();
+  }
+}
+
 async function withDbHarness<T>(
   t: { skip: (reason?: string) => void },
   fn: (context: { baseUrl: string }) => Promise<T>
@@ -121,18 +136,7 @@ async function withDbHarness<T>(
     return undefined;
   }
 
-  resetReleaseFlags();
-  const server = app.listen(0);
-  await new Promise<void>((resolve) => server.once("listening", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  const baseUrl = `http://127.0.0.1:${port}`;
-
-  try {
-    return await fn({ baseUrl });
-  } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    resetReleaseFlags();
-  }
+  return withAppHarness(fn);
 }
 
 after(async () => {
@@ -173,6 +177,199 @@ test("compareShadowObservations escalates immediate rollback when citations disa
   assert.equal(result.rollbackRecommendation.class, "immediate");
   assert.equal(result.rollbackRecommendation.reasonCodes.includes("kb_unavailable_false_positive_spike"), true);
   assert.equal(result.rollbackRecommendation.reasonCodes.includes("citation_disappearance_spike"), true);
+});
+
+test("internal ai release decision endpoint reports db-backed verification blockers and current feature flags", async () => {
+  await withAppHarness(async ({ baseUrl }) => {
+    env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL = true;
+    env.FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING = true;
+
+    const response = await requestJson(`${baseUrl}/api/v1/internal/ai/release/decision`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer ",
+        "content-type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        buildSummary: {
+          metrics: {
+            build_success_rate: 1,
+            build_validation_pass_rate: 1,
+            duplicate_active_path_rate: 0,
+            artifact_count_delta_by_family: {},
+            citation_count_delta: 0,
+            memory_entry_count_delta: 0,
+            embedding_missing_rate: 0,
+            cross_build_reference_violation_count: 0
+          },
+          publishable: true,
+          failures: []
+        },
+        retrievalSummary: {
+          metrics: {
+            retrieval_hit_at_1: 0.9,
+            retrieval_hit_at_3: 0.9,
+            retrieval_hit_at_5: 0.9,
+            retrieval_hit_at_10: 0.9,
+            family_hit_at_3: 0.9,
+            exact_signal_capture_rate: 0.9,
+            wrong_family_top_3_rate: 0,
+            groundable_candidate_rate: 1,
+            kb_unavailable_false_positive_rate: 0,
+            publication_scoped_read_rate: 1
+          },
+          scoreCounts: {
+            exact_top_3: 1,
+            acceptable_family_top_3: 0,
+            low_credit_late_hit: 0,
+            wrong_family_penalty: 0,
+            no_useful_candidate: 0
+          },
+          failures: []
+        },
+        runtimeSummary: {
+          metrics: {
+            route_accuracy: 1,
+            specialist_selection_accuracy: 1,
+            clarification_precision: 1,
+            clarification_recall: 1,
+            stage_timeout_rate: 0,
+            stage_fallback_rate: 0,
+            stage_contract_violation_count: 0,
+            verification_overturn_rate: 0
+          },
+          failures: []
+        },
+        answerSummary: {
+          metrics: {
+            answer_mode_accuracy: 1,
+            direct_answer_correctness: 1,
+            customer_actionability_score: 1,
+            citation_presence_rate: 1,
+            hallucination_rate: 0,
+            handoff_appropriateness: 1,
+            minimum_missing_info_quality: 1
+          },
+          labelCounts: {
+            pass: 1,
+            pass_with_minor_issue: 0,
+            needs_improvement: 0,
+            fail: 0
+          },
+          failures: []
+        },
+        executionMode: "production",
+        shadowValidationStable: true,
+        rollbackReady: true,
+        diagnosticsAvailable: true,
+        verificationSuites: [
+          {
+            name: "release.integration",
+            kind: "db_backed",
+            requiredForRollout: true,
+            status: "failed",
+            reason: "assertion_failed"
+          }
+        ]
+      })
+    });
+
+    assert.equal(response.status, 200);
+    const result = response.json.result as {
+      decision: {
+        releaseDecision: string;
+        gates: {
+          productionEnablementGate: {
+            passed: boolean;
+            reasons: string[];
+          };
+        };
+      };
+      blockingReasons: string[];
+      verificationEvidence: {
+        dbBacked: {
+          status: string;
+          ready: boolean;
+          suites: Array<{ name: string; status: string; reason: string | null }>;
+        };
+      };
+      featureFlags: {
+        FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: boolean;
+        FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: boolean;
+      };
+      recommendation: string;
+    };
+
+    assert.equal(result.decision.releaseDecision, "blocked");
+    assert.equal(result.decision.gates.productionEnablementGate.passed, false);
+    assert.equal(result.blockingReasons.includes("db_backed_verification_failed"), true);
+    assert.equal(result.verificationEvidence.dbBacked.status, "blocked");
+    assert.equal(result.verificationEvidence.dbBacked.ready, false);
+    assert.equal(result.verificationEvidence.dbBacked.suites[0]?.name, "release.integration");
+    assert.equal(result.featureFlags.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL, true);
+    assert.equal(result.featureFlags.FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING, true);
+    assert.equal(result.recommendation, "hold_rollout_and_fix_blockers");
+  });
+});
+
+test("internal ai shadow compare endpoint reports immediate rollback recommendation for citation disappearance and kb unavailable spike", async () => {
+  await withAppHarness(async ({ baseUrl }) => {
+    const response = await requestJson(`${baseUrl}/api/v1/internal/ai/release/shadow-compare`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer ",
+        "content-type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        baseline: [
+          {
+            requestId: "case-1",
+            retrievalStatus: "grounded",
+            route: "api_scope_auth",
+            specialistFamily: "api",
+            answerMode: "grounded",
+            citationCount: 2,
+            unsupportedClaimCount: 0,
+            latencyMs: 150,
+            stageTrace: [{ stage: "retrieval", status: "completed", durationMs: 60 }]
+          }
+        ],
+        candidate: [
+          {
+            requestId: "case-1",
+            retrievalStatus: "kb_unavailable",
+            route: "api_scope_auth",
+            specialistFamily: "api",
+            answerMode: "handoff",
+            citationCount: 0,
+            unsupportedClaimCount: 2,
+            latencyMs: 210,
+            stageTrace: [{ stage: "retrieval", status: "fallback", durationMs: 95 }]
+          }
+        ]
+      })
+    });
+
+    assert.equal(response.status, 200);
+    const result = response.json.result as {
+      metrics: {
+        kbUnavailableFalsePositiveRate: number;
+        citationDisappearanceRate: number;
+      };
+      rollbackRecommendation: {
+        class: string;
+        reasonCodes: string[];
+      };
+    };
+
+    assert.equal(result.metrics.kbUnavailableFalsePositiveRate, 1);
+    assert.equal(result.metrics.citationDisappearanceRate, 1);
+    assert.equal(result.rollbackRecommendation.class, "immediate");
+    assert.equal(result.rollbackRecommendation.reasonCodes.includes("kb_unavailable_false_positive_spike"), true);
+    assert.equal(result.rollbackRecommendation.reasonCodes.includes("citation_disappearance_spike"), true);
+  });
 });
 
 test("previewKbPromotion blocks promotion when rollout evidence is missing even if build is validated", async (t) => {
