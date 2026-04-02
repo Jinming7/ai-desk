@@ -76,9 +76,27 @@ const DOCUMENT_MUTATION_LOCK_TTL_SECONDS = 300;
 const DOCUMENT_MUTATION_LOCK_RETRY_MS = 100;
 const DOCUMENT_MUTATION_LOCK_MAX_WAIT_MS = 300_000;
 
+interface GithubKbIndexDocumentInput {
+  registration: RepoRegistration;
+  knowledgeSpace: KbKnowledgeSpace;
+  branch: string;
+  commitSha: string;
+  path: string;
+  buildVersion?: string;
+  publicationMode?: KbBuildPublicationMode;
+  embeddingMode?: KbEmbeddingMode;
+}
+
 export const githubKbServiceDeps = {
   updateManifestItemBuildStatus(input: Parameters<typeof repo.updateManifestItemBuildStatus>[0]) {
     return repo.updateManifestItemBuildStatus(input);
+  },
+  indexDocument(input: GithubKbIndexDocumentInput) {
+    return indexDocument(input.registration, input.knowledgeSpace, input.branch, input.commitSha, input.path, {
+      buildVersion: input.buildVersion,
+      publicationMode: input.publicationMode,
+      embeddingMode: input.embeddingMode
+    });
   },
   getBuildByVersion(input: Parameters<typeof repo.getBuildByVersion>[0]) {
     return repo.getBuildByVersion(input);
@@ -2940,11 +2958,18 @@ async function runRemoteSnapshotBatch(input: {
       buildVersion: input.buildVersion,
       source: "remote"
     });
-    await indexDocument(input.registration, input.knowledgeSpace, input.branch, input.head, relativePath, {
-      buildVersion: input.buildVersion,
-      publicationMode: "build_only",
-      embeddingMode: input.embeddingMode
-    });
+    await withTransientDbRetry(() =>
+      githubKbServiceDeps.indexDocument({
+        registration: input.registration,
+        knowledgeSpace: input.knowledgeSpace,
+        branch: input.branch,
+        commitSha: input.head,
+        path: relativePath,
+        buildVersion: input.buildVersion,
+        publicationMode: "build_only",
+        embeddingMode: input.embeddingMode
+      })
+    );
     indexed += 1;
   }
 

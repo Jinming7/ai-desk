@@ -1184,6 +1184,61 @@ test("docs-com full shard retries transient DB timeout without failing the full 
   }
 });
 
+test("generic remote direct build retries transient document indexing timeout within the same run", async (t) => {
+  const registration = await createIsolationRegistration();
+  const originalBatchSize = env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE;
+  env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE = 20;
+
+  const serviceDeps = githubKbServiceDeps as typeof githubKbServiceDeps & {
+    indexDocument?: (input: {
+      registration: Awaited<ReturnType<typeof createIsolationRegistration>>;
+      knowledgeSpace: "support-local";
+      branch: string;
+      commitSha: string;
+      path: string;
+      buildVersion?: string;
+      publicationMode?: "build_only" | "publish_inline";
+      embeddingMode?: "disabled" | "best_effort" | "required";
+    }) => Promise<void>;
+  };
+
+  assert.equal(typeof serviceDeps.indexDocument, "function");
+  const originalIndexDocument = serviceDeps.indexDocument!;
+  let attempts = 0;
+
+  t.mock.method(serviceDeps, "indexDocument", async (input: Parameters<typeof originalIndexDocument>[0]) => {
+    attempts += 1;
+    if (attempts === 1) {
+      throw new Error("timeout exceeded when trying to connect");
+    }
+    return originalIndexDocument(input);
+  });
+
+  try {
+    const executionId = "generic-timeout-retry";
+    const result = await serviceModule.runRepositorySyncDirect({
+      repoId: registration.id,
+      branch: "main",
+      mode: "full",
+      source: "manual",
+      executionId
+    });
+
+    assert.equal(result.finished, true);
+    assert.equal(attempts > 1, true);
+
+    const build = await githubRepo.getBuildByVersion({
+      knowledgeSpace: "support-local",
+      repoId: registration.id,
+      branch: "main",
+      buildVersion: `${result.head}:${executionId}`
+    });
+    assert.equal(build?.status, "validated");
+  } finally {
+    env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE = originalBatchSize;
+  }
+});
+
 test("claimDueSyncJobs only claims one queued job per full-run shard", async () => {
   const registration = await githubRepo.upsertRepoRegistration({
     repoOwner: "BangWork",
