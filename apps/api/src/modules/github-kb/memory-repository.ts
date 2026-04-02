@@ -26,6 +26,16 @@ function clampScore(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
 
+export function attachBuildVersionToDocMetadata(
+  buildVersion: string,
+  metadata: Record<string, unknown> | null | undefined
+): Record<string, unknown> {
+  return {
+    build_version: buildVersion,
+    ...(metadata ?? {})
+  };
+}
+
 function normalizeSignalRows(input: Array<{ signalType?: string; value: string }>): Array<{ signalType: string | null; value: string }> {
   const deduped = new Map<string, { signalType: string | null; value: string }>();
   for (const item of input) {
@@ -773,6 +783,7 @@ export async function resolveMemorySourcesToChunks(input: {
     source_url: string;
     repo_source_url: string;
     commit_sha: string;
+    build_version: string;
     title: string;
     heading_path: string;
     snippet: string;
@@ -794,6 +805,7 @@ export async function resolveMemorySourcesToChunks(input: {
         doc.source_url,
         doc.repo_source_url,
         doc.commit_sha,
+        doc.build_version::text,
         doc.title,
         chunk.heading_path,
         LEFT(chunk.content, 2400) AS snippet,
@@ -840,7 +852,7 @@ export async function resolveMemorySourcesToChunks(input: {
     snippet: row.snippet,
     sourceScore: Number(row.source_score),
     chunkMetadata: row.chunk_metadata_json ?? undefined,
-    docMetadata: row.doc_metadata_json ?? undefined,
+    docMetadata: attachBuildVersionToDocMetadata(row.build_version, row.doc_metadata_json),
     memoryMetadata: row.memory_metadata_json ?? undefined
   }));
 }
@@ -863,6 +875,7 @@ export async function resolveMemorySourcesToCitations(input: {
     source_url: string;
     repo_source_url: string;
     commit_sha: string;
+    build_version: string;
     title: string;
     heading_path: string | null;
     snippet: string;
@@ -886,6 +899,7 @@ export async function resolveMemorySourcesToCitations(input: {
         doc.source_url,
         doc.repo_source_url,
         doc.commit_sha,
+        doc.build_version::text,
         cu.title,
         cu.heading_path,
         cu.snippet_text AS snippet,
@@ -936,7 +950,7 @@ export async function resolveMemorySourcesToCitations(input: {
     citationFamily: row.citation_family,
     sourceFamily: row.source_family,
     citationMetadata: row.citation_metadata_json ?? undefined,
-    docMetadata: row.doc_metadata_json ?? undefined,
+    docMetadata: attachBuildVersionToDocMetadata(row.build_version, row.doc_metadata_json),
     memoryMetadata: row.memory_metadata_json ?? undefined
   }));
 }
