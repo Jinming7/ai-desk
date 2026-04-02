@@ -21,6 +21,7 @@ import type {
 } from "./types.js";
 import type {
   DraftSupportAnswer,
+  SearchReference,
   SpecialistDraftAnswer,
   SupportCaseFrame,
   SupportEvidencePlan,
@@ -54,6 +55,98 @@ const mockCorpus: Array<{ id: string; title: string; content: string; sourceUrl:
       "https://github.com/BangWork/docs-com/blob/8d8f2ee6875f2d146f8f0d3bd82f51a8cb4d0a11/docs/billing-permissions.md"
   }
 ];
+
+function normalizeMockText(input: string | null | undefined): string {
+  return String(input ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasCjkText(input: string): boolean {
+  return /[\u3400-\u9FBF]/.test(input);
+}
+
+function isMockCapabilityQuestion(query: string): boolean {
+  return (
+    /是否支持|支不支持|是否可以|能否|有没有|可不可以/.test(query) ||
+    /\b(does|can|is)\b[\s\S]{0,80}\b(support|supported|possible|available|allow|allows)\b/i.test(query)
+  );
+}
+
+function isMockTroubleshootingQuery(query: string): boolean {
+  return (
+    /问题|失败|报错|错误|异常|无法|不能|404|401|403|500|page not found/.test(query) ||
+    /\b(troubleshoot|troubleshooting|error|errors|failed|failure|cannot|unable|not work|not working|stopped working|page not found|404|401|403|500)\b/i.test(
+      query
+    )
+  );
+}
+
+function hasExplicitMockSupportAnchor(query: string): boolean {
+  return (
+    /接口|开放平台|鉴权|授权|回调|集成|登录|单点|账单|结算|部署|私有部署|公有云|查询|回调域名|重定向/.test(query) ||
+    /\b(api|openapi|token|oauth|comment|issue|github|gitlab|callback|webhook|redirect|sso|billing|checkout|deployment|self-hosted|private deployment|public cloud|onesql|query)\b/i.test(
+      query
+    )
+  );
+}
+
+function buildMockMinimumTroubleshootingGap(query: string, language: "zh" | "en"): string {
+  return language === "zh" || hasCjkText(query)
+    ? "变更后具体是哪个页面、接口或操作不能工作，以及你刚改了什么"
+    : "which exact page, API, or action stopped working, and what changed right before it";
+}
+
+function buildMockEvidenceClaimText(reference: SearchReference | undefined): string {
+  if (!reference) return "";
+  return normalizeMockText(
+    [reference.title, reference.headingPath && reference.headingPath !== "ROOT" ? reference.headingPath : "", reference.snippet]
+      .filter(Boolean)
+      .join(" ")
+  );
+}
+
+function buildMockBehaviorNextActions(input: {
+  language: "zh" | "en";
+  reference: SearchReference | undefined;
+}): string[] {
+  const title = normalizeMockText(input.reference?.title);
+  const snippet = normalizeMockText(input.reference?.snippet);
+  const path = normalizeMockText(input.reference?.path);
+  const queryLanguageName =
+    title.match(/^(.*?)\s+query language$/i)?.[1]?.trim() ??
+    snippet.match(/^([A-Za-z0-9_-]+)\s+supports\b/i)?.[1]?.trim() ??
+    path
+      .match(/(?:^|\/)([^/]+)\/query-language\.[^/]+$/i)?.[1]
+      ?.replace(/[-_]+/g, " ")
+      .trim();
+  if (queryLanguageName && /(query language|order by|group by|syntax)/i.test(`${title} ${snippet} ${path}`)) {
+    return [
+      input.language === "zh"
+        ? `先按文档校验 ${queryLanguageName} 查询语法。`
+        : `Validate the query against the documented ${queryLanguageName} syntax.`
+    ];
+  }
+  return [input.language === "zh" ? "先对照文档规则核对当前输入或配置。" : "Check whether the observed behavior matches the documented rule."];
+}
+
+function buildMockTroubleshootingNextActions(input: {
+  language: "zh" | "en";
+  reference: SearchReference | undefined;
+}): string[] {
+  const evidenceText = buildMockEvidenceClaimText(input.reference).toLowerCase();
+  if (evidenceText.includes("redirect uri") && (evidenceText.includes("callback") || evidenceText.includes("回调"))) {
+    return [
+      input.language === "zh"
+        ? "检查 Redirect URI 与回调域名配置。"
+        : "Check Redirect URI and callback domain alignment."
+    ];
+  }
+  return [
+    input.language === "zh" ? "先按主文档里的排查项逐条核对。" : "Start with the primary documented check.",
+    input.language === "zh" ? "如果仍未恢复，请补充准确报错、复现步骤和影响范围。" : "If the issue persists, collect the exact error and repro steps."
+  ];
+}
 
 export class MockOpenClawAdapter implements OpenClawAdapter {
   async analyzeTicket(input: OpenClawAnalyzeInput, _idempotencyKey: string, _runtime?: OpenClawRuntimeContext): Promise<OpenClawAnalyzeOutput> {
@@ -189,15 +282,21 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     const query = input.query.trim();
     const strippedQuery = query.replace(/how to|如何|怎么/gi, "").trim();
     const isBillingCheckout = /billing admin role denied checkout/i.test(query);
+    const capabilityQuestion = isMockCapabilityQuestion(query);
+    const troubleshootingQuery = isMockTroubleshootingQuery(query);
+    const vagueTroubleshootingGap = troubleshootingQuery && !hasExplicitMockSupportAnchor(query);
+    const howToQuestion = /how|如何|怎么|create|创建|导出|export/i.test(query);
     return {
       goal: query,
-      symptom: /failed|error|timeout|not work|问题|失败|报错/i.test(query) ? query : "needs product/support guidance",
-      object: /api|openapi|token|oauth|comment|issue/i.test(query) ? "api_or_integration" : "general_support",
-      action_type: /how|如何|怎么|create|创建|导出|export/i.test(query) ? "how_to" : "troubleshooting",
+      symptom: troubleshootingQuery ? query : "needs product/support guidance",
+      object:
+        /api|openapi|token|oauth|comment|issue/i.test(query) ? "api_or_integration" : vagueTroubleshootingGap ? "unspecified" : "general_support",
+      action_type: howToQuestion ? "how_to" : capabilityQuestion ? "behavior" : "troubleshooting",
       deployment_model: /public cloud|公有云/i.test(query) ? "public_cloud" : "shared",
       product_area: /api|openapi/i.test(query) ? "openapi" : /oauth|login|sso|github/i.test(query) ? "integrations" : "general",
       constraints: [],
       missing_critical_info: [
+        vagueTroubleshootingGap ? buildMockMinimumTroubleshootingGap(query, input.language) : "",
         /thisquerywillnotmatchkbx/i.test(query) ? "the exact object or failing step" : "",
         isBillingCheckout ? "the exact billing role mapping and denied checkout step" : ""
       ].filter(Boolean),
@@ -205,7 +304,13 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       query_plan: {
         concept_queries: [query].filter(Boolean),
         object_queries: [strippedQuery || query].filter(Boolean),
-        behavior_queries: [/why|原因|为什么/i.test(query) ? `${query} rule behavior limitation` : `${query} procedure step`]
+        behavior_queries: [
+          /why|原因|为什么/i.test(query)
+            ? `${query} rule behavior limitation`
+            : capabilityQuestion
+            ? `${query} documented capability`
+            : `${query} procedure step`
+        ]
       }
     };
   }
@@ -216,6 +321,7 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     _runtime?: OpenClawRuntimeContext
   ): Promise<SupportQuestionRoute> {
     const query = input.query.toLowerCase();
+    const capabilityQuestion = isMockCapabilityQuestion(input.query);
     const question_type: SupportQuestionRoute["question_type"] =
       /scope|oauth|token/.test(query)
         ? "api_scope_auth"
@@ -227,6 +333,8 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
         ? "why_behavior"
         : /如何|怎么|步骤|setup|configure|config|export|导出/.test(input.query)
         ? "how_to_product"
+        : capabilityQuestion
+        ? "capability_confirmation"
         : "troubleshooting";
     return {
       question_type,
@@ -314,24 +422,22 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       };
     }
 
+    const primaryText = buildMockEvidenceClaimText(primary);
+
     return {
-      direct_answer:
-        input.language === "zh"
-          ? `${primary.snippet}`
-          : `${primary.snippet}`,
+      direct_answer: primaryText,
       claims: [
         {
-          text: primary.snippet,
+          text: primaryText,
           kind: "verified_fact",
           evidence_ids: [primary.documentId],
           authority: "canonical"
         }
       ],
-      next_actions: [
-        input.language === "zh"
-          ? "如果仍未恢复，请补充准确报错、复现步骤和影响范围。"
-          : "If the issue persists, share the exact error, repro steps, and impact scope."
-      ],
+      next_actions:
+        input.caseFrame.question_type === "capability_confirmation"
+          ? buildMockBehaviorNextActions({ language: input.language, reference: primary })
+          : buildMockTroubleshootingNextActions({ language: input.language, reference: primary }),
       unknowns: [],
       escalation_needed: false
     };
@@ -391,18 +497,19 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     _runtime?: OpenClawRuntimeContext
   ): Promise<SpecialistDraftAnswer> {
     const primary = input.evidenceBundle.primary[0];
+    const primaryText = buildMockEvidenceClaimText(primary);
     return {
       question_type: input.route.question_type,
       render_variant: "behavior",
-      direct_answer: primary ? "The documentation supports a likely explanation, but not every detail is explicit." : "I could not confirm the behavior from the current evidence.",
+      direct_answer: primary ? primaryText : "I could not confirm the behavior from the current evidence.",
       claims: primary
-        ? [{ text: primary.snippet, kind: "grounded_inference", evidence_ids: [primary.documentId], authority: "canonical" }]
+        ? [{ text: primaryText, kind: "grounded_inference", evidence_ids: [primary.documentId], authority: "canonical" }]
         : [],
-      next_actions: ["Check whether the observed behavior matches the documented rule."],
+      next_actions: buildMockBehaviorNextActions({ language: input.language, reference: primary }),
       unknowns: input.caseFrame.missing_critical_info.slice(0, 2),
       escalation_needed: false,
-      most_likely_explanation: primary?.snippet,
-      confirmed_facts: primary ? [primary.snippet] : [],
+      most_likely_explanation: primaryText || undefined,
+      confirmed_facts: primaryText ? [primaryText] : [],
       what_to_check_next: ["Verify the exact input, object, or configuration involved."]
     };
   }
@@ -413,17 +520,18 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     _runtime?: OpenClawRuntimeContext
   ): Promise<SpecialistDraftAnswer> {
     const primary = input.evidenceBundle.primary[0];
+    const primaryText = buildMockEvidenceClaimText(primary);
     return {
       question_type: input.route.question_type,
       render_variant: "troubleshooting",
       direct_answer: primary ? "The current evidence points to a documented troubleshooting path." : "I still need one critical detail before I can suggest a reliable fix.",
       claims: primary
-        ? [{ text: primary.snippet, kind: "verified_fact", evidence_ids: [primary.documentId], authority: "canonical" }]
+        ? [{ text: primaryText, kind: "verified_fact", evidence_ids: [primary.documentId], authority: "canonical" }]
         : [],
-      next_actions: ["Start with the primary documented check.", "If the issue persists, collect the exact error and repro steps."],
+      next_actions: buildMockTroubleshootingNextActions({ language: input.language, reference: primary }),
       unknowns: input.caseFrame.missing_critical_info.slice(0, 2),
       escalation_needed: false,
-      most_likely_causes: primary ? [primary.snippet] : [],
+      most_likely_causes: primaryText ? [primaryText] : [],
       recommended_checks: ["Validate the exact failing step.", "Compare the actual result with the expected behavior."],
       required_followup_info: input.caseFrame.missing_critical_info.slice(0, 2),
       when_to_handoff: "Escalate if the documented checks do not explain the result."

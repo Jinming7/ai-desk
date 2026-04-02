@@ -58,6 +58,7 @@ function createAdapter(options: {
   writerAnswer?: Partial<DraftSupportAnswer>;
   verification?: Partial<SupportVerificationResult>;
   queryPlan?: SupportCaseFrame["query_plan"];
+  caseFrameOverride?: Partial<SupportCaseFrame>;
   routeOverride?: Partial<SupportQuestionRoute>;
   evidencePlanOverride?: Partial<SupportEvidencePlan>;
 }): OpenClawAdapter {
@@ -127,7 +128,8 @@ function createAdapter(options: {
         constraints: [],
         missing_critical_info: options.missingInfo ?? [],
         retrieval_queries: [input.query],
-        query_plan: options.queryPlan
+        query_plan: options.queryPlan,
+        ...options.caseFrameOverride
       };
     },
     async routeSupportQuestion(
@@ -1403,6 +1405,370 @@ title: "GitHub 和公共 GitLab"
     assert.equal(String(result.result.references[0]?.supportMetadata?.product_area ?? ""), "integrations");
     assert.match(result.result.references[0]?.snippet ?? "", /Redirect URI|回调|page not found/i);
     assert.equal(result.result.support_answer?.render_variant, "troubleshooting");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent upgrades fully cited troubleshooting claims from partial to grounded when nothing is still missing", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "docs/ones-devops/code-integration/github-and-public-gitlab.mdx",
+    `---
+title: "GitHub 和公共 GitLab"
+---
+
+# GitHub 和公共 GitLab
+
+## Callback 404
+
+如果 GitHub 集成授权后回调页面显示 page not found，请检查 Redirect URI、Webhook 回调地址，以及 baseURL 配置是否一致。
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "troubleshooting",
+      specialist_agent: "troubleshooting-specialist",
+      answer_contract: "Give the most likely integration configuration cause first, then the direct checks to run now."
+    },
+    caseFrameOverride: {
+      object: "integration authorization callback",
+      action_type: "troubleshooting",
+      deployment_model: "shared",
+      product_area: "integrations",
+      missing_critical_info: [],
+      retrieval_queries: ["GitHub callback page not found", "Redirect URI", "callback domain"],
+      query_plan: {
+        concept_queries: ["GitHub callback", "callback 404"],
+        object_queries: ["Redirect URI", "callback domain"],
+        behavior_queries: ["page not found", "authorization callback failed"]
+      },
+      required_doc_kinds: ["troubleshooting", "product_guide"]
+    },
+    writerAnswer: {
+      direct_answer: "The callback 404 usually means the Redirect URI, callback domain, or baseURL is inconsistent.",
+      claims: [
+        {
+          text: "The callback 404 usually means the Redirect URI, callback domain, or baseURL is inconsistent.",
+          kind: "verified_fact",
+          evidence_ids: [],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["Check Redirect URI, callback domain, and baseURL alignment now."],
+      unknowns: [],
+      escalation_needed: false
+    }
+  });
+  adapter.verifySupportAnswer = async (input) => {
+    const cited = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].find((item) =>
+      /github/i.test(item.title)
+    );
+    const verifiedId = cited?.documentId ? [cited.documentId] : [];
+    return {
+      verdict: "partial",
+      summary: "The core troubleshooting claim is fully cited, but the verifier remained conservative.",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: verifiedId,
+      display_citation_ids: verifiedId,
+      verified_claims: ["The callback 404 usually means the Redirect URI, callback domain, or baseURL is inconsistent."],
+      claim_to_citation_map: [
+        {
+          text: "The callback 404 usually means the Redirect URI, callback domain, or baseURL is inconsistent.",
+          kind: "verified_fact",
+          verdict: "verified",
+          citation_ids: verifiedId
+        }
+      ]
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "GitHub 集成授权后回调页面显示 page not found，怎么排查？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [{ role: "user", content: "我们是通过公网域名做的 GitHub OAuth 集成。" }],
+      adapter,
+      idempotencyKey: "support-agent-partial-to-grounded-troubleshooting"
+    });
+
+    assert.equal(result.result.support_answer?.mode, "grounded");
+    assert.equal(result.result.verification?.verdict, "verified");
+    assert.ok(result.result.citations.length >= 1);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent asks for clarification when troubleshooting context is too vague to anchor the failing object", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "docs/troubleshooting/generic-change-regression.md",
+    `# Generic Regression
+
+## After a change
+
+If it does not work after you changed it, start by identifying the exact page, API, or workflow that failed before you compare any configuration details.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "troubleshooting",
+      specialist_agent: "troubleshooting-specialist",
+      answer_contract: "Provide the most useful support answer first."
+    },
+    caseFrameOverride: {
+      object: "unspecified",
+      action_type: "troubleshooting",
+      deployment_model: "shared",
+      product_area: "general",
+      missing_critical_info: [],
+      retrieval_queries: ["It does not work after I changed it."],
+      query_plan: {
+        concept_queries: ["changed setting"],
+        object_queries: ["unspecified object"],
+        behavior_queries: ["does not work"]
+      },
+      required_doc_kinds: ["troubleshooting"]
+    }
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "It does not work after I changed it.",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-minimum-clarification-gate"
+    });
+
+    assert.equal(result.result.support_answer?.mode, "clarification");
+    assert.equal(result.result.clarification_round, 1);
+    assert.match(
+      (result.result.support_answer?.still_need_to_confirm ?? []).join(" "),
+      /exact page|exact api|exact action|what changed/i
+    );
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent keeps blocking clarification ahead of unrelated grounded evidence for vague troubleshooting queries", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "docs/integrations/github-callback.md",
+    `# GitHub Callback
+
+## Callback 404
+
+If the GitHub callback page shows page not found, check Redirect URI, callback domain, and baseURL alignment first.
+`
+  );
+
+  const claimText = "If the GitHub callback page shows page not found, check Redirect URI, callback domain, and baseURL alignment first.";
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "troubleshooting",
+      specialist_agent: "troubleshooting-specialist",
+      answer_contract: "Provide the most useful support answer first."
+    },
+    caseFrameOverride: {
+      object: "unspecified",
+      action_type: "troubleshooting",
+      deployment_model: "shared",
+      product_area: "general",
+      missing_critical_info: [],
+      retrieval_queries: ["It does not work after I changed it."],
+      query_plan: {
+        concept_queries: ["changed setting"],
+        object_queries: ["unspecified object"],
+        behavior_queries: ["does not work"]
+      },
+      required_doc_kinds: ["troubleshooting"]
+    },
+    writerAnswer: {
+      direct_answer: claimText,
+      claims: [
+        {
+          text: claimText,
+          kind: "verified_fact",
+          evidence_ids: [],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["Check Redirect URI, callback domain, and baseURL alignment first."],
+      unknowns: [],
+      escalation_needed: false
+    }
+  });
+  adapter.verifySupportAnswer = async (input) => {
+    const cited = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental][0];
+    const verifiedId = cited?.documentId ? [cited.documentId] : [];
+    return {
+      verdict: "verified",
+      summary: "The retrieved troubleshooting note is fully cited, but the query is still too vague to answer directly.",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: verifiedId,
+      display_citation_ids: verifiedId,
+      verified_claims: [claimText],
+      claim_to_citation_map: [
+        {
+          text: claimText,
+          kind: "verified_fact",
+          verdict: "verified",
+          citation_ids: verifiedId
+        }
+      ]
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "It does not work after I changed it.",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-vague-troubleshooting-blocking-clarification"
+    });
+
+    assert.equal(result.result.references.length > 0, true);
+    assert.equal(result.result.support_answer?.mode, "clarification");
+    assert.equal(result.result.clarification_round, 1);
+    assert.match(
+      (result.result.support_answer?.still_need_to_confirm ?? []).join(" "),
+      /exact page|exact api|exact action|what changed/i
+    );
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent realigns generic capability questions from troubleshooting to behavior evidence", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "docs/onesql/query-language.md",
+    `# ONESQL Query Language
+
+## ORDER BY
+
+ONESQL supports ORDER BY and GROUP BY clauses.
+`
+  );
+  await writeFixture(
+    rootDir,
+    "deploy-docs/troubleshooting/infra/callback-runbook.mdx",
+    `---
+title: "Callback Runbook"
+---
+
+# Callback Runbook
+
+Verify Redirect URI and callback domain wiring before retrying.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "troubleshooting",
+      specialist_agent: "troubleshooting-specialist",
+      answer_contract: "Provide the most useful support answer first."
+    },
+    caseFrameOverride: {
+      object: "unspecified",
+      action_type: "troubleshooting",
+      deployment_model: "shared",
+      product_area: "general",
+      missing_critical_info: [],
+      retrieval_queries: ["ONESQL ORDER BY", "ONESQL GROUP BY"],
+      query_plan: {
+        concept_queries: ["ONESQL support"],
+        object_queries: ["ONESQL", "ORDER BY", "GROUP BY"],
+        behavior_queries: ["supports query syntax"]
+      },
+      required_doc_kinds: []
+    },
+    writerAnswer: {
+      direct_answer: "ONESQL supports ORDER BY and GROUP BY clauses.",
+      claims: [
+        {
+          text: "ONESQL supports ORDER BY and GROUP BY clauses.",
+          kind: "verified_fact",
+          evidence_ids: [],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["Validate the query against the documented ONESQL syntax."],
+      unknowns: [],
+      escalation_needed: false
+    }
+  });
+  adapter.verifySupportAnswer = async (input) => {
+    const cited = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].find((item) =>
+      /onesql/i.test(item.title)
+    );
+    const verifiedId = cited?.documentId ? [cited.documentId] : [];
+    return {
+      verdict: "verified",
+      summary: "The syntax reference directly confirms the supported clauses.",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: verifiedId,
+      display_citation_ids: verifiedId,
+      verified_claims: ["ONESQL supports ORDER BY and GROUP BY clauses."],
+      claim_to_citation_map: [
+        {
+          text: "ONESQL supports ORDER BY and GROUP BY clauses.",
+          kind: "verified_fact",
+          verdict: "verified",
+          citation_ids: verifiedId
+        }
+      ]
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "does ONESQL support ORDER BY and GROUP BY?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-capability-to-behavior"
+    });
+
+    assert.equal(result.caseFrame.question_type, "capability_confirmation");
+    assert.equal(result.caseFrame.specialist_agent, "behavior-specialist");
+    assert.equal(result.result.support_answer?.render_variant, "behavior");
+    assert.match(result.result.answer, /ONESQL|ORDER BY|GROUP BY/i);
+    assert.ok(result.result.citations.some((item) => /onesql/i.test(item.path ?? "")));
+    assert.doesNotMatch(result.result.answer, /Redirect URI|callback domain/i);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });
