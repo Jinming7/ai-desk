@@ -1,18 +1,27 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { test } from "node:test";
 import { env } from "../../config/env.js";
 import type { RepoRegistration } from "./types.js";
+import { buildDocsComSourceManifest } from "./source/manifest-builder.js";
 import {
+  buildEnqueuedSyncPayload,
   buildDocsComIncludePaths,
+  buildPollingSyncRequestFromPublication,
   buildQueryAnchoredSnippet,
+  resolveSyncExecutionId,
   ensureMarkdownCoverage,
   getLocalDocsMirrorState,
+  populateDocsComManifestEligibleChecksumsForSnapshot,
   resolveBootstrapIncludePaths,
+  resolvePublicationAwareIncrementalBase,
+  shouldAdvanceFullSyncCheckpoint,
   sliceSnapshotForBackfill
 } from "./service.js";
+import { summarizeServingCompatibilityMetadata } from "./release/service.js";
 
 const localMirrorRegistration: RepoRegistration = {
   id: "docs-com-test",
@@ -32,6 +41,10 @@ const localMirrorRegistration: RepoRegistration = {
   created_at: new Date(0).toISOString(),
   updated_at: new Date(0).toISOString()
 };
+
+function sha256(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
 
 test("resolveBootstrapIncludePaths falls back to markdown and mdx coverage", () => {
   assert.deepEqual(resolveBootstrapIncludePaths(""), ["**/*.md", "**/*.mdx"]);
@@ -130,6 +143,51 @@ test("buildDocsComIncludePaths strips non-docs repo metadata patterns", () => {
   assert.equal(includePaths.includes("deploy-docs/**/*.md"), true);
 });
 
+test("buildEnqueuedSyncPayload assigns distinct execution-scoped build versions for different logical full-sync runs on the same commit", () => {
+  const first = buildEnqueuedSyncPayload({
+    mode: "full",
+    idempotencyKey: "poll:repo-1:main:none:shared-head",
+    afterCommitSha: "shared-head",
+    knowledgeSpace: "support-local",
+    payload: {}
+  });
+  const second = buildEnqueuedSyncPayload({
+    mode: "full",
+    idempotencyKey: "manual:repo-1:main:none:shared-head",
+    afterCommitSha: "shared-head",
+    knowledgeSpace: "support-local",
+    payload: {}
+  });
+
+  assert.notEqual(first.buildVersion, "shared-head");
+  assert.notEqual(second.buildVersion, "shared-head");
+  assert.notEqual(first.buildVersion, second.buildVersion);
+  assert.notEqual(first.executionId, second.executionId);
+});
+
+test("resolveSyncExecutionId prefers the explicit execution id over build version fallback", () => {
+  assert.equal(
+    resolveSyncExecutionId({ executionId: "exec-123", buildVersion: "shared-head" }, "job-1"),
+    "exec-123"
+  );
+});
+
+test("buildEnqueuedSyncPayload preserves the explicit build version for full-sync continuations", () => {
+  const payload = buildEnqueuedSyncPayload({
+    mode: "full",
+    idempotencyKey: "sync-continuation:full:repo-1:main:shared-head:cursor-2",
+    afterCommitSha: "shared-head",
+    knowledgeSpace: "support-local",
+    payload: {
+      executionId: "sync-exec:abc123",
+      buildVersion: "shared-head:sync-exec:abc123"
+    }
+  });
+
+  assert.equal(payload.executionId, "sync-exec:abc123");
+  assert.equal(payload.buildVersion, "shared-head:sync-exec:abc123");
+});
+
 test("buildQueryAnchoredSnippet exposes later callback evidence instead of chunk prefix", () => {
   const raw = `
 Intro paragraph about repository linking and account authorization.
@@ -202,4 +260,290 @@ test("sliceSnapshotForBackfill continues across uppercase paths using the same o
   ]);
   assert.equal(window.nextCursor, "deploy-docs/scaling/database/TaurusDB-external.cn.md");
   assert.equal(window.finished, false);
+});
+
+test("buildDocsComSourceManifest records included files and machine-readable skip reasons", () => {
+  const manifest = buildDocsComSourceManifest({
+    sourceMode: "remote",
+    includePaths: ["docs/**"],
+    excludePaths: ["docs/excluded/**"],
+    files: [
+      {
+        path: "docs/guide/setup.mdx",
+        sha: "sha-doc",
+        contentChecksum: "checksum-doc",
+        size: 12,
+        type: "blob"
+      },
+      {
+        path: "docs/assets/logo.png",
+        sha: "sha-png",
+        contentChecksum: "checksum-png",
+        size: 8,
+        type: "blob"
+      },
+      {
+        path: "docs/example/openapi.yaml",
+        sha: "sha-openapi",
+        contentChecksum: "checksum-openapi",
+        size: 24,
+        type: "blob"
+      },
+      {
+        path: "docs/excluded/secret.mdx",
+        sha: "sha-excluded",
+        contentChecksum: "checksum-excluded",
+        size: 16,
+        type: "blob"
+      },
+      {
+        path: "README.md",
+        sha: "sha-readme",
+        contentChecksum: "checksum-readme",
+        size: 32,
+        type: "blob"
+      }
+    ]
+  });
+
+  assert.equal(manifest.eligibleItems.length, 2);
+  assert.equal(manifest.skippedItems.length, 3);
+  assert.deepEqual(
+    manifest.eligibleItems.map((item) => [item.path, item.sourceFamily]),
+    [
+      ["docs/example/openapi.yaml", "openapi_spec"],
+      ["docs/guide/setup.mdx", "doc_page"]
+    ]
+  );
+  assert.deepEqual(
+    manifest.skippedItems.map((item) => [item.path, item.skipReason, item.shardKey, item.contentChecksum]),
+    [
+      ["docs/assets/logo.png", "unsupported_extension", "docs", null],
+      ["docs/excluded/secret.mdx", "excluded_by_pattern", "docs", null],
+      ["README.md", "outside_docs_com_scope", null, null]
+    ]
+  );
+  assert.equal(manifest.skippedItems[0].sourceAcquisitionMode, "remote");
+});
+
+test("buildDocsComSourceManifest keeps content checksum stable across acquisition modes", () => {
+  const remoteManifest = buildDocsComSourceManifest({
+    sourceMode: "remote",
+    includePaths: ["docs/**/*.md"],
+    excludePaths: [],
+    files: [
+      {
+        path: "docs/api/auth.md",
+        sha: "blob-remote",
+        contentChecksum: "sha256-same-content",
+        size: 42,
+        type: "blob"
+      }
+    ]
+  });
+
+  const localManifest = buildDocsComSourceManifest({
+    sourceMode: "local_mirror",
+    includePaths: ["docs/**/*.md"],
+    excludePaths: [],
+    files: [
+      {
+        path: "docs/api/auth.md",
+        sha: "blob-local",
+        contentChecksum: "sha256-same-content",
+        size: 42,
+        type: "blob"
+      }
+    ]
+  });
+
+  assert.equal(remoteManifest.eligibleItems[0]?.blobSha, "blob-remote");
+  assert.equal(localManifest.eligibleItems[0]?.blobSha, "blob-local");
+  assert.equal(remoteManifest.eligibleItems[0]?.contentChecksum, "sha256-same-content");
+  assert.equal(localManifest.eligibleItems[0]?.contentChecksum, "sha256-same-content");
+});
+
+test("remote manifest checksum hydration fetches only eligible files and respects bounded concurrency", async () => {
+  const manifest = buildDocsComSourceManifest({
+    sourceMode: "remote",
+    includePaths: ["docs/**"],
+    excludePaths: ["docs/excluded/**"],
+    files: [
+      {
+        path: "docs/guide/setup.mdx",
+        sha: "blob-doc",
+        size: 12,
+        type: "blob"
+      },
+      {
+        path: "docs/reference/openapi.yaml",
+        sha: "blob-openapi",
+        size: 24,
+        type: "blob"
+      },
+      {
+        path: "docs/assets/logo.png",
+        sha: "blob-png",
+        size: 8,
+        type: "blob"
+      },
+      {
+        path: "docs/excluded/secret.mdx",
+        sha: "blob-excluded",
+        size: 16,
+        type: "blob"
+      },
+      {
+        path: "README.md",
+        sha: "blob-readme",
+        size: 32,
+        type: "blob"
+      }
+    ]
+  });
+
+  const fetchedPaths: string[] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+
+  const hydrated = await populateDocsComManifestEligibleChecksumsForSnapshot({
+    registration: localMirrorRegistration,
+    targetHead: "mock-head",
+    sourceMode: "remote",
+    manifest,
+    remoteConcurrency: 1,
+    fetchContentBuffer: async (filePath) => {
+      fetchedPaths.push(filePath);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      inFlight -= 1;
+      return Buffer.from(`content:${filePath}`, "utf8");
+    }
+  });
+
+  assert.deepEqual(fetchedPaths, ["docs/guide/setup.mdx", "docs/reference/openapi.yaml"]);
+  assert.equal(maxInFlight, 1);
+  assert.equal(hydrated.skippedItems.every((item) => item.contentChecksum === null), true);
+  assert.equal(
+    hydrated.eligibleItems.every((item) => typeof item.contentChecksum === "string" && item.contentChecksum.length > 0),
+    true
+  );
+});
+
+test("remote eligible checksum matches local mirror checksum for the same content", async () => {
+  const content = "# Setup\n\nUse the same content across acquisition modes.";
+  const localManifest = buildDocsComSourceManifest({
+    sourceMode: "local_mirror",
+    includePaths: ["docs/**"],
+    excludePaths: [],
+    files: [
+      {
+        path: "docs/guide/setup.mdx",
+        sha: "blob-local",
+        contentChecksum: sha256(content),
+        size: Buffer.byteLength(content, "utf8"),
+        type: "blob"
+      }
+    ]
+  });
+
+  const remoteManifest = buildDocsComSourceManifest({
+    sourceMode: "remote",
+    includePaths: ["docs/**"],
+    excludePaths: [],
+    files: [
+      {
+        path: "docs/guide/setup.mdx",
+        sha: "blob-remote",
+        size: Buffer.byteLength(content, "utf8"),
+        type: "blob"
+      }
+    ]
+  });
+
+  const hydrated = await populateDocsComManifestEligibleChecksumsForSnapshot({
+    registration: localMirrorRegistration,
+    targetHead: "mock-head",
+    sourceMode: "remote",
+    manifest: remoteManifest,
+    fetchContentBuffer: async () => Buffer.from(content, "utf8")
+  });
+
+  assert.equal(hydrated.eligibleItems[0]?.contentChecksum, localManifest.eligibleItems[0]?.contentChecksum);
+});
+
+test("summarizeServingCompatibilityMetadata marks legacy serving rows as ambiguous when multiple knowledge spaces publish the same repo scope", () => {
+  const serving = summarizeServingCompatibilityMetadata({
+    serving: {
+      repo_id: "repo-1",
+      branch: "main",
+      active_build_version: "build-local-current",
+      active_head: "sha-local-current",
+      activated_at: new Date(0).toISOString(),
+      updated_at: new Date(0).toISOString()
+    },
+    publication: {
+      knowledge_space: "support-preview",
+      repo_id: "repo-1",
+      branch: "main",
+      published_build_version: "build-preview-current",
+      published_head: "sha-preview-current",
+      published_by: "test",
+      published_from_env: "preview",
+      published_at: new Date(0).toISOString(),
+      updated_at: new Date(0).toISOString()
+    },
+    publicationScopeCount: 2
+  });
+
+  assert.deepEqual(serving, {
+    source: "compatibility_metadata",
+    scope: "repo_branch",
+    activeBuildVersion: "build-local-current",
+    activeHead: "sha-local-current",
+    activatedAt: new Date(0).toISOString(),
+    comparisonToPublication: "ambiguous_across_knowledge_spaces",
+    consistentWithPublication: null
+  });
+});
+
+test("resolvePublicationAwareIncrementalBase ignores newer unpublished checkpoint heads", () => {
+  const baseline = resolvePublicationAwareIncrementalBase({
+    publication: {
+      published_build_version: "build-v1",
+      published_head: "sha-v1"
+    },
+    checkpoint: {
+      last_synced_commit_sha: "sha-v2-unpublished",
+      last_full_synced_commit_sha: "sha-v2-unpublished"
+    }
+  });
+
+  assert.deepEqual(baseline, {
+    kind: "published",
+    commitSha: "sha-v1",
+    buildVersion: "build-v1"
+  });
+});
+
+test("buildPollingSyncRequestFromPublication falls back to full sync when no publication exists", () => {
+  assert.deepEqual(
+    buildPollingSyncRequestFromPublication({
+      latestHead: "sha-v3",
+      publication: null,
+      checkpoint: {
+        last_synced_commit_sha: "sha-v2-unpublished",
+        last_full_synced_commit_sha: "sha-v2-unpublished"
+      }
+    }),
+    {
+      mode: "full"
+    }
+  );
+});
+
+test("shouldAdvanceFullSyncCheckpoint only advances baseline state for publish_inline full builds", () => {
+  assert.equal(shouldAdvanceFullSyncCheckpoint("build_only"), false);
+  assert.equal(shouldAdvanceFullSyncCheckpoint("publish_inline"), true);
 });

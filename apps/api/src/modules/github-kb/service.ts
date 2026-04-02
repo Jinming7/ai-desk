@@ -9,12 +9,14 @@ import { embedText, toVectorLiteral } from "./embedding.js";
 import { buildRepositoryKnowledgeArtifacts } from "./builders/repository-knowledge-builder.js";
 import { buildDocumentRetrievalUnits } from "./builders/document-builder.js";
 import { classifySourceFamily } from "./parsers/source-classifier.js";
+import { buildDocsComSourceManifest, type DocsComSourceManifest } from "./source/manifest-builder.js";
 import {
   assertGithubReadOnlyMethod,
   buildSourceUrl,
   compareCommits,
   getBranchHead,
   getFileContentAtCommit,
+  getFileContentBufferAtCommit,
   getRepositoryDefaultBranch,
   getRepoFullName,
   listFilesAtCommit,
@@ -31,9 +33,13 @@ import { canPublishToKnowledgeSpace, resolveRequestedFromEnv, resolveRuntimeKnow
 import type {
   GitHubTreeFile,
   KbBuild,
+  KbBuildPublicationMode,
+  KbEmbeddingMode,
   KbFullSyncShardKey,
   KbKnowledgeSpace,
+  KbPublication,
   KbRequestedFromEnv,
+  SyncCheckpoint,
   KbSyncManifestItem,
   KbSyncRun,
   KbSyncRunShard,
@@ -63,6 +69,14 @@ const DOCS_COM_REPO_NAME = "docs-com";
 const DOCS_COM_DEFAULT_BRANCH = "master";
 const DOCS_COM_REPO_URL = "https://github.com/BangWork/docs-com";
 const DOCS_COM_PUBLIC_BASE_URL = "https://docs.ones.com";
+const DEFAULT_EMBEDDING_MODE: KbEmbeddingMode = "best_effort";
+const REMOTE_MANIFEST_CHECKSUM_CONCURRENCY = 4;
+
+export const githubKbServiceDeps = {
+  updateManifestItemBuildStatus(input: Parameters<typeof repo.updateManifestItemBuildStatus>[0]) {
+    return repo.updateManifestItemBuildStatus(input);
+  }
+};
 
 interface SyncExecutionResult {
   indexed: number;
@@ -132,6 +146,18 @@ function sha256(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
+function sha256Buffer(input: Buffer): string {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+function gitBlobSha(input: Buffer): string {
+  return crypto
+    .createHash("sha1")
+    .update(`blob ${input.byteLength}\0`)
+    .update(input)
+    .digest("hex");
+}
+
 function parseRepoOwnerName(repoUrl: string): { owner: string; name: string } {
   if (repoUrl.startsWith("mock://")) {
     const parts = repoUrl.replace("mock://", "").split("/").filter(Boolean);
@@ -180,6 +206,45 @@ export function resolveBootstrapIncludePaths(raw: string): string[] {
     .filter(Boolean);
   const includePaths = uniqueStrings(parsed, MAX_BOOTSTRAP_INCLUDE_PATHS);
   return includePaths.length ? includePaths : [...DEFAULT_BOOTSTRAP_INCLUDE_PATHS];
+}
+
+function deriveSyncExecutionId(seed: string): string {
+  const normalized = String(seed ?? "").trim() || "sync-execution";
+  return `sync-exec:${sha256(normalized).slice(0, 24)}`;
+}
+
+function buildExecutionScopedBuildVersion(targetHead: string, executionId: string): string {
+  const normalizedHead = String(targetHead ?? "").trim();
+  const normalizedExecutionId = String(executionId ?? "").trim();
+  if (!normalizedHead) return normalizedExecutionId;
+  if (!normalizedExecutionId) return normalizedHead;
+  return `${normalizedHead}:${normalizedExecutionId}`;
+}
+
+export function resolveSyncExecutionId(payload: Record<string, unknown> | null | undefined, fallbackSeed: string): string {
+  const explicit = String(payload?.executionId ?? "").trim();
+  return explicit || deriveSyncExecutionId(fallbackSeed);
+}
+
+export function buildEnqueuedSyncPayload(input: {
+  mode: "full" | "incremental" | "reindex";
+  idempotencyKey: string;
+  knowledgeSpace: KbKnowledgeSpace;
+  afterCommitSha?: string;
+  payload?: Record<string, unknown>;
+}): Record<string, unknown> {
+  const executionId = resolveSyncExecutionId(input.payload, input.idempotencyKey);
+  return {
+    ...(input.payload ?? {}),
+    knowledgeSpace: input.knowledgeSpace,
+    executionId,
+    ...(input.mode === "full" && input.afterCommitSha
+      ? {
+          buildVersion:
+            String(input.payload?.buildVersion ?? "").trim() || buildExecutionScopedBuildVersion(input.afterCommitSha, executionId)
+        }
+      : {})
+  };
 }
 
 export function buildDocsComIncludePaths(raw: string): string[] {
@@ -254,8 +319,68 @@ function parseKnowledgeSpace(value: unknown): KbKnowledgeSpace | null {
   return null;
 }
 
+function parsePublicationMode(value: unknown): KbBuildPublicationMode | null {
+  return value === "build_only" || value === "publish_inline" ? value : null;
+}
+
+function parseEmbeddingMode(value: unknown): KbEmbeddingMode | null {
+  return value === "disabled" || value === "best_effort" || value === "required" ? value : null;
+}
+
+function resolvePublicationModeFromPayload(
+  payload: Record<string, unknown> | undefined,
+  fallback: KbBuildPublicationMode
+): KbBuildPublicationMode {
+  return parsePublicationMode(payload?.publicationMode) ?? fallback;
+}
+
+function resolveEmbeddingModeFromPayload(payload: Record<string, unknown> | undefined): KbEmbeddingMode {
+  return parseEmbeddingMode(payload?.embeddingMode) ?? DEFAULT_EMBEDDING_MODE;
+}
+
 function resolveJobKnowledgeSpace(job: SyncJob): KbKnowledgeSpace {
   return parseKnowledgeSpace(job.payload_json?.knowledgeSpace) ?? resolveRuntimeKnowledgeSpace();
+}
+
+export function shouldAdvanceFullSyncCheckpoint(publicationMode: KbBuildPublicationMode): boolean {
+  return publicationMode === "publish_inline";
+}
+
+export function resolvePublicationAwareIncrementalBase(input: {
+  publication: Pick<KbPublication, "published_head" | "published_build_version"> | null;
+  checkpoint?: Pick<SyncCheckpoint, "last_synced_commit_sha" | "last_full_synced_commit_sha"> | null;
+}): { kind: "published"; commitSha: string; buildVersion: string } | { kind: "unavailable" } {
+  const publishedHead = String(input.publication?.published_head ?? "").trim();
+  const publishedBuildVersion = String(input.publication?.published_build_version ?? "").trim();
+  if (!publishedHead || !publishedBuildVersion) {
+    return { kind: "unavailable" };
+  }
+  return {
+    kind: "published",
+    commitSha: publishedHead,
+    buildVersion: publishedBuildVersion
+  };
+}
+
+export function buildPollingSyncRequestFromPublication(input: {
+  latestHead: string;
+  publication: Pick<KbPublication, "published_head" | "published_build_version"> | null;
+  checkpoint?: Pick<SyncCheckpoint, "last_synced_commit_sha" | "last_full_synced_commit_sha"> | null;
+}): { mode: "full" } | { mode: "incremental"; beforeCommitSha: string } | null {
+  const baseline = resolvePublicationAwareIncrementalBase({
+    publication: input.publication,
+    checkpoint: input.checkpoint
+  });
+  if (baseline.kind === "unavailable") {
+    return { mode: "full" };
+  }
+  if (baseline.commitSha === input.latestHead) {
+    return null;
+  }
+  return {
+    mode: "incremental",
+    beforeCommitSha: baseline.commitSha
+  };
 }
 
 async function ensureBuildRecord(input: {
@@ -299,11 +424,18 @@ async function validateBuildForPublication(input: {
     branch: input.branch,
     buildVersion: input.buildVersion
   });
+  const artifactSummary = await repo.getBuildArtifactSummary({
+    knowledgeSpace: input.knowledgeSpace,
+    repoId: input.repoId,
+    branch: input.branch,
+    buildVersion: input.buildVersion
+  });
   const prefixRows = input.requiredPrefixes?.length
     ? await repo.countDocumentsByPathPrefixes({
         knowledgeSpace: input.knowledgeSpace,
         repoId: input.repoId,
         branch: input.branch,
+        buildVersion: input.buildVersion,
         prefixes: input.requiredPrefixes
       })
     : [];
@@ -365,6 +497,29 @@ async function validateBuildForPublication(input: {
         totalChunks: snapshot.totalChunks,
         totalMemoryEntries: snapshot.totalMemoryEntries
       }
+    },
+    {
+      validationKind: "parser_degradation_summary",
+      passed: true,
+      severity: artifactSummary.parserDegradation.degradedDocuments > 0 ? ("warn" as const) : ("info" as const),
+      summary:
+        artifactSummary.parserDegradation.degradedDocuments > 0
+          ? `${artifactSummary.parserDegradation.degradedDocuments} documents used degraded parser paths`
+          : "all documents used canonical parser paths",
+      details: artifactSummary.parserDegradation
+    },
+    {
+      validationKind: "embedding_summary",
+      passed: true,
+      severity:
+        artifactSummary.embeddingSummary.chunkEmbeddings.missing > 0 || artifactSummary.embeddingSummary.citationEmbeddings.missing > 0
+          ? ("warn" as const)
+          : ("info" as const),
+      summary:
+        artifactSummary.embeddingSummary.chunkEmbeddings.missing > 0 || artifactSummary.embeddingSummary.citationEmbeddings.missing > 0
+          ? "some embeddings are missing for build artifacts"
+          : "all chunk and citation embeddings are present",
+      details: artifactSummary.embeddingSummary
     }
   ];
 
@@ -373,7 +528,7 @@ async function validateBuildForPublication(input: {
       validationKind: `required_doc_family:${row.prefix}`,
       passed: row.active > 0,
       severity: "error" as const,
-      summary: row.active > 0 ? `${row.prefix} present in published candidate build` : `${row.prefix} missing from build`,
+      summary: row.active > 0 ? `${row.prefix} present in build` : `${row.prefix} missing from build`,
       details: { prefix: row.prefix, total: row.total, active: row.active }
     });
   }
@@ -387,7 +542,8 @@ async function validateBuildForPublication(input: {
   const summary = {
     totalChecks: results.length,
     failedChecks: results.filter((item) => !item.passed).map((item) => item.validationKind),
-    snapshot
+    snapshot,
+    artifactSummary
   };
 
   await repo.updateBuildStatus({
@@ -470,7 +626,7 @@ async function publishValidatedBuild(input: {
   }
 }
 
-async function finalizeAndPublishBuild(input: {
+async function finalizeBuild(input: {
   knowledgeSpace: KbKnowledgeSpace;
   repoId: string;
   branch: string;
@@ -479,6 +635,8 @@ async function finalizeAndPublishBuild(input: {
   buildKind: KbBuild["build_kind"];
   requestedBy: string;
   requestedFromEnv: KbRequestedFromEnv;
+  publicationMode: KbBuildPublicationMode;
+  embeddingMode?: KbEmbeddingMode;
   sourceSnapshotTotal?: number;
   requiredPrefixes?: string[];
 }): Promise<KbBuild> {
@@ -524,34 +682,37 @@ async function finalizeAndPublishBuild(input: {
   if (!validation.passed) {
     throw new Error(`Build validation failed for ${input.buildVersion}`);
   }
-  if (!canPublishToKnowledgeSpace(input.requestedFromEnv, input.knowledgeSpace)) {
-    throw new Error(`Environment ${input.requestedFromEnv} cannot publish into ${input.knowledgeSpace}`);
+  if (input.publicationMode === "publish_inline") {
+    if (!canPublishToKnowledgeSpace(input.requestedFromEnv, input.knowledgeSpace)) {
+      throw new Error(`Environment ${input.requestedFromEnv} cannot publish into ${input.knowledgeSpace}`);
+    }
+    await publishValidatedBuild({
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.repoId,
+      branch: input.branch,
+      buildId: build.id,
+      buildVersion: input.buildVersion,
+      targetHead: input.targetHead,
+      publishedBy: input.requestedBy,
+      publishedFromEnv: input.requestedFromEnv
+    });
   }
-  await publishValidatedBuild({
-    knowledgeSpace: input.knowledgeSpace,
-    repoId: input.repoId,
-    branch: input.branch,
-    buildId: build.id,
-    buildVersion: input.buildVersion,
-    targetHead: input.targetHead,
-    publishedBy: input.requestedBy,
-    publishedFromEnv: input.requestedFromEnv
-  });
   return (await repo.getBuildById(build.id)) ?? build;
 }
 
 async function freezeDocsComSourceSnapshot(registration: RepoRegistration, branch?: string): Promise<FrozenDocsComSourceSnapshot> {
   const localMirror = await getLocalDocsMirrorState(registration);
   if (localMirror) {
-    const markdownFiles = await collectLocalMirrorSnapshot(registration, localMirror);
+    const visibleFiles = await collectLocalMirrorManifestSnapshot(localMirror);
     const files: GitHubTreeFile[] = [];
-    for (const relativePath of markdownFiles.sort(compareSnapshotPaths)) {
+    for (const relativePath of visibleFiles) {
       const absolutePath = path.join(localMirror.rootDir, relativePath);
-      const content = await readFile(absolutePath, "utf8").catch(() => "");
+      const content = await readFile(absolutePath);
       files.push({
         path: relativePath,
-        sha: sha256(content),
-        size: Buffer.byteLength(content, "utf8"),
+        sha: gitBlobSha(content),
+        contentChecksum: sha256Buffer(content),
+        size: content.byteLength,
         type: "blob"
       });
     }
@@ -566,17 +727,72 @@ async function freezeDocsComSourceSnapshot(registration: RepoRegistration, branc
 
   const resolved = await resolveRegistrationBranch(registration, branch || registration.default_branch || DOCS_COM_DEFAULT_BRANCH, "full_run_plan");
   const head = await getBranchHead(resolved.registration, resolved.branch);
-  const files = (await listFilesAtCommit(resolved.registration, head))
-    .filter((file) => isSupportedKnowledgePath(file.path))
-    .filter((file) => isPathIncluded(file.path, resolved.registration.include_paths, resolved.registration.exclude_paths))
-    .filter((file) => Boolean(classifyDocsComShard(file.path)))
-    .sort((left, right) => compareSnapshotPaths(left.path, right.path));
+  const files = (await listFilesAtCommit(resolved.registration, head)).sort((left, right) => compareSnapshotPaths(left.path, right.path));
 
   return {
     mode: "remote",
     branch: resolved.branch,
     head,
     files
+  };
+}
+
+async function mapWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const normalizedLimit = Math.max(1, Math.min(limit, items.length || 1));
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+
+  const runWorker = async () => {
+    while (true) {
+      const current = cursor;
+      cursor += 1;
+      if (current >= items.length) return;
+      results[current] = await worker(items[current], current);
+    }
+  };
+
+  await Promise.all(Array.from({ length: normalizedLimit }, () => runWorker()));
+  return results;
+}
+
+export async function populateDocsComManifestEligibleChecksumsForSnapshot(input: {
+  registration: RepoRegistration;
+  targetHead: string;
+  sourceMode: "local_mirror" | "remote";
+  manifest: DocsComSourceManifest;
+  remoteConcurrency?: number;
+  fetchContentBuffer?: (filePath: string) => Promise<Buffer>;
+}): Promise<DocsComSourceManifest> {
+  if (input.sourceMode !== "remote") {
+    return input.manifest;
+  }
+
+  const eligibleWithoutChecksum = input.manifest.eligibleItems.filter((item) => !item.contentChecksum);
+  if (!eligibleWithoutChecksum.length) {
+    return input.manifest;
+  }
+
+  const fetchContentBuffer =
+    input.fetchContentBuffer ??
+    ((filePath: string) => getFileContentBufferAtCommit(input.registration, filePath, input.targetHead));
+
+  const hydrated = await mapWithConcurrency(
+    eligibleWithoutChecksum,
+    input.remoteConcurrency ?? REMOTE_MANIFEST_CHECKSUM_CONCURRENCY,
+    async (item) => ({
+      path: item.path,
+      contentChecksum: sha256Buffer(await fetchContentBuffer(item.path))
+    })
+  );
+
+  const checksumByPath = new Map(hydrated.map((item) => [item.path, item.contentChecksum]));
+
+  return {
+    eligibleItems: input.manifest.eligibleItems.map((item) => ({
+      ...item,
+      contentChecksum: item.contentChecksum ?? checksumByPath.get(item.path) ?? null
+    })),
+    skippedItems: input.manifest.skippedItems
   };
 }
 
@@ -940,6 +1156,23 @@ async function collectLocalMirrorMarkdownFiles(
   return output;
 }
 
+async function collectLocalMirrorVisibleFiles(rootDir: string, relativeDir = ""): Promise<string[]> {
+  const dirPath = path.join(rootDir, relativeDir);
+  const entries = await readdir(dirPath, { withFileTypes: true });
+  const output: string[] = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith(".") && entry.name !== ".well-known") continue;
+    if (entry.isDirectory()) {
+      if (LOCAL_DOCS_SKIP_DIRS.has(entry.name)) continue;
+      output.push(...(await collectLocalMirrorVisibleFiles(rootDir, path.join(relativeDir, entry.name))));
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    output.push(path.posix.join(relativeDir.split(path.sep).join(path.posix.sep), entry.name));
+  }
+  return output;
+}
+
 async function collectLocalMirrorSnapshot(
   registration: LocalMirrorRegistrationTarget,
   localMirror: LocalDocsMirrorState
@@ -952,6 +1185,10 @@ async function collectLocalMirrorSnapshot(
     )
   );
   return fileGroups.flat().sort((left, right) => left.localeCompare(right, "en"));
+}
+
+async function collectLocalMirrorManifestSnapshot(localMirror: LocalDocsMirrorState): Promise<string[]> {
+  return (await collectLocalMirrorVisibleFiles(localMirror.rootDir)).sort(compareSnapshotPaths);
 }
 
 function compareSnapshotPaths(left: string, right: string): number {
@@ -987,7 +1224,8 @@ async function indexLocalMirrorPaths(input: {
   commitSha: string;
   rootDir: string;
   buildVersion?: string;
-  publicationMode?: "build_only" | "publish_inline";
+  publicationMode?: KbBuildPublicationMode;
+  embeddingMode?: KbEmbeddingMode;
   paths: string[];
 }): Promise<number> {
   let indexed = 0;
@@ -1002,6 +1240,7 @@ async function indexLocalMirrorPaths(input: {
       commitSha: input.commitSha,
       buildVersion: input.buildVersion,
       publicationMode: input.publicationMode,
+      embeddingMode: input.embeddingMode,
       path: relativePath,
       content
     });
@@ -1646,12 +1885,17 @@ async function embedWithRetry(text: string): Promise<{ vectorLiteral: string; mo
   throw lastError ?? new Error("Embedding failed");
 }
 
-async function embedChunkBestEffort(
-  text: string
+async function embedTextForBuild(
+  text: string,
+  embeddingMode: KbEmbeddingMode
 ): Promise<{ vectorLiteral: string; model: string; version: string } | null> {
+  if (embeddingMode === "disabled") return null;
   try {
     return await embedWithRetry(text);
-  } catch {
+  } catch (error) {
+    if (embeddingMode === "required") {
+      throw error;
+    }
     return null;
   }
 }
@@ -1663,7 +1907,11 @@ function isPermanentEmbeddingError(error: unknown): boolean {
     message.includes("quota") ||
     message.includes("invalid_api_key") ||
     message.includes("incorrect api key") ||
-    message.includes("401")
+    message.includes("unauthorized") ||
+    message.includes("authentication") ||
+    message.includes("forbidden") ||
+    message.includes("401") ||
+    message.includes("403")
   );
 }
 
@@ -1730,7 +1978,7 @@ async function indexDocument(
   branch: string,
   commitSha: string,
   path: string,
-  options?: { buildVersion?: string; publicationMode?: "build_only" | "publish_inline" }
+  options?: { buildVersion?: string; publicationMode?: KbBuildPublicationMode; embeddingMode?: KbEmbeddingMode }
 ): Promise<void> {
   const content = await getFileContentAtCommit(registration, path, commitSha);
   await indexDocumentContent({
@@ -1740,6 +1988,7 @@ async function indexDocument(
     commitSha,
     buildVersion: options?.buildVersion,
     publicationMode: options?.publicationMode,
+    embeddingMode: options?.embeddingMode,
     path,
     content
   });
@@ -1751,12 +2000,14 @@ async function indexDocumentContent(input: {
   branch: string;
   commitSha: string;
   buildVersion?: string;
-  publicationMode?: "build_only" | "publish_inline";
+  publicationMode?: KbBuildPublicationMode;
+  embeddingMode?: KbEmbeddingMode;
   path: string;
   content: string;
 }): Promise<void> {
   const { registration, knowledgeSpace, branch, commitSha, path, content } = input;
   const buildVersion = input.buildVersion?.trim() || commitSha;
+  const embeddingMode = input.embeddingMode ?? DEFAULT_EMBEDDING_MODE;
   const normalizedContent = enrichIndexableContent(path, content);
   const contentHash = sha256(content);
   const repoSourceUrl = buildSourceUrl(registration, path, commitSha);
@@ -1851,7 +2102,7 @@ async function indexDocumentContent(input: {
         apiDoc,
         inherited: docSupportEvidence
       });
-      const embedded = await embedChunkBestEffort(chunk.content);
+      const embedded = await embedTextForBuild(chunk.content, embeddingMode);
       await repo.upsertChunk({
         id: chunk.id,
         docId: doc.id,
@@ -2006,7 +2257,7 @@ async function indexDocumentContent(input: {
   );
   const allCitations = [...docChunkCitations, ...knowledgeArtifacts.citationUnits];
   for (const citation of allCitations) {
-    const embedded = await embedChunkBestEffort(citation.embeddingText ?? citation.snippetText);
+    const embedded = await embedTextForBuild(citation.embeddingText ?? citation.snippetText, embeddingMode);
     await repo.upsertCitationUnit({
       id: citation.id,
       knowledgeSpace,
@@ -2035,6 +2286,9 @@ async function indexDocumentContent(input: {
   const docCitationByHeading = new Map(
     docChunkCitations.map((citation) => [citation.headingPath ?? "ROOT", citation.id] as const)
   );
+  const chunkByHeading = new Map(
+    persistedChunks.map((chunk) => [chunk.headingPath ?? "ROOT", chunk] as const)
+  );
   const docRetrievalUnits =
     knowledgeArtifacts.docPage && docChunkCitations.length
       ? buildDocumentRetrievalUnits({
@@ -2056,7 +2310,27 @@ async function indexDocumentContent(input: {
         }
       },
       docRetrievalUnits
-    ),
+    ).map((entry) => {
+      if (entry.sources.length > 0) return entry;
+      const headingPath = String(entry.metadata_json?.heading_path ?? "").trim() || "ROOT";
+      const sourceChunk = chunkByHeading.get(headingPath) ?? chunkByHeading.get("ROOT");
+      if (!sourceChunk) return entry;
+      return {
+        ...entry,
+        sources: [
+          {
+            doc_id: doc.id,
+            chunk_id: sourceChunk.id,
+            heading_path: sourceChunk.headingPath,
+            source_score: 1,
+            source_metadata_json: {
+              source_family: "doc_chunk",
+              generated_from: "document_retrieval_unit"
+            }
+          }
+        ]
+      };
+    }),
     ...knowledgeArtifacts.memoryEntries
   ];
 
@@ -2076,14 +2350,14 @@ async function indexDocumentContent(input: {
   });
 }
 
-async function maybeFinalizeDocsComFullSyncRun(runId: string): Promise<void> {
+async function maybeFinalizeDocsComFullSyncRun(runId: string, publicationMode: KbBuildPublicationMode): Promise<void> {
   const run = await repo.tryStartSyncRunFinalization(runId);
   if (!run) return;
   const knowledgeSpace = resolveRuntimeKnowledgeSpace();
   try {
     const buildVersion = buildFullRunBuildVersion(run.target_head, run.id);
     const requestedFromEnv = resolveRequestedFromEnv();
-    await finalizeAndPublishBuild({
+    await finalizeBuild({
       knowledgeSpace,
       repoId: run.repo_id,
       branch: run.branch,
@@ -2092,6 +2366,7 @@ async function maybeFinalizeDocsComFullSyncRun(runId: string): Promise<void> {
       buildKind: "full",
       requestedBy: "docs-com-full-sync",
       requestedFromEnv,
+      publicationMode,
       sourceSnapshotTotal: run.source_snapshot_total,
       requiredPrefixes: DOCS_COM_REQUIRED_PREFIXES
     });
@@ -2100,7 +2375,8 @@ async function maybeFinalizeDocsComFullSyncRun(runId: string): Promise<void> {
       repoId: run.repo_id,
       branch: run.branch,
       buildVersion,
-      targetHead: run.target_head
+      targetHead: run.target_head,
+      publicationMode
     });
     await repo.recordMetric({
       repoId: run.repo_id,
@@ -2119,6 +2395,8 @@ async function maybeFinalizeDocsComFullSyncRun(runId: string): Promise<void> {
 async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
   const knowledgeSpace = resolveJobKnowledgeSpace(job);
   const requestedFromEnv = resolveRequestedFromEnv();
+  const publicationMode = resolvePublicationModeFromPayload(job.payload_json, "build_only");
+  const embeddingMode = resolveEmbeddingModeFromPayload(job.payload_json);
   const payload = getFullRunPayload(job);
   if (!payload) {
     throw new Error(`Missing docs-com full run payload on job ${job.id}`);
@@ -2168,7 +2446,7 @@ async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegist
       nextCursor: null,
       status: "succeeded"
     });
-    await maybeFinalizeDocsComFullSyncRun(run.id);
+    await maybeFinalizeDocsComFullSyncRun(run.id, publicationMode);
     return { indexed: 0, head: run.target_head, finished: true, nextCursor: null };
   }
 
@@ -2183,7 +2461,9 @@ async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegist
       }
       for (const item of manifestItems) {
         if (!item.needs_rebuild) {
-          await withTransientDbRetry(() => repo.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "reused" }));
+          await withTransientDbRetry(() =>
+            githubKbServiceDeps.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "reused" })
+          );
           reused += 1;
           continue;
         }
@@ -2200,26 +2480,30 @@ async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegist
             commitSha: run.target_head,
             buildVersion: payload.buildVersion,
             publicationMode: "build_only",
+            embeddingMode,
             path: item.path,
             content
           });
-          await repo.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "rebuilt" });
+          await githubKbServiceDeps.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "rebuilt" });
         });
         rebuilt += 1;
       }
     } else {
       for (const item of manifestItems) {
         if (!item.needs_rebuild) {
-          await withTransientDbRetry(() => repo.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "reused" }));
+          await withTransientDbRetry(() =>
+            githubKbServiceDeps.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "reused" })
+          );
           reused += 1;
           continue;
         }
         await withTransientDbRetry(async () => {
           await indexDocument(registration, knowledgeSpace, run.branch, run.target_head, item.path, {
             buildVersion: payload.buildVersion,
-            publicationMode: "build_only"
+            publicationMode: "build_only",
+            embeddingMode
           });
-          await repo.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "rebuilt" });
+          await githubKbServiceDeps.updateManifestItemBuildStatus({ runId: run.id, path: item.path, status: "rebuilt" });
         });
         
         rebuilt += 1;
@@ -2232,7 +2516,7 @@ async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegist
     }
     const failingPath = manifestItems[rebuilt + reused]?.path;
     if (failingPath) {
-      await repo.updateManifestItemBuildStatus({
+      await githubKbServiceDeps.updateManifestItemBuildStatus({
         runId: run.id,
         path: failingPath,
         status: "failed",
@@ -2280,7 +2564,7 @@ async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegist
       idempotencyKey: `sync-continuation:full:${run.id}:${payload.shardKey}:${run.target_head}:${nextCursor}`
     });
   } else {
-    await maybeFinalizeDocsComFullSyncRun(run.id);
+    await maybeFinalizeDocsComFullSyncRun(run.id, publicationMode);
   }
 
   return {
@@ -2294,17 +2578,23 @@ async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegist
 async function runLocalMirrorFullSync(
   job: SyncJob,
   registration: RepoRegistration,
-  localMirror: LocalDocsMirrorState
+  localMirror: LocalDocsMirrorState,
+  leaseOwnerId: string,
+  buildVersion: string
 ): Promise<LocalMirrorBatchResult> {
   const branch = job.branch || localMirror.branch || registration.default_branch;
   const knowledgeSpace = resolveRuntimeKnowledgeSpace();
-  const buildVersion = String(job.payload_json?.buildVersion ?? "").trim() || localMirror.head;
+  const publicationMode = resolvePublicationModeFromPayload(job.payload_json, "build_only");
+  const embeddingMode = resolveEmbeddingModeFromPayload(job.payload_json);
   return runLocalMirrorSyncBatch({
     registration,
     knowledgeSpace,
     branch,
     localMirror,
+    leaseOwnerId,
     buildVersion,
+    publicationMode,
+    embeddingMode,
     cursor: getLocalMirrorCursor(job),
     limit: env.GITHUB_KB_LOCAL_MIRROR_BATCH_SIZE
   });
@@ -2315,7 +2605,10 @@ async function runLocalMirrorSyncBatch(input: {
   knowledgeSpace: KbKnowledgeSpace;
   branch: string;
   localMirror: LocalDocsMirrorState;
+  leaseOwnerId: string;
   buildVersion: string;
+  publicationMode: KbBuildPublicationMode;
+  embeddingMode: KbEmbeddingMode;
   cursor?: string;
   limit: number;
 }): Promise<LocalMirrorBatchResult> {
@@ -2329,6 +2622,7 @@ async function runLocalMirrorSyncBatch(input: {
     rootDir: input.localMirror.rootDir,
     buildVersion: input.buildVersion,
     publicationMode: "build_only",
+    embeddingMode: input.embeddingMode,
     paths: window.files
   });
 
@@ -2343,7 +2637,7 @@ async function runLocalMirrorSyncBatch(input: {
       input.knowledgeSpace,
       markdownFiles
     );
-    await finalizeAndPublishBuild({
+    await finalizeBuild({
       knowledgeSpace: input.knowledgeSpace,
       repoId: input.registration.id,
       branch: input.branch,
@@ -2351,18 +2645,21 @@ async function runLocalMirrorSyncBatch(input: {
       targetHead: input.localMirror.head,
       buildKind: "full",
       requestedBy: "sync_worker",
-      requestedFromEnv: resolveRequestedFromEnv()
+      requestedFromEnv: resolveRequestedFromEnv(),
+      publicationMode: input.publicationMode
     });
     await repo.releaseIngestLease(
       buildKnowledgeSpaceLeaseKey(input.knowledgeSpace, input.registration.id, input.branch),
-      input.buildVersion
+      input.leaseOwnerId
     ).catch(() => undefined);
-    await repo.upsertCheckpoint({
-      repoId: input.registration.id,
-      branch: input.branch,
-      lastSyncedCommitSha: input.localMirror.head,
-      fullSync: true
-    });
+    if (shouldAdvanceFullSyncCheckpoint(input.publicationMode)) {
+      await repo.upsertCheckpoint({
+        repoId: input.registration.id,
+        branch: input.branch,
+        lastSyncedCommitSha: input.localMirror.head,
+        fullSync: true
+      });
+    }
   }
 
   return {
@@ -2381,7 +2678,10 @@ async function runRemoteSnapshotBatch(input: {
   knowledgeSpace: KbKnowledgeSpace;
   branch: string;
   head: string;
+  leaseOwnerId: string;
   buildVersion: string;
+  publicationMode: KbBuildPublicationMode;
+  embeddingMode: KbEmbeddingMode;
   cursor?: string;
   limit: number;
 }): Promise<RemoteBatchResult> {
@@ -2397,7 +2697,8 @@ async function runRemoteSnapshotBatch(input: {
   for (const relativePath of window.files) {
     await indexDocument(input.registration, input.knowledgeSpace, input.branch, input.head, relativePath, {
       buildVersion: input.buildVersion,
-      publicationMode: "build_only"
+      publicationMode: "build_only",
+      embeddingMode: input.embeddingMode
     });
     indexed += 1;
   }
@@ -2410,7 +2711,7 @@ async function runRemoteSnapshotBatch(input: {
       input.knowledgeSpace,
       markdownFiles
     );
-    await finalizeAndPublishBuild({
+    await finalizeBuild({
       knowledgeSpace: input.knowledgeSpace,
       repoId: input.registration.id,
       branch: input.branch,
@@ -2418,18 +2719,21 @@ async function runRemoteSnapshotBatch(input: {
       targetHead: input.head,
       buildKind: "full",
       requestedBy: "sync_worker",
-      requestedFromEnv: resolveRequestedFromEnv()
+      requestedFromEnv: resolveRequestedFromEnv(),
+      publicationMode: input.publicationMode
     });
     await repo.releaseIngestLease(
       buildKnowledgeSpaceLeaseKey(input.knowledgeSpace, input.registration.id, input.branch),
-      input.buildVersion
+      input.leaseOwnerId
     ).catch(() => undefined);
-    await repo.upsertCheckpoint({
-      repoId: input.registration.id,
-      branch: input.branch,
-      lastSyncedCommitSha: input.head,
-      fullSync: true
-    });
+    if (shouldAdvanceFullSyncCheckpoint(input.publicationMode)) {
+      await repo.upsertCheckpoint({
+        repoId: input.registration.id,
+        branch: input.branch,
+        lastSyncedCommitSha: input.head,
+        fullSync: true
+      });
+    }
   }
 
   return {
@@ -2448,6 +2752,7 @@ function buildSyntheticSyncJob(input: {
   branch: string;
   mode: "full" | "incremental" | "reindex";
   source: KbSyncSource;
+  payload?: Record<string, unknown>;
 }): SyncJob {
   const now = new Date().toISOString();
   return {
@@ -2460,7 +2765,7 @@ function buildSyntheticSyncJob(input: {
     idempotency_key: `synthetic:${input.repoId}:${input.branch}:${input.mode}:${Date.now()}`,
     before_commit_sha: null,
     after_commit_sha: null,
-    payload_json: {},
+    payload_json: input.payload ?? {},
     attempts: 0,
     max_attempts: 1,
     next_run_at: now,
@@ -2475,15 +2780,19 @@ function buildSyntheticSyncJob(input: {
 async function runFullSync(job: SyncJob, registration: RepoRegistration): Promise<SyncExecutionResult> {
   const knowledgeSpace = resolveJobKnowledgeSpace(job);
   const requestedFromEnv = resolveRequestedFromEnv();
+  const publicationMode = resolvePublicationModeFromPayload(job.payload_json, "build_only");
+  const embeddingMode = resolveEmbeddingModeFromPayload(job.payload_json);
+  const leaseOwnerId = resolveSyncExecutionId(job.payload_json, job.id);
   const localMirror = await getLocalDocsMirrorState(registration);
   if (localMirror) {
-    const buildVersion = String(job.payload_json?.buildVersion ?? "").trim() || localMirror.head;
+    const buildVersion =
+      String(job.payload_json?.buildVersion ?? "").trim() || buildExecutionScopedBuildVersion(localMirror.head, leaseOwnerId);
     await repo.acquireIngestLease({
       leaseKey: buildKnowledgeSpaceLeaseKey(knowledgeSpace, registration.id, job.branch || localMirror.branch || registration.default_branch),
-      ownerId: buildVersion,
+      ownerId: leaseOwnerId,
       ownerEnv: requestedFromEnv,
       ttlSeconds: 300,
-      metadata: { buildVersion, source: "local_mirror" }
+      metadata: { buildVersion, source: "local_mirror", executionId: leaseOwnerId }
     });
     await ensureBuildRecord({
       knowledgeSpace,
@@ -2495,19 +2804,20 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
       requestedBy: job.source,
       requestedFromEnv
     });
-    return runLocalMirrorFullSync(job, registration, localMirror);
+    return runLocalMirrorFullSync(job, registration, localMirror, leaseOwnerId, buildVersion);
   }
   const resolved = await resolveRegistrationBranch(registration, job.branch, "sync_worker");
   const branch = resolved.branch;
   const effectiveRegistration = resolved.registration;
   const head = job.after_commit_sha ?? (await getBranchHead(effectiveRegistration, branch));
-  const buildVersion = String(job.payload_json?.buildVersion ?? "").trim() || head;
+  const buildVersion =
+    String(job.payload_json?.buildVersion ?? "").trim() || buildExecutionScopedBuildVersion(head, leaseOwnerId);
   await repo.acquireIngestLease({
     leaseKey: buildKnowledgeSpaceLeaseKey(knowledgeSpace, effectiveRegistration.id, branch),
-    ownerId: buildVersion,
+    ownerId: leaseOwnerId,
     ownerEnv: requestedFromEnv,
     ttlSeconds: 300,
-    metadata: { buildVersion, source: "remote" }
+    metadata: { buildVersion, source: "remote", executionId: leaseOwnerId }
   });
   await ensureBuildRecord({
     knowledgeSpace,
@@ -2525,7 +2835,10 @@ async function runFullSync(job: SyncJob, registration: RepoRegistration): Promis
     knowledgeSpace,
     branch,
     head,
+    leaseOwnerId,
     buildVersion,
+    publicationMode,
+    embeddingMode,
     cursor,
     limit: env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE
   });
@@ -2547,6 +2860,7 @@ export async function runRepositorySyncDirect(input: {
   mode: "full" | "incremental" | "reindex";
   source?: KbSyncSource;
   cursor?: string;
+  executionId?: string;
 }): Promise<SyncExecutionResult> {
   const registration = await repo.getRepoRegistrationById(input.repoId);
   if (!registration || !registration.is_active) {
@@ -2554,14 +2868,18 @@ export async function runRepositorySyncDirect(input: {
   }
 
   const branch = input.branch?.trim() || registration.default_branch;
+  const executionId = String(input.executionId ?? "").trim() || deriveSyncExecutionId(`direct:${registration.id}:${branch}:${input.mode}`);
   const syntheticJob: SyncJob = {
     ...buildSyntheticSyncJob({
       repoId: registration.id,
       branch,
       mode: input.mode,
-      source: input.source ?? "manual"
-    }),
-    payload_json: input.cursor ? { cursor: input.cursor } : {}
+      source: input.source ?? "manual",
+      payload: {
+        ...(input.cursor ? { cursor: input.cursor } : {}),
+        executionId
+      }
+    })
   };
 
   if (input.mode === "full") {
@@ -2710,6 +3028,8 @@ async function createDocsComFullSyncRun(input: {
   actor: string;
   branch?: string;
   runReason?: string;
+  publicationMode: KbBuildPublicationMode;
+  embeddingMode: KbEmbeddingMode;
 }): Promise<{
   run: KbSyncRun;
   shards: KbSyncRunShard[];
@@ -2729,20 +3049,34 @@ async function createDocsComFullSyncRun(input: {
   const snapshot = await freezeDocsComSourceSnapshot(input.registration, input.branch);
   const knowledgeSpace = resolveRuntimeKnowledgeSpace();
   const requestedFromEnv = resolveRequestedFromEnv();
-  const manifestItems = snapshot.files
-    .map((file) => {
-      const shardKey = classifyDocsComShard(file.path);
-      if (!shardKey) return null;
-      return {
-        path: file.path,
-        shardKey,
-        blobSha: file.sha,
-        sizeBytes: file.size,
-        needsRebuild: true,
-        reuseReason: null
-      };
-    })
-    .filter((item): item is NonNullable<typeof item> => Boolean(item));
+  const manifest = buildDocsComSourceManifest({
+    sourceMode: snapshot.mode,
+    includePaths: input.registration.include_paths,
+    excludePaths: input.registration.exclude_paths,
+    files: snapshot.files
+  });
+  const hydratedManifest = await populateDocsComManifestEligibleChecksumsForSnapshot({
+    registration: input.registration,
+    targetHead: snapshot.head,
+    sourceMode: snapshot.mode,
+    manifest
+  });
+  const manifestItems = [
+    ...hydratedManifest.eligibleItems,
+    ...hydratedManifest.skippedItems.map((item) => ({
+      path: item.path,
+      shardKey: item.shardKey,
+      sourceFamily: item.sourceFamily,
+      contentChecksum: item.contentChecksum,
+      sourceAcquisitionMode: item.sourceAcquisitionMode,
+      blobSha: item.blobSha,
+      sizeBytes: item.sizeBytes,
+      needsRebuild: false,
+      reuseReason: null,
+      skipReason: item.skipReason,
+      buildStatus: "skipped" as const
+    }))
+  ];
 
   const { run, shards } = await repo.createFullSyncRun({
     repoId: input.registration.id,
@@ -2750,7 +3084,7 @@ async function createDocsComFullSyncRun(input: {
     targetHead: snapshot.head,
     requestedBy: input.actor,
     runReason: input.runReason,
-    sourceSnapshotTotal: manifestItems.length,
+    sourceSnapshotTotal: snapshot.files.length,
     manifestItems
   });
 
@@ -2775,7 +3109,7 @@ async function createDocsComFullSyncRun(input: {
     buildKind: "full",
     requestedBy: input.actor,
     requestedFromEnv,
-    sourceSnapshotTotal: manifestItems.length
+    sourceSnapshotTotal: snapshot.files.length
   });
   for (const shard of shards) {
     if (shard.total_docs === 0) {
@@ -2802,7 +3136,9 @@ async function createDocsComFullSyncRun(input: {
         shardKey: shard.shard_key,
         targetHead: snapshot.head,
         buildVersion,
-        sourceMode: snapshot.mode
+        sourceMode: snapshot.mode,
+        publicationMode: input.publicationMode,
+        embeddingMode: input.embeddingMode
       },
       idempotencyKey: `sync-continuation:full:${run.id}:${shard.shard_key}:${snapshot.head}:start`
     });
@@ -2821,6 +3157,8 @@ export async function ensureDocsComKnowledgeBase(input?: {
   mode?: "incremental" | "full" | "reindex";
   runLimit?: number;
   idempotencySeed?: string;
+  publicationMode?: KbBuildPublicationMode;
+  embeddingMode?: KbEmbeddingMode;
 }) {
   const actor = input?.actor?.trim() || "internal_operator";
   const mode = input?.mode ?? "incremental";
@@ -2853,7 +3191,9 @@ export async function ensureDocsComKnowledgeBase(input?: {
       registration,
       actor,
       branch: registration.default_branch,
-      runReason: `docs-com ensure ${input?.idempotencySeed?.trim() || new Date().toISOString()}`
+      runReason: `docs-com ensure ${input?.idempotencySeed?.trim() || new Date().toISOString()}`,
+      publicationMode: input?.publicationMode ?? "build_only",
+      embeddingMode: input?.embeddingMode ?? DEFAULT_EMBEDDING_MODE
     });
     runSummary = {
       id: run.run.id,
@@ -2912,6 +3252,8 @@ export async function startKnowledgeBaseFullBuild(input: {
   branch?: string;
   actor: string;
   knowledgeSpace?: KbKnowledgeSpace;
+  publicationMode?: KbBuildPublicationMode;
+  embeddingMode?: KbEmbeddingMode;
 }): Promise<{
   knowledgeSpace: KbKnowledgeSpace;
   job?: Awaited<ReturnType<typeof enqueueSyncJob>>;
@@ -2932,7 +3274,9 @@ export async function startKnowledgeBaseFullBuild(input: {
       registration,
       actor: input.actor,
       branch: input.branch ?? registration.default_branch,
-      runReason: `api full build ${new Date().toISOString()}`
+      runReason: `api full build ${new Date().toISOString()}`,
+      publicationMode: input.publicationMode ?? "build_only",
+      embeddingMode: input.embeddingMode ?? DEFAULT_EMBEDDING_MODE
     });
     const buildVersion = buildFullRunBuildVersion(run.run.target_head, run.run.id);
     const build = await repo.getBuildByVersion({
@@ -2958,7 +3302,9 @@ export async function startKnowledgeBaseFullBuild(input: {
     mode: "full",
     source: "manual",
     payload: {
-      knowledgeSpace
+      knowledgeSpace,
+      publicationMode: input.publicationMode ?? "build_only",
+      embeddingMode: input.embeddingMode ?? DEFAULT_EMBEDDING_MODE
     }
   });
   return {
@@ -2972,6 +3318,8 @@ export async function startKnowledgeBaseIncrementalBuild(input: {
   branch?: string;
   actor: string;
   knowledgeSpace?: KbKnowledgeSpace;
+  publicationMode?: KbBuildPublicationMode;
+  embeddingMode?: KbEmbeddingMode;
 }): Promise<{
   knowledgeSpace: KbKnowledgeSpace;
   fallbackMode: "full_rebuild";
@@ -2990,7 +3338,9 @@ export async function startKnowledgeBaseIncrementalBuild(input: {
     mode: "incremental",
     source: "manual",
     payload: {
-      knowledgeSpace
+      knowledgeSpace,
+      publicationMode: input.publicationMode ?? "build_only",
+      embeddingMode: input.embeddingMode ?? DEFAULT_EMBEDDING_MODE
     }
   });
   return {
@@ -3057,12 +3407,84 @@ export async function getKnowledgeBasePublicationStatus(input?: {
   });
 }
 
+function buildCleanupHints(input: {
+  build: KbBuild;
+  publication: Awaited<ReturnType<typeof repo.getPublication>>;
+  validationSnapshot: Awaited<ReturnType<typeof repo.getBuildValidationSnapshot>>;
+  artifactSummary: Awaited<ReturnType<typeof repo.getBuildArtifactSummary>>;
+}): string[] {
+  const hints: string[] = [];
+  if (!input.publication && (input.build.status === "failed" || input.build.status === "abandoned")) {
+    hints.push("terminal_build_without_publication");
+  }
+  if (input.publication && input.publication.published_build_version !== input.build.build_version) {
+    hints.push("superseded_by_newer_publication");
+  }
+  if (input.validationSnapshot.duplicatePaths > 0) {
+    hints.push("duplicate_path_anomaly_present");
+  }
+  if (input.validationSnapshot.crossBuildMemorySources > 0 || input.validationSnapshot.missingChunkDocuments > 0) {
+    hints.push("cross_build_or_orphan_linkage_present");
+  }
+  if (input.build.status === "abandoned" && input.artifactSummary.embeddingSummary.chunkEmbeddings.ready > 0) {
+    hints.push("stale_chunk_embeddings_for_abandoned_build");
+  }
+  return hints;
+}
+
 export async function getKnowledgeBaseBuildDetails(buildId: string) {
   const build = await repo.getBuildById(buildId);
   if (!build) return null;
   const validations = await repo.listBuildValidationResults(buildId);
-  return { build, validations };
+  const publication = await repo.getPublication({
+    knowledgeSpace: build.knowledge_space,
+    repoId: build.repo_id,
+    branch: build.branch
+  });
+  const validationSnapshot = await repo.getBuildValidationSnapshot({
+    knowledgeSpace: build.knowledge_space,
+    repoId: build.repo_id,
+    branch: build.branch,
+    buildVersion: build.build_version
+  });
+  const artifactSummary = await repo.getBuildArtifactSummary({
+    knowledgeSpace: build.knowledge_space,
+    repoId: build.repo_id,
+    branch: build.branch,
+    buildVersion: build.build_version
+  });
+  return {
+    build,
+    validations,
+    summary: {
+      resolvedSnapshot: {
+        knowledgeSpace: build.knowledge_space,
+        repoId: build.repo_id,
+        branch: build.branch,
+        buildVersion: build.build_version,
+        targetHead: build.target_head
+      },
+      artifactCountsByFamily: artifactSummary.artifactCountsByFamily,
+      parserDegradation: artifactSummary.parserDegradation,
+      embeddingSummary: artifactSummary.embeddingSummary,
+      validationSnapshot,
+      publicationStatus:
+        publication?.published_build_version === build.build_version
+          ? "published"
+          : publication
+            ? "not_currently_published"
+            : "not_published",
+      cleanupHints: buildCleanupHints({
+        build,
+        publication,
+        validationSnapshot,
+        artifactSummary
+      })
+    }
+  };
 }
+
+export { buildDocsComSourceManifest };
 
 export async function enqueueSyncJob(input: {
   repoId: string;
@@ -3086,11 +3508,13 @@ export async function enqueueSyncJob(input: {
     input.idempotencyKey ??
     `${input.mode}:${resolved.registration.id}:${resolved.branch}:${input.beforeCommitSha ?? "none"}:${input.afterCommitSha ?? Date.now()}`;
   const knowledgeSpace = resolveRuntimeKnowledgeSpace();
-  const payload = {
-    ...(input.payload ?? {}),
+  const payload = buildEnqueuedSyncPayload({
+    mode: input.mode,
+    idempotencyKey,
     knowledgeSpace,
-    ...(input.mode === "full" && input.afterCommitSha ? { buildVersion: String(input.payload?.buildVersion ?? "").trim() || input.afterCommitSha } : {})
-  };
+    afterCommitSha: input.afterCommitSha,
+    payload: input.payload
+  });
 
   return repo.enqueueSyncJob({
     repoId: resolved.registration.id,
@@ -3179,6 +3603,10 @@ export async function runDueSyncJobs(limit: number): Promise<{ processed: number
       });
       succeeded += 1;
     } catch (error) {
+      const fullRunPayload = getFullRunPayload(job);
+      if (fullRunPayload && isTransientDbError(error)) {
+        await repo.heartbeatSyncRunShard(fullRunPayload.runId, fullRunPayload.shardKey, "queued").catch(() => undefined);
+      }
       const status = await repo.markSyncJobFailed(job, (error as Error).message);
       failed += 1;
       if (status === "dead_letter") {
@@ -3214,17 +3642,27 @@ export async function pollAndEnqueueIncremental(limit = env.GITHUB_KB_POLL_BATCH
       }
       const branch = localMirror.branch || registration.default_branch;
       const checkpoint = await repo.getCheckpoint(registration.id, branch);
-      if (checkpoint?.last_synced_commit_sha === localMirror.head) {
+      const publication = await repo.getPublication({
+        knowledgeSpace: resolveRuntimeKnowledgeSpace(),
+        repoId: registration.id,
+        branch
+      });
+      const request = buildPollingSyncRequestFromPublication({
+        latestHead: localMirror.head,
+        publication,
+        checkpoint
+      });
+      if (!request) {
         continue;
       }
       await enqueueSyncJob({
         repoId: registration.id,
         branch,
-        mode: checkpoint?.last_synced_commit_sha ? "incremental" : "full",
+        mode: request.mode,
         source: "polling",
-        beforeCommitSha: checkpoint?.last_synced_commit_sha ?? undefined,
+        beforeCommitSha: "beforeCommitSha" in request ? request.beforeCommitSha : undefined,
         afterCommitSha: localMirror.head,
-        idempotencyKey: `poll:local:${registration.id}:${branch}:${checkpoint?.last_synced_commit_sha ?? "none"}:${localMirror.head}`
+        idempotencyKey: `poll:local:${registration.id}:${branch}:${"beforeCommitSha" in request ? request.beforeCommitSha : "none"}:${localMirror.head}`
       });
       enqueued += 1;
       continue;
@@ -3234,19 +3672,28 @@ export async function pollAndEnqueueIncremental(limit = env.GITHUB_KB_POLL_BATCH
     const effectiveRegistration = resolved.registration;
     const latest = await getBranchHead(effectiveRegistration, branch);
     const checkpoint = await repo.getCheckpoint(effectiveRegistration.id, branch);
-    const previous = checkpoint?.last_synced_commit_sha;
-    if (previous && previous === latest) {
+    const publication = await repo.getPublication({
+      knowledgeSpace: resolveRuntimeKnowledgeSpace(),
+      repoId: effectiveRegistration.id,
+      branch
+    });
+    const request = buildPollingSyncRequestFromPublication({
+      latestHead: latest,
+      publication,
+      checkpoint
+    });
+    if (!request) {
       continue;
     }
 
     await enqueueSyncJob({
       repoId: effectiveRegistration.id,
       branch,
-      mode: previous ? "incremental" : "full",
+      mode: request.mode,
       source: "polling",
-      beforeCommitSha: previous ?? undefined,
+      beforeCommitSha: "beforeCommitSha" in request ? request.beforeCommitSha : undefined,
       afterCommitSha: latest,
-      idempotencyKey: `poll:${effectiveRegistration.id}:${branch}:${previous ?? "none"}:${latest}`
+      idempotencyKey: `poll:${effectiveRegistration.id}:${branch}:${"beforeCommitSha" in request ? request.beforeCommitSha : "none"}:${latest}`
     });
     enqueued += 1;
   }
@@ -3286,12 +3733,39 @@ export async function backfillRepositoryFromLocalMirror(
   }
 
   const branch = registration.default_branch;
+  const knowledgeSpace = resolveRuntimeKnowledgeSpace();
+  const requestedFromEnv = resolveRequestedFromEnv();
+  const buildVersion = localMirror.head;
+  const leaseOwnerId = deriveSyncExecutionId(`local-backfill:${registration.id}:${branch}:${buildVersion}`);
+
+  await repo.acquireIngestLease({
+    leaseKey: buildKnowledgeSpaceLeaseKey(knowledgeSpace, registration.id, branch),
+    ownerId: leaseOwnerId,
+    ownerEnv: requestedFromEnv,
+    ttlSeconds: 300,
+    metadata: { buildVersion, source: "local_mirror", executionId: leaseOwnerId }
+  });
+  await ensureBuildRecord({
+    knowledgeSpace,
+    repoId: registration.id,
+    branch,
+    buildVersion,
+    targetHead: localMirror.head,
+    buildKind: "full",
+    requestedBy: "local_mirror_backfill",
+    requestedFromEnv,
+    sourceSnapshotTotal: localMirror.markdownCount
+  });
+
   const batch = await runLocalMirrorSyncBatch({
     registration,
-    knowledgeSpace: resolveRuntimeKnowledgeSpace(),
+    knowledgeSpace,
     branch,
     localMirror,
-    buildVersion: localMirror.head,
+    leaseOwnerId,
+    buildVersion,
+    publicationMode: "build_only",
+    embeddingMode: DEFAULT_EMBEDDING_MODE,
     cursor: options?.cursor,
     limit: options?.limit ?? env.GITHUB_KB_LOCAL_MIRROR_BATCH_SIZE
   });
@@ -3633,6 +4107,7 @@ export async function retrieveKnowledge(input: {
       query: input.query,
       profile: input.profile,
       answerLanguage: input.answerLanguage ?? detectQueryLanguage(input.query),
+      retrievalStatus: "kb_unavailable",
       answer:
         (input.answerLanguage ?? detectQueryLanguage(input.query)) === "zh"
           ? "当前知识库不可用，无法给出可靠引用答案。请先完成对应 knowledge space 的发布，再重试。"
@@ -3729,6 +4204,7 @@ export async function retrieveKnowledge(input: {
             repoId: input.repoId,
             branch: effectiveBranch,
             vectorLiteral: embedded.vectorLiteral,
+            embeddingModel: embedded.model,
             limit: effectiveTopK * 4
           });
         } catch {
@@ -3830,6 +4306,7 @@ export async function retrieveKnowledge(input: {
     answerLanguage,
     answer: groundedAnswer,
     resolvedQueries: queryVariants,
+    retrievalStatus: hits.length > 0 ? "grounded" : "no_results",
     confidence,
     fallbackUsed,
     hits: hits.map((hit) => ({ ...hit, snippet: cleanSnippet(hit.snippet || hit.title) })),
