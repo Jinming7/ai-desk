@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { after, test } from "node:test";
 import type { AddressInfo } from "node:net";
 import "../helpers/fetch-polyfill.js";
@@ -8,49 +9,14 @@ import { pool } from "../../db/client.js";
 import * as githubRepo from "../../modules/github-kb/repository.js";
 import { formatLocalDbBlockedMessage, probeLocalDbReadiness } from "../helpers/local-db-readiness.js";
 
-function assertSafeTestDatabase() {
-  const url = process.env.DATABASE_URL ?? env.DATABASE_URL;
-  if (!isSafeTestDatabaseUrl(url)) {
-    throw new Error("Refusing to run cleanup integration tests against a non-local database");
-  }
-}
-
-async function resetKbDb() {
-  await pool.query("DELETE FROM kb_build_validation_results");
-  await pool.query("DELETE FROM kb_ingest_leases");
-  await pool.query("DELETE FROM kb_publications");
-  await pool.query("DELETE FROM kb_builds");
-  await pool.query("DELETE FROM kb_memory_citations");
-  await pool.query("DELETE FROM kb_citation_units");
-  await pool.query("DELETE FROM kb_openapi_operations");
-  await pool.query("DELETE FROM kb_code_symbols");
-  await pool.query("DELETE FROM kb_config_surfaces");
-  await pool.query("DELETE FROM kb_schema_objects");
-  await pool.query("DELETE FROM kb_test_behaviors");
-  await pool.query("DELETE FROM kb_memory_profiles");
-  await pool.query("DELETE FROM kb_memory_relations");
-  await pool.query("DELETE FROM kb_memory_aliases");
-  await pool.query("DELETE FROM kb_memory_signals");
-  await pool.query("DELETE FROM kb_memory_sources");
-  await pool.query("DELETE FROM kb_memory_entries");
-  await pool.query("DELETE FROM kb_chunks");
-  await pool.query("DELETE FROM kb_documents");
-  await pool.query("DELETE FROM kb_serving_versions");
-  await pool.query("DELETE FROM kb_sync_manifest_items");
-  await pool.query("DELETE FROM kb_sync_run_shards");
-  await pool.query("DELETE FROM kb_sync_runs");
-  await pool.query("DELETE FROM kb_sync_jobs");
-  await pool.query("DELETE FROM kb_sync_checkpoints");
-  await pool.query("DELETE FROM kb_github_webhook_events");
-  await pool.query("DELETE FROM kb_metrics_events");
-  await pool.query("DELETE FROM kb_repo_registrations");
-}
-
 async function createRegistration() {
+  const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+  const repoOwner = `acme-cleanup-${suffix}`;
+  const repoName = `ticket-kb-${suffix}`;
   return githubRepo.upsertRepoRegistration({
-    repoOwner: "acme",
-    repoName: "ticket-kb",
-    repoUrl: "mock://acme/ticket-kb",
+    repoOwner,
+    repoName,
+    repoUrl: `mock://${repoOwner}/${repoName}`,
     defaultBranch: "main",
     includePaths: ["docs/*.md", "docs/**/*.md"],
     excludePaths: [],
@@ -196,7 +162,6 @@ async function withDbHarness<T>(
     return undefined;
   }
 
-  await resetKbDb();
   const server = app.listen(0);
   await new Promise<void>((resolve) => server.once("listening", () => resolve()));
   const { port } = server.address() as AddressInfo;
