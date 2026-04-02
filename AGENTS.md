@@ -27,6 +27,14 @@
 - Stage files deliberately. In a dirty worktree, do not accidentally include other AI/user changes, temp files, local backups, or generated noise.
 - Use conventional commit subjects: `feat`, `fix`, `refactor`, `chore`, `docs`, `test`, `release`. `checkpoint:` is allowed only on topic branches to preserve a validated intermediate state and must never be used as the final merge title.
 - One commit or PR must not mix unrelated feature work, refactor work, migration changes, workflow changes, and ops changes without explicit user approval.
+- Non-trivial progress must never live only in a dirty worktree across context switches. Preserve it with a commit or a dedicated backup branch before doing anything that could make recovery harder.
+- Mandatory preservation points:
+  - after each validated milestone that establishes a recoverable state
+  - before switching branches, changing worktrees, rebasing, cherry-picking, merging, resolving conflicts, or cleaning local state
+  - before handing work to another AI/human or pausing a non-trivial task
+  - before any risky Git or filesystem action that could hide, discard, or overwrite current work
+- A validated milestone commit should use a normal typed commit or `checkpoint:` and must correspond to actual verification evidence.
+- If work must be preserved before it is mergeable or fully verified, create a local snapshot commit on the topic branch or a `backup/*` branch. Do not rely on stash as the only copy of meaningful work.
 
 ### Required Handoff Before Merge Or Review
 - State what the branch or commit includes.
@@ -38,6 +46,8 @@
 - State what verification was run and what was not run.
 - State the merge risk.
 - State whether the branch is safe to merge directly.
+- State the latest validated checkpoint commit for the branch.
+- If recovery depends on any backup branch or snapshot commit, name it explicitly.
 - If prerequisites exist, explicitly write `Depends on: <branch/commit/PR>`.
 - If the change is not independently mergeable, explicitly write `Do not merge directly` and name the blocker.
 

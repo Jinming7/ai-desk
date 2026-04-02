@@ -29,6 +29,11 @@
 - Commands run:
 - Commands not run and why:
 
+## Preservation / Checkpoints
+- Latest validated checkpoint commit:
+- Additional backup branch or snapshot commit:
+- [ ] No meaningful work for this scope remains only in an uncommitted dirty worktree
+
 ## Merge Risk
 - Main merge risk:
 - Rollback / containment note:
@@ -41,4 +46,5 @@
 - [ ] I declared dependency branches, commits, or PRs.
 - [ ] I marked whether this PR is safe to merge directly.
 - [ ] I synced the latest target branch when required by shared/high-conflict overlap.
+- [ ] I recorded the latest validated checkpoint commit and any backup recovery branch if one exists.
 - [ ] I documented the main merge risk and any remaining verification gap.

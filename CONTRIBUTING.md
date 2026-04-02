@@ -49,6 +49,15 @@
 - Commit only what you own and reviewed.
 - Do not mix unrelated feature work, refactor work, migration work, workflow changes, and documentation changes in one commit or one PR unless the dependency is inseparable and explicitly explained.
 - On a dirty worktree, inspect staged content carefully before committing. Never assume unstaged or nearby changes are disposable.
+- Non-trivial progress must not exist only as uncommitted local changes once you reach a validated milestone, pause work, hand off work, or prepare any risky Git action.
+- Mandatory preservation points:
+  - after each validated milestone that you may need to roll back to or resume from
+  - before branch switch, worktree switch, rebase, cherry-pick, merge, conflict resolution, or local cleanup
+  - before handing the branch to another AI/human or ending a session with meaningful unfinished work
+  - before any action that could discard, overwrite, or make current work hard to recover
+- Use a normal typed commit or `checkpoint:` for validated milestones.
+- If a state must be preserved before it is mergeable or fully verified, preserve it with a local snapshot commit on the topic branch or a `backup/*` branch. Do not rely on stash as the only durable copy.
+- Professional default: fewer, coherent, recoverable commits. Do not commit every trivial keystroke; do commit every recoverable milestone and every risky transition point.
 
 ## PR Rules
 - Open a PR to `staging` by default.
@@ -144,3 +153,5 @@
 - Remaining verification gap
 - Merge risk
 - Whether the change is safe to merge directly
+- Latest validated checkpoint commit
+- Backup branch or snapshot commit, if recovery depends on one
