@@ -1,5 +1,9 @@
 # AGENTS
 
+## Repository Git Governance
+- The repository-wide Git governance in `/Users/jeremypeng/Downloads/Workspace/TicketManagement/AGENTS.md` applies here as the default policy.
+- Local agent workflow artifacts may add process-specific rules, but they may not weaken the root Git policy.
+
 This folder stores agent workflow artifacts for the workspace.
 
 ## Workflow
