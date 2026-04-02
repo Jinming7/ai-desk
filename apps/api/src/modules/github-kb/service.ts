@@ -505,13 +505,15 @@ export function buildGenericSyncContinuationPayload(
   job: SyncJob,
   result: Pick<SyncExecutionResult, "head" | "nextCursor">
 ): Record<string, unknown> {
+  const executionId = resolveSyncExecutionId(job.payload_json, job.id);
+  const explicitBuildVersion = String(job.payload_json?.buildVersion ?? "").trim();
   return {
     ...job.payload_json,
     cursor: result.nextCursor,
-    buildVersion: String(job.payload_json?.buildVersion ?? "").trim() || result.head,
+    buildVersion: explicitBuildVersion || buildExecutionScopedBuildVersion(result.head, executionId),
     knowledgeSpace: String(job.payload_json?.knowledgeSpace ?? "").trim() || resolveRuntimeKnowledgeSpace(),
     requestedFromEnv: String(job.payload_json?.requestedFromEnv ?? "").trim() || resolveRequestedFromEnv(),
-    executionId: resolveSyncExecutionId(job.payload_json, job.id)
+    executionId
   };
 }
 

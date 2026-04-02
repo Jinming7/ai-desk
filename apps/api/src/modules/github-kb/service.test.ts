@@ -203,7 +203,7 @@ test("legacy generic full-sync continuations keep a stable execution owner", () 
     id: "legacy-job-1",
     payload_json: {
       knowledgeSpace: "support-local",
-      buildVersion: "shared-head"
+      executionId: "sync-exec:abc123"
     }
   });
   const payload = buildContinuationPayloadFn(job, {
@@ -211,8 +211,8 @@ test("legacy generic full-sync continuations keep a stable execution owner", () 
     nextCursor: "docs/next.md"
   });
 
-  assert.equal(payload?.executionId, resolveSyncExecutionId(job.payload_json, job.id));
-  assert.equal(payload?.buildVersion, "shared-head");
+  assert.equal(payload?.executionId, "sync-exec:abc123");
+  assert.equal(payload?.buildVersion, "shared-head:sync-exec:abc123");
   assert.equal(payload?.cursor, "docs/next.md");
   assert.equal(payload?.knowledgeSpace, "support-local");
 });

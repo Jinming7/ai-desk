@@ -571,6 +571,80 @@ test("build API creates a validated build without implicit publication", async (
   assert.equal(publicationBody.result.length, 0);
 });
 
+test("build API keeps one execution-scoped build across generic full-sync continuations", async () => {
+  const originalBatchSize = env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE;
+  env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE = 1;
+
+  try {
+    const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        repoUrl: "mock://acme/ticket-kb",
+        defaultBranch: "main",
+        includePaths: ["docs/*.md", "docs/**/*.md", "deploy-docs/*.md", "deploy-docs/**/*.md"],
+        excludePaths: [],
+        pollingIntervalSeconds: 60,
+        actor: "test"
+      })
+    });
+    assert.equal(register.status, 201);
+    const regPayload = (await register.json()) as { registration: { id: string; default_branch: string } };
+
+    const buildStart = await fetch(`${baseUrl}/api/v1/internal/kb/builds/full`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        repoId: regPayload.registration.id,
+        branch: regPayload.registration.default_branch,
+        actor: "test"
+      })
+    });
+    assert.equal(buildStart.status, 202);
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const run = await fetch(`${baseUrl}/api/v1/internal/kb/sync/run`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-portal-surface": "internal"
+        },
+        body: JSON.stringify({ limit: 20 })
+      });
+      assert.equal(run.status, 200);
+    }
+
+    const builds = await pool.query<{ build_version: string; status: string }>(
+      `SELECT build_version, status
+         FROM kb_builds
+        WHERE repo_id = $1
+        ORDER BY created_at ASC`,
+      [regPayload.registration.id]
+    );
+
+    assert.equal(builds.rowCount, 1);
+    assert.match(builds.rows[0]?.build_version ?? "", /^mockc3:sync-exec:/);
+    assert.equal(builds.rows[0]?.status, "validated");
+
+    const dangling = await pool.query<{ total: string }>(
+      `SELECT COUNT(*)::text AS total
+         FROM kb_builds
+        WHERE repo_id = $1
+          AND status = 'building'`,
+      [regPayload.registration.id]
+    );
+    assert.equal(dangling.rows[0]?.total, "0");
+  } finally {
+    env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE = originalBatchSize;
+  }
+});
+
 test("build API allows explicit internal operator override into support-shadow", async () => {
   const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
     method: "POST",
