@@ -230,6 +230,7 @@ type SupportQuerySignals = {
   mailDependencyContext: boolean;
   troubleshootingContext: boolean;
   wantsProcedure: boolean;
+  capabilityQuestionContext: boolean;
 };
 
 function hasCjkText(input: string): boolean {
@@ -264,11 +265,40 @@ function analyzeSupportQuerySignals(query: string): SupportQuerySignals {
       /\b(email|mail|smtp|remote access|remote operation|external connection)\b/i.test(lowered),
     troubleshootingContext:
       /排查|报错|错误|异常|失败|无法|不能|404|401|500|page not found/.test(normalized) ||
-      /\b(troubleshoot|troubleshooting|error|errors|failed|failure|cannot|unable|page not found|404|401|403|500)\b/i.test(lowered),
+      /\b(troubleshoot|troubleshooting|error|errors|failed|failure|cannot|unable|not work|not working|stopped working|page not found|404|401|403|500)\b/i.test(lowered),
     wantsProcedure:
       /如何|怎么|步骤|方式|能否|是否存在|可以通过/.test(normalized) ||
-      /\b(how|how to|steps?|procedure|workflow|can we|is there|via server|via os)\b/i.test(lowered)
+      /\b(how|how to|steps?|procedure|workflow|can we|is there|via server|via os)\b/i.test(lowered),
+    capabilityQuestionContext:
+      /是否支持|支不支持|是否可以|能否|有没有|可不可以/.test(normalized) ||
+      /\b(does|can|is)\b[\s\S]{0,80}\b(support|supported|possible|available|allow|allows)\b/i.test(normalized)
   };
+}
+
+function hasExplicitSupportAnchor(signals: SupportQuerySignals): boolean {
+  return (
+    signals.apiContext ||
+    signals.integrationContext ||
+    signals.privateDeploymentContext ||
+    signals.infrastructureContext ||
+    signals.deploymentArchitectureContext ||
+    signals.isolationContext ||
+    signals.accountRecoveryContext ||
+    signals.mailDependencyContext
+  );
+}
+
+function buildMinimumTroubleshootingClarification(query: string, caseFrame: SupportCaseFrame, signals: SupportQuerySignals): string | null {
+  if (sanitizeMissingCriticalInfo(caseFrame.missing_critical_info, 1).length > 0) return null;
+  if (String(caseFrame.question_type ?? "") !== "troubleshooting") return null;
+  if (String(caseFrame.object ?? "").trim() && String(caseFrame.object ?? "").trim() !== "unspecified") return null;
+  if (!signals.troubleshootingContext) return null;
+  if (hasExplicitSupportAnchor(signals)) return null;
+  return localizedSupportLabel(
+    query,
+    "变更后具体是哪个页面、接口或操作不能工作，以及你刚改了什么",
+    "which exact page, API, or action stopped working, and what changed right before it"
+  );
 }
 
 function localizedSupportLabel(query: string, zh: string, en: string): string {
@@ -322,6 +352,13 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   const shouldPreserveIntegrationTroubleshooting =
     (productArea === "integrations" || input.caseFrame.product_area === "integrations" || signals.integrationContext) &&
     (input.caseFrame.action_type === "troubleshooting" || signals.troubleshootingContext);
+  const shouldForceBehaviorRoute =
+    signals.capabilityQuestionContext &&
+    !signals.apiContext &&
+    !signals.troubleshootingContext &&
+    !shouldPreserveIntegrationTroubleshooting &&
+    !shouldTreatAsHowTo &&
+    !architectureQuestion;
   const shouldForceApiRoute =
     signals.apiContext &&
     !shouldPreserveIntegrationTroubleshooting &&
@@ -371,6 +408,8 @@ function stabilizeSupportRouteAndCaseFrame(input: {
           ],
           6
         )
+      : shouldForceBehaviorRoute
+      ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "rules", "product_guide"], 6)
       : shouldPreserveIntegrationTroubleshooting
       ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "troubleshooting", "product_guide", "rules"], 6)
       : architectureQuestion
@@ -387,6 +426,14 @@ function stabilizeSupportRouteAndCaseFrame(input: {
           question_type: inferApiQuestionType(input.query),
           specialist_agent: "api-specialist",
           answer_contract: "Give the exact API answer first.",
+          routing_confidence: Math.max(input.route.routing_confidence, 0.84)
+        }
+      : shouldForceBehaviorRoute
+      ? {
+          ...input.route,
+          question_type: "capability_confirmation",
+          specialist_agent: "behavior-specialist",
+          answer_contract: "State the documented capability or limitation first, then cite the closest behavior-defining evidence.",
           routing_confidence: Math.max(input.route.routing_confidence, 0.84)
         }
       : shouldPreserveIntegrationTroubleshooting
@@ -416,8 +463,10 @@ function stabilizeSupportRouteAndCaseFrame(input: {
         }
       : input.route;
 
+  const minimumClarification = buildMinimumTroubleshootingClarification(input.query, { ...caseFrame, question_type: route.question_type }, signals);
   caseFrame = {
     ...caseFrame,
+    missing_critical_info: uniqueStrings([minimumClarification, ...caseFrame.missing_critical_info], 3),
     question_type: route.question_type,
     specialist_agent: route.specialist_agent,
     answer_contract: route.answer_contract,
@@ -1528,20 +1577,25 @@ function resolveSupportMode(input: {
   references: SearchReference[];
   currentRound: number;
   missingInfo: string[];
+  preferClarificationWhenBlocking?: boolean;
 }): SupportAnswer["mode"] {
   const supportedCoreClaims = input.verification.claim_to_citation_map.filter(
     (claim) => (claim.verdict === "verified" || claim.verdict === "supported_inference") && claim.citation_ids.length > 0
   );
+  const clarificationAvailable = input.missingInfo.length > 0 && input.currentRound < env.AI_SEARCH_MAX_CLARIFICATION_ROUNDS;
+  if (input.preferClarificationWhenBlocking && clarificationAvailable) {
+    return "clarification";
+  }
   if (supportedCoreClaims.length > 0 && input.verification.verdict === "verified" && input.missingInfo.length === 0) {
     return "grounded";
   }
   if (supportedCoreClaims.length > 0) {
     return "partial";
   }
-  if (input.missingInfo.length > 0 && input.currentRound < env.AI_SEARCH_MAX_CLARIFICATION_ROUNDS) {
+  if (clarificationAvailable) {
     return "clarification";
   }
-  if (!input.references.length && input.missingInfo.length > 0 && input.currentRound < env.AI_SEARCH_MAX_CLARIFICATION_ROUNDS) {
+  if (!input.references.length && clarificationAvailable) {
     return "clarification";
   }
   return "handoff";
@@ -3356,11 +3410,13 @@ export async function runSupportSearchAgent(input: {
           draftClaim.kind !== "operational_advice" && overlapsUnsupportedClaim(draftClaim.text, [claim])
       )
   );
-  const effectiveVerification =
+  const shouldUpgradeVerifiedVerdict =
     sanitizedVerification.verdict === "partial" &&
     supportedCoreClaims.length > 0 &&
-    sanitizedVerification.unsupported_claims.length > 0 &&
-    !unsupportedCore
+    !unsupportedCore &&
+    sanitizedVerification.missing_info.length === 0;
+  const effectiveVerification =
+    shouldUpgradeVerifiedVerdict
       ? {
           ...sanitizedVerification,
           verdict: "verified" as const,
@@ -3470,7 +3526,8 @@ export async function runSupportSearchAgent(input: {
     verification: finalVerification,
     references: evidenceCollection.references,
     currentRound: input.currentRound + 1,
-    missingInfo
+    missingInfo,
+    preferClarificationWhenBlocking: caseFrame.object === "unspecified" && caseFrame.missing_critical_info.length > 0
   });
   const answerComposerRuntime = withStageRuntime(
     buildStageRuntime(input.runtime, 1500, 4000, 14000),
