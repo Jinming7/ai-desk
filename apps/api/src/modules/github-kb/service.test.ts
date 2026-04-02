@@ -5,13 +5,15 @@ import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { test } from "node:test";
 import { env } from "../../config/env.js";
-import type { RepoRegistration } from "./types.js";
+import type { KbBuild, RepoRegistration, SyncJob } from "./types.js";
 import { buildDocsComSourceManifest } from "./source/manifest-builder.js";
 import {
   buildEnqueuedSyncPayload,
   buildDocsComIncludePaths,
   buildPollingSyncRequestFromPublication,
   buildQueryAnchoredSnippet,
+  githubKbServiceDeps,
+  handleTerminalGenericSyncJobFailure,
   resolveSyncExecutionId,
   ensureMarkdownCoverage,
   getLocalDocsMirrorState,
@@ -186,6 +188,123 @@ test("buildEnqueuedSyncPayload preserves the explicit build version for full-syn
 
   assert.equal(payload.executionId, "sync-exec:abc123");
   assert.equal(payload.buildVersion, "shared-head:sync-exec:abc123");
+});
+
+function buildSyncJob(overrides: Partial<SyncJob> = {}): SyncJob {
+  return {
+    id: "job-1",
+    repo_id: "repo-1",
+    branch: "main",
+    sync_mode: "full",
+    source: "manual",
+    status: "running",
+    idempotency_key: "sync:repo-1:main",
+    before_commit_sha: null,
+    after_commit_sha: "shared-head",
+    payload_json: {
+      knowledgeSpace: "support-local",
+      buildVersion: "shared-head:exec-1",
+      executionId: "exec-1"
+    },
+    attempts: 0,
+    max_attempts: 5,
+    next_run_at: new Date(0).toISOString(),
+    started_at: new Date(0).toISOString(),
+    finished_at: null,
+    error_message: null,
+    created_at: new Date(0).toISOString(),
+    updated_at: new Date(0).toISOString(),
+    ...overrides
+  };
+}
+
+function buildRecord(overrides: Partial<KbBuild> = {}): KbBuild {
+  return {
+    id: "build-1",
+    knowledge_space: "support-local",
+    repo_id: "repo-1",
+    branch: "main",
+    build_version: "shared-head:exec-1",
+    target_head: "shared-head",
+    build_kind: "full",
+    requested_by: "manual",
+    requested_from_env: "local",
+    status: "building",
+    source_snapshot_total: 1,
+    documents_built: 0,
+    chunks_built: 0,
+    memory_entries_built: 0,
+    embeddings_built: 0,
+    validation_passed: false,
+    validation_summary_json: null,
+    error_message: null,
+    started_at: new Date(0).toISOString(),
+    finished_at: null,
+    created_at: new Date(0).toISOString(),
+    updated_at: new Date(0).toISOString(),
+    ...overrides
+  };
+}
+
+test("handleTerminalGenericSyncJobFailure marks dead-lettered generic builds failed and releases the lease", async (t) => {
+  const job = buildSyncJob();
+  const build = buildRecord();
+  const calls: {
+    getBuildByVersion?: Record<string, unknown>;
+    updateBuildStatus?: Record<string, unknown>;
+    releaseIngestLease?: { leaseKey: string; ownerId: string | undefined };
+  } = {};
+
+  t.mock.method(githubKbServiceDeps, "getBuildByVersion", async (input) => {
+    calls.getBuildByVersion = input;
+    return build;
+  });
+  t.mock.method(githubKbServiceDeps, "updateBuildStatus", async (input) => {
+    calls.updateBuildStatus = input as Record<string, unknown>;
+    return { ...build, status: "failed", error_message: "forced failure", finished_at: new Date().toISOString() };
+  });
+  t.mock.method(githubKbServiceDeps, "releaseIngestLease", async (leaseKey, ownerId) => {
+    calls.releaseIngestLease = { leaseKey, ownerId };
+  });
+
+  await handleTerminalGenericSyncJobFailure({
+    job,
+    status: "dead_letter",
+    errorMessage: "forced failure"
+  });
+
+  assert.deepEqual(calls.getBuildByVersion, {
+    knowledgeSpace: "support-local",
+    repoId: "repo-1",
+    branch: "main",
+    buildVersion: "shared-head:exec-1"
+  });
+  assert.deepEqual(calls.updateBuildStatus, {
+    buildId: "build-1",
+    status: "failed",
+    errorMessage: "forced failure",
+    finished: true
+  });
+  assert.deepEqual(calls.releaseIngestLease, {
+    leaseKey: "build:support-local:repo-1:main",
+    ownerId: "exec-1"
+  });
+});
+
+test("handleTerminalGenericSyncJobFailure leaves retriable generic failures resumable", async (t) => {
+  const getBuildByVersion = t.mock.method(githubKbServiceDeps, "getBuildByVersion", async () => buildRecord());
+  const updateBuildStatus = t.mock.method(githubKbServiceDeps, "updateBuildStatus", async () => buildRecord({ status: "failed" }));
+  const releaseIngestLease = t.mock.method(githubKbServiceDeps, "releaseIngestLease", async () => undefined);
+
+  await handleTerminalGenericSyncJobFailure({
+    job: buildSyncJob(),
+    status: "failed",
+    errorMessage: "transient failure"
+  });
+
+  assert.equal(getBuildByVersion.mock.callCount(), 0);
+  assert.equal(updateBuildStatus.mock.callCount(), 0);
+  assert.equal(releaseIngestLease.mock.callCount(), 0);
 });
 
 test("buildQueryAnchoredSnippet exposes later callback evidence instead of chunk prefix", () => {
