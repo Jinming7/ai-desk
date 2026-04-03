@@ -63,6 +63,38 @@ test("buildRepositoryKnowledgeArtifacts extracts code symbols with code citation
   assert.equal(result.memoryEntries.some((item) => item.memory_kind === "symbol_responsibility"), true);
 });
 
+test("buildRepositoryKnowledgeArtifacts only materializes high-signal top-level code symbols into memory", () => {
+  const result = buildRepositoryKnowledgeArtifacts({
+    ...baseContext,
+    path: "src/github/callback.ts",
+    content: `
+      const INTERNAL_FLAG = "callback";
+
+      class GithubCallbackService {
+        handleGithubCallback(code: string) {
+          return normalizeGithubCallback(code);
+        }
+      }
+
+      export async function normalizeGithubCallback(code: string) {
+        if (!code) throw new Error("page not found");
+        return code.trim();
+      }
+    `
+  });
+
+  assert.equal(result.codeSymbols.some((item) => item.symbolKind === "constant"), true);
+  assert.equal(result.codeSymbols.some((item) => item.symbolKind === "method"), true);
+  assert.equal(result.codeSymbols.some((item) => item.symbolKind === "function"), true);
+
+  const memoryTitles = result.memoryEntries.map((item) => item.title);
+  assert.equal(memoryTitles.includes("INTERNAL_FLAG"), false);
+  assert.equal(memoryTitles.includes("GithubCallbackService.handleGithubCallback"), false);
+  assert.equal(memoryTitles.includes("GithubCallbackService"), true);
+  assert.equal(memoryTitles.includes("normalizeGithubCallback"), true);
+  assert.equal(result.memoryEntries.length, 2);
+});
+
 test("buildRepositoryKnowledgeArtifacts extracts config surfaces and schema objects", () => {
   const configResult = buildRepositoryKnowledgeArtifacts({
     ...baseContext,

@@ -1,8 +1,14 @@
 import { summarizeText, uniqueStrings } from "../knowledge-common.js";
 import type { CodeSymbolDraft, RetrievalUnitDraft } from "../knowledge-model.js";
 
+function shouldBuildSymbolMemoryUnit(symbol: CodeSymbolDraft): boolean {
+  if (symbol.parentSymbol) return false;
+  return ["class", "function", "interface", "type", "enum", "exported_utility"].includes(symbol.symbolKind);
+}
+
 export function buildSymbolRetrievalUnits(symbols: CodeSymbolDraft[], citationByArtifactId: Map<string, string>): RetrievalUnitDraft[] {
   return symbols.flatMap((symbol) => {
+    if (!shouldBuildSymbolMemoryUnit(symbol)) return [];
     const citationId = citationByArtifactId.get(symbol.id);
     if (!citationId) return [];
     return [
