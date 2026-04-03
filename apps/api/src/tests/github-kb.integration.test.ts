@@ -2041,7 +2041,7 @@ When callback redirects fail, verify Redirect URI and baseURL deployment wiring 
         registrationChanged: boolean;
         runResult: { processed: number; succeeded: number };
         afterStatus: {
-          registration: { includePaths: string[] };
+          registration: { repo: string; repoUrl: string; includePaths: string[] };
           sourceSnapshot: { mode: string };
           corpus: Array<{ prefix: string; total: number; active: number }>;
         };
@@ -2051,11 +2051,34 @@ When callback redirects fail, verify Redirect URI and baseURL deployment wiring 
     assert.equal(ensurePayload.result.registrationChanged, true);
     assert.equal(ensurePayload.result.runResult.processed >= 1, true);
     assert.equal(ensurePayload.result.runResult.succeeded >= 1, true);
+    assert.equal(ensurePayload.result.afterStatus.registration.repo, "docs/docs-com");
+    assert.equal(ensurePayload.result.afterStatus.registration.repoUrl, "https://git.ones.pro/docs/docs-com");
     assert.equal(ensurePayload.result.afterStatus.sourceSnapshot.mode, "local_mirror");
     assert.deepEqual(ensurePayload.result.afterStatus.registration.includePaths, buildDocsComIncludePaths(env.GITHUB_KB_BOOTSTRAP_INCLUDE_PATHS));
     const openDocs = ensurePayload.result.afterStatus.corpus.find((item) => item.prefix === "open-docs/");
     assert.equal(openDocs?.total, 1);
     assert.equal(openDocs?.active, 1);
+
+    const docsComRegistrations = await pool.query<{ repo_owner: string; repo_url: string; is_active: boolean }>(
+      `SELECT repo_owner, repo_url, is_active
+         FROM kb_repo_registrations
+        WHERE repo_name = 'docs-com'
+        ORDER BY updated_at DESC`
+    );
+    const activeDocsComRegistrations = docsComRegistrations.rows.filter((row) => row.is_active);
+    assert.equal(activeDocsComRegistrations.length, 1);
+    assert.equal(activeDocsComRegistrations[0]?.repo_owner, "docs");
+    assert.equal(activeDocsComRegistrations[0]?.repo_url, "https://git.ones.pro/docs/docs-com");
+
+    const legacyRegistration = await pool.query<{ is_active: boolean }>(
+      `SELECT is_active
+         FROM kb_repo_registrations
+        WHERE repo_url = 'mock://BangWork/docs-com'
+        ORDER BY updated_at DESC
+        LIMIT 1`
+    );
+    assert.equal(legacyRegistration.rowCount, 1);
+    assert.equal(legacyRegistration.rows[0]?.is_active, false);
 
     const status = await fetch(`${baseUrl}/api/v1/internal/kb/docs-com/status?limit=5`, {
       headers: { "x-portal-surface": "internal" }
@@ -2146,7 +2169,7 @@ When callback redirects fail, verify Redirect URI and baseURL deployment wiring 
       })
     });
     assert.equal(register.status, 201);
-    const regPayload = (await register.json()) as { registration: { id: string } };
+    await register.json();
 
     const ensure = await fetch(`${baseUrl}/api/v1/internal/kb/docs-com/ensure`, {
       method: "POST",
@@ -2162,13 +2185,24 @@ When callback redirects fail, verify Redirect URI and baseURL deployment wiring 
     });
     assert.equal(ensure.status, 202);
 
+    const activeDocsComRegistration = await pool.query<{ id: string }>(
+      `SELECT id
+         FROM kb_repo_registrations
+        WHERE repo_owner = 'docs'
+          AND repo_name = 'docs-com'
+          AND is_active = true
+        ORDER BY updated_at DESC
+        LIMIT 1`
+    );
+    assert.equal(activeDocsComRegistration.rowCount, 1);
+
     const builds = await pool.query<{ status: string }>(
       `SELECT status
          FROM kb_builds
         WHERE repo_id = $1
         ORDER BY created_at DESC
         LIMIT 1`,
-      [regPayload.registration.id]
+      [activeDocsComRegistration.rows[0].id]
     );
     assert.equal(builds.rowCount, 1);
     assert.equal(builds.rows[0].status, "validated");
@@ -2177,7 +2211,7 @@ When callback redirects fail, verify Redirect URI and baseURL deployment wiring 
       `SELECT COUNT(*)::text AS total
          FROM kb_publications
         WHERE repo_id = $1`,
-      [regPayload.registration.id]
+      [activeDocsComRegistration.rows[0].id]
     );
     assert.equal(publications.rows[0]?.total, "0");
   } finally {

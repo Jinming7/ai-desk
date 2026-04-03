@@ -147,6 +147,78 @@ test("buildDocsComIncludePaths strips non-docs repo metadata patterns", () => {
   assert.equal(includePaths.includes("deploy-docs/**/*.md"), true);
 });
 
+test("resolveRepoProviderKind distinguishes mock, github, and gitlab repository urls", () => {
+  const resolveRepoProviderKind = (serviceModule as Record<string, unknown>).resolveRepoProviderKind as
+    | ((repoUrl: string) => "mock" | "github" | "gitlab")
+    | undefined;
+
+  assert.equal(typeof resolveRepoProviderKind, "function");
+  assert.equal(resolveRepoProviderKind!("mock://BangWork/docs-com"), "mock");
+  assert.equal(resolveRepoProviderKind!("https://github.com/BangWork/docs-com"), "github");
+  assert.equal(resolveRepoProviderKind!("https://git.ones.pro/docs/docs-com"), "gitlab");
+});
+
+test("getDocsComCanonicalSource pins docs-com to the gitlab source of truth", () => {
+  const getDocsComCanonicalSource = (serviceModule as Record<string, unknown>).getDocsComCanonicalSource as
+    | (() => { repoUrl: string; defaultBranch: string; publicBaseUrl: string })
+    | undefined;
+
+  assert.equal(typeof getDocsComCanonicalSource, "function");
+
+  const source = getDocsComCanonicalSource!();
+  assert.equal(source.repoUrl, "https://git.ones.pro/docs/docs-com");
+  assert.equal(source.defaultBranch, "master");
+  assert.equal(source.publicBaseUrl, "https://docs.ones.com");
+});
+
+test("validateGitLabPatScopes accepts read-only gitlab token scopes", () => {
+  const validateGitLabPatScopes = (serviceModule as Record<string, unknown>).validateGitLabPatScopes as
+    | ((scopes: string[]) => { ok: boolean; scopes: string[]; message: string })
+    | undefined;
+
+  assert.equal(typeof validateGitLabPatScopes, "function");
+
+  const result = validateGitLabPatScopes!(["read_repository", "read_api"]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.scopes, ["read_repository", "read_api"]);
+});
+
+test("validateGitLabPatScopes rejects write-capable gitlab scopes", () => {
+  const validateGitLabPatScopes = (serviceModule as Record<string, unknown>).validateGitLabPatScopes as
+    | ((scopes: string[]) => { ok: boolean; scopes: string[]; message: string })
+    | undefined;
+
+  assert.equal(typeof validateGitLabPatScopes, "function");
+
+  const result = validateGitLabPatScopes!(["read_api", "api"]);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /disallowed/i);
+});
+
+test("validateGitLabPatScopes rejects gitlab tokens missing required read scopes", () => {
+  const validateGitLabPatScopes = (serviceModule as Record<string, unknown>).validateGitLabPatScopes as
+    | ((scopes: string[]) => { ok: boolean; scopes: string[]; message: string })
+    | undefined;
+
+  assert.equal(typeof validateGitLabPatScopes, "function");
+
+  const result = validateGitLabPatScopes!(["read_api"]);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /missing required/i);
+});
+
+test("buildGitLabSourceUrl uses the gitlab blob route", () => {
+  const buildGitLabSourceUrl = (serviceModule as Record<string, unknown>).buildGitLabSourceUrl as
+    | ((repoUrl: string, filePath: string, commitSha: string) => string)
+    | undefined;
+
+  assert.equal(typeof buildGitLabSourceUrl, "function");
+  assert.equal(
+    buildGitLabSourceUrl!("https://git.ones.pro/docs/docs-com", "docs/api.md", "abc123"),
+    "https://git.ones.pro/docs/docs-com/-/blob/abc123/docs/api.md"
+  );
+});
+
 test("shouldEmbedCitationUnit is opt-in via citation metadata", () => {
   assert.equal(shouldEmbedCitationUnit({ metadata: {} }), false);
   assert.equal(shouldEmbedCitationUnit({ metadata: { embeddingTarget: "selected" } }), true);

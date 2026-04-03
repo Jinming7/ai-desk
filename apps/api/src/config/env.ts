@@ -119,6 +119,8 @@ const envSchema = z.object({
   CRON_SECRET: z.string().optional(),
   GITHUB_API_BASE_URL: z.string().default("https://api.github.com"),
   GITHUB_TOKEN_READONLY: z.string().optional(),
+  GITLAB_API_BASE_URL: z.string().default("https://git.ones.pro/api/v4"),
+  GITLAB_TOKEN_READONLY: z.string().optional(),
   GITHUB_WEBHOOK_SECRET: z.string().optional(),
   GITHUB_KB_ALLOW_BROAD_SCOPES: envBoolean(false),
   GITHUB_KB_BOOTSTRAP_REPO_URL: z.string().optional(),

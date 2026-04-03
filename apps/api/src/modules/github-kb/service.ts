@@ -20,9 +20,11 @@ import {
   getFileContentBufferAtCommit,
   getRepositoryDefaultBranch,
   getRepoFullName,
+  getDocsComCanonicalSource,
   listFilesAtCommit,
+  resolveRepoProviderKind,
   validateReadOnlyAccess
-} from "./github-client.js";
+} from "./repo-provider.js";
 import { parseMarkdownSections } from "./markdown.js";
 import { buildDocChunkCitations } from "./chunkers/doc-citation-builder.js";
 import { generateMemoryEntriesFromRetrievalUnits } from "./memory/generate-memory-entries.js";
@@ -66,16 +68,24 @@ const DEFAULT_BOOTSTRAP_INCLUDE_PATHS = ["**/*.md", "**/*.mdx"];
 const DEFAULT_BOOTSTRAP_EXCLUDE_PATHS = [".claude/**", ".github/**", ".docusaurus/**", "node_modules/**", "build/**", "dist/**"];
 const MAX_BOOTSTRAP_INCLUDE_PATHS = 64;
 const DOCS_COM_REQUIRED_PREFIXES = ["docs/", "deploy-docs/", "open-docs/"];
-const DOCS_COM_REPO_OWNER = "BangWork";
-const DOCS_COM_REPO_NAME = "docs-com";
-const DOCS_COM_DEFAULT_BRANCH = "master";
-const DOCS_COM_REPO_URL = "https://github.com/BangWork/docs-com";
-const DOCS_COM_PUBLIC_BASE_URL = "https://docs.ones.com";
+const DOCS_COM_CANONICAL_SOURCE = getDocsComCanonicalSource();
+const DOCS_COM_CANONICAL_PROJECT_PARTS = DOCS_COM_CANONICAL_SOURCE.projectPath.split("/").filter(Boolean);
+if (DOCS_COM_CANONICAL_PROJECT_PARTS.length < 2) {
+  throw new Error(`Invalid docs-com canonical project path: ${DOCS_COM_CANONICAL_SOURCE.projectPath}`);
+}
+const DOCS_COM_REPO_OWNER = DOCS_COM_CANONICAL_PROJECT_PARTS[0];
+const DOCS_COM_REPO_NAME = DOCS_COM_CANONICAL_PROJECT_PARTS[1];
+const DOCS_COM_LEGACY_REPO_OWNERS = new Set(["bangwork"]);
+const DOCS_COM_DEFAULT_BRANCH = DOCS_COM_CANONICAL_SOURCE.defaultBranch;
+const DOCS_COM_REPO_URL = DOCS_COM_CANONICAL_SOURCE.repoUrl;
+const DOCS_COM_PUBLIC_BASE_URL = DOCS_COM_CANONICAL_SOURCE.publicBaseUrl;
 const DEFAULT_EMBEDDING_MODE: KbEmbeddingMode = "best_effort";
 const REMOTE_MANIFEST_CHECKSUM_CONCURRENCY = 4;
 const DOCUMENT_MUTATION_LOCK_TTL_SECONDS = 300;
 const DOCUMENT_MUTATION_LOCK_RETRY_MS = 100;
 const DOCUMENT_MUTATION_LOCK_MAX_WAIT_MS = 300_000;
+
+export { buildGitLabSourceUrl, getDocsComCanonicalSource, resolveRepoProviderKind, validateGitLabPatScopes } from "./repo-provider.js";
 
 interface GithubKbIndexDocumentInput {
   registration: RepoRegistration;
@@ -202,16 +212,31 @@ function parseRepoOwnerName(repoUrl: string): { owner: string; name: string } {
 
   const url = new URL(repoUrl);
   const parts = url.pathname.replace(/^\//, "").replace(/\.git$/i, "").split("/").filter(Boolean);
-  if (parts.length < 2) throw new Error(`Invalid GitHub repo url: ${repoUrl}`);
+  if (parts.length < 2) throw new Error(`Invalid repository url: ${repoUrl}`);
   return { owner: parts[0], name: parts[1] };
 }
 
-function isDocsComRepo(owner: string, name: string): boolean {
+function isCanonicalDocsComRepo(owner: string, name: string): boolean {
   return owner.toLowerCase() === DOCS_COM_REPO_OWNER.toLowerCase() && name.toLowerCase() === DOCS_COM_REPO_NAME.toLowerCase();
+}
+
+function isDocsComRepo(owner: string, name: string): boolean {
+  const normalizedOwner = owner.toLowerCase();
+  return name.toLowerCase() === DOCS_COM_REPO_NAME.toLowerCase() &&
+    (normalizedOwner === DOCS_COM_REPO_OWNER.toLowerCase() || DOCS_COM_LEGACY_REPO_OWNERS.has(normalizedOwner));
 }
 
 function isDocsComRegistration(registration: RepoRegistration): boolean {
   return isDocsComRepo(registration.repo_owner, registration.repo_name);
+}
+
+function isCanonicalDocsComRegistration(registration: RepoRegistration): boolean {
+  return (
+    isCanonicalDocsComRepo(registration.repo_owner, registration.repo_name) &&
+    registration.repo_url === DOCS_COM_REPO_URL &&
+    registration.default_branch === DOCS_COM_DEFAULT_BRANCH &&
+    registration.public_base_url === DOCS_COM_PUBLIC_BASE_URL
+  );
 }
 
 function hasIncludePattern(includePaths: string[], extension: "md" | "mdx"): boolean {
@@ -314,7 +339,27 @@ function buildDocsComRegistrationInput(actor: string) {
 }
 
 async function getDocsComRegistration(): Promise<RepoRegistration | null> {
-  return repo.findActiveRepoByOwnerNameBranch(DOCS_COM_REPO_OWNER, DOCS_COM_REPO_NAME, DOCS_COM_DEFAULT_BRANCH);
+  const registrations = (await repo.listActiveRepoRegistrations())
+    .filter((item) => item.default_branch === DOCS_COM_DEFAULT_BRANCH && isDocsComRegistration(item))
+    .sort((left, right) => {
+      const canonicalDiff = Number(isCanonicalDocsComRegistration(right)) - Number(isCanonicalDocsComRegistration(left));
+      if (canonicalDiff !== 0) {
+        return canonicalDiff;
+      }
+      return new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime();
+    });
+
+  return registrations[0] ?? null;
+}
+
+async function deactivateLegacyDocsComRegistrations(keepRepoId: string, actor: string): Promise<void> {
+  const registrations = await repo.listActiveRepoRegistrations();
+  for (const registration of registrations) {
+    if (registration.id === keepRepoId) continue;
+    if (registration.default_branch !== DOCS_COM_DEFAULT_BRANCH) continue;
+    if (!isDocsComRegistration(registration)) continue;
+    await repo.deactivateRepoRegistration(registration.id, actor);
+  }
 }
 
 function summarizePrefixTotals(paths: string[]): Array<{ prefix: string; total: number }> {
@@ -1513,7 +1558,7 @@ function pickDefaultPublicBaseUrl(repoUrl: string, explicit?: string): string | 
   if (explicit) return explicit;
   try {
     const parsed = parseRepoOwnerName(repoUrl);
-    if (parsed.owner.toLowerCase() === "bangwork" && parsed.name.toLowerCase() === "docs-com") {
+    if (isDocsComRepo(parsed.owner, parsed.name)) {
       return "https://docs.ones.com";
     }
   } catch {
@@ -3501,6 +3546,9 @@ export async function ensureDocsComKnowledgeBase(input?: {
   const beforeStatus = beforeRegistration ? await summarizeDocsComCorpus(beforeRegistration, 5) : null;
 
   const { registration, validation } = await registerRepository(registrationInput);
+  if (isCanonicalDocsComRegistration(registration)) {
+    await deactivateLegacyDocsComRegistrations(registration.id, actor);
+  }
   let enqueuedJob:
     | {
         id: string;
@@ -4078,7 +4126,7 @@ export async function backfillRepositoryFromLocalMirror(
 }> {
   const registration = repoId
     ? await repo.getRepoRegistrationById(repoId)
-    : (await repo.listActiveRepoRegistrations()).find((item) => isDocsComRegistration(item)) ?? null;
+    : await getDocsComRegistration();
   if (!registration || !registration.is_active) {
     throw new Error(`Repository registration not found or inactive: ${repoId ?? "docs-com"}`);
   }

@@ -82,7 +82,7 @@ const defaultDatasetPaths = {
   build: path.resolve(__dirname, "evals/fixtures/support-build-validation.json")
 } as const;
 
-const DOCS_COM_REPO_OWNER = "BangWork";
+const DOCS_COM_REPO_OWNER = "docs";
 const DOCS_COM_REPO_NAME = "docs-com";
 const DOCS_COM_DEFAULT_BRANCH = "master";
 
