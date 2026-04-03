@@ -6,7 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { test } from "node:test";
 import { env } from "../../config/env.js";
 import type { KbBuild, RepoRegistration, SyncJob } from "./types.js";
-import { buildDocsComSourceManifest } from "./source/manifest-builder.js";
+import { buildDocsComSourceManifest, filterDocsComSnapshotFilesForManifest } from "./source/manifest-builder.js";
 import * as serviceModule from "./service.js";
 import {
   buildEnqueuedSyncPayload,
@@ -679,6 +679,48 @@ test("buildDocsComSourceManifest treats docs double-star patterns as matching di
     "docs/20_AI_Support_Agent_Rebuild_Part_01_System_Model_And_Single_DB_Publishing.md"
   ]);
   assert.equal(manifest.skippedItems.length, 0);
+});
+
+test("filterDocsComSnapshotFilesForManifest keeps only docs-com content roots before manifest planning", () => {
+  const files = [
+    {
+      path: ".claude/skills/concurrent-batch-task/SKILL.md",
+      sha: "sha-claude",
+      size: 12,
+      type: "blob" as const
+    },
+    {
+      path: "README.md",
+      sha: "sha-readme",
+      size: 8,
+      type: "blob" as const
+    },
+    {
+      path: "docs/guide/setup.mdx",
+      sha: "sha-doc",
+      size: 24,
+      type: "blob" as const
+    },
+    {
+      path: "open-docs/reference/auth.mdx",
+      sha: "sha-open-doc",
+      size: 32,
+      type: "blob" as const
+    },
+    {
+      path: "deploy-docs/assets/logo.png",
+      sha: "sha-deploy-asset",
+      size: 16,
+      type: "blob" as const
+    }
+  ];
+
+  const scoped = filterDocsComSnapshotFilesForManifest(files);
+
+  assert.deepEqual(
+    scoped.map((file) => file.path),
+    ["docs/guide/setup.mdx", "open-docs/reference/auth.mdx", "deploy-docs/assets/logo.png"]
+  );
 });
 
 test("remote manifest checksum hydration fetches only eligible files and respects bounded concurrency", async () => {

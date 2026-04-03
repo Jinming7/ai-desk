@@ -9,7 +9,11 @@ import { embedText, toVectorLiteral } from "./embedding.js";
 import { buildRepositoryKnowledgeArtifacts } from "./builders/repository-knowledge-builder.js";
 import { buildDocumentRetrievalUnits } from "./builders/document-builder.js";
 import { classifySourceFamily } from "./parsers/source-classifier.js";
-import { buildDocsComSourceManifest, type DocsComSourceManifest } from "./source/manifest-builder.js";
+import {
+  buildDocsComSourceManifest,
+  filterDocsComSnapshotFilesForManifest,
+  type DocsComSourceManifest
+} from "./source/manifest-builder.js";
 import { isPathIncluded } from "./source/path-glob.js";
 import {
   assertGithubReadOnlyMethod,
@@ -983,7 +987,9 @@ async function freezeDocsComSourceSnapshot(registration: RepoRegistration, branc
 
   const resolved = await resolveRegistrationBranch(registration, branch || registration.default_branch || DOCS_COM_DEFAULT_BRANCH, "full_run_plan");
   const head = await getBranchHead(resolved.registration, resolved.branch);
-  const files = (await listFilesAtCommit(resolved.registration, head)).sort((left, right) => compareSnapshotPaths(left.path, right.path));
+  const files = filterDocsComSnapshotFilesForManifest(
+    (await listFilesAtCommit(resolved.registration, head)).sort((left, right) => compareSnapshotPaths(left.path, right.path))
+  );
 
   return {
     mode: "remote",

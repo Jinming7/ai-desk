@@ -36,6 +36,10 @@ function classifyShard(pathname: string): KbFullSyncShardKey | null {
   return null;
 }
 
+export function filterDocsComSnapshotFilesForManifest(files: GitHubTreeFile[]): GitHubTreeFile[] {
+  return files.filter((file) => classifyShard(file.path) !== null);
+}
+
 function classifyFamilyHint(pathname: string): KbSourceFamily | null {
   const lower = pathname.toLowerCase();
   if (/\.(md|mdx)$/i.test(lower)) {
