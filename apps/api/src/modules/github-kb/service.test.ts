@@ -21,6 +21,7 @@ import {
   populateDocsComManifestEligibleChecksumsForSnapshot,
   resolveBootstrapIncludePaths,
   resolvePublicationAwareIncrementalBase,
+  shouldEmbedCitationUnit,
   shouldAdvanceFullSyncCheckpoint,
   sliceSnapshotForBackfill
 } from "./service.js";
@@ -144,6 +145,11 @@ test("buildDocsComIncludePaths strips non-docs repo metadata patterns", () => {
   assert.equal(includePaths.includes("docs/**/*.md"), true);
   assert.equal(includePaths.includes("open-docs/**/*.mdx"), true);
   assert.equal(includePaths.includes("deploy-docs/**/*.md"), true);
+});
+
+test("shouldEmbedCitationUnit is opt-in via citation metadata", () => {
+  assert.equal(shouldEmbedCitationUnit({ metadata: {} }), false);
+  assert.equal(shouldEmbedCitationUnit({ metadata: { embeddingTarget: "selected" } }), true);
 });
 
 test("buildEnqueuedSyncPayload assigns distinct execution-scoped build versions for different logical full-sync runs on the same commit", () => {

@@ -778,8 +778,21 @@ export async function getBuildArtifactSummary(input: {
     `SELECT
        (SELECT COUNT(*)::text FROM kb_chunks WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS chunk_total,
        (SELECT COUNT(*)::text FROM kb_chunks WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4 AND embedding IS NOT NULL) AS chunk_ready,
-       (SELECT COUNT(*)::text FROM kb_citation_units WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS citation_total,
-       (SELECT COUNT(*)::text FROM kb_citation_units WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4 AND embedding IS NOT NULL) AS citation_ready`,
+       (SELECT COUNT(*)::text
+          FROM kb_citation_units
+         WHERE knowledge_space = $1
+           AND repo_id = $2
+           AND branch = $3
+           AND build_version = $4
+           AND COALESCE(metadata_json->>'embeddingTarget', 'disabled') = 'selected') AS citation_total,
+       (SELECT COUNT(*)::text
+          FROM kb_citation_units
+         WHERE knowledge_space = $1
+           AND repo_id = $2
+           AND branch = $3
+           AND build_version = $4
+           AND COALESCE(metadata_json->>'embeddingTarget', 'disabled') = 'selected'
+           AND embedding IS NOT NULL) AS citation_ready`,
     [input.knowledgeSpace, input.repoId, input.branch, input.buildVersion]
   );
   const embeddings = embeddingCounts.rows[0];

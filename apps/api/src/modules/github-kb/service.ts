@@ -2139,6 +2139,12 @@ async function embedTextForBuild(
   }
 }
 
+export function shouldEmbedCitationUnit(input: { metadata?: Record<string, unknown> | null }): boolean {
+  return String(input.metadata?.embeddingTarget ?? "")
+    .trim()
+    .toLowerCase() === "selected";
+}
+
 function isPermanentEmbeddingError(error: unknown): boolean {
   const message = (error as Error)?.message?.toLowerCase?.() ?? "";
   return (
@@ -2505,7 +2511,11 @@ async function indexDocumentContent(input: {
       );
       const allCitations = [...docChunkCitations, ...knowledgeArtifacts.citationUnits];
       for (const citation of allCitations) {
-        const embedded = await embedTextForBuild(citation.embeddingText ?? citation.snippetText, embeddingMode);
+        const citationEmbeddingTarget = shouldEmbedCitationUnit(citation) ? "selected" : "disabled";
+        const embedded =
+          citationEmbeddingTarget === "selected"
+            ? await embedTextForBuild(citation.embeddingText ?? citation.snippetText, embeddingMode)
+            : null;
         await repo.upsertCitationUnit({
           id: citation.id,
           knowledgeSpace,
@@ -2524,7 +2534,10 @@ async function indexDocumentContent(input: {
           snippetText: citation.snippetText,
           sourceLocation: citation.sourceLocation,
           authority: citation.authority,
-          metadata: citation.metadata,
+          metadata: {
+            ...citation.metadata,
+            embeddingTarget: citationEmbeddingTarget
+          },
           embedding: embedded?.vectorLiteral ?? null,
           embeddingModel: embedded?.model ?? null,
           embeddingVersion: embedded?.version ?? null

@@ -142,6 +142,87 @@ async function createIsolationRegistration() {
   });
 }
 
+test("build artifact summary only counts selected citation embedding targets", async () => {
+  const registration = await createIsolationRegistration();
+  const buildVersion = "build-selected-citation-embeddings";
+  const doc = await githubRepo.upsertDocument({
+    repoId: registration.id,
+    knowledgeSpace: "support-local",
+    branch: "main",
+    path: "docs/auth.md",
+    buildVersion,
+    title: "Auth",
+    sourceUrl: "https://example.com/docs/auth",
+    repoSourceUrl: "https://example.com/repo/docs/auth.md",
+    publicSourceUrl: "https://example.com/docs/auth",
+    commitSha: "mockc1",
+    contentHash: "hash-auth",
+    content: "# Auth\n",
+    metadata: { sourceFamily: "doc_page" }
+  });
+
+  await githubRepo.upsertCitationUnit({
+    id: "11111111-1111-5111-8111-111111111111",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    citationFamily: "code_symbol_span",
+    sourceFamily: "code_file",
+    sourceArtifactType: "kb_code_symbols",
+    sourceArtifactId: null,
+    citationKey: "disabled-citation",
+    path: "apps/api/src/app.ts",
+    title: "App",
+    headingPath: "App.start",
+    snippetText: "function start() {}",
+    sourceLocation: { lineStart: 1, lineEnd: 1 },
+    authority: { authority: "repository_code" },
+    metadata: { embeddingTarget: "disabled" },
+    embedding: toVectorLiteral([1, 0]),
+    embeddingModel: "model-2d",
+    embeddingVersion: "v1"
+  });
+
+  await githubRepo.upsertCitationUnit({
+    id: "22222222-2222-5222-8222-222222222222",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    citationFamily: "openapi_operation_span",
+    sourceFamily: "openapi_spec",
+    sourceArtifactType: "kb_openapi_operations",
+    sourceArtifactId: null,
+    citationKey: "selected-citation",
+    path: "apps/api/openapi.yaml",
+    title: "OpenAPI",
+    headingPath: "/tickets",
+    snippetText: "get /tickets",
+    sourceLocation: { lineStart: 1, lineEnd: 1 },
+    authority: { authority: "repository_openapi" },
+    metadata: { embeddingTarget: "selected" },
+    embedding: null,
+    embeddingModel: null,
+    embeddingVersion: null
+  });
+
+  const summary = await githubRepo.getBuildArtifactSummary({
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion
+  });
+
+  assert.deepEqual(summary.embeddingSummary.citationEmbeddings, {
+    total: 1,
+    ready: 0,
+    missing: 1
+  });
+});
+
 test("withBuildDocumentMutationLock serializes concurrent mutations for the same build document", async () => {
   const withBuildDocumentMutationLock = (serviceModule as Record<string, unknown>).withBuildDocumentMutationLock as
     | ((
