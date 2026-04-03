@@ -85,6 +85,7 @@ const DOCS_COM_REPO_URL = DOCS_COM_CANONICAL_SOURCE.repoUrl;
 const DOCS_COM_PUBLIC_BASE_URL = DOCS_COM_CANONICAL_SOURCE.publicBaseUrl;
 const DEFAULT_EMBEDDING_MODE: KbEmbeddingMode = "best_effort";
 const REMOTE_MANIFEST_CHECKSUM_CONCURRENCY = 4;
+const SYNC_JOB_HEARTBEAT_INTERVAL_MS = 60_000;
 const DOCUMENT_MUTATION_LOCK_TTL_SECONDS = 300;
 const DOCUMENT_MUTATION_LOCK_RETRY_MS = 100;
 const DOCUMENT_MUTATION_LOCK_MAX_WAIT_MS = 300_000;
@@ -126,6 +127,37 @@ export const githubKbServiceDeps = {
     return repo.releaseIngestLease(leaseKey, ownerId);
   }
 };
+
+export async function withSyncJobHeartbeat<T>(
+  jobId: string,
+  work: () => Promise<T>,
+  options?: {
+    intervalMs?: number;
+    heartbeat?: (jobId: string) => Promise<void>;
+  }
+): Promise<T> {
+  const intervalMs = Number.isFinite(options?.intervalMs)
+    ? Math.max(10, Math.floor(options?.intervalMs ?? SYNC_JOB_HEARTBEAT_INTERVAL_MS))
+    : SYNC_JOB_HEARTBEAT_INTERVAL_MS;
+  const heartbeat = options?.heartbeat ?? ((runningJobId: string) => repo.heartbeatSyncJob(runningJobId));
+  let heartbeatInFlight = false;
+  const timer = setInterval(() => {
+    if (heartbeatInFlight) return;
+    heartbeatInFlight = true;
+    void heartbeat(jobId)
+      .catch(() => undefined)
+      .finally(() => {
+        heartbeatInFlight = false;
+      });
+  }, intervalMs);
+  timer.unref?.();
+
+  try {
+    return await work();
+  } finally {
+    clearInterval(timer);
+  }
+}
 
 interface SyncExecutionResult {
   indexed: number;
@@ -3942,61 +3974,63 @@ export async function runDueSyncJobs(limit: number): Promise<{ processed: number
   for (const job of jobs) {
     const startedAt = Date.now();
     try {
-      const registration = await repo.getRepoRegistrationById(job.repo_id);
-      if (!registration || !registration.is_active) {
-        throw new Error(`Repository registration not found or inactive: ${job.repo_id}`);
-      }
-
-      const localMirror = await getLocalDocsMirrorState(registration);
-      if (!localMirror) {
-        const validation = await validateReadOnlyAccess(registration);
-        if (!validation.ok) {
-          throw new Error(`Read-only validation failed: ${validation.message}`);
+      await withSyncJobHeartbeat(job.id, async () => {
+        const registration = await repo.getRepoRegistrationById(job.repo_id);
+        if (!registration || !registration.is_active) {
+          throw new Error(`Repository registration not found or inactive: ${job.repo_id}`);
         }
-      }
 
-      let executionResult: SyncExecutionResult;
-      if (job.sync_mode === "full") {
-        const fullRunPayload = getFullRunPayload(job);
-        const activeDocsComFullRun =
-          !fullRunPayload && isDocsComRegistration(registration)
-            ? await repo.findActiveFullSyncRun(registration.id, job.branch)
-            : null;
-        const result = fullRunPayload
-          ? await runDocsComFullSyncShardJob(job, registration)
-          : activeDocsComFullRun
-            ? { indexed: 0, head: activeDocsComFullRun.target_head, finished: true, nextCursor: null }
-            : await runFullSync(job, registration);
-        executionResult = result;
-        await repo.recordMetric({
-          repoId: registration.id,
-          metricName: "kb_full_sync_docs",
-          metricValue: result.indexed,
-          tags: { branch: job.branch, commit: result.head }
-        });
-      } else if (job.sync_mode === "incremental") {
-        const result = await runIncrementalSync(job, registration);
-        executionResult = result;
-        await repo.recordMetric({
-          repoId: registration.id,
-          metricName: "kb_incremental_sync_docs",
-          metricValue: result.indexed,
-          tags: { branch: job.branch, commit: result.head }
-        });
-      } else {
-        const result = await runReindex(job, registration);
-        executionResult = result;
-        await repo.recordMetric({
-          repoId: registration.id,
-          metricName: "kb_reindex_docs",
-          metricValue: result.indexed,
-          tags: { branch: job.branch, commit: result.head }
-        });
-      }
+        const localMirror = await getLocalDocsMirrorState(registration);
+        if (!localMirror) {
+          const validation = await validateReadOnlyAccess(registration);
+          if (!validation.ok) {
+            throw new Error(`Read-only validation failed: ${validation.message}`);
+          }
+        }
 
-      if (!getFullRunPayload(job)) {
-        await enqueueSyncContinuation(job, registration, executionResult);
-      }
+        let executionResult: SyncExecutionResult;
+        if (job.sync_mode === "full") {
+          const fullRunPayload = getFullRunPayload(job);
+          const activeDocsComFullRun =
+            !fullRunPayload && isDocsComRegistration(registration)
+              ? await repo.findActiveFullSyncRun(registration.id, job.branch)
+              : null;
+          const result = fullRunPayload
+            ? await runDocsComFullSyncShardJob(job, registration)
+            : activeDocsComFullRun
+              ? { indexed: 0, head: activeDocsComFullRun.target_head, finished: true, nextCursor: null }
+              : await runFullSync(job, registration);
+          executionResult = result;
+          await repo.recordMetric({
+            repoId: registration.id,
+            metricName: "kb_full_sync_docs",
+            metricValue: result.indexed,
+            tags: { branch: job.branch, commit: result.head }
+          });
+        } else if (job.sync_mode === "incremental") {
+          const result = await runIncrementalSync(job, registration);
+          executionResult = result;
+          await repo.recordMetric({
+            repoId: registration.id,
+            metricName: "kb_incremental_sync_docs",
+            metricValue: result.indexed,
+            tags: { branch: job.branch, commit: result.head }
+          });
+        } else {
+          const result = await runReindex(job, registration);
+          executionResult = result;
+          await repo.recordMetric({
+            repoId: registration.id,
+            metricName: "kb_reindex_docs",
+            metricValue: result.indexed,
+            tags: { branch: job.branch, commit: result.head }
+          });
+        }
+
+        if (!getFullRunPayload(job)) {
+          await enqueueSyncContinuation(job, registration, executionResult);
+        }
+      });
 
       await repo.markSyncJobSucceeded(job.id);
       await repo.recordMetric({

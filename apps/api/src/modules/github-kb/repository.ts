@@ -1028,6 +1028,16 @@ export async function markSyncJobSucceeded(jobId: string): Promise<void> {
   );
 }
 
+export async function heartbeatSyncJob(jobId: string): Promise<void> {
+  await pool.query(
+    `UPDATE kb_sync_jobs
+     SET updated_at = NOW()
+     WHERE id = $1
+       AND status = 'running'`,
+    [jobId]
+  );
+}
+
 export async function markSyncJobFailed(job: SyncJob, errorMessage: string): Promise<KbSyncJobStatus> {
   const attempts = job.attempts + 1;
   if (attempts >= job.max_attempts) {

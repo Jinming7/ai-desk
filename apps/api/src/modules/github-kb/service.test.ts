@@ -219,6 +219,43 @@ test("buildGitLabSourceUrl uses the gitlab blob route", () => {
   );
 });
 
+test("withSyncJobHeartbeat refreshes long-running jobs until work completes", async () => {
+  const withSyncJobHeartbeat = (serviceModule as Record<string, unknown>).withSyncJobHeartbeat as
+    | (<T>(
+        jobId: string,
+        work: () => Promise<T>,
+        options?: { intervalMs?: number; heartbeat?: (jobId: string) => Promise<void> }
+      ) => Promise<T>)
+    | undefined;
+
+  assert.equal(typeof withSyncJobHeartbeat, "function");
+
+  const heartbeats: string[] = [];
+  let resolveWork: ((value: string) => void) | undefined;
+  const work = new Promise<string>((resolve) => {
+    resolveWork = resolve;
+  });
+
+  const pending = withSyncJobHeartbeat!("job-1", () => work, {
+    intervalMs: 10,
+    heartbeat: async (jobId) => {
+      heartbeats.push(jobId);
+    }
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(heartbeats.length >= 2, true);
+  assert.equal(heartbeats.every((jobId) => jobId === "job-1"), true);
+
+  resolveWork!("done");
+  const result = await pending;
+  assert.equal(result, "done");
+
+  const heartbeatCountAfterFinish = heartbeats.length;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(heartbeats.length, heartbeatCountAfterFinish);
+});
+
 test("shouldEmbedCitationUnit is opt-in via citation metadata", () => {
   assert.equal(shouldEmbedCitationUnit({ metadata: {} }), false);
   assert.equal(shouldEmbedCitationUnit({ metadata: { embeddingTarget: "selected" } }), true);
