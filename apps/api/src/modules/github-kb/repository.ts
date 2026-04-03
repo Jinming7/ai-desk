@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 import { pool } from "../../db/client.js";
+import { chunkFullSyncManifestItems } from "./full-sync-manifest-batching.js";
 import type {
   KbBuild,
   KbBuildStatus,
@@ -2645,14 +2646,11 @@ export async function createFullSyncRun(input: {
       shards.push(shardResult.rows[0]);
     }
 
-    for (const item of input.manifestItems) {
-      await client.query(
-        `INSERT INTO kb_sync_manifest_items (
-          id, run_id, repo_id, branch, target_head, path, shard_key, source_family,
-          content_checksum, source_acquisition_mode, blob_sha, size_bytes,
-          needs_rebuild, reuse_reason, skip_reason, build_status
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
-        [
+    for (const manifestBatch of chunkFullSyncManifestItems(input.manifestItems)) {
+      const values: unknown[] = [];
+      const valuePlaceholders = manifestBatch.map((item, batchIndex) => {
+        const offset = batchIndex * 16;
+        values.push(
           uuidv4(),
           run.id,
           input.repoId,
@@ -2669,7 +2667,18 @@ export async function createFullSyncRun(input: {
           item.reuseReason ?? null,
           item.skipReason ?? null,
           item.buildStatus ?? "pending"
-        ]
+        );
+
+        return `($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7},$${offset + 8},$${offset + 9},$${offset + 10},$${offset + 11},$${offset + 12},$${offset + 13},$${offset + 14},$${offset + 15},$${offset + 16})`;
+      });
+
+      await client.query(
+        `INSERT INTO kb_sync_manifest_items (
+          id, run_id, repo_id, branch, target_head, path, shard_key, source_family,
+          content_checksum, source_acquisition_mode, blob_sha, size_bytes,
+          needs_rebuild, reuse_reason, skip_reason, build_status
+        ) VALUES ${valuePlaceholders.join(",")}`,
+        values
       );
     }
 
