@@ -1594,6 +1594,120 @@ test("claimDueSyncJobs only claims one queued job per full-run shard", async () 
   assert.equal(docsQueued.length, 1);
 });
 
+test("claimDueSyncJobs does not claim queued full-run shard continuation while a matching shard job is still running", async () => {
+  const registration = await githubRepo.upsertRepoRegistration({
+    repoOwner: "BangWork",
+    repoName: "docs-com",
+    repoUrl: "https://github.com/BangWork/docs-com",
+    publicBaseUrl: "https://docs.ones.com",
+    defaultBranch: "master",
+    includePaths: ["docs/**/*.mdx", "open-docs/**/*.mdx", "deploy-docs/**/*.mdx"],
+    excludePaths: [],
+    pollingIntervalSeconds: 60,
+    createdBy: "test"
+  });
+
+  const { run } = await githubRepo.createFullSyncRun({
+    repoId: registration.id,
+    branch: "master",
+    targetHead: "mock-head-running-dedup",
+    requestedBy: "test",
+    runReason: "running-dedup-claim",
+    sourceSnapshotTotal: 3,
+    manifestItems: [
+      {
+        path: "docs/example/a.mdx",
+        shardKey: "docs",
+        blobSha: "blob-a",
+        sizeBytes: 10,
+        needsRebuild: true,
+        reuseReason: null
+      },
+      {
+        path: "docs/example/b.mdx",
+        shardKey: "docs",
+        blobSha: "blob-b",
+        sizeBytes: 10,
+        needsRebuild: true,
+        reuseReason: null
+      },
+      {
+        path: "open-docs/example/c.mdx",
+        shardKey: "open-docs",
+        blobSha: "blob-c",
+        sizeBytes: 10,
+        needsRebuild: true,
+        reuseReason: null
+      }
+    ]
+  });
+
+  await githubRepo.enqueueSyncJob({
+    repoId: registration.id,
+    branch: "master",
+    syncMode: "full",
+    source: "system",
+    idempotencyKey: `claim-running-dedup:${run.id}:docs:cursor-a`,
+    afterCommitSha: "mock-head-running-dedup",
+    payload: {
+      runId: run.id,
+      shardKey: "docs",
+      targetHead: "mock-head-running-dedup",
+      buildVersion: `mock-head-running-dedup:${run.id}`,
+      sourceMode: "remote",
+      cursor: "docs/example/a.mdx"
+    }
+  });
+  await githubRepo.enqueueSyncJob({
+    repoId: registration.id,
+    branch: "master",
+    syncMode: "full",
+    source: "system",
+    idempotencyKey: `claim-running-dedup:${run.id}:open-docs:cursor-c`,
+    afterCommitSha: "mock-head-running-dedup",
+    payload: {
+      runId: run.id,
+      shardKey: "open-docs",
+      targetHead: "mock-head-running-dedup",
+      buildVersion: `mock-head-running-dedup:${run.id}`,
+      sourceMode: "remote",
+      cursor: "open-docs/example/c.mdx"
+    }
+  });
+  await githubRepo.enqueueSyncJob({
+    repoId: registration.id,
+    branch: "master",
+    syncMode: "full",
+    source: "system",
+    idempotencyKey: `claim-running-dedup:${run.id}:docs:cursor-b`,
+    afterCommitSha: "mock-head-running-dedup",
+    payload: {
+      runId: run.id,
+      shardKey: "docs",
+      targetHead: "mock-head-running-dedup",
+      buildVersion: `mock-head-running-dedup:${run.id}`,
+      sourceMode: "remote",
+      cursor: "docs/example/b.mdx"
+    }
+  });
+
+  const firstClaim = await githubRepo.claimDueSyncJobs(1);
+  assert.equal(firstClaim.length, 1);
+  assert.equal(firstClaim[0]?.payload_json?.shardKey, "docs");
+
+  const secondClaim = await githubRepo.claimDueSyncJobs(10);
+  assert.equal(secondClaim.length, 1);
+  assert.deepEqual(secondClaim.map((job) => job.payload_json?.shardKey), ["open-docs"]);
+
+  const jobs = await githubRepo.listRecentSyncJobs(10);
+  const docsRunning = jobs.filter((job) => job.status === "running" && job.payload_json?.shardKey === "docs");
+  const docsQueued = jobs.filter((job) => job.status === "queued" && job.payload_json?.shardKey === "docs");
+  const openDocsRunning = jobs.filter((job) => job.status === "running" && job.payload_json?.shardKey === "open-docs");
+  assert.equal(docsRunning.length, 1);
+  assert.equal(docsQueued.length, 1);
+  assert.equal(openDocsRunning.length, 1);
+});
+
 test("createFullSyncRun persists skipped manifest ledger including null shard items", async () => {
   const registration = await githubRepo.upsertRepoRegistration({
     repoOwner: "BangWork",

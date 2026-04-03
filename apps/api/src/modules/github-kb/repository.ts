@@ -943,9 +943,24 @@ export async function claimDueSyncJobs(limit: number): Promise<SyncJob[]> {
   try {
     await client.query("BEGIN");
     const result = await client.query<SyncJob>(
-      `WITH ranked AS (
+      `WITH running_full_shards AS (
+        SELECT DISTINCT
+          CONCAT('full-run-shard:', job.payload_json->>'runId', ':', job.payload_json->>'shardKey') AS claim_scope
+        FROM kb_sync_jobs AS job
+        WHERE job.status = 'running'
+          AND job.sync_mode = 'full'
+          AND job.payload_json ? 'runId'
+          AND job.payload_json ? 'shardKey'
+      ), ranked AS (
         SELECT
           job.id,
+          CASE
+            WHEN job.sync_mode = 'full'
+              AND job.payload_json ? 'runId'
+              AND job.payload_json ? 'shardKey'
+            THEN CONCAT('full-run-shard:', job.payload_json->>'runId', ':', job.payload_json->>'shardKey')
+            ELSE CONCAT('job:', job.id::text)
+          END AS claim_scope,
           ROW_NUMBER() OVER (
             PARTITION BY CASE
               WHEN job.sync_mode = 'full'
@@ -963,7 +978,9 @@ export async function claimDueSyncJobs(limit: number): Promise<SyncJob[]> {
         SELECT job.id
         FROM kb_sync_jobs AS job
         INNER JOIN ranked ON ranked.id = job.id
+        LEFT JOIN running_full_shards AS blocked ON blocked.claim_scope = ranked.claim_scope
         WHERE ranked.claim_rank = 1
+          AND blocked.claim_scope IS NULL
         ORDER BY job.attempts ASC, job.next_run_at ASC, job.created_at DESC
         LIMIT $1
         FOR UPDATE OF job SKIP LOCKED
