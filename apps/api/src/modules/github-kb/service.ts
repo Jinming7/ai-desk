@@ -72,6 +72,7 @@ const DEFAULT_BOOTSTRAP_INCLUDE_PATHS = ["**/*.md", "**/*.mdx"];
 const DEFAULT_BOOTSTRAP_EXCLUDE_PATHS = [".claude/**", ".github/**", ".docusaurus/**", "node_modules/**", "build/**", "dist/**"];
 const MAX_BOOTSTRAP_INCLUDE_PATHS = 64;
 const DOCS_COM_REQUIRED_PREFIXES = ["docs/", "deploy-docs/", "open-docs/"];
+const DOCS_COM_STRUCTURED_INCLUDE_EXTENSIONS = ["yaml", "yml", "json", "toml", "sql", "ddl", "ts", "tsx", "js", "jsx", "mjs", "cjs"];
 const DOCS_COM_CANONICAL_SOURCE = getDocsComCanonicalSource();
 const DOCS_COM_CANONICAL_PROJECT_PARTS = DOCS_COM_CANONICAL_SOURCE.projectPath.split("/").filter(Boolean);
 if (DOCS_COM_CANONICAL_PROJECT_PARTS.length < 2) {
@@ -350,7 +351,10 @@ export function buildDocsComIncludePaths(raw: string): string[] {
   const docsComPrefixes = DOCS_COM_REQUIRED_PREFIXES.map((prefix) => prefix.toLowerCase());
   const filtered = parsed.filter((item) => docsComPrefixes.some((prefix) => item.toLowerCase().startsWith(prefix)));
   const defaults = DOCS_COM_REQUIRED_PREFIXES.flatMap((prefix) => [`${prefix}*.md`, `${prefix}*.mdx`, `${prefix}**/*.md`, `${prefix}**/*.mdx`]);
-  return ensureMarkdownCoverage(filtered.length ? filtered : defaults);
+  const structuredCoverage = DOCS_COM_REQUIRED_PREFIXES.flatMap((prefix) =>
+    DOCS_COM_STRUCTURED_INCLUDE_EXTENSIONS.map((extension) => `${prefix}**/*.${extension}`)
+  );
+  return uniqueStrings([...(filtered.length ? filtered : defaults), ...defaults, ...structuredCoverage], MAX_BOOTSTRAP_INCLUDE_PATHS);
 }
 
 function resolveBootstrapExcludePaths(raw: string): string[] {

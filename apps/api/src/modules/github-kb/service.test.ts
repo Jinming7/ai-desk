@@ -145,6 +145,22 @@ test("buildDocsComIncludePaths strips non-docs repo metadata patterns", () => {
   assert.equal(includePaths.includes("docs/**/*.md"), true);
   assert.equal(includePaths.includes("open-docs/**/*.mdx"), true);
   assert.equal(includePaths.includes("deploy-docs/**/*.md"), true);
+  assert.equal(includePaths.includes("docs/**/*.yaml"), true);
+  assert.equal(includePaths.includes("open-docs/**/*.json"), true);
+  assert.equal(includePaths.includes("open-docs/**/*.ts"), true);
+});
+
+test("buildDocsComIncludePaths adds structured repository-native coverage inside docs-com roots", () => {
+  const includePaths = buildDocsComIncludePaths("docs/**/*.md,open-docs/**/*.mdx,deploy-docs/**/*.md");
+
+  assert.equal(includePaths.includes("docs/**/*.yaml"), true);
+  assert.equal(includePaths.includes("docs/**/*.json"), true);
+  assert.equal(includePaths.includes("docs/**/*.sql"), true);
+  assert.equal(includePaths.includes("open-docs/**/*.ts"), true);
+  assert.equal(includePaths.includes("open-docs/**/*.tsx"), true);
+  assert.equal(includePaths.includes("deploy-docs/**/*.toml"), true);
+  assert.equal(includePaths.includes("README.md"), false);
+  assert.equal(includePaths.includes("docusaurus.config.ts"), false);
 });
 
 test("resolveRepoProviderKind distinguishes mock, github, and gitlab repository urls", () => {
@@ -657,6 +673,55 @@ test("buildDocsComSourceManifest records included files and machine-readable ski
     ]
   );
   assert.equal(manifest.skippedItems[0].sourceAcquisitionMode, "remote");
+});
+
+test("buildDocsComSourceManifest includes structured docs-com files when canonical include paths are used", () => {
+  const manifest = buildDocsComSourceManifest({
+    sourceMode: "remote",
+    includePaths: buildDocsComIncludePaths("docs/**/*.md,open-docs/**/*.mdx,deploy-docs/**/*.md"),
+    excludePaths: [],
+    files: [
+      {
+        path: "open-docs/docs/openapi/source/app.yaml",
+        sha: "sha-openapi-yaml",
+        contentChecksum: "checksum-openapi-yaml",
+        size: 64,
+        type: "blob"
+      },
+      {
+        path: "open-docs/docs/abilities/events/_category_.json",
+        sha: "sha-category",
+        contentChecksum: "checksum-category",
+        size: 48,
+        type: "blob"
+      },
+      {
+        path: "open-docs/docs/openapi/api/sidebar.ts",
+        sha: "sha-sidebar",
+        contentChecksum: "checksum-sidebar",
+        size: 24,
+        type: "blob"
+      },
+      {
+        path: "docs/setup/getting-started.mdx",
+        sha: "sha-doc",
+        contentChecksum: "checksum-doc",
+        size: 24,
+        type: "blob"
+      }
+    ]
+  });
+
+  assert.deepEqual(
+    manifest.eligibleItems.map((item) => [item.path, item.sourceFamily]),
+    [
+      ["docs/setup/getting-started.mdx", "doc_page"],
+      ["open-docs/docs/abilities/events/_category_.json", "config_file"],
+      ["open-docs/docs/openapi/api/sidebar.ts", "code_file"],
+      ["open-docs/docs/openapi/source/app.yaml", "openapi_spec"]
+    ]
+  );
+  assert.equal(manifest.skippedItems.length, 0);
 });
 
 test("buildDocsComSourceManifest keeps content checksum stable across acquisition modes", () => {

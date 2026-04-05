@@ -2683,6 +2683,201 @@ When callback redirects fail, verify Redirect URI and baseURL deployment wiring 
   }
 });
 
+test("docs-com ensure full persists structured repository-native artifacts inside canonical docs-com roots", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalMirrorEnabled = env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR;
+  env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR = true;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  try {
+    await writeFixture(
+      rootDir,
+      "docs/auth/callback.mdx",
+      `---
+title: "Callback Troubleshooting"
+---
+
+# Callback Troubleshooting
+
+Check Redirect URI, callback address, and baseURL consistency.
+`
+    );
+    await writeFixture(
+      rootDir,
+      "open-docs/docs/openapi/api/execute-onesql.api.mdx",
+      `---
+title: "Execute ONESQL query"
+---
+
+# Execute ONESQL query
+
+ONESQL supports ORDER BY and GROUP BY clauses in POST /onesql/query.
+`
+    );
+    await writeFixture(
+      rootDir,
+      "deploy-docs/troubleshooting/infra/callback-runbook.mdx",
+      `---
+title: "Callback Runbook"
+---
+
+# Callback Runbook
+
+When callback redirects fail, verify Redirect URI and baseURL deployment wiring before retrying.
+`
+    );
+    await writeFixture(
+      rootDir,
+      "open-docs/docs/openapi/source/app.yaml",
+      `openapi: 3.0.1
+info:
+  title: App API
+  version: 1.0.0
+paths:
+  /api/apps:
+    get:
+      operationId: listApps
+      summary: List apps
+      responses:
+        '200':
+          description: ok
+`
+    );
+    await writeFixture(
+      rootDir,
+      "open-docs/docs/abilities/events/_category_.json",
+      JSON.stringify(
+        {
+          label: "Events",
+          position: 3,
+          metadata: {
+            product: "ONES",
+            owner: "docs-team"
+          }
+        },
+        null,
+        2
+      )
+    );
+    await writeFixture(
+      rootDir,
+      "open-docs/docs/openapi/api/sidebar.ts",
+      `export function buildSidebar() {
+  return ["execute-onesql"];
+}
+`
+    );
+
+    const register = await fetch(`${baseUrl}/api/v1/internal/kb/repos/register`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        repoUrl: "mock://BangWork/docs-com",
+        publicBaseUrl: "https://docs.ones.com",
+        defaultBranch: "master",
+        includePaths: ["**/*.md", "**/*.mdx"],
+        excludePaths: [],
+        pollingIntervalSeconds: 60,
+        actor: "test"
+      })
+    });
+    assert.equal(register.status, 201);
+    await register.json();
+
+    const ensure = await fetch(`${baseUrl}/api/v1/internal/kb/docs-com/ensure`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-portal-surface": "internal"
+      },
+      body: JSON.stringify({
+        mode: "full",
+        actor: "test",
+        runLimit: 8
+      })
+    });
+    assert.equal(ensure.status, 202);
+
+    const activeDocsComRegistration = await pool.query<{ id: string }>(
+      `SELECT id
+         FROM kb_repo_registrations
+        WHERE repo_owner = 'docs'
+          AND repo_name = 'docs-com'
+          AND is_active = true
+        ORDER BY updated_at DESC
+        LIMIT 1`
+    );
+    assert.equal(activeDocsComRegistration.rowCount, 1);
+
+    const latestBuild = await pool.query<{ build_version: string; status: string }>(
+      `SELECT build_version, status
+         FROM kb_builds
+        WHERE repo_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [activeDocsComRegistration.rows[0].id]
+    );
+    assert.equal(latestBuild.rowCount, 1);
+    assert.equal(latestBuild.rows[0].status, "validated");
+
+    const artifactSummary = await githubRepo.getBuildArtifactSummary({
+      knowledgeSpace: "support-local",
+      repoId: activeDocsComRegistration.rows[0].id,
+      branch: "master",
+      buildVersion: latestBuild.rows[0].build_version
+    });
+
+    assert.equal(artifactSummary.artifactCountsByFamily.doc_page >= 1, true);
+    assert.equal(artifactSummary.artifactCountsByFamily.runbook_file >= 1, true);
+    assert.equal(artifactSummary.artifactCountsByFamily.openapi_spec >= 2, true);
+    assert.equal(artifactSummary.artifactCountsByFamily.config_file >= 1, true);
+    assert.equal(artifactSummary.artifactCountsByFamily.code_file >= 1, true);
+    assert.equal(artifactSummary.artifactCountsByFamily.openapi_operations >= 1, true);
+    assert.equal(artifactSummary.artifactCountsByFamily.config_surfaces >= 1, true);
+    assert.equal(artifactSummary.artifactCountsByFamily.code_symbols >= 1, true);
+
+    const structuredDocs = await pool.query<{ path: string; family: string }>(
+      `SELECT path, metadata_json->>'sourceFamily' AS family
+         FROM kb_documents
+        WHERE knowledge_space = 'support-local'
+          AND repo_id = $1
+          AND branch = 'master'
+          AND build_version = $2
+          AND path = ANY($3::text[])
+        ORDER BY path`,
+      [
+        activeDocsComRegistration.rows[0].id,
+        latestBuild.rows[0].build_version,
+        [
+          "open-docs/docs/abilities/events/_category_.json",
+          "open-docs/docs/openapi/api/sidebar.ts",
+          "open-docs/docs/openapi/source/app.yaml"
+        ]
+      ]
+    );
+    assert.deepEqual(structuredDocs.rows, [
+      { path: "open-docs/docs/abilities/events/_category_.json", family: "config_file" },
+      { path: "open-docs/docs/openapi/api/sidebar.ts", family: "code_file" },
+      { path: "open-docs/docs/openapi/source/app.yaml", family: "openapi_spec" }
+    ]);
+
+    const publications = await pool.query<{ total: string }>(
+      `SELECT COUNT(*)::text AS total
+         FROM kb_publications
+        WHERE repo_id = $1`,
+      [activeDocsComRegistration.rows[0].id]
+    );
+    assert.equal(publications.rows[0]?.total, "0");
+  } finally {
+    env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR = originalMirrorEnabled;
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("docs-com sync builds memory graph and grounds callback troubleshooting retrieval", async () => {
   const rootDir = await createFixtureRoot();
   const originalMirrorEnabled = env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR;
