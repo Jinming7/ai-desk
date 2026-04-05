@@ -107,6 +107,22 @@ Expected:
 `false`
 and local mirror path not used as an active runtime source.
 
+- [ ] Confirm the live docs-com registration is pinned to the GitLab production source, not the legacy GitHub source.
+Run:
+```bash
+set -a; source .env >/dev/null 2>&1
+psql "$DATABASE_URL" -P pager=off -F $'\t' -Atqc "
+select id, repo_url, repo_owner, repo_name, default_branch, public_base_url, is_active
+from kb_repo_registrations
+where repo_owner='docs' and repo_name='docs-com'
+order by updated_at desc;
+"
+```
+Expected:
+the active registration points to `https://git.ones.pro/docs/docs-com`,
+branch `master`,
+and the public base URL remains `docs.ones.com`.
+
 ### Architecture freeze
 
 - [ ] Re-read these source-of-truth docs before changing behavior:
@@ -315,7 +331,7 @@ one `support-local` publication exists and `kb_serving_versions.active_build_ver
 
 **Outcome:** the build path can ingest the canonical artifact families needed by the support agent.
 
-**Blocking risks addressed:** markdown-only scope, architecture present only in code and schema, no openapi/code/config/schema/test artifacts in live builds.
+**Blocking risks addressed:** markdown-only scope, architecture present only in code and schema, no openapi/code/config/schema/test artifacts in live builds, and retry-time structured artifact conflicts that are hard to observe or repair.
 
 ### Task 2.1: Expand source scope from markdown-only to required repository-native families
 
@@ -364,7 +380,24 @@ npx tsx --test apps/api/src/modules/github-kb/repository-knowledge-builder.test.
 Expected:
 exit `0` with family-specific fixture coverage extended.
 
-### Task 2.3: Prove the live build now has non-zero structured artifacts
+### Task 2.3: Harden structured-artifact identity, observability, and repairability
+
+**Files:**
+- Modify: `apps/api/src/modules/github-kb/repository.ts`
+- Modify: `apps/api/src/modules/github-kb/service.ts`
+- Test: `apps/api/src/tests/github-kb.integration.test.ts`
+
+- [ ] Before the next publication gate, ensure structured artifact upserts are not only retry-safe but also diagnosable.
+Minimum requirements:
+  - natural-key conflict paths are explicit in validation or diagnostics
+  - collision symptoms can be traced back to `build_version + source_doc_id + source artifact identity`
+  - any repair path remains build-scoped and does not require destructive table-wide cleanup
+
+- [ ] Add a focused regression proving same-build retries do not silently corrupt or cross-contaminate other structured artifacts.
+
+- [ ] Add operator-facing verification or SQL probes that can quickly isolate a suspect structured family without touching unrelated build rows.
+
+### Task 2.4: Prove the live build now has non-zero structured artifacts
 
 **Files:**
 - Verify: `apps/api/src/modules/github-kb/repository.ts`
