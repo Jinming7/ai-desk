@@ -1346,7 +1346,7 @@ export async function upsertOpenApiOperation(input: {
       $10,$11,$12,$13::jsonb,$14::jsonb,$15::text[],
       $16::text[],$17::jsonb,$18::jsonb,$19::jsonb
     )
-    ON CONFLICT (id)
+    ON CONFLICT (knowledge_space, repo_id, branch, build_version, method, route_path, operation_id)
     DO UPDATE SET
       knowledge_space = EXCLUDED.knowledge_space,
       repo_id = EXCLUDED.repo_id,
@@ -1424,7 +1424,7 @@ export async function upsertCodeSymbol(input: {
       $9,$10,$11,$12,$13,$14,
       $15,$16,$17,$18::jsonb,$19::jsonb
     )
-    ON CONFLICT (id)
+    ON CONFLICT (knowledge_space, repo_id, branch, build_version, path, qualified_name, start_line, end_line)
     DO UPDATE SET
       knowledge_space = EXCLUDED.knowledge_space,
       repo_id = EXCLUDED.repo_id,
@@ -1499,7 +1499,7 @@ export async function upsertConfigSurface(input: {
       $9,$10,$11,$12,$13::jsonb,
       $14::jsonb,$15::jsonb,$16::jsonb
     )
-    ON CONFLICT (id)
+    ON CONFLICT (knowledge_space, repo_id, branch, build_version, path, normalized_key)
     DO UPDATE SET
       knowledge_space = EXCLUDED.knowledge_space,
       repo_id = EXCLUDED.repo_id,
@@ -1567,7 +1567,7 @@ export async function upsertSchemaObject(input: {
       $9,$10,$11,$12,$13::jsonb,
       $14::jsonb,$15::jsonb
     )
-    ON CONFLICT (id)
+    ON CONFLICT (knowledge_space, repo_id, branch, build_version, path, object_kind, normalized_name)
     DO UPDATE SET
       knowledge_space = EXCLUDED.knowledge_space,
       repo_id = EXCLUDED.repo_id,
@@ -1630,7 +1630,7 @@ export async function upsertTestBehavior(input: {
       $1,$2,$3,$4,$5,$6,$7,$8,
       $9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb
     )
-    ON CONFLICT (id)
+    ON CONFLICT (knowledge_space, repo_id, branch, build_version, path, behavior_key)
     DO UPDATE SET
       knowledge_space = EXCLUDED.knowledge_space,
       repo_id = EXCLUDED.repo_id,
@@ -1700,7 +1700,7 @@ export async function upsertCitationUnit(input: {
       $9,$10::uuid,$11,$12,$13,$14,$15,
       $16::jsonb,$17::jsonb,$18::jsonb,$19::vector,$20,$21
     )
-    ON CONFLICT (id)
+    ON CONFLICT (knowledge_space, repo_id, branch, build_version, citation_key)
     DO UPDATE SET
       knowledge_space = EXCLUDED.knowledge_space,
       repo_id = EXCLUDED.repo_id,

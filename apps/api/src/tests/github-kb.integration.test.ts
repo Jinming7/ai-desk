@@ -223,6 +223,354 @@ test("build artifact summary only counts selected citation embedding targets", a
   });
 });
 
+test("structured artifact upserts reuse natural-key rows when retries generate new ids", async () => {
+  const registration = await createIsolationRegistration();
+  const buildVersion = "build-structured-artifact-natural-key-upsert";
+  const doc = await githubRepo.upsertDocument({
+    repoId: registration.id,
+    knowledgeSpace: "support-local",
+    branch: "main",
+    path: "docs/repository-artifacts.md",
+    buildVersion,
+    title: "Repository Artifacts",
+    sourceUrl: "https://example.com/docs/repository-artifacts",
+    repoSourceUrl: "https://example.com/repo/docs/repository-artifacts.md",
+    publicSourceUrl: "https://example.com/docs/repository-artifacts",
+    commitSha: "mockc2",
+    contentHash: "hash-repository-artifacts",
+    content: "# Repository Artifacts\n",
+    metadata: { sourceFamily: "doc_page" }
+  });
+
+  const scope = ["support-local", registration.id, "main", buildVersion];
+
+  const firstOperation = await githubRepo.upsertOpenApiOperation({
+    id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    path: "open-docs/api/tickets.mdx",
+    method: "GET",
+    routePath: "/api/tickets",
+    operationId: "listTickets",
+    summary: "List tickets",
+    description: "Original operation",
+    requestSchema: {},
+    responseSchema: {},
+    authScopes: ["tickets:read"],
+    tags: ["tickets"],
+    errorShapes: {},
+    sourceLocation: { lineStart: 1, lineEnd: 12 },
+    metadata: { retry: 1 }
+  });
+  const retriedOperation = await githubRepo.upsertOpenApiOperation({
+    id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    path: "open-docs/api/tickets.mdx",
+    method: "GET",
+    routePath: "/api/tickets",
+    operationId: "listTickets",
+    summary: "List tickets updated",
+    description: "Retried operation",
+    requestSchema: {},
+    responseSchema: {},
+    authScopes: ["tickets:read"],
+    tags: ["tickets", "retry"],
+    errorShapes: {},
+    sourceLocation: { lineStart: 1, lineEnd: 18 },
+    metadata: { retry: 2 }
+  });
+  assert.equal(retriedOperation.id, firstOperation.id);
+  const openApiRows = await pool.query<{ count: string; summary: string }>(
+    `SELECT COUNT(*)::text AS count, MAX(summary) AS summary
+     FROM kb_openapi_operations
+     WHERE knowledge_space = $1
+       AND repo_id = $2
+       AND branch = $3
+       AND build_version = $4
+       AND method = 'GET'
+       AND route_path = '/api/tickets'
+       AND operation_id = 'listTickets'`,
+    scope
+  );
+  assert.equal(openApiRows.rows[0].count, "1");
+  assert.equal(openApiRows.rows[0].summary, "List tickets updated");
+
+  const firstSymbol = await githubRepo.upsertCodeSymbol({
+    id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    path: "src/tickets/service.ts",
+    language: "typescript",
+    symbolKind: "function",
+    symbolName: "listTickets",
+    qualifiedName: "TicketService.listTickets",
+    parentSymbol: "TicketService",
+    startLine: 10,
+    endLine: 32,
+    signatureText: "async listTickets(input: ListTicketsInput): Promise<Ticket[]>",
+    docComment: "Lists tickets",
+    bodySummary: "Queries tickets",
+    dependencyRefs: { calls: ["db.ticket.findMany"] },
+    metadata: { retry: 1 }
+  });
+  const retriedSymbol = await githubRepo.upsertCodeSymbol({
+    id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    path: "src/tickets/service.ts",
+    language: "typescript",
+    symbolKind: "function",
+    symbolName: "listTickets",
+    qualifiedName: "TicketService.listTickets",
+    parentSymbol: "TicketService",
+    startLine: 10,
+    endLine: 32,
+    signatureText: "async listTickets(input: ListTicketsInput): Promise<Ticket[]>",
+    docComment: "Lists tickets after retry",
+    bodySummary: "Queries tickets with retry",
+    dependencyRefs: { calls: ["db.ticket.findMany", "trace.retry"] },
+    metadata: { retry: 2 }
+  });
+  assert.equal(retriedSymbol.id, firstSymbol.id);
+  const codeSymbolRows = await pool.query<{ count: string; body_summary: string }>(
+    `SELECT COUNT(*)::text AS count, MAX(body_summary) AS body_summary
+     FROM kb_code_symbols
+     WHERE knowledge_space = $1
+       AND repo_id = $2
+       AND branch = $3
+       AND build_version = $4
+       AND path = 'src/tickets/service.ts'
+       AND qualified_name = 'TicketService.listTickets'
+       AND start_line = 10
+       AND end_line = 32`,
+    scope
+  );
+  assert.equal(codeSymbolRows.rows[0].count, "1");
+  assert.equal(codeSymbolRows.rows[0].body_summary, "Queries tickets with retry");
+
+  const firstConfig = await githubRepo.upsertConfigSurface({
+    id: "cccccccc-cccc-4ccc-8ccc-ccccccccccc1",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    path: "open-docs/config.yaml",
+    configKind: "yaml",
+    configKey: "tickets.cache.enabled",
+    normalizedKey: "tickets.cache.enabled",
+    defaultValue: "false",
+    description: "Ticket cache toggle",
+    requiredFor: { service: ["ticket-api"] },
+    relatedComponents: { services: ["ticket-cache"] },
+    sourceLocation: { lineStart: 4, lineEnd: 7 },
+    metadata: { retry: 1 }
+  });
+  const retriedConfig = await githubRepo.upsertConfigSurface({
+    id: "cccccccc-cccc-4ccc-8ccc-ccccccccccc2",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    path: "open-docs/config.yaml",
+    configKind: "yaml",
+    configKey: "tickets.cache.enabled",
+    normalizedKey: "tickets.cache.enabled",
+    defaultValue: "true",
+    description: "Ticket cache toggle after retry",
+    requiredFor: { service: ["ticket-api", "ticket-worker"] },
+    relatedComponents: { services: ["ticket-cache"] },
+    sourceLocation: { lineStart: 4, lineEnd: 8 },
+    metadata: { retry: 2 }
+  });
+  assert.equal(retriedConfig.id, firstConfig.id);
+  const configRows = await pool.query<{ count: string; description: string }>(
+    `SELECT COUNT(*)::text AS count, MAX(description) AS description
+     FROM kb_config_surfaces
+     WHERE knowledge_space = $1
+       AND repo_id = $2
+       AND branch = $3
+       AND build_version = $4
+       AND path = 'open-docs/config.yaml'
+       AND normalized_key = 'tickets.cache.enabled'`,
+    scope
+  );
+  assert.equal(configRows.rows[0].count, "1");
+  assert.equal(configRows.rows[0].description, "Ticket cache toggle after retry");
+
+  const firstSchema = await githubRepo.upsertSchemaObject({
+    id: "dddddddd-dddd-4ddd-8ddd-ddddddddddd1",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    path: "docs/schema/tickets.sql",
+    objectKind: "table",
+    schemaName: "public",
+    objectName: "tickets",
+    normalizedName: "tickets",
+    definitionSummary: "Tickets table",
+    relatedTables: { tables: ["ticket_comments"] },
+    sourceLocation: { lineStart: 1, lineEnd: 20 },
+    metadata: { retry: 1 }
+  });
+  const retriedSchema = await githubRepo.upsertSchemaObject({
+    id: "dddddddd-dddd-4ddd-8ddd-ddddddddddd2",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    path: "docs/schema/tickets.sql",
+    objectKind: "table",
+    schemaName: "public",
+    objectName: "tickets",
+    normalizedName: "tickets",
+    definitionSummary: "Tickets table after retry",
+    relatedTables: { tables: ["ticket_comments", "ticket_watchers"] },
+    sourceLocation: { lineStart: 1, lineEnd: 22 },
+    metadata: { retry: 2 }
+  });
+  assert.equal(retriedSchema.id, firstSchema.id);
+  const schemaRows = await pool.query<{ count: string; definition_summary: string }>(
+    `SELECT COUNT(*)::text AS count, MAX(definition_summary) AS definition_summary
+     FROM kb_schema_objects
+     WHERE knowledge_space = $1
+       AND repo_id = $2
+       AND branch = $3
+       AND build_version = $4
+       AND path = 'docs/schema/tickets.sql'
+       AND object_kind = 'table'
+       AND normalized_name = 'tickets'`,
+    scope
+  );
+  assert.equal(schemaRows.rows[0].count, "1");
+  assert.equal(schemaRows.rows[0].definition_summary, "Tickets table after retry");
+
+  const firstBehavior = await githubRepo.upsertTestBehavior({
+    id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    path: "tests/tickets/list-tickets.test.ts",
+    behaviorKey: "listTickets_returns_open_items",
+    title: "List tickets returns open items",
+    summary: "Ensures open tickets are returned",
+    assertions: { contains: ["OPEN"] },
+    signals: { suite: "ticket-service" },
+    sourceLocation: { lineStart: 3, lineEnd: 18 },
+    metadata: { retry: 1 }
+  });
+  const retriedBehavior = await githubRepo.upsertTestBehavior({
+    id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    path: "tests/tickets/list-tickets.test.ts",
+    behaviorKey: "listTickets_returns_open_items",
+    title: "List tickets returns open items",
+    summary: "Ensures open tickets are returned after retry",
+    assertions: { contains: ["OPEN", "PENDING"] },
+    signals: { suite: "ticket-service" },
+    sourceLocation: { lineStart: 3, lineEnd: 20 },
+    metadata: { retry: 2 }
+  });
+  assert.equal(retriedBehavior.id, firstBehavior.id);
+  const behaviorRows = await pool.query<{ count: string; summary: string }>(
+    `SELECT COUNT(*)::text AS count, MAX(summary) AS summary
+     FROM kb_test_behaviors
+     WHERE knowledge_space = $1
+       AND repo_id = $2
+       AND branch = $3
+       AND build_version = $4
+       AND path = 'tests/tickets/list-tickets.test.ts'
+       AND behavior_key = 'listTickets_returns_open_items'`,
+    scope
+  );
+  assert.equal(behaviorRows.rows[0].count, "1");
+  assert.equal(behaviorRows.rows[0].summary, "Ensures open tickets are returned after retry");
+
+  const firstCitation = await githubRepo.upsertCitationUnit({
+    id: "ffffffff-ffff-4fff-8fff-fffffffffff1",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    citationFamily: "doc_heading",
+    sourceFamily: "doc_page",
+    sourceArtifactType: "kb_documents",
+    sourceArtifactId: null,
+    citationKey: "repository-artifacts#natural-key",
+    path: "docs/repository-artifacts.md",
+    title: "Natural key",
+    headingPath: "Repository Artifacts > Natural key",
+    snippetText: "Original snippet",
+    sourceLocation: { lineStart: 10, lineEnd: 12 },
+    authority: { authority: "documentation" },
+    metadata: { retry: 1 },
+    embedding: toVectorLiteral([1, 0]),
+    embeddingModel: "model-2d",
+    embeddingVersion: "v1"
+  });
+  const retriedCitation = await githubRepo.upsertCitationUnit({
+    id: "ffffffff-ffff-4fff-8fff-fffffffffff2",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    sourceDocId: doc.id,
+    citationFamily: "doc_heading",
+    sourceFamily: "doc_page",
+    sourceArtifactType: "kb_documents",
+    sourceArtifactId: null,
+    citationKey: "repository-artifacts#natural-key",
+    path: "docs/repository-artifacts.md",
+    title: "Natural key",
+    headingPath: "Repository Artifacts > Natural key",
+    snippetText: "Retried snippet",
+    sourceLocation: { lineStart: 10, lineEnd: 14 },
+    authority: { authority: "documentation" },
+    metadata: { retry: 2 },
+    embedding: toVectorLiteral([0, 1]),
+    embeddingModel: "model-2d",
+    embeddingVersion: "v2"
+  });
+  assert.equal(retriedCitation.id, firstCitation.id);
+  const citationRows = await pool.query<{ count: string; snippet_text: string; embedding_version: string }>(
+    `SELECT COUNT(*)::text AS count, MAX(snippet_text) AS snippet_text, MAX(embedding_version) AS embedding_version
+     FROM kb_citation_units
+     WHERE knowledge_space = $1
+       AND repo_id = $2
+       AND branch = $3
+       AND build_version = $4
+       AND citation_key = 'repository-artifacts#natural-key'`,
+    scope
+  );
+  assert.equal(citationRows.rows[0].count, "1");
+  assert.equal(citationRows.rows[0].snippet_text, "Retried snippet");
+  assert.equal(citationRows.rows[0].embedding_version, "v2");
+});
+
 test("withBuildDocumentMutationLock serializes concurrent mutations for the same build document", async () => {
   const withBuildDocumentMutationLock = (serviceModule as Record<string, unknown>).withBuildDocumentMutationLock as
     | ((
