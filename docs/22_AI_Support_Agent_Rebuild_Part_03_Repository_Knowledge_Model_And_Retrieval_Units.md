@@ -279,6 +279,7 @@ Use cases:
 - request/response schema
 - auth scope
 - operation-specific troubleshooting
+- explicit 4xx/5xx response behavior contracts when the API doc is canonical
 
 ## 6.3 `code_file`
 
@@ -522,6 +523,7 @@ New required artifact family.
 Purpose:
 
 - represent behavior evidence extracted from tests
+- or from explicit behavior contracts embedded in canonical repository-native API docs when executable tests are absent
 
 Examples:
 
@@ -529,8 +531,15 @@ Examples:
 - expected error
 - expected status transition
 - fixture-backed setup requirements
+- explicit `403` / `404` / `500` response contract tabs in canonical OpenAPI MDX pages
 
 This artifact family is lower-authority than docs or canonical API schema, but still useful for behavior confirmation and troubleshooting.
+
+For docs-first repositories:
+
+- `kb_test_behaviors` may be emitted as degraded-quality artifacts from explicit OpenAPI response contracts
+- grounding must still point to the real `openapi_spec` source document
+- do not invent `kb_test_behaviors` from generic prose or troubleshooting paragraphs alone
 
 ## 7.8 `kb_memory_entries`
 
@@ -570,6 +579,12 @@ Parse as structured OpenAPI object.
 Do not treat canonical OpenAPI as plain text first.
 
 The operation object must be extracted before any text chunking happens.
+
+When canonical API docs are represented as MDX components instead of raw YAML/JSON:
+
+- extract `MethodEndpoint`-style method/path metadata before chunking
+- extract explicit response-contract sections before flattening the page
+- these explicit response contracts may ground degraded `kb_test_behaviors` if the repository does not ship canonical executable tests
 
 ## 8.4 Code files
 

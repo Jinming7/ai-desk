@@ -10,11 +10,13 @@ export function buildTestCitations(context: SourceDocumentContext, behaviors: Te
   return behaviors.map((behavior) => {
     const lineStart = Number(behavior.sourceLocation.lineStart ?? 1);
     const lineEnd = Number(behavior.sourceLocation.lineEnd ?? lineStart);
+    const sourceFamily =
+      typeof context.metadata.source_family === "string" ? (context.metadata.source_family as CitationUnitDraft["sourceFamily"]) : "test_file";
     return {
       id: stableUuidFromParts([context.knowledgeSpace, context.repoId, context.branch, context.buildVersion, context.path, behavior.id]),
       sourceDocId: context.docId,
       citationFamily: "test_snippet",
-      sourceFamily: "test_file",
+      sourceFamily,
       sourceArtifactType: "kb_test_behaviors",
       sourceArtifactId: behavior.id,
       citationKey: behavior.id,
@@ -23,7 +25,10 @@ export function buildTestCitations(context: SourceDocumentContext, behaviors: Te
       headingPath: behavior.behaviorKey,
       snippetText: summarizeText(extractBlock(context.content, lineStart, lineEnd) || behavior.summary, 700),
       sourceLocation: behavior.sourceLocation,
-      authority: { authority: "repository_test", behavior_key: behavior.behaviorKey },
+      authority: {
+        authority: sourceFamily === "openapi_spec" ? "repository_openapi_response_contract" : "repository_test",
+        behavior_key: behavior.behaviorKey
+      },
       metadata: { signals: behavior.signals }
     };
   });

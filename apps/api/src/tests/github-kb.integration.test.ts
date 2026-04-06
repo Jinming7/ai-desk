@@ -2830,7 +2830,32 @@ title: "Execute ONESQL query"
 
 # Execute ONESQL query
 
-ONESQL supports ORDER BY and GROUP BY clauses in POST /onesql/query.
+<MethodEndpoint
+  method={"post"}
+  path={"/onesql/query"}
+>
+</MethodEndpoint>
+
+ONESQL supports ORDER BY and GROUP BY clauses.
+
+<TabItem
+  label={"200"}
+  value={"200"}
+>
+  <div>Returns when the query executes successfully.</div>
+</TabItem>
+<TabItem
+  label={"403"}
+  value={"403"}
+>
+  <div>Returns if the scope check fails.</div>
+</TabItem>
+<TabItem
+  label={"500"}
+  value={"500"}
+>
+  <div>Returns when query execution fails unexpectedly.</div>
+</TabItem>
 `
     );
     await writeFixture(
@@ -2943,7 +2968,32 @@ title: "Execute ONESQL query"
 
 # Execute ONESQL query
 
-ONESQL supports ORDER BY and GROUP BY clauses in POST /onesql/query.
+<MethodEndpoint
+  method={"post"}
+  path={"/onesql/query"}
+>
+</MethodEndpoint>
+
+ONESQL supports ORDER BY and GROUP BY clauses.
+
+<TabItem
+  label={"200"}
+  value={"200"}
+>
+  <div>Returns when the query executes successfully.</div>
+</TabItem>
+<TabItem
+  label={"403"}
+  value={"403"}
+>
+  <div>Returns if the scope check fails.</div>
+</TabItem>
+<TabItem
+  label={"500"}
+  value={"500"}
+>
+  <div>Returns when query execution fails unexpectedly.</div>
+</TabItem>
 `
     );
     await writeFixture(
@@ -3084,6 +3134,7 @@ paths:
     assert.equal(artifactSummary.artifactCountsByFamily.config_surfaces >= 1, true);
     assert.equal(artifactSummary.artifactCountsByFamily.code_symbols >= 1, true);
     assert.equal(artifactSummary.artifactCountsByFamily.schema_objects >= 1, true);
+    assert.equal(artifactSummary.artifactCountsByFamily.test_behaviors >= 1, true);
 
     const structuredDocs = await pool.query<{ path: string; family: string }>(
       `SELECT path, metadata_json->>'sourceFamily' AS family

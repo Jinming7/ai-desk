@@ -1,6 +1,6 @@
 import { collapseWhitespace, splitLines, uniqueStrings } from "../knowledge-common.js";
 import { stableUuidFromParts, summarizeText } from "../knowledge-common.js";
-import type { SourceDocumentContext, TestBehaviorDraft } from "../knowledge-model.js";
+import type { OpenApiOperationDraft, SourceDocumentContext, TestBehaviorDraft } from "../knowledge-model.js";
 
 function extractSignalValues(text: string): string[] {
   return uniqueStrings(
@@ -62,4 +62,106 @@ export function parseTestBehaviors(context: SourceDocumentContext): TestBehavior
 
   flush();
   return behaviors;
+}
+
+function normalizeBehaviorKey(input: string): string {
+  return collapseWhitespace(input)
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function sanitizeMdxLine(line: string): string {
+  return collapseWhitespace(
+    line
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\{["'`](.*?)["'`]\}/g, " $1 ")
+      .replace(/\{[^}]+\}/g, " ")
+      .replace(/[<>]/g, " ")
+  );
+}
+
+function collectOpenApiResponseContracts(content: string): Array<{ responseCode: string; lineStart: number; lineEnd: number; summary: string }> {
+  const lines = splitLines(content);
+  const starts: Array<{ responseCode: string; lineStart: number }> = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const matched = /label=\{"([45]\d{2})"\}/.exec(lines[index]);
+    if (matched?.[1]) {
+      starts.push({ responseCode: matched[1], lineStart: index + 1 });
+    }
+  }
+
+  return starts.flatMap((start, index) => {
+    const lineEnd = (starts[index + 1]?.lineStart ?? lines.length + 1) - 1;
+    const block = lines.slice(start.lineStart - 1, lineEnd);
+    const description = summarizeText(
+      collapseWhitespace(
+        block
+          .map((line) => sanitizeMdxLine(line))
+          .filter((line) => {
+            if (!line) return false;
+            if (line === start.responseCode) return false;
+            if (/^(TabItem|MimeTabs|SchemaTabs|SchemaItem|Heading|MethodEndpoint|ResponseSamples)\b/i.test(line)) return false;
+            if (/^(Schema|Example|application\/json|application\/octet-stream)$/i.test(line)) return false;
+            if (/^(label|value|className|schemaType|style|open|children|collapsible|language|responseExample)\s*=/i.test(line)) return false;
+            return /[A-Za-z\u4e00-\u9fa5]/.test(line);
+          })
+          .join(" "),
+      ),
+      280
+    );
+    if (!description) return [];
+    return [{ responseCode: start.responseCode, lineStart: start.lineStart, lineEnd, summary: description }];
+  });
+}
+
+export function parseOpenApiResponseContractBehaviors(
+  context: SourceDocumentContext,
+  openApiOperations: OpenApiOperationDraft[]
+): TestBehaviorDraft[] {
+  if (openApiOperations.length !== 1) return [];
+  const [operation] = openApiOperations;
+  const contracts = collectOpenApiResponseContracts(context.content);
+  return contracts.map((contract) => {
+    const method = operation.method.toUpperCase();
+    const routePath = operation.routePath;
+    const responseCode = contract.responseCode;
+    const title = `${method} ${routePath} returns ${responseCode}`;
+    const summary = summarizeText(
+      collapseWhitespace(`${title}. ${contract.summary}`),
+      320
+    );
+    const behaviorKey = normalizeBehaviorKey(`${method}-${routePath}-${responseCode}`);
+    return {
+      id: stableUuidFromParts([context.knowledgeSpace, context.repoId, context.branch, context.buildVersion, context.path, behaviorKey]),
+      sourceDocId: context.docId,
+      path: context.path,
+      behaviorKey,
+      title,
+      summary,
+      assertions: {
+        contractType: "openapi_response_contract",
+        responseCode,
+        method,
+        routePath
+      },
+      signals: {
+        signals: uniqueStrings(
+          [`http_status:${responseCode}`, method, routePath, ...extractSignalValues(summary)],
+          12
+        )
+      },
+      sourceLocation: { lineStart: contract.lineStart, lineEnd: contract.lineEnd },
+      metadata: {
+        parser: "openapi_response_contract_mdx",
+        degraded_quality: true,
+        productArea: "openapi",
+        docKind: "api_contract",
+        objectType: "response_contract",
+        responseCode,
+        method,
+        routePath
+      }
+    };
+  });
 }

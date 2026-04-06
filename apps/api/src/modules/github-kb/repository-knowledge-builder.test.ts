@@ -151,6 +151,49 @@ test("buildRepositoryKnowledgeArtifacts extracts test behaviors", () => {
   assert.equal(result.memoryEntries.some((item) => item.memory_kind === "behavior_rule"), true);
 });
 
+test("buildRepositoryKnowledgeArtifacts extracts response-contract behaviors from openapi mdx", () => {
+  const result = buildRepositoryKnowledgeArtifacts({
+    ...baseContext,
+    path: "open-docs/docs/openapi/api/list-issues.api.mdx",
+    content: `
+      # Get a list of issues
+
+      <MethodEndpoint
+        method={"get"}
+        path={"/project/issues"}
+      >
+      </MethodEndpoint>
+
+      <TabItem
+        label={"200"}
+        value={"200"}
+      >
+        <div>Returns when the request succeeds.</div>
+      </TabItem>
+      <TabItem
+        label={"403"}
+        value={"403"}
+      >
+        <div>Returns if the scope check fails.</div>
+      </TabItem>
+      <TabItem
+        label={"500"}
+        value={"500"}
+      >
+        <div>Returns when the server fails unexpectedly.</div>
+      </TabItem>
+    `
+  });
+
+  assert.equal(result.classification.sourceFamily, "openapi_spec");
+  assert.equal(result.openApiOperations.length, 1);
+  assert.equal(result.testBehaviors.length, 2);
+  assert.equal(result.testBehaviors.some((item) => item.behaviorKey.includes("403")), true);
+  assert.equal(result.testBehaviors.some((item) => item.behaviorKey.includes("500")), true);
+  assert.equal(result.citationUnits.some((item) => item.citationFamily === "test_snippet" && item.sourceFamily === "openapi_spec"), true);
+  assert.equal(result.memoryEntries.some((item) => item.memory_kind === "behavior_rule"), true);
+});
+
 test("document retrieval units always keep grounded citation mappings", () => {
   const sections = [
     {

@@ -4,7 +4,7 @@ import { parseOpenApiOperations } from "../parsers/openapi-parser.js";
 import { parseCodeSymbols } from "../parsers/code-parser.js";
 import { parseConfigSurfaces } from "../parsers/config-parser.js";
 import { parseSchemaObjects } from "../parsers/schema-parser.js";
-import { parseTestBehaviors } from "../parsers/test-parser.js";
+import { parseOpenApiResponseContractBehaviors, parseTestBehaviors } from "../parsers/test-parser.js";
 import { classifySourceFamily } from "../parsers/source-classifier.js";
 import { buildOpenApiCitations, buildOpenApiRetrievalUnits } from "./openapi-builder.js";
 import { buildCodeSymbolCitations } from "../chunkers/code-span-builder.js";
@@ -38,7 +38,12 @@ export function buildRepositoryKnowledgeArtifacts(context: SourceDocumentContext
     classification.sourceFamily === "config_file"
       ? parseSchemaObjects(groundedContext)
       : [];
-  const testBehaviors = classification.sourceFamily === "test_file" ? parseTestBehaviors(context) : [];
+  const testBehaviors =
+    classification.sourceFamily === "test_file"
+      ? parseTestBehaviors(context)
+      : classification.sourceFamily === "openapi_spec"
+      ? parseOpenApiResponseContractBehaviors(groundedContext, openApiOperations)
+      : [];
 
   const citationUnits = [
     ...buildOpenApiCitations(groundedContext, openApiOperations),

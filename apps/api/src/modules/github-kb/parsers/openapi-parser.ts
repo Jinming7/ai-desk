@@ -212,6 +212,20 @@ function parseOperationsFromYamlFallback(context: SourceDocumentContext, content
   return operations;
 }
 
+function parseMethodEndpointComponent(content: string): { method: string; routePath: string } | null {
+  const matched =
+    /<MethodEndpoint[\s\S]*?method=\{["'`](get|post|put|patch|delete|head|options)["'`]\}[\s\S]*?path=\{["'`]([^"'`]+)["'`]\}/i.exec(content) ||
+    /<MethodEndpoint[\s\S]*?path=\{["'`]([^"'`]+)["'`]\}[\s\S]*?method=\{["'`](get|post|put|patch|delete|head|options)["'`]\}/i.exec(content);
+  if (!matched) return null;
+  if (matched.length >= 3 && /^(get|post|put|patch|delete|head|options)$/i.test(matched[1] ?? "")) {
+    return { method: matched[1], routePath: matched[2] };
+  }
+  if (matched.length >= 3) {
+    return { method: matched[2], routePath: matched[1] };
+  }
+  return null;
+}
+
 export function parseOpenApiOperations(context: SourceDocumentContext): OpenApiOperationDraft[] {
   const structured =
     decodeEmbeddedOpenApiBlob(context.content) ||
@@ -223,6 +237,20 @@ export function parseOpenApiOperations(context: SourceDocumentContext): OpenApiO
 
   const yamlFallback = parseOperationsFromYamlFallback(context, context.content);
   if (yamlFallback.length) return yamlFallback;
+
+  const methodEndpoint = parseMethodEndpointComponent(context.content);
+  if (methodEndpoint) {
+    return [
+      buildOperationDraft(context, {
+        method: methodEndpoint.method,
+        routePath: methodEndpoint.routePath,
+        summary: summarizeText(context.title, 120),
+        description: summarizeText(collapseWhitespace(context.content), 320),
+        sourceLocation: { routePath: methodEndpoint.routePath, method: methodEndpoint.method.toUpperCase() },
+        metadata: { parser: "mdx_method_endpoint", degraded_quality: true }
+      })
+    ];
+  }
 
   const method = /(^|\n)\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+([/A-Za-z0-9_{}:.-]+)/i.exec(context.content);
   if (!method) return [];

@@ -26,6 +26,12 @@ Current verified state on April 6, 2026:
   `kb_test_behaviors=0`
 - preview rollback target is still absent for the bootstrap publication
 
+Current branch-state update:
+
+- schema-bearing config/object-definition files are now extracted into `kb_schema_objects` in code
+- canonical OpenAPI MDX response contracts are now extracted into degraded but grounded `kb_test_behaviors` in code
+- shared DB still requires one fresh validated build and one safe promotion step to materialize those code-path improvements into the published snapshot
+
 This means the KB substrate and non-prod publication path are no longer the primary blocker.
 
 The next blocker is repository-native artifact completeness.
