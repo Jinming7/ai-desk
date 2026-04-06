@@ -8,6 +8,7 @@ import { env, isSafeTestDatabaseUrl } from "../config/env.js";
 import { buildRolloutDecision, compareShadowObservations } from "../modules/ai/release/service.js";
 import * as githubRepo from "../modules/github-kb/repository.js";
 import { buildKbRollbackRunbook, previewKbPromotion } from "../modules/github-kb/release/service.js";
+import { promoteValidatedBuild } from "../modules/github-kb/service.js";
 import { formatLocalDbBlockedMessage, probeLocalDbReadiness } from "./helpers/local-db-readiness.js";
 
 const originalHybridRetrievalFlag = env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL;
@@ -118,6 +119,32 @@ async function seedPublishedScope() {
     activeHead: currentBuild.target_head
   });
   return { registration, previousBuild, currentBuild };
+}
+
+async function seedBuildDocument(input: {
+  repoId: string;
+  knowledgeSpace: "support-prod" | "support-preview" | "support-local" | "support-shadow" | "support-eval";
+  buildVersion: string;
+  targetHead: string;
+  path: string;
+  title: string;
+  content: string;
+}) {
+  return githubRepo.upsertDocument({
+    repoId: input.repoId,
+    knowledgeSpace: input.knowledgeSpace,
+    branch: "main",
+    path: input.path,
+    buildVersion: input.buildVersion,
+    title: input.title,
+    sourceUrl: `https://example.test/${input.path}`,
+    repoSourceUrl: `https://example.test/repo/${input.path}`,
+    publicSourceUrl: null,
+    commitSha: input.targetHead,
+    contentHash: `${input.buildVersion}:${input.path}`,
+    content: input.content,
+    metadata: { sourceFamily: "doc_page" }
+  });
 }
 
 async function requestJson(pathname: string, options: RequestInit = {}) {
@@ -485,6 +512,57 @@ test("previewKbPromotion allows explicit operator override for isolated shadow p
   });
 });
 
+test("previewKbPromotion evaluates cross-scope bootstrap against the target scope", async (t) => {
+  await withDbHarness(t, async () => {
+    const registration = await createRegistration();
+    const localCurrent = await createBuild({
+      repoId: registration.id,
+      knowledgeSpace: "support-local",
+      buildVersion: "build-local-current",
+      targetHead: "sha-local-current",
+      status: "published"
+    });
+    const candidateBuild = await createBuild({
+      repoId: registration.id,
+      knowledgeSpace: "support-local",
+      buildVersion: "build-local-promote",
+      targetHead: "sha-local-promote",
+      status: "validated"
+    });
+
+    await githubRepo.upsertPublication({
+      knowledgeSpace: "support-local",
+      repoId: registration.id,
+      branch: "main",
+      publishedBuildVersion: localCurrent.build_version,
+      publishedHead: localCurrent.target_head,
+      publishedBy: "test",
+      publishedFromEnv: "local"
+    });
+
+    const result = (await previewKbPromotion({
+      buildId: candidateBuild.id,
+      actor: "internal_operator",
+      evaluationRecorded: true,
+      shadowValidationStable: true,
+      rollbackReviewed: true,
+      operatorOverride: true,
+      ...({ targetKnowledgeSpace: "support-preview" } as Record<string, unknown>)
+    } as Parameters<typeof previewKbPromotion>[0])) as Awaited<ReturnType<typeof previewKbPromotion>> & {
+      targetKnowledgeSpace?: string;
+      action: { body: Record<string, unknown> };
+    };
+
+    assert.equal(result.eligible, true);
+    assert.equal(result.requestedFromEnv, "operator");
+    assert.equal(result.targetKnowledgeSpace, "support-preview");
+    assert.equal(result.currentPublication, null);
+    assert.equal(result.rollbackTarget, null);
+    assert.equal(result.action.body.targetKnowledgeSpace, "support-preview");
+    assert.equal(result.action.body.operatorOverride, true);
+  });
+});
+
 test("internal publication promote allows explicit operator override for support-shadow", async (t) => {
   await withDbHarness(t, async ({ baseUrl }) => {
     const registration = await createRegistration();
@@ -537,6 +615,78 @@ test("internal publication promote allows explicit operator override for support
     assert.equal(publication?.published_from_env, "operator");
     assert.equal(serving?.active_build_version, candidateBuild.build_version);
     assert.equal(updatedBuild?.status, "published");
+  });
+});
+
+test("internal release status reports effective artifact diagnostics for a promoted preview alias build", async (t) => {
+  await withDbHarness(t, async ({ baseUrl }) => {
+    const registration = await createRegistration();
+    const sourceBuild = await createBuild({
+      repoId: registration.id,
+      knowledgeSpace: "support-local",
+      buildVersion: "build-local-diagnostics",
+      targetHead: "sha-local-diagnostics",
+      status: "validated"
+    });
+
+    await seedBuildDocument({
+      repoId: registration.id,
+      knowledgeSpace: "support-local",
+      buildVersion: sourceBuild.build_version,
+      targetHead: sourceBuild.target_head,
+      path: "docs/promotion-diagnostics.md",
+      title: "Promotion Diagnostics",
+      content: "# Promotion Diagnostics\n\nPreview should reuse local artifact diagnostics."
+    });
+
+    await promoteValidatedBuild({
+      buildId: sourceBuild.id,
+      actor: "internal_operator",
+      operatorOverride: true,
+      ...({ targetKnowledgeSpace: "support-preview" } as Record<string, unknown>)
+    } as Parameters<typeof promoteValidatedBuild>[0]);
+
+    const response = await requestJson(
+      `${baseUrl}/api/v1/internal/kb/release/status?repoId=${registration.id}&branch=main&knowledgeSpace=support-preview&includeBuildDetails=true`,
+      {
+        headers: {
+          authorization: "Bearer ",
+          "x-portal-surface": "internal"
+        }
+      }
+    );
+
+    assert.equal(response.status, 200);
+    const result = response.json as {
+      result: {
+        scopes: Array<{
+          knowledgeSpace: string;
+          publication: { publishedBuildVersion: string } | null;
+          diagnostics:
+            | {
+                validationSnapshot: { totalDocuments: number };
+                artifactSummary: { artifactCountsByFamily: Record<string, number> };
+              }
+            | null;
+        }>;
+      };
+    };
+    const previewScope = result.result.scopes.find((scope) => scope.knowledgeSpace === "support-preview");
+    assert.ok(previewScope);
+    assert.equal(previewScope.publication?.publishedBuildVersion, sourceBuild.build_version);
+    assert.equal(previewScope.diagnostics?.validationSnapshot.totalDocuments, 1);
+    assert.equal(previewScope.diagnostics?.artifactSummary.artifactCountsByFamily.doc_page, 1);
+
+    const previewDocs = await pool.query<{ total: string }>(
+      `SELECT COUNT(*)::text AS total
+         FROM kb_documents
+        WHERE knowledge_space = 'support-preview'
+          AND repo_id = $1
+          AND branch = 'main'
+          AND build_version = $2`,
+      [registration.id, sourceBuild.build_version]
+    );
+    assert.equal(previewDocs.rows[0]?.total, "0");
   });
 });
 

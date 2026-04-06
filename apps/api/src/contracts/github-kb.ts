@@ -64,7 +64,8 @@ export const kbBuildsIncrementalSchema = z.object({
 export const kbPublicationPromoteSchema = z.object({
   buildId: z.string().uuid(),
   actor: z.string().min(1).default("internal_operator"),
-  operatorOverride: z.coerce.boolean().default(false)
+  operatorOverride: z.coerce.boolean().default(false),
+  targetKnowledgeSpace: kbKnowledgeSpaceSchema.optional()
 });
 
 export const kbPublicationStatusQuerySchema = z.object({

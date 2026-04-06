@@ -177,6 +177,21 @@ export async function countDocumentsByPathPrefixes(input: {
   const branch = input.branch?.trim() || null;
   const knowledgeSpace = normalizeKnowledgeSpace(input.knowledgeSpace);
   const buildVersion = input.buildVersion?.trim() || null;
+  const effectiveBuild =
+    buildVersion && branch
+      ? (
+          await resolveEffectiveBuildByVersion({
+            knowledgeSpace,
+            repoId: input.repoId,
+            branch,
+            buildVersion
+          })
+        ).effectiveBuild
+      : branch
+        ? (await resolveEffectivePublicationBuild({ knowledgeSpace, repoId: input.repoId, branch })).effectiveBuild
+        : null;
+  const effectiveKnowledgeSpace = effectiveBuild?.knowledge_space ?? knowledgeSpace;
+  const effectiveBuildVersion = effectiveBuild?.build_version ?? buildVersion;
   const result = await pool.query<{ prefix: string; total: string; active: string }>(
     `WITH prefixes(prefix) AS (
        SELECT UNNEST($3::text[])
@@ -203,11 +218,11 @@ export async function countDocumentsByPathPrefixes(input: {
               AND pub.branch = doc.branch
               AND pub.published_build_version = doc.build_version
           )
-        )
-      )
+         )
+       )
      GROUP BY prefixes.prefix
      ORDER BY prefixes.prefix`,
-    [input.repoId, branch, prefixes, knowledgeSpace, buildVersion]
+    [input.repoId, branch, prefixes, effectiveKnowledgeSpace, effectiveBuildVersion]
   );
 
   return result.rows.map((row) => ({
@@ -227,6 +242,59 @@ export async function getBuildById(buildId: string): Promise<KbBuild | null> {
   return result.rows[0] ?? null;
 }
 
+async function resolveMaterializedBuild(build: KbBuild | null): Promise<KbBuild | null> {
+  let current = build;
+  const visited = new Set<string>();
+  while (current?.promoted_from_build_id) {
+    if (visited.has(current.id)) break;
+    visited.add(current.id);
+    const sourceBuild = await getBuildById(current.promoted_from_build_id);
+    if (!sourceBuild) break;
+    current = sourceBuild;
+  }
+  return current;
+}
+
+async function resolveEffectiveBuildByVersion(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  buildVersion: string;
+}): Promise<{ build: KbBuild | null; effectiveBuild: KbBuild | null }> {
+  const build = await getBuildByVersion(input);
+  return {
+    build,
+    effectiveBuild: await resolveMaterializedBuild(build)
+  };
+}
+
+async function resolveEffectivePublicationBuild(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+}): Promise<{ publication: KbPublication | null; build: KbBuild | null; effectiveBuild: KbBuild | null }> {
+  const publication = await getPublication(input);
+  if (!publication) {
+    return {
+      publication: null,
+      build: null,
+      effectiveBuild: null
+    };
+  }
+
+  const build = await getBuildByVersion({
+    knowledgeSpace: input.knowledgeSpace,
+    repoId: input.repoId,
+    branch: input.branch,
+    buildVersion: publication.published_build_version
+  });
+  return {
+    publication,
+    build,
+    effectiveBuild: await resolveMaterializedBuild(build)
+  };
+}
+
 export async function getBuildByVersion(input: {
   knowledgeSpace: KbKnowledgeSpace;
   repoId: string;
@@ -244,6 +312,53 @@ export async function getBuildByVersion(input: {
     [input.knowledgeSpace, input.repoId, input.branch, input.buildVersion]
   );
   return result.rows[0] ?? null;
+}
+
+export async function upsertPromotedBuildAlias(input: {
+  targetKnowledgeSpace: KbKnowledgeSpace;
+  sourceBuild: KbBuild;
+  requestedBy: string;
+  requestedFromEnv: KbRequestedFromEnv;
+}): Promise<KbBuild> {
+  const result = await pool.query<KbBuild>(
+    `INSERT INTO kb_builds (
+      id, knowledge_space, repo_id, branch, build_version, promoted_from_build_id, target_head, build_kind,
+      requested_by, requested_from_env, status, source_snapshot_total, validation_passed, validation_summary_json,
+      started_at, finished_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'validated',$11,$12,$13::jsonb,NOW(),NOW())
+    ON CONFLICT (knowledge_space, repo_id, branch, build_version)
+    DO UPDATE SET
+      promoted_from_build_id = EXCLUDED.promoted_from_build_id,
+      target_head = EXCLUDED.target_head,
+      build_kind = EXCLUDED.build_kind,
+      requested_by = EXCLUDED.requested_by,
+      requested_from_env = EXCLUDED.requested_from_env,
+      status = CASE WHEN kb_builds.status = 'published' THEN kb_builds.status ELSE 'validated' END,
+      source_snapshot_total = GREATEST(kb_builds.source_snapshot_total, EXCLUDED.source_snapshot_total),
+      validation_passed = EXCLUDED.validation_passed,
+      validation_summary_json = EXCLUDED.validation_summary_json,
+      error_message = NULL,
+      started_at = COALESCE(kb_builds.started_at, NOW()),
+      finished_at = CASE WHEN kb_builds.status = 'published' THEN kb_builds.finished_at ELSE NOW() END,
+      updated_at = NOW()
+    RETURNING *`,
+    [
+      uuidv4(),
+      input.targetKnowledgeSpace,
+      input.sourceBuild.repo_id,
+      input.sourceBuild.branch,
+      input.sourceBuild.build_version,
+      input.sourceBuild.id,
+      input.sourceBuild.target_head,
+      input.sourceBuild.build_kind,
+      input.requestedBy,
+      input.requestedFromEnv,
+      Math.max(0, input.sourceBuild.source_snapshot_total ?? 0),
+      input.sourceBuild.validation_passed,
+      toJson(input.sourceBuild.validation_summary_json ?? {})
+    ]
+  );
+  return result.rows[0];
 }
 
 export async function listRecentBuildsForScope(input: {
@@ -411,12 +526,14 @@ export async function replaceBuildValidationResults(input: {
 }
 
 export async function listBuildValidationResults(buildId: string): Promise<KbBuildValidationResult[]> {
+  const build = await getBuildById(buildId);
+  const validationBuildId = build?.promoted_from_build_id ?? buildId;
   const result = await pool.query<KbBuildValidationResult>(
     `SELECT *
      FROM kb_build_validation_results
      WHERE build_id = $1
      ORDER BY created_at ASC`,
-    [buildId]
+    [validationBuildId]
   );
   return result.rows;
 }
@@ -581,6 +698,9 @@ export async function getBuildValidationSnapshot(input: {
   totalChunks: number;
   totalMemoryEntries: number;
 }> {
+  const { effectiveBuild } = await resolveEffectiveBuildByVersion(input);
+  const effectiveKnowledgeSpace = effectiveBuild?.knowledge_space ?? input.knowledgeSpace;
+  const effectiveBuildVersion = effectiveBuild?.build_version ?? input.buildVersion;
   const result = await pool.query<{
     duplicate_paths: string;
     orphan_chunks: string;
@@ -665,7 +785,7 @@ export async function getBuildValidationSnapshot(input: {
            AND branch = $3
            AND build_version = $4
        ) AS total_memory_entries`,
-    [input.knowledgeSpace, input.repoId, input.branch, input.buildVersion]
+    [effectiveKnowledgeSpace, input.repoId, input.branch, effectiveBuildVersion]
   );
   const row = result.rows[0];
   return {
@@ -696,6 +816,9 @@ export async function getBuildArtifactSummary(input: {
     citationEmbeddings: { total: number; ready: number; missing: number };
   };
 }> {
+  const { effectiveBuild } = await resolveEffectiveBuildByVersion(input);
+  const effectiveKnowledgeSpace = effectiveBuild?.knowledge_space ?? input.knowledgeSpace;
+  const effectiveBuildVersion = effectiveBuild?.build_version ?? input.buildVersion;
   const docRows = await pool.query<{ family: string | null; total: string; degraded: string }>(
     `SELECT
        NULLIF(metadata_json->>'sourceFamily', '') AS family,
@@ -707,7 +830,7 @@ export async function getBuildArtifactSummary(input: {
        AND branch = $3
        AND build_version = $4
      GROUP BY NULLIF(metadata_json->>'sourceFamily', '')`,
-    [input.knowledgeSpace, input.repoId, input.branch, input.buildVersion]
+    [effectiveKnowledgeSpace, input.repoId, input.branch, effectiveBuildVersion]
   );
 
   const counts = {
@@ -757,7 +880,7 @@ export async function getBuildArtifactSummary(input: {
        (SELECT COUNT(*)::text FROM kb_citation_units WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS citation_units,
        (SELECT COUNT(*)::text FROM kb_chunks WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS chunks,
        (SELECT COUNT(*)::text FROM kb_memory_entries WHERE knowledge_space = $1 AND repo_id = $2 AND branch = $3 AND build_version = $4) AS memory_entries`,
-    [input.knowledgeSpace, input.repoId, input.branch, input.buildVersion]
+    [effectiveKnowledgeSpace, input.repoId, input.branch, effectiveBuildVersion]
   );
 
   const scalar = scalarCounts.rows[0];
@@ -794,7 +917,7 @@ export async function getBuildArtifactSummary(input: {
            AND build_version = $4
            AND COALESCE(metadata_json->>'embeddingTarget', 'disabled') = 'selected'
            AND embedding IS NOT NULL) AS citation_ready`,
-    [input.knowledgeSpace, input.repoId, input.branch, input.buildVersion]
+    [effectiveKnowledgeSpace, input.repoId, input.branch, effectiveBuildVersion]
   );
   const embeddings = embeddingCounts.rows[0];
   const chunkTotal = Number(embeddings?.chunk_total ?? "0");
@@ -1766,6 +1889,18 @@ function buildWhereClause(filters: { repoId?: string; branch?: string; knowledge
   return { clause: parts.join(" AND "), values };
 }
 
+const EFFECTIVE_PUBLISHED_BUILD_JOIN = `
+     INNER JOIN kb_builds published_build
+       ON published_build.knowledge_space = pub.knowledge_space
+      AND published_build.repo_id = pub.repo_id
+      AND published_build.branch = pub.branch
+      AND published_build.build_version = pub.published_build_version
+     LEFT JOIN kb_builds effective_build
+       ON effective_build.id = published_build.promoted_from_build_id`;
+
+const EFFECTIVE_BUILD_SPACE_SQL = `COALESCE(effective_build.knowledge_space, published_build.knowledge_space)`;
+const EFFECTIVE_BUILD_VERSION_SQL = `COALESCE(effective_build.build_version, published_build.build_version)`;
+
 export async function searchVectorCandidates(input: {
   knowledgeSpace: KbKnowledgeSpace;
   repoId?: string;
@@ -1820,11 +1955,12 @@ export async function searchVectorCandidates(input: {
      INNER JOIN kb_publications pub
        ON pub.repo_id = chunk.repo_id
       AND pub.branch = chunk.branch
+     ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
      WHERE ${where.clause || "TRUE"}
-       AND chunk.knowledge_space = pub.knowledge_space
-       AND doc.knowledge_space = pub.knowledge_space
-       AND chunk.build_version = pub.published_build_version
-       AND doc.build_version = pub.published_build_version
+       AND chunk.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+       AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+       AND chunk.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+       AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
        AND chunk.embedding IS NOT NULL
        ${embeddingModelFilter}
      ORDER BY chunk.embedding <=> $${vectorParam}::vector
@@ -1973,11 +2109,12 @@ export async function searchKeywordCandidates(input: {
      INNER JOIN kb_publications pub
        ON pub.repo_id = chunk.repo_id
       AND pub.branch = chunk.branch
+     ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
      WHERE ${where.clause || "TRUE"}
-      AND chunk.knowledge_space = pub.knowledge_space
-      AND doc.knowledge_space = pub.knowledge_space
-      AND chunk.build_version = pub.published_build_version
-      AND doc.build_version = pub.published_build_version
+      AND chunk.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+      AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+      AND chunk.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+      AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
       AND (
          ${hasCjk ? "FALSE" : `chunk.search_vector @@ websearch_to_tsquery('english', $${queryParam ?? 0})`}
          OR (${tokenOr})
@@ -2076,10 +2213,11 @@ export async function listCandidateDocumentsForFallback(input: {
      INNER JOIN kb_publications pub
        ON pub.repo_id = doc.repo_id
       AND pub.branch = doc.branch
+     ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
      WHERE ${conditions.length ? conditions.join(" AND ") : "TRUE"}
        AND pub.knowledge_space = $${limitParam + 1}
-       AND doc.knowledge_space = pub.knowledge_space
-       AND doc.build_version = pub.published_build_version
+       AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+       AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
        AND (${tokenOr})
      ORDER BY (${tokenScore}) DESC, doc.updated_at DESC
      LIMIT $${limitParam}`,
@@ -2206,11 +2344,12 @@ export async function searchStructuredArtifactCandidates(input: {
       INNER JOIN kb_documents doc ON doc.id = op.source_doc_id
       INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
       INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
       WHERE ${conditions.join(" AND ")}
-        AND op.knowledge_space = pub.knowledge_space
-        AND doc.knowledge_space = pub.knowledge_space
-        AND op.build_version = pub.published_build_version
-        AND doc.build_version = pub.published_build_version
+        AND op.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND op.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+        AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
         AND (
           op.method = ANY($${exactParam}::text[])
           OR op.route_path = ANY($${exactParam}::text[])
@@ -2253,11 +2392,12 @@ export async function searchStructuredArtifactCandidates(input: {
       INNER JOIN kb_documents doc ON doc.id = cfg.source_doc_id
       INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
       INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
       WHERE ${conditions.join(" AND ")}
-        AND cfg.knowledge_space = pub.knowledge_space
-        AND doc.knowledge_space = pub.knowledge_space
-        AND cfg.build_version = pub.published_build_version
-        AND doc.build_version = pub.published_build_version
+        AND cfg.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND cfg.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+        AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
         AND (
           cfg.normalized_key = ANY($${exactParam}::text[])
           OR cfg.config_key = ANY($${exactParam}::text[])
@@ -2299,11 +2439,12 @@ export async function searchStructuredArtifactCandidates(input: {
       INNER JOIN kb_documents doc ON doc.id = sym.source_doc_id
       INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
       INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
       WHERE ${conditions.join(" AND ")}
-        AND sym.knowledge_space = pub.knowledge_space
-        AND doc.knowledge_space = pub.knowledge_space
-        AND sym.build_version = pub.published_build_version
-        AND doc.build_version = pub.published_build_version
+        AND sym.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND sym.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+        AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
         AND (
           sym.symbol_name = ANY($${exactParam}::text[])
           OR sym.qualified_name = ANY($${exactParam}::text[])
@@ -2344,11 +2485,12 @@ export async function searchStructuredArtifactCandidates(input: {
       INNER JOIN kb_documents doc ON doc.id = sch.source_doc_id
       INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
       INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
       WHERE ${conditions.join(" AND ")}
-        AND sch.knowledge_space = pub.knowledge_space
-        AND doc.knowledge_space = pub.knowledge_space
-        AND sch.build_version = pub.published_build_version
-        AND doc.build_version = pub.published_build_version
+        AND sch.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND sch.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+        AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
         AND (
           sch.normalized_name = ANY($${exactParam}::text[])
           OR sch.object_name = ANY($${exactParam}::text[])
@@ -2390,11 +2532,12 @@ export async function searchStructuredArtifactCandidates(input: {
       INNER JOIN kb_documents doc ON doc.id = beh.source_doc_id
       INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
       INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
       WHERE ${conditions.join(" AND ")}
-        AND beh.knowledge_space = pub.knowledge_space
-        AND doc.knowledge_space = pub.knowledge_space
-        AND beh.build_version = pub.published_build_version
-        AND doc.build_version = pub.published_build_version
+        AND beh.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND beh.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+        AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
         AND (
           beh.behavior_key = ANY($${exactParam}::text[])
           OR beh.title = ANY($${exactParam}::text[])
@@ -2485,7 +2628,7 @@ export async function resolveArtifactCitations(input: {
         cu.heading_path,
         cu.snippet_text AS snippet,
         cu.build_version,
-        cu.knowledge_space,
+        pub.knowledge_space,
         cu.citation_family,
         cu.source_family,
         cu.metadata_json AS citation_metadata_json,
@@ -2495,12 +2638,13 @@ export async function resolveArtifactCitations(input: {
       INNER JOIN kb_documents doc ON doc.id = cu.source_doc_id
       INNER JOIN kb_repo_registrations reg ON reg.id = doc.repo_id
       INNER JOIN kb_publications pub ON pub.repo_id = doc.repo_id AND pub.branch = doc.branch
+      ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
       WHERE cu.source_artifact_id::text = ANY($1::text[])
         AND pub.knowledge_space = $2
-        AND cu.knowledge_space = pub.knowledge_space
-        AND doc.knowledge_space = pub.knowledge_space
-        AND cu.build_version = pub.published_build_version
-        AND doc.build_version = pub.published_build_version
+        AND cu.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND cu.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+        AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
     )
     SELECT * FROM ranked WHERE rn <= $3`,
     [artifactIds, input.knowledgeSpace, input.limitPerArtifact]
@@ -2521,12 +2665,13 @@ export async function getDocumentByPath(
      INNER JOIN kb_publications pub
        ON pub.repo_id = doc.repo_id
       AND pub.branch = doc.branch
+     ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
      WHERE doc.repo_id = $1
        AND doc.branch = $2
        AND doc.path = $3
        AND pub.knowledge_space = $4
-       AND doc.knowledge_space = pub.knowledge_space
-       AND doc.build_version = pub.published_build_version
+       AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+       AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
      ORDER BY doc.updated_at DESC
      LIMIT 1`,
     [repoId, branch, path, knowledgeSpace]

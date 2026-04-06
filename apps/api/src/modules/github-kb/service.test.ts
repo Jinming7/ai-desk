@@ -455,6 +455,7 @@ function buildRecord(overrides: Partial<KbBuild> = {}): KbBuild {
     repo_id: "repo-1",
     branch: "main",
     build_version: "shared-head:exec-1",
+    promoted_from_build_id: null,
     target_head: "shared-head",
     build_kind: "full",
     requested_by: "manual",

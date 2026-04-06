@@ -353,6 +353,7 @@ export interface KbBuild {
   repo_id: string;
   branch: string;
   build_version: string;
+  promoted_from_build_id: string | null;
   target_head: string;
   build_kind: KbBuildKind;
   requested_by: string;

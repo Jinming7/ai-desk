@@ -16,6 +16,7 @@ export const kbPromotionDryRunSchema = z.object({
   buildId: z.string().uuid(),
   actor: z.string().min(1).default("internal_operator"),
   operatorOverride: z.coerce.boolean().default(false),
+  targetKnowledgeSpace: kbKnowledgeSpaceSchema.optional(),
   evaluationRecorded: z.coerce.boolean().default(false),
   shadowValidationStable: z.coerce.boolean().default(false),
   rollbackReviewed: z.coerce.boolean().default(false)

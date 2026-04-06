@@ -3790,14 +3790,23 @@ export async function promoteValidatedBuild(input: {
   buildId: string;
   actor: string;
   operatorOverride?: boolean;
+  targetKnowledgeSpace?: KbKnowledgeSpace;
 }): Promise<{
   build: KbBuild;
   publication: Awaited<ReturnType<typeof repo.getPublication>>;
 }> {
   const build = await repo.getBuildById(input.buildId);
   if (!build) throw new Error(`Build not found: ${input.buildId}`);
+  const targetKnowledgeSpace = input.targetKnowledgeSpace ?? build.knowledge_space;
+  const isCrossScopePromotion = targetKnowledgeSpace !== build.knowledge_space;
+  if (isCrossScopePromotion && !input.operatorOverride) {
+    throw new Error(`Cross-space promotion from ${build.knowledge_space} to ${targetKnowledgeSpace} requires operator override`);
+  }
+  if (build.status !== "validated" && build.status !== "published") {
+    throw new Error(`Build ${build.build_version} is not promotion-ready from status ${build.status}`);
+  }
   const registration = await repo.getRepoRegistrationById(build.repo_id);
-  const requestedFromEnv = resolveRequestedFromEnvForOperation(Boolean(input.operatorOverride));
+  const requestedFromEnv = isCrossScopePromotion ? "operator" : resolveRequestedFromEnvForOperation(Boolean(input.operatorOverride));
   const validation = await validateBuildForPublication({
     knowledgeSpace: build.knowledge_space,
     repoId: build.repo_id,
@@ -3809,23 +3818,31 @@ export async function promoteValidatedBuild(input: {
   if (!validation.passed) {
     throw new Error(`Build ${build.build_version} is not publishable`);
   }
-  if (!canPublishToKnowledgeSpace(requestedFromEnv, build.knowledge_space)) {
-    throw new Error(`Environment ${requestedFromEnv} cannot promote build ${build.build_version} into ${build.knowledge_space}`);
+  if (!canPublishToKnowledgeSpace(requestedFromEnv, targetKnowledgeSpace)) {
+    throw new Error(`Environment ${requestedFromEnv} cannot promote build ${build.build_version} into ${targetKnowledgeSpace}`);
   }
+  const targetBuild = isCrossScopePromotion
+    ? await repo.upsertPromotedBuildAlias({
+        targetKnowledgeSpace,
+        sourceBuild: build,
+        requestedBy: input.actor,
+        requestedFromEnv
+      })
+    : build;
   await publishValidatedBuild({
-    knowledgeSpace: build.knowledge_space,
+    knowledgeSpace: targetKnowledgeSpace,
     repoId: build.repo_id,
     branch: build.branch,
-    buildId: build.id,
-    buildVersion: build.build_version,
+    buildId: targetBuild.id,
+    buildVersion: targetBuild.build_version,
     targetHead: build.target_head,
     publishedBy: input.actor,
     publishedFromEnv: requestedFromEnv
   });
   return {
-    build: (await repo.getBuildById(build.id)) ?? build,
+    build: (await repo.getBuildById(targetBuild.id)) ?? targetBuild,
     publication: await repo.getPublication({
-      knowledgeSpace: build.knowledge_space,
+      knowledgeSpace: targetKnowledgeSpace,
       repoId: build.repo_id,
       branch: build.branch
     })

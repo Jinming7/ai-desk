@@ -12,6 +12,7 @@ import { env, isSafeTestDatabaseUrl } from "../config/env.js";
 import { buildChunks } from "../modules/github-kb/chunker.js";
 import { toVectorLiteral } from "../modules/github-kb/embedding.js";
 import { parseMarkdownSections } from "../modules/github-kb/markdown.js";
+import * as memoryRepo from "../modules/github-kb/memory-repository.js";
 import * as githubRepo from "../modules/github-kb/repository.js";
 import * as serviceModule from "../modules/github-kb/service.js";
 import { buildDocsComIncludePaths, githubKbServiceDeps, promoteValidatedBuild, runDueSyncJobs } from "../modules/github-kb/service.js";
@@ -782,6 +783,16 @@ test("vector candidate search ignores chunks from other embedding models in the 
   const knowledgeSpace = "support-local";
   const buildVersion = "build-vector-model-safety";
   const commitSha = "abc1234";
+  await githubRepo.ensureBuild({
+    knowledgeSpace,
+    repoId: registration.id,
+    branch: "main",
+    buildVersion,
+    targetHead: commitSha,
+    buildKind: "full",
+    requestedBy: "test",
+    requestedFromEnv: "local"
+  });
   const doc = await githubRepo.upsertDocument({
     repoId: registration.id,
     knowledgeSpace,
@@ -1534,6 +1545,13 @@ test("local promotion guard rejects non-local knowledge space promotion", async 
     buildVersion: "prod-build"
   });
   assert.ok(prodBuild);
+  await githubRepo.updateBuildStatus({
+    buildId: prodBuild.id,
+    status: "validated",
+    validationPassed: true,
+    validationSummary: { checks: [] },
+    finished: true
+  });
   await assert.rejects(
     async () =>
       promoteValidatedBuild({
@@ -1571,11 +1589,225 @@ test("local promotion guard rejects non-local knowledge space promotion", async 
     buildVersion: "local-build"
   });
   assert.ok(localBuild);
+  await githubRepo.updateBuildStatus({
+    buildId: localBuild.id,
+    status: "validated",
+    validationPassed: true,
+    validationSummary: { checks: [] },
+    finished: true
+  });
   const promoted = await promoteValidatedBuild({
     buildId: localBuild!.id,
     actor: "test"
   });
   assert.equal(promoted.publication?.knowledge_space, "support-local");
+});
+
+test("cross-scope promotion publishes a preview alias build without cloning source artifacts", async () => {
+  const registration = await createIsolationRegistration();
+  const sourceBuild = await githubRepo.ensureBuild({
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion: "local-validated-build",
+    targetHead: "mockc2",
+    buildKind: "full",
+    requestedBy: "test",
+    requestedFromEnv: "local"
+  });
+
+  const sourceDoc = await createBuildScopedDocAndChunk({
+    repoId: registration.id,
+    knowledgeSpace: "support-local",
+    branch: "main",
+    buildVersion: sourceBuild.build_version,
+    commitSha: sourceBuild.target_head,
+    path: "docs/promotion-reuse.md",
+    title: "Promotion Reuse",
+    content: "# Promotion Reuse\n\nPreview should reuse this validated local KB artifact."
+  });
+
+  await githubRepo.upsertOpenApiOperation({
+    id: "a0c2d8b5-5a39-4b2f-8de8-3eb1da9f7f50",
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion: sourceBuild.build_version,
+    sourceDocId: sourceDoc.doc.id,
+    path: "openapi/tickets.yaml",
+    method: "GET",
+    routePath: "/api/tickets",
+    operationId: "listTickets",
+    summary: "List tickets",
+    description: "Preview should reuse this OpenAPI artifact from the validated local build.",
+    requestSchema: {},
+    responseSchema: {},
+    authScopes: [],
+    tags: ["tickets"],
+    errorShapes: {},
+    sourceLocation: { lineStart: 1, lineEnd: 8 },
+    metadata: {}
+  });
+
+  await memoryRepo.upsertMemoryEntry({
+    id: "52d4ef53-7da8-4b56-9c42-b40d464b7e49",
+    repo_id: registration.id,
+    knowledge_space: "support-local",
+    branch: "main",
+    doc_id: sourceDoc.doc.id,
+    path: sourceDoc.doc.path,
+    memory_kind: "procedure",
+    title: "Promotion Reuse",
+    canonical_claim: "Preview promotion reuses the validated local KB snapshot.",
+    summary: "Promote the validated local snapshot instead of rebuilding preview.",
+    product_area: "support",
+    doc_kind: "runbook",
+    action_type: "promote_snapshot",
+    deployment_model: "shared_db",
+    object_type: "kb_snapshot",
+    is_static: true,
+    build_version: sourceBuild.build_version,
+    metadata_json: {},
+    search_text: "preview promotion reuses the validated local kb snapshot",
+    aliases: [],
+    signals: [],
+    sources: []
+  });
+
+  const validatedSource = await githubRepo.updateBuildStatus({
+    buildId: sourceBuild.id,
+    status: "validated",
+    validationPassed: true,
+    validationSummary: { checks: [] },
+    finished: true
+  });
+  assert.ok(validatedSource);
+
+  const promoted = await promoteValidatedBuild({
+    buildId: sourceBuild.id,
+    actor: "internal_operator",
+    operatorOverride: true,
+    ...({ targetKnowledgeSpace: "support-preview" } as Record<string, unknown>)
+  } as Parameters<typeof promoteValidatedBuild>[0]);
+
+  const previewPublication = await githubRepo.getPublication({
+    knowledgeSpace: "support-preview",
+    repoId: registration.id,
+    branch: "main"
+  });
+  const localPublication = await githubRepo.getPublication({
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main"
+  });
+  const previewBuild = await githubRepo.getBuildByVersion({
+    knowledgeSpace: "support-preview",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion: sourceBuild.build_version
+  });
+  const sourceBuildAfter = await githubRepo.getBuildById(sourceBuild.id);
+
+  assert.equal(promoted.publication?.knowledge_space, "support-preview");
+  assert.equal(previewPublication?.published_build_version, sourceBuild.build_version);
+  assert.equal(localPublication, null);
+  assert.ok(previewBuild);
+  assert.equal(sourceBuildAfter?.status, "validated");
+  assert.equal(previewBuild?.status, "published");
+
+  const promotionLinkage = await pool.query<{ promoted_from_build_id: string | null }>(
+    `SELECT promoted_from_build_id
+       FROM kb_builds
+      WHERE id = $1`,
+    [previewBuild?.id ?? sourceBuild.id]
+  );
+  assert.equal(promotionLinkage.rows[0]?.promoted_from_build_id, sourceBuild.id);
+
+  const previewArtifacts = await pool.query<{
+    docs: string;
+    chunks: string;
+    memory_entries: string;
+    openapi_operations: string;
+  }>(
+    `SELECT
+       (SELECT COUNT(*)::text FROM kb_documents WHERE knowledge_space = 'support-preview' AND repo_id = $1 AND branch = 'main' AND build_version = $2) AS docs,
+       (SELECT COUNT(*)::text FROM kb_chunks WHERE knowledge_space = 'support-preview' AND repo_id = $1 AND branch = 'main' AND build_version = $2) AS chunks,
+       (SELECT COUNT(*)::text FROM kb_memory_entries WHERE knowledge_space = 'support-preview' AND repo_id = $1 AND branch = 'main' AND build_version = $2) AS memory_entries,
+       (SELECT COUNT(*)::text FROM kb_openapi_operations WHERE knowledge_space = 'support-preview' AND repo_id = $1 AND branch = 'main' AND build_version = $2) AS openapi_operations`,
+    [registration.id, sourceBuild.build_version]
+  );
+  assert.deepEqual(previewArtifacts.rows[0], {
+    docs: "0",
+    chunks: "0",
+    memory_entries: "0",
+    openapi_operations: "0"
+  });
+
+  const previewKeywordHits = await githubRepo.searchKeywordCandidates({
+    knowledgeSpace: "support-preview",
+    repoId: registration.id,
+    branch: "main",
+    query: "validated local kb artifact",
+    limit: 5
+  });
+  const previewStructuredHits = await githubRepo.searchStructuredArtifactCandidates({
+    knowledgeSpace: "support-preview",
+    repoId: registration.id,
+    branch: "main",
+    query: "GET /api/tickets listTickets",
+    likeTerms: ["tickets", "list"],
+    exactTerms: ["GET", "/api/tickets", "listTickets"],
+    limit: 5
+  });
+  const previewMemoryHits = await memoryRepo.searchMemoryEntries({
+    knowledgeSpace: "support-preview",
+    repoId: registration.id,
+    branch: "main",
+    query: "reuses the validated local kb snapshot",
+    limit: 5
+  });
+
+  assert.equal(previewKeywordHits.length > 0, true);
+  assert.match(stripHighlightMarkup(previewKeywordHits[0]?.snippet ?? ""), /validated local kb artifact/i);
+  assert.equal(previewStructuredHits.some((hit) => hit.artifact_family === "api_operation"), true);
+  assert.equal(previewMemoryHits.length > 0, true);
+  assert.match(previewMemoryHits[0]?.canonicalClaim ?? "", /validated local kb snapshot/i);
+});
+
+test("cross-scope promotion rejects source builds that are not promotion-ready", async () => {
+  const registration = await createIsolationRegistration();
+  const sourceBuild = await githubRepo.ensureBuild({
+    knowledgeSpace: "support-local",
+    repoId: registration.id,
+    branch: "main",
+    buildVersion: "local-building-build",
+    targetHead: "mockc2",
+    buildKind: "full",
+    requestedBy: "test",
+    requestedFromEnv: "local"
+  });
+
+  await createBuildScopedDocAndChunk({
+    repoId: registration.id,
+    knowledgeSpace: "support-local",
+    branch: "main",
+    buildVersion: sourceBuild.build_version,
+    commitSha: sourceBuild.target_head,
+    path: "docs/building-source.md",
+    title: "Building Source",
+    content: "# Building Source\n\nA building source build must not be promoted."
+  });
+
+  await assert.rejects(
+    async () =>
+      promoteValidatedBuild({
+        buildId: sourceBuild.id,
+        actor: "internal_operator",
+        operatorOverride: true,
+        ...({ targetKnowledgeSpace: "support-preview" } as Record<string, unknown>)
+      } as Parameters<typeof promoteValidatedBuild>[0]),
+    /promotion-ready|not ready|validated/i
+  );
 });
 
 test("remote full sync continues in batches until all docs are indexed", async () => {

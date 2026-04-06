@@ -276,6 +276,7 @@ export async function previewKbPromotion(input: {
   buildId: string;
   actor: string;
   operatorOverride?: boolean;
+  targetKnowledgeSpace?: KbKnowledgeSpace;
   evaluationRecorded: boolean;
   shadowValidationStable: boolean;
   rollbackReviewed: boolean;
@@ -285,19 +286,20 @@ export async function previewKbPromotion(input: {
     throw new Error(`Build not found: ${input.buildId}`);
   }
 
+  const targetKnowledgeSpace = input.targetKnowledgeSpace ?? build.knowledge_space;
   const requestedFromEnv = input.operatorOverride ? "operator" : resolveRequestedFromEnv();
   const currentPublication = await repo.getPublication({
-    knowledgeSpace: build.knowledge_space,
+    knowledgeSpace: targetKnowledgeSpace,
     repoId: build.repo_id,
     branch: build.branch
   });
   const rollbackCandidate = await resolveRollbackCandidate({
-    knowledgeSpace: build.knowledge_space,
+    knowledgeSpace: targetKnowledgeSpace,
     repoId: build.repo_id,
     branch: build.branch,
     excludeBuildVersion: build.build_version
   });
-  const rollbackTargetSeverity = build.knowledge_space === "support-prod" ? ("error" as const) : ("warn" as const);
+  const rollbackTargetSeverity = targetKnowledgeSpace === "support-prod" ? ("error" as const) : ("warn" as const);
   const checks = [
     {
       code: "build_validation_passed",
@@ -315,12 +317,23 @@ export async function previewKbPromotion(input: {
           : `build status ${build.status} is not promotion-ready`
     },
     {
+      code: "cross_scope_operator_override",
+      passed: targetKnowledgeSpace === build.knowledge_space || Boolean(input.operatorOverride),
+      severity: targetKnowledgeSpace === build.knowledge_space ? ("info" as const) : ("error" as const),
+      message:
+        targetKnowledgeSpace === build.knowledge_space
+          ? "same-scope promotion does not require operator override"
+          : input.operatorOverride
+            ? "cross-scope promotion uses explicit operator override"
+            : "cross-scope promotion requires explicit operator override"
+    },
+    {
       code: "publication_authority_matches_space",
-      passed: canPublishToKnowledgeSpace(requestedFromEnv, build.knowledge_space),
+      passed: canPublishToKnowledgeSpace(requestedFromEnv, targetKnowledgeSpace),
       severity: "error" as const,
-      message: canPublishToKnowledgeSpace(requestedFromEnv, build.knowledge_space)
-        ? `environment ${requestedFromEnv} may publish to ${build.knowledge_space}`
-        : `environment ${requestedFromEnv} may not publish to ${build.knowledge_space}`
+      message: canPublishToKnowledgeSpace(requestedFromEnv, targetKnowledgeSpace)
+        ? `environment ${requestedFromEnv} may publish to ${targetKnowledgeSpace}`
+        : `environment ${requestedFromEnv} may not publish to ${targetKnowledgeSpace}`
     },
     {
       code: "rollback_target_known",
@@ -336,10 +349,10 @@ export async function previewKbPromotion(input: {
     },
     {
       code: "shadow_validation_stable",
-      passed: build.knowledge_space === "support-prod" ? input.shadowValidationStable : true,
-      severity: build.knowledge_space === "support-prod" ? ("error" as const) : ("info" as const),
+      passed: targetKnowledgeSpace === "support-prod" ? input.shadowValidationStable : true,
+      severity: targetKnowledgeSpace === "support-prod" ? ("error" as const) : ("info" as const),
       message:
-        build.knowledge_space === "support-prod"
+        targetKnowledgeSpace === "support-prod"
           ? input.shadowValidationStable
             ? "shadow validation was confirmed stable"
             : "shadow validation was not confirmed stable for production rollout"
@@ -348,7 +361,7 @@ export async function previewKbPromotion(input: {
     {
       code: "rollback_reviewed",
       passed: input.rollbackReviewed,
-      severity: build.knowledge_space === "support-prod" ? ("error" as const) : ("warn" as const),
+      severity: targetKnowledgeSpace === "support-prod" ? ("error" as const) : ("warn" as const),
       message: input.rollbackReviewed ? "rollback procedure was reviewed" : "rollback procedure was not reviewed"
     },
     {
@@ -375,6 +388,7 @@ export async function previewKbPromotion(input: {
       status: build.status,
       validationPassed: build.validation_passed
     },
+    targetKnowledgeSpace,
     currentPublication: currentPublication
       ? {
           publishedBuildVersion: currentPublication.published_build_version,
@@ -397,7 +411,8 @@ export async function previewKbPromotion(input: {
       body: {
         buildId: build.id,
         actor: input.actor,
-        ...(input.operatorOverride ? { operatorOverride: true } : {})
+        ...(input.operatorOverride ? { operatorOverride: true } : {}),
+        ...(targetKnowledgeSpace !== build.knowledge_space ? { targetKnowledgeSpace } : {})
       }
     }
   };

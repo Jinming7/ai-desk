@@ -51,9 +51,9 @@ function normalizeSignalRows(input: Array<{ signalType?: string; value: string }
 function buildMemoryWhere(filters: { repoId?: string; branch?: string; knowledgeSpace: KbKnowledgeSpace }) {
   const clauses = [
     `pub.knowledge_space = $1`,
-    `entry.knowledge_space = pub.knowledge_space`,
+    `entry.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}`,
     `entry.status = 'active'`,
-    `entry.build_version = pub.published_build_version`
+    `entry.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}`
   ];
   const values: unknown[] = [filters.knowledgeSpace];
   if (filters.repoId) {
@@ -66,6 +66,18 @@ function buildMemoryWhere(filters: { repoId?: string; branch?: string; knowledge
   }
   return { clause: clauses.join(" AND "), values };
 }
+
+const EFFECTIVE_PUBLISHED_BUILD_JOIN = `
+    INNER JOIN kb_builds published_build
+      ON published_build.knowledge_space = pub.knowledge_space
+     AND published_build.repo_id = pub.repo_id
+     AND published_build.branch = pub.branch
+     AND published_build.build_version = pub.published_build_version
+    LEFT JOIN kb_builds effective_build
+      ON effective_build.id = published_build.promoted_from_build_id`;
+
+const EFFECTIVE_BUILD_SPACE_SQL = `COALESCE(effective_build.knowledge_space, published_build.knowledge_space)`;
+const EFFECTIVE_BUILD_VERSION_SQL = `COALESCE(effective_build.build_version, published_build.build_version)`;
 
 export async function upsertMemoryEntry(input: MemoryEntryDraft): Promise<KbMemoryEntry> {
   const result = await pool.query<KbMemoryEntry>(
@@ -309,6 +321,7 @@ export async function searchMemoryEntries(input: {
     INNER JOIN kb_publications pub
       ON pub.repo_id = entry.repo_id
      AND pub.branch = entry.branch
+    ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
     WHERE ${where.clause}
       AND (
         entry.search_vector @@ websearch_to_tsquery('english', $${queryParam})
@@ -424,6 +437,7 @@ export async function searchMemoryAliases(input: {
     INNER JOIN kb_publications pub
       ON pub.repo_id = entry.repo_id
      AND pub.branch = entry.branch
+    ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
     WHERE ${where.clause}
       AND (
         similarity(alias.alias, $${queryParam}) >= 0.2
@@ -549,6 +563,7 @@ export async function searchMemorySignals(input: {
     INNER JOIN kb_publications pub
       ON pub.repo_id = entry.repo_id
      AND pub.branch = entry.branch
+    ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
     WHERE ${where.clause}
     ORDER BY
       GREATEST(
@@ -601,8 +616,8 @@ export async function searchMemoryProfiles(input: {
 }): Promise<MemoryProfileHit[]> {
   const conditions = [
     `pub.knowledge_space = $1`,
-    `profile.knowledge_space = pub.knowledge_space`,
-    `profile.build_version = pub.published_build_version`
+    `profile.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}`,
+    `profile.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}`
   ];
   const values: unknown[] = [input.knowledgeSpace];
   if (input.repoId) {
@@ -653,6 +668,7 @@ export async function searchMemoryProfiles(input: {
     INNER JOIN kb_publications pub
       ON pub.repo_id = profile.repo_id
      AND pub.branch = profile.branch
+    ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
     WHERE ${conditions.join(" AND ")}
       AND (
         similarity(profile.title, $${queryParam}) >= 0.16
@@ -730,10 +746,11 @@ export async function expandMemoryRelations(input: {
         ON pub.repo_id = target.repo_id
        AND pub.branch = target.branch
        AND pub.knowledge_space = $2
-       AND target.knowledge_space = pub.knowledge_space
-       AND target.status = 'active'
-       AND target.build_version = pub.published_build_version
+      ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
       WHERE rel.from_memory_id = ANY($1::uuid[])
+        AND target.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND target.status = 'active'
+        AND target.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
     )
     SELECT * FROM ranked WHERE rn <= $3`,
     [memoryIds, input.knowledgeSpace, input.limitPerMemory]
@@ -822,15 +839,16 @@ export async function resolveMemorySourcesToChunks(input: {
       INNER JOIN kb_publications pub
         ON pub.repo_id = doc.repo_id
        AND pub.branch = doc.branch
+      ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
       WHERE src.memory_id = ANY($1::uuid[])
         AND pub.knowledge_space = $2
-        AND entry.knowledge_space = pub.knowledge_space
-        AND chunk.knowledge_space = pub.knowledge_space
-        AND doc.knowledge_space = pub.knowledge_space
+        AND entry.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND chunk.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
         AND entry.status = 'active'
-        AND entry.build_version = pub.published_build_version
-        AND chunk.build_version = pub.published_build_version
-        AND doc.build_version = pub.published_build_version
+        AND entry.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+        AND chunk.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+        AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
     )
     SELECT * FROM ranked WHERE rn <= $3`,
     [memoryIds, input.knowledgeSpace, input.limitPerMemory]
@@ -918,15 +936,16 @@ export async function resolveMemorySourcesToCitations(input: {
       INNER JOIN kb_publications pub
         ON pub.repo_id = doc.repo_id
        AND pub.branch = doc.branch
+      ${EFFECTIVE_PUBLISHED_BUILD_JOIN}
       WHERE mc.memory_id = ANY($1::uuid[])
         AND pub.knowledge_space = $2
-        AND entry.knowledge_space = pub.knowledge_space
-        AND cu.knowledge_space = pub.knowledge_space
-        AND doc.knowledge_space = pub.knowledge_space
+        AND entry.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND cu.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
+        AND doc.knowledge_space = ${EFFECTIVE_BUILD_SPACE_SQL}
         AND entry.status = 'active'
-        AND entry.build_version = pub.published_build_version
-        AND cu.build_version = pub.published_build_version
-        AND doc.build_version = pub.published_build_version
+        AND entry.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+        AND cu.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
+        AND doc.build_version = ${EFFECTIVE_BUILD_VERSION_SQL}
     )
     SELECT * FROM ranked WHERE rn <= $3`,
     [memoryIds, input.knowledgeSpace, input.limitPerMemory]

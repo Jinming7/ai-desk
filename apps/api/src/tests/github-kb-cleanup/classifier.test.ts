@@ -16,6 +16,7 @@ function buildFixture(overrides: Partial<KbBuild> = {}): KbBuild {
     repo_id: overrides.repo_id ?? "repo-1",
     branch: overrides.branch ?? "main",
     build_version: overrides.build_version ?? "build-1",
+    promoted_from_build_id: overrides.promoted_from_build_id ?? null,
     target_head: overrides.target_head ?? "sha-1",
     build_kind: overrides.build_kind ?? "full",
     requested_by: overrides.requested_by ?? "test",
