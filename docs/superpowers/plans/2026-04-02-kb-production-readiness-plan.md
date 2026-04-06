@@ -4,7 +4,7 @@
 
 **Goal:** Turn the current partial KB substrate into a fully publishable, repository-native, production-usable knowledge base with one coherent published snapshot, complete core artifact coverage, grounded retrieval evidence, and explicit rollout/rollback safety.
 
-**Architecture:** The implementation must preserve the Part 01 to Part 09 rebuild contract: one shared DB, publication-based serving only, strict separation between build state and serving state, and one coherent published snapshot per `knowledge_space + repo_id + branch`. The work proceeds in six phases: environment normalization, build/finalization closure, repository-native artifact completion, validation and acceptance, shared-DB-safe publication and rollout, then historical cleanup after the new serving truth is trusted.
+**Architecture:** The implementation must preserve the Part 01 to Part 09 rebuild contract: one shared DB, publication-based serving only, strict separation between build state and serving state, and one coherent published snapshot per serving scope. For schema-sensitive KB work, `schema-first` is mandatory: inspect the real live schema and keys before editing code or SQL. Promotion target is `validated snapshot promotion`, not per-environment full rebuild: one validated source build may be promoted across `support-local -> support-preview -> support-prod` through explicit publication-safe promotion records while runtime still resolves only through `kb_publications`.
 
 **Tech Stack:** TypeScript, Node.js, PostgreSQL, `pg`, `tsx`, `tsc`, repository-local KB services under `apps/api/src/modules/github-kb`, support retrieval runtime under `apps/api/src/modules/ai`, SQL migrations under `apps/api/src/db/migrations`.
 
@@ -12,18 +12,20 @@
 
 ## Why This Plan Exists
 
-Current verified state on April 2, 2026:
+Current verified state on April 6, 2026:
 
-- `kb_publications = 0`
-- `kb_serving_versions = 0`
-- the only build is still `support-local / master / 47a873debcde934bfd318d680eab197f5248a3b2 / building`
-- raw KB rows exist, but publication-scoped serving rows are still `0`
-- live artifact coverage is still docs-only:
-  `kb_documents=22`, `kb_chunks=158`, `kb_citation_units=158`, `kb_memory_entries=143`
-- live canonical structured artifacts are still missing:
-  `kb_openapi_operations=0`, `kb_code_symbols=0`, `kb_config_surfaces=0`, `kb_schema_objects=0`, `kb_test_behaviors=0`
+- canonical source repo is pinned to GitLab `https://git.ones.pro/docs/docs-com` on `master`
+- `support-local` has:
+  - one older published build
+  - one newer `validated=true` build that has not yet been promoted
+- the newest validated local build currently contains real repository-native artifacts:
+  `docs=732`, `chunks=3912`, `memory=3883`, `openapi=125`, `code=2`, `config=181`
+- `schema` and `test` artifact counts are still `0` on that validated build, so artifact-family completeness gate is not yet satisfied
+- `support-preview` still has no valid published snapshot for this repo
+- an earlier wrong-direction preview full run may still exist in `running/building` state, but it is not serving-visible because no preview publication points to it
+- current architecture still lacks a production-grade `validated snapshot promotion` path, so preview/prod currently depend on rebuilding instead of reusing the already validated snapshot
 
-Therefore the next step is not rollout. The next step is to complete the KB until all production gates are satisfied.
+Therefore the next step is not another environment rebuild. The next step is to add the promotion substrate that safely reuses the existing validated build, then continue the remaining production gates.
 
 ## Non-Negotiable Done Criteria
 
@@ -133,6 +135,32 @@ and the public base URL remains `docs.ones.com`.
   - `docs/27_AI_Support_Agent_Rebuild_Part_07_KB_Build_Pipeline_And_Cleanup_Compatibility.md`
   - `docs/28_AI_Support_Agent_Rebuild_Part_08_Rollout_Rollback_And_Operations.md`
   - `docs/30_AI_Support_Agent_Rebuild_Part_09_Historical_KB_Cleanup_And_Decontamination.md`
+
+### Schema-first gate
+
+- [ ] Inspect the real live schema for every table touched by the current phase before editing code or SQL.
+Minimum set for promotion work:
+  - `kb_builds`
+  - `kb_publications`
+  - `kb_serving_versions`
+  - `kb_sync_runs`
+  - `kb_sync_run_shards`
+  - `kb_documents`
+  - `kb_chunks`
+  - `kb_memory_entries`
+  - `kb_memory_sources`
+  - canonical artifact tables
+
+- [ ] Record the real identity model before implementation.
+Required outcome:
+  - which tables key identity by `knowledge_space`
+  - which tables key identity by `build_version`
+  - which runtime queries currently join directly to `kb_publications`
+  - which release/cleanup paths would break if a cross-space promotion only changed publication metadata
+
+- [ ] Reject any implementation plan that was not first checked against the live schema.
+Expected:
+  no migration or SQL written from memory alone.
 
 ## File Map
 
@@ -326,6 +354,102 @@ one `support-local` publication exists and `kb_serving_versions.active_build_ver
 **Go/No-Go gate:**
 
 - Do not continue to Phase 2 until one non-prod knowledge space has a validated published snapshot and serving reads are publication-scoped.
+
+## Phase 1B: Add Validated Snapshot Promotion Substrate
+
+**Outcome:** an already validated build can be promoted from one scope to another without re-running repository build ingestion, while runtime still reads only the published snapshot and rollback remains explicit.
+
+**Blocking risks addressed:** per-environment rebuild dependency, no upgrade path from local to preview/prod, release status lacking target-scope promotion history, runtime/source identity ambiguity.
+
+### Task 1B.1: Prove why publication-pointer-only reuse is insufficient
+
+**Files:**
+- Verify: `apps/api/src/modules/github-kb/repository.ts`
+- Verify: `apps/api/src/modules/github-kb/memory-repository.ts`
+- Verify: `apps/api/src/modules/ai/hybrid-retrieval-provider.ts`
+- Verify: `apps/api/src/modules/ai/hybrid-retrieval.ts`
+
+- [ ] Inspect runtime query filters and confirm whether artifact reads are keyed by `publication knowledge_space` or by an effective source-build identity.
+Expected:
+  direct evidence for whether a `support-preview` publication can reuse `support-local` artifacts without additional substrate.
+
+- [ ] Inspect artifact table uniqueness and FK edges.
+Expected:
+  direct evidence for whether physical artifact cloning would require FK remap and duplicated storage.
+
+**Go/No-Go gate:**
+
+- Reject publication-pointer-only reuse if runtime queries still require artifact rows in the target `knowledge_space`.
+- Reject physical artifact cloning if it materially increases risk versus logical promotion aliasing.
+
+### Task 1B.2: Define the promotion record model
+
+**Files:**
+- Modify: `docs/21_AI_Support_Agent_Rebuild_Part_02_Single_DB_Build_Sync_Publish_And_Repair.md`
+- Modify: `docs/superpowers/plans/2026-04-02-kb-production-readiness-plan.md`
+- Modify if required: `apps/api/src/db/migrations/*.sql`
+- Modify if required: `apps/api/src/modules/github-kb/types.ts`
+
+- [ ] Lock the target model:
+  - source validated build remains the canonical artifact-producing build
+  - target scope receives an explicit promotion record
+  - publication points to the target-scope promotion record
+  - runtime resolves effective artifact coordinates from that record
+  - rollback candidate remains target-scope specific
+
+- [ ] Explicitly document that `kb_serving_versions` remains compatibility metadata only and must not be used as runtime truth.
+
+### Task 1B.3: Add TDD coverage before implementation
+
+**Files:**
+- Modify: `apps/api/src/tests/github-kb.integration.test.ts`
+- Modify: `apps/api/src/tests/release.integration.test.ts`
+- Modify: `apps/api/src/modules/ai/hybrid-retrieval.test.ts`
+
+- [ ] Add failing tests for:
+  - cross-scope promotion from a validated source build into preview without full rebuild
+  - rejection of failed or partial source builds
+  - runtime retrieval resolving the promoted effective snapshot correctly
+  - rollback candidate visibility after at least two promotions in the same target scope
+
+### Task 1B.4: Implement the minimal promotion substrate
+
+**Files:**
+- Modify: `apps/api/src/modules/github-kb/service.ts`
+- Modify: `apps/api/src/modules/github-kb/repository.ts`
+- Modify: `apps/api/src/modules/github-kb/memory-repository.ts`
+- Modify: `apps/api/src/modules/ai/hybrid-retrieval-provider.ts`
+- Modify: `apps/api/src/modules/ai/hybrid-retrieval.ts`
+- Modify: `apps/api/src/modules/github-kb/release/service.ts`
+- Modify: `apps/api/src/modules/github-kb/cleanup/service.ts`
+- Modify: `apps/api/src/modules/github-kb/cleanup/repository.ts`
+- Modify if required: `apps/api/src/contracts/github-kb.ts`
+- Modify if required: `apps/api/src/contracts/release.ts`
+- Modify if required: `apps/api/src/app.ts`
+- Modify if required: `apps/api/src/db/migrations/*.sql`
+
+- [ ] Implement the smallest safe logical promotion model that does not rerun repo ingestion and does not physically clone artifact tables.
+
+- [ ] Verify the existing local validated build can be reused as the promotion source.
+
+### Task 1B.5: Perform the first real promotion from the existing local validated build
+
+**Files:**
+- Verify only: live DB tables and internal endpoints
+
+- [ ] First publish the already validated local build if it is not yet the active `support-local` publication.
+
+- [ ] Then promote that exact validated snapshot into `support-preview` without starting a new repo build.
+
+- [ ] Verify:
+  - `kb_publications`
+  - `kb_builds`
+  - release status
+  - runtime retrieval
+
+**Go/No-Go gate:**
+
+- Do not continue to Phase 2 until preview can reuse the validated local snapshot without a rebuild and runtime reads only the promoted published snapshot.
 
 ## Phase 2: Expand the KB from Docs-Only into Repository-Native Coverage
 

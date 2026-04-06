@@ -152,6 +152,9 @@
 
 ## KB Sync Change Discipline (Mandatory)
 - For KB/sync development, correctness analysis must happen before coding. Do not start by writing code and discovering the design through trial-and-error.
+- Schema-first is a hard prerequisite for KB/sync, publication, promotion, release-status, cleanup, and runtime data-path changes. Before changing code or writing SQL, inspect the real schema and live state first:
+  `actual columns`, `primary/unique keys`, `foreign keys`, `knowledge_space/build_version identity`, and the current rows involved in the workflow.
+- Do not assume table shape, column names, or uniqueness semantics from memory, from stale SQL snippets, or from design docs alone. Design docs define the target contract; schema-first inspection defines the safe implementation surface.
 - Before implementing sync logic or sync-efficiency changes, explicitly do the following:
   1. map the target workflow end-to-end
   2. identify invariants, idempotency requirements, restart/retry behavior, and shared-DB safety constraints

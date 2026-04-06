@@ -121,6 +121,35 @@ The system must provide an ordered cleanup strategy that:
 - does not require a second database
 - allows recovery if repair is interrupted
 
+### 3.6 Schema-first implementation is mandatory
+
+This document is implementation-ready design, but it is not permission to code from memory.
+
+Before changing build, publication, promotion, rollback, cleanup, or runtime KB read behavior, the developer must first inspect the actual live schema and data shape involved in the change:
+
+- current columns
+- primary keys and unique constraints
+- foreign-key edges
+- whether `knowledge_space` and `build_version` participate in identity
+- whether the live tables still match the document exactly
+
+Rules:
+
+- do not write migrations from memory
+- do not write repair SQL from memory
+- do not reuse old monitoring SQL blindly when the live schema has changed
+- if schema and document differ, implementation must follow the real schema first and then update the docs
+
+This is especially important for:
+
+- `kb_builds`
+- `kb_publications`
+- `kb_serving_versions`
+- `kb_sync_runs`
+- `kb_sync_run_shards`
+- canonical artifact tables
+- memory linkage tables
+
 ---
 
 ## 4. Current Confirmed Root Causes This Part Fixes
@@ -827,6 +856,38 @@ This is mandatory for:
 - embedding model changes
 - source normalization changes
 
+## 12.4 Validated snapshot promotion across knowledge spaces
+
+The rollout path must support:
+
+- build once
+- validate once
+- promote the validated snapshot from `support-local` to `support-preview`
+- later promote the same validated snapshot to `support-prod`
+
+without requiring a second repository rebuild for every environment.
+
+Required model:
+
+1. the source build remains the canonical artifact-producing build
+2. cross-space promotion creates a target-scope promotion record with audit trail
+3. target-scope publication points to that promoted snapshot record
+4. runtime still resolves only through `kb_publications`
+5. the promoted target scope must remain rollbackable without deleting rows
+
+Hard prohibitions:
+
+- do not republish by reading raw active rows
+- do not treat `kb_serving_versions` as runtime truth
+- do not require per-environment full rebuild as the steady-state promotion model
+- do not physically clone large artifact tables across spaces unless the architecture is explicitly revised to require that
+
+Implementation implication:
+
+- target-scope promotion may reuse validated source-build artifacts logically
+- the system must preserve enough build metadata to resolve the effective published artifact snapshot safely at runtime
+- rollback and cleanup views must remain able to reason about the promoted target scope explicitly
+
 ---
 
 ## 13. Current Data Repair Plan
@@ -1012,6 +1073,7 @@ Purpose:
 Purpose:
 
 - explicitly promote a validated build to published state
+- support explicit cross-space promotion of an already validated snapshot when operator authority is used
 
 Must require:
 
@@ -1211,4 +1273,3 @@ Part 03 will define:
 - retrieval units vs citation units
 - symbol extraction
 - chunking and code-aware segmentation
-
