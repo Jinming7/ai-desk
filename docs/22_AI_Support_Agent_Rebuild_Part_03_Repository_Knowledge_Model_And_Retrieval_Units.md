@@ -596,6 +596,22 @@ Parse with format-aware parser:
 
 Do not chunk raw config files as plain text first.
 
+### 8.5.1 Schema-first hard constraint for structured files
+
+Some YAML or JSON files look like config files by extension but are actually schema-bearing sources.
+
+Examples:
+
+- OpenAPI schema fragments
+- shared request or response schema snippets
+- object-definition files under API docs trees
+
+For these files:
+
+- schema extraction must run before generic config flattening discards object boundaries
+- one source file may emit both `kb_config_surfaces` and `kb_schema_objects`
+- if extraction is partial or heuristic, degraded quality must be recorded explicitly in metadata
+
 ## 8.6 SQL / schema files
 
 Use SQL-aware parsing where possible.
@@ -606,6 +622,10 @@ At minimum extract:
 - alter table
 - add constraint
 - create index
+
+Schema extraction is not limited to `.sql`.
+
+If the canonical schema is expressed through OpenAPI objects or standalone schema-bearing YAML or JSON, the build must still emit `kb_schema_objects` from those sources.
 
 ---
 
@@ -1206,4 +1226,3 @@ Part 04 will define:
 - dense + sparse + exact-signal retrieval
 - rerank stack
 - retrieval orchestration against these new artifact families
-

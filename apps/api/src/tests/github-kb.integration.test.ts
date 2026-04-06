@@ -2977,6 +2977,19 @@ paths:
     );
     await writeFixture(
       rootDir,
+      "open-docs/docs/openapi/source/common/no-200-response-schemas.yaml",
+      `BadResponse401:
+  description: Access token is invalid
+  type: object
+  properties:
+    errorCode:
+      type: string
+    errorMsg:
+      type: string
+`
+    );
+    await writeFixture(
+      rootDir,
       "open-docs/docs/abilities/events/_category_.json",
       JSON.stringify(
         {
@@ -3070,6 +3083,7 @@ paths:
     assert.equal(artifactSummary.artifactCountsByFamily.openapi_operations >= 1, true);
     assert.equal(artifactSummary.artifactCountsByFamily.config_surfaces >= 1, true);
     assert.equal(artifactSummary.artifactCountsByFamily.code_symbols >= 1, true);
+    assert.equal(artifactSummary.artifactCountsByFamily.schema_objects >= 1, true);
 
     const structuredDocs = await pool.query<{ path: string; family: string }>(
       `SELECT path, metadata_json->>'sourceFamily' AS family
@@ -3086,14 +3100,16 @@ paths:
         [
           "open-docs/docs/abilities/events/_category_.json",
           "open-docs/docs/openapi/api/sidebar.ts",
-          "open-docs/docs/openapi/source/app.yaml"
+          "open-docs/docs/openapi/source/app.yaml",
+          "open-docs/docs/openapi/source/common/no-200-response-schemas.yaml"
         ]
       ]
     );
     assert.deepEqual(structuredDocs.rows, [
       { path: "open-docs/docs/abilities/events/_category_.json", family: "config_file" },
       { path: "open-docs/docs/openapi/api/sidebar.ts", family: "code_file" },
-      { path: "open-docs/docs/openapi/source/app.yaml", family: "openapi_spec" }
+      { path: "open-docs/docs/openapi/source/app.yaml", family: "openapi_spec" },
+      { path: "open-docs/docs/openapi/source/common/no-200-response-schemas.yaml", family: "config_file" }
     ]);
 
     const publications = await pool.query<{ total: string }>(

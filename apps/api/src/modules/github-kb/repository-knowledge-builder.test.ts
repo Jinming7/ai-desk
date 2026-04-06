@@ -115,6 +115,25 @@ test("buildRepositoryKnowledgeArtifacts extracts config surfaces and schema obje
   });
   assert.equal(schemaResult.schemaObjects.length >= 2, true);
   assert.equal(schemaResult.memoryEntries.some((item) => item.memory_kind === "schema_constraint"), true);
+
+  const schemaLikeConfigResult = buildRepositoryKnowledgeArtifacts({
+    ...baseContext,
+    path: "open-docs/docs/openapi/source/common/no-200-response-schemas.yaml",
+    content: `
+      BadResponse401:
+        description: Access token is invalid
+        type: object
+        properties:
+          errorCode:
+            type: string
+          errorMsg:
+            type: string
+    `
+  });
+  assert.equal(schemaLikeConfigResult.classification.sourceFamily, "config_file");
+  assert.equal(schemaLikeConfigResult.schemaObjects.some((item) => item.objectKind === "schema"), true);
+  assert.equal(schemaLikeConfigResult.schemaObjects.some((item) => item.objectKind === "property"), true);
+  assert.equal(schemaLikeConfigResult.memoryEntries.some((item) => item.memory_kind === "schema_constraint"), true);
 });
 
 test("buildRepositoryKnowledgeArtifacts extracts test behaviors", () => {

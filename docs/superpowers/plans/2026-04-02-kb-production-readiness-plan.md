@@ -14,18 +14,40 @@
 
 Current verified state on April 6, 2026:
 
-- canonical source repo is pinned to GitLab `https://git.ones.pro/docs/docs-com` on `master`
-- `support-local` has:
-  - one older published build
-  - one newer `validated=true` build that has not yet been promoted
-- the newest validated local build currently contains real repository-native artifacts:
-  `docs=732`, `chunks=3912`, `memory=3883`, `openapi=125`, `code=2`, `config=181`
-- `schema` and `test` artifact counts are still `0` on that validated build, so artifact-family completeness gate is not yet satisfied
-- `support-preview` still has no valid published snapshot for this repo
-- an earlier wrong-direction preview full run may still exist in `running/building` state, but it is not serving-visible because no preview publication points to it
-- current architecture still lacks a production-grade `validated snapshot promotion` path, so preview/prod currently depend on rebuilding instead of reusing the already validated snapshot
+- repo `https://git.ones.pro/docs/docs-com` is the active target knowledge source
+- one validated local source build exists:
+  `support-local / master / 352f7e0725e0ab43ea7c901ebbcdea866240f401:598a569b-fc50-46f7-9e6b-382a84a82345`
+- one preview published alias build exists and resolves back to that validated source build through promotion
+- runtime retrieval for preview already resolves through `kb_publications`, not `is_active`
+- current published artifact counts are non-zero for:
+  `kb_documents`, `kb_chunks`, `kb_memory_entries`, `kb_openapi_operations`, `kb_code_symbols`, `kb_config_surfaces`
+- current remaining artifact blockers are:
+  `kb_schema_objects=0`
+  `kb_test_behaviors=0`
+- preview rollback target is still absent for the bootstrap publication
 
-Therefore the next step is not another environment rebuild. The next step is to add the promotion substrate that safely reuses the existing validated build, then continue the remaining production gates.
+This means the KB substrate and non-prod publication path are no longer the primary blocker.
+
+The next blocker is repository-native artifact completeness.
+
+Therefore the next step is not rollout. The next step is to complete the KB until all production gates are satisfied.
+
+## Current Execution Map
+
+As of April 6, 2026, the active execution order is:
+
+1. preserve current publication-based serving truth and promotion model
+2. close schema and test artifact completeness gaps without regressing runtime truth
+3. rerun focused verification suites
+4. produce one new validated local build for the same docs-com source commit under the updated builders
+5. promote that validated snapshot to preview through the official promotion path
+6. verify retrieval, validation, publication, release, cleanup dry-run, and rollback readiness again
+
+Important current rule:
+
+- do not reintroduce per-environment rebuild as the default rollout path
+- do not use `kb_serving_versions` as runtime truth
+- do not claim production readiness until schema/test completeness and rollback visibility are closed
 
 ## Non-Negotiable Done Criteria
 

@@ -19,21 +19,33 @@ import { generateMemoryEntriesFromRetrievalUnits } from "../memory/generate-memo
 
 export function buildRepositoryKnowledgeArtifacts(context: SourceDocumentContext): RepositoryKnowledgeBuildResult {
   const classification = classifySourceFamily(context.path, context.content);
+  const groundedContext = {
+    ...context,
+    metadata: {
+      ...context.metadata,
+      source_family: classification.sourceFamily
+    }
+  };
   const docPage = classification.sourceFamily === "doc_page" || classification.sourceFamily === "runbook_file" || classification.sourceFamily === "openapi_spec"
     ? parseDocPage(context.path, context.title, context.content)
     : null;
   const openApiOperations = classification.sourceFamily === "openapi_spec" ? parseOpenApiOperations(context) : [];
   const codeSymbols = classification.sourceFamily === "code_file" ? parseCodeSymbols(context) : [];
   const configSurfaces = classification.sourceFamily === "config_file" ? parseConfigSurfaces(context) : [];
-  const schemaObjects = classification.sourceFamily === "schema_file" ? parseSchemaObjects(context) : [];
+  const schemaObjects =
+    classification.sourceFamily === "schema_file" ||
+    classification.sourceFamily === "openapi_spec" ||
+    classification.sourceFamily === "config_file"
+      ? parseSchemaObjects(groundedContext)
+      : [];
   const testBehaviors = classification.sourceFamily === "test_file" ? parseTestBehaviors(context) : [];
 
   const citationUnits = [
-    ...buildOpenApiCitations(context, openApiOperations),
-    ...buildCodeSymbolCitations(context, codeSymbols),
-    ...buildConfigCitations(context, configSurfaces),
-    ...buildSchemaCitations(context, schemaObjects),
-    ...buildTestCitations(context, testBehaviors)
+    ...buildOpenApiCitations(groundedContext, openApiOperations),
+    ...buildCodeSymbolCitations(groundedContext, codeSymbols),
+    ...buildConfigCitations(groundedContext, configSurfaces),
+    ...buildSchemaCitations(groundedContext, schemaObjects),
+    ...buildTestCitations(groundedContext, testBehaviors)
   ];
   const citationByArtifactId = new Map<string, string>();
   for (const citation of citationUnits) {
@@ -49,13 +61,7 @@ export function buildRepositoryKnowledgeArtifacts(context: SourceDocumentContext
   ];
 
   const memoryEntries = generateMemoryEntriesFromRetrievalUnits(
-    {
-      ...context,
-      metadata: {
-        ...context.metadata,
-        source_family: classification.sourceFamily
-      }
-    },
+    groundedContext,
     retrievalUnits
   );
 

@@ -229,6 +229,21 @@ The support agent remains the only customer-answer pipeline.
 
 No sidecar deterministic answering path may be added.
 
+### 4.7 Schema-first hard constraint
+
+If a repository source already contains explicit schema structure, the KB build must preserve that schema structure before generic text chunking or generic config flattening happens.
+
+This applies to:
+
+- SQL migrations
+- OpenAPI `components.schemas`
+- standalone request or response schema fragments
+- shared schema-bearing YAML or JSON files under API docs trees
+
+A docs-first repository is not allowed to remain `schema-empty` merely because it lacks `.sql`.
+
+Schema-bearing sources may still emit other artifact families, but schema extraction must happen first and must remain traceable in build metadata.
+
 ---
 
 ## 5. Target System Model
@@ -281,6 +296,15 @@ Publication is:
 - knowledge-space scoped
 
 Only published builds are retrievable at runtime.
+
+Steady-state rollout should prefer:
+
+1. build once
+2. validate once
+3. publish explicitly
+4. promote that validated snapshot across knowledge spaces through an audited publication flow
+
+Rebuilding the same repository snapshot independently in each environment is fallback behavior, not the target rollout model.
 
 ## Layer 4. Knowledge Retrieval Layer
 
@@ -797,4 +821,3 @@ Part 02 will define:
 - exact build tables and publication tables
 - exact local / preview / prod same-database isolation workflow
 - exact cleanup and repair sequence for the currently polluted data
-

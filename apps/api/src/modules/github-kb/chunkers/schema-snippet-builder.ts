@@ -9,11 +9,13 @@ function extractLine(content: string, lineNumber: number): string {
 export function buildSchemaCitations(context: SourceDocumentContext, objects: SchemaObjectDraft[]): CitationUnitDraft[] {
   return objects.map((object) => {
     const lineStart = Number(object.sourceLocation.lineStart ?? 1);
+    const sourceFamily =
+      typeof context.metadata.source_family === "string" ? (context.metadata.source_family as CitationUnitDraft["sourceFamily"]) : "schema_file";
     return {
       id: stableUuidFromParts([context.knowledgeSpace, context.repoId, context.branch, context.buildVersion, context.path, object.id]),
       sourceDocId: context.docId,
       citationFamily: "sql_snippet",
-      sourceFamily: "schema_file",
+      sourceFamily,
       sourceArtifactType: "kb_schema_objects",
       sourceArtifactId: object.id,
       citationKey: object.id,
