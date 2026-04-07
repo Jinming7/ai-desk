@@ -13,6 +13,7 @@ import type {
   OpenClawSearchInput,
   OpenClawSearchOutput,
   OpenClawSupportAnswerComposerInput,
+  OpenClawSupportExecutionPlannerOutput,
   OpenClawSupportCitationSelectorInput,
   OpenClawSupportEvidencePlannerInput,
   OpenClawSupportEvidenceSelectorInput,
@@ -31,6 +32,7 @@ import type {
   TriageSupportInsight,
   SupportVerificationResult
 } from "./types.js";
+import { buildSearchRuntime } from "./agent-router.js";
 
 function createPlannerFailureAdapter(): OpenClawAdapter {
   const emptyVerification: SupportVerificationResult = {
@@ -354,6 +356,57 @@ test("runSupportSearchAgent prefers the unified support execution planner over l
     assert.deepEqual(adapter.legacyCalls, []);
     const retrievalQueries = execution.result.internal_diagnostics?.retrieval_queries_used ?? [];
     assert.equal(retrievalQueries.some((query) => /linux distributions|supported operating systems/i.test(query)), true);
+  } finally {
+    SearchOrchestrator.prototype.collectEvidence = originalCollectEvidence;
+  }
+});
+
+test("runSupportSearchAgent gives the unified planner a larger async-job timeout budget than the legacy planner cap", async () => {
+  const originalCollectEvidence = SearchOrchestrator.prototype.collectEvidence;
+  SearchOrchestrator.prototype.collectEvidence = async function collectEvidenceStub(input) {
+    return {
+      query: input.queries[0] ?? "",
+      answer: "",
+      confidence: 0.4,
+      references: [],
+      retrievalStatus: "no_results",
+      unresolvedReasonCode: "NO_MATCHING_KB",
+      resolvedQueries: input.queries,
+      fallbackUsed: false
+    };
+  };
+
+  try {
+    const adapter = createUnifiedPlannerAdapter() as OpenClawAdapter & {
+      observedTimeoutMs?: number;
+      planSupportExecution: (
+        input: OpenClawSupportPlannerInput,
+        idempotencyKey: string,
+        runtime?: OpenClawRuntimeContext
+      ) => Promise<OpenClawSupportExecutionPlannerOutput>;
+    };
+    const originalUnifiedPlanner = adapter.planSupportExecution.bind(adapter);
+    adapter.planSupportExecution = async (input, idempotencyKey, runtime) => {
+      adapter.observedTimeoutMs = runtime?.timeoutMs;
+      return originalUnifiedPlanner(input, idempotencyKey, runtime);
+    };
+
+    await runSupportSearchAgent({
+      query: "Which Linux distributions are officially supported?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      runtime: buildSearchRuntime({
+        intent: "retrieval",
+        sessionId: "support-execution-plan-async-timeout",
+        delivery: "async_job"
+      }),
+      idempotencyKey: "support-execution-plan-async-timeout"
+    });
+
+    assert.equal(typeof adapter.observedTimeoutMs, "number");
+    assert.equal((adapter.observedTimeoutMs ?? 0) > 14_000, true);
   } finally {
     SearchOrchestrator.prototype.collectEvidence = originalCollectEvidence;
   }

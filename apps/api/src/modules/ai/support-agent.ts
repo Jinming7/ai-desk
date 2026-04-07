@@ -2951,6 +2951,16 @@ export async function runSupportSearchAgent(input: {
   const allowRefinement = input.runtime?.allowRefinement !== false;
   const contextType = input.contextType ?? "search";
   const runtimePolicy = resolveSupportRuntimePolicy(input.runtime);
+  const unifiedPlannerRuntime = withStageRuntime(
+    buildStageRuntime(
+      input.runtime,
+      input.runtime?.deliveryMode === "async_job" ? 60_000 : 22_000,
+      input.runtime?.deliveryMode === "async_job" ? 18_000 : 5_000,
+      input.runtime?.deliveryMode === "async_job" ? 30_000 : 14_000
+    ),
+    "planner",
+    `${input.idempotencyKey}:support-execution-plan`
+  );
   const plannerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 22000, 5000, 14000), "planner", `${input.idempotencyKey}:planner`);
   let routeResult: { route: SupportQuestionRoute; timing: SupportAgentStageTiming };
   let evidencePlanResult: { plan: SupportEvidencePlan; timing: SupportAgentStageTiming };
@@ -2969,7 +2979,7 @@ export async function runSupportSearchAgent(input: {
             ticketContext: input.ticketContext
           },
           `${input.idempotencyKey}:support-execution-plan`,
-          plannerRuntime
+          unifiedPlannerRuntime
         )
         .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(unifiedPlanStartedAt)) }))
         .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(unifiedPlanStartedAt)) }))
