@@ -17,6 +17,7 @@ import {
 } from "./contracts/tickets.js";
 import {
   aiEscalateRequestSchema,
+  aiSearchJobRunRequestSchema,
   aiSearchRequestSchema,
   aiTicketDraftRequestSchema,
   aiTicketSubmitRequestSchema
@@ -333,6 +334,48 @@ app.post(
       imageAttachments: body.imageAttachments,
       attachments: body.attachments
     });
+    res.json({ result });
+  })
+);
+
+app.post(
+  "/api/v1/ai/search/jobs",
+  asyncHandler(async (req, res) => {
+    if (env.NODE_ENV !== "test" && !hasOpenClawGatewayAuth()) {
+      res.status(503).json({ error: "OpenClaw gateway auth is not configured" });
+      return;
+    }
+    const body = aiSearchRequestSchema.parse(req.body);
+    const job = await aiService.submitSearchModeJob(body.query, {
+      sessionId: body.sessionId,
+      conversation: body.conversation,
+      answerLanguage: body.answerLanguage,
+      imageAttachments: body.imageAttachments,
+      attachments: body.attachments
+    });
+    res.status(202).json({ job });
+  })
+);
+
+app.get(
+  "/api/v1/ai/search/jobs/:id",
+  asyncHandler(async (req, res) => {
+    const id = z.string().uuid().parse(req.params.id);
+    const job = await aiService.getSearchModeJob(id);
+    if (!job) {
+      res.status(404).json({ error: "Search job not found" });
+      return;
+    }
+    res.json({ job });
+  })
+);
+
+app.post(
+  "/api/v1/internal/ai/search/jobs/run",
+  requireInternalOrAutomationRequest,
+  asyncHandler(async (req, res) => {
+    const body = aiSearchJobRunRequestSchema.parse(req.body ?? {});
+    const result = await aiService.runDueSearchModeJobs(body.limit, aiAdapter);
     res.json({ result });
   })
 );

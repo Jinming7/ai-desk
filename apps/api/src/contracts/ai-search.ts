@@ -31,6 +31,10 @@ export const aiSearchRequestSchema = z.object({
   message: "query or attachments is required"
 });
 
+export const aiSearchJobRunRequestSchema = z.object({
+  limit: z.coerce.number().int().min(1).max(10).default(1)
+});
+
 export const aiEscalateRequestSchema = z.object({
   sessionId: z.string().uuid(),
   question: z.string().min(2),

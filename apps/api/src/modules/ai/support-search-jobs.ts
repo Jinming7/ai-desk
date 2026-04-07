@@ -313,7 +313,7 @@ export async function markSupportSearchJobFailed(input: {
 export async function markSupportSearchJobSucceeded(input: {
   jobId: string;
   leaseKey: string;
-  result: Record<string, unknown>;
+  result: unknown;
   stageState?: Record<string, unknown>;
 }): Promise<void> {
   const result = await pool.query(

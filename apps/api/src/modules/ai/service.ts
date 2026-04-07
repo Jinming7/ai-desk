@@ -6,6 +6,16 @@ import * as aiRepo from "./repository.js";
 import { buildSearchRuntime, resolveExecutionRuntime } from "./agent-router.js";
 import { summarizeImageAttachments, summarizeTextAttachments } from "./multimodal.js";
 import { runSupportSearchAgent, runSupportTriageAgent } from "./support-agent.js";
+import {
+  claimDueSupportSearchJobs,
+  enqueueSupportSearchJob,
+  getSupportSearchJob,
+  heartbeatSupportSearchJob,
+  markSupportSearchJobFailed,
+  markSupportSearchJobSucceeded,
+  requeueStaleRunningSupportSearchJobs,
+  type SupportSearchJob
+} from "./support-search-jobs.js";
 import type {
   ConversationTurn,
   ChatTicketDraft,
@@ -1415,6 +1425,178 @@ function mergeTranscript(
     merged.push({ role: "assistant", content: latestAnswer.trim(), at: new Date().toISOString() });
   }
   return merged.slice(-40);
+}
+
+function normalizeJobConversation(input: ConversationTurn[] | undefined): Array<{ role: "user" | "assistant"; content: string }> {
+  return (input ?? [])
+    .map((turn) => ({
+      role: turn.role,
+      content: turn.content.trim()
+    }))
+    .filter((turn) => turn.content.length > 0);
+}
+
+function buildSupportSearchRequestKey(input: {
+  sessionId: string;
+  query: string;
+  conversation: Array<{ role: "user" | "assistant"; content: string }>;
+  attachments: string[];
+  answerLanguage: "zh" | "en";
+  currentRound: number;
+}): string {
+  const digest = crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify({
+        query: input.query,
+        conversation: input.conversation,
+        attachments: [...input.attachments].sort(),
+        answerLanguage: input.answerLanguage,
+        round: input.currentRound + 1
+      })
+    )
+    .digest("hex");
+  return `support-search:${input.sessionId}:${input.currentRound + 1}:${digest}`;
+}
+
+export async function submitSearchModeJob(
+  query: string,
+  options?: {
+    sessionId?: string;
+    conversation?: ConversationTurn[];
+    answerLanguage?: "zh" | "en";
+    imageAttachments?: string[];
+    attachments?: string[];
+  }
+): Promise<SupportSearchJob> {
+  const sessionId = options?.sessionId ?? crypto.randomUUID();
+  const previousDialog = await aiRepo.getDialogState(sessionId);
+  const currentRound = previousDialog?.clarification_round ?? 0;
+  const attachments = options?.attachments ?? options?.imageAttachments ?? [];
+  const answerLanguage = options?.answerLanguage ?? detectLanguage(query.trim() || "image");
+  const conversation = normalizeJobConversation(options?.conversation);
+
+  try {
+    return await enqueueSupportSearchJob({
+      sessionId,
+      requestKey: buildSupportSearchRequestKey({
+        sessionId,
+        query,
+        conversation,
+        attachments,
+        answerLanguage,
+        currentRound
+      }),
+      query,
+      answerLanguage,
+      currentRound,
+      conversation,
+      attachments
+    });
+  } catch (error) {
+    if (error instanceof Error && /active support search job/i.test(error.message)) {
+      const conflict = new Error(error.message);
+      (conflict as Error & { statusCode?: number }).statusCode = 409;
+      throw conflict;
+    }
+    throw error;
+  }
+}
+
+export async function getSearchModeJob(jobId: string): Promise<SupportSearchJob | null> {
+  return getSupportSearchJob(jobId);
+}
+
+export async function runDueSearchModeJobs(
+  limit: number,
+  adapter: OpenClawAdapter
+): Promise<{
+  requeued: number;
+  claimed: number;
+  completed: number;
+  failedRetryable: number;
+  failedTerminal: number;
+  jobs: Array<{ id: string; sessionId: string; status: SupportSearchJob["status"] }>;
+}> {
+  const requeued = await requeueStaleRunningSupportSearchJobs(15);
+  const claimedJobs = await claimDueSupportSearchJobs({
+    limit,
+    leaseMs: 60_000,
+    workerId: "support-search-worker"
+  });
+
+  let completed = 0;
+  let failedRetryable = 0;
+  let failedTerminal = 0;
+  const jobs: Array<{ id: string; sessionId: string; status: SupportSearchJob["status"] }> = [];
+
+  for (const job of claimedJobs) {
+    if (!job.leaseKey) {
+      failedRetryable += 1;
+      jobs.push({ id: job.id, sessionId: job.sessionId, status: "failed_retryable" });
+      continue;
+    }
+
+    try {
+      await heartbeatSupportSearchJob({
+        jobId: job.id,
+        leaseKey: job.leaseKey,
+        stageState: {
+          currentStage: "run_search_mode",
+          lastCompletedStage: "job_claimed"
+        }
+      });
+
+      const requestConversation = Array.isArray(job.request.conversation)
+        ? (job.request.conversation as Array<{ role: "user" | "assistant"; content: string }>)
+        : [];
+      const requestAttachments = Array.isArray(job.request.attachments)
+        ? job.request.attachments.map((item) => String(item))
+        : [];
+      const result = await runSearchMode(String(job.request.query ?? job.query), adapter, {
+        sessionId: job.sessionId,
+        conversation: requestConversation,
+        answerLanguage: job.answerLanguage,
+        attachments: requestAttachments
+      });
+
+      await markSupportSearchJobSucceeded({
+        jobId: job.id,
+        leaseKey: job.leaseKey,
+        result,
+        stageState: {
+          currentStage: "completed",
+          lastCompletedStage: "result_persisted"
+        }
+      });
+
+      completed += 1;
+      jobs.push({ id: job.id, sessionId: job.sessionId, status: "completed" });
+    } catch (error) {
+      const status = await markSupportSearchJobFailed({
+        jobId: job.id,
+        leaseKey: job.leaseKey,
+        errorMessage: error instanceof Error ? error.message : String(error),
+        retryable: true,
+        retryDelaySeconds: 5
+      });
+      if (status === "failed_terminal") {
+        failedTerminal += 1;
+      } else {
+        failedRetryable += 1;
+      }
+      jobs.push({ id: job.id, sessionId: job.sessionId, status });
+    }
+  }
+
+  return {
+    requeued,
+    claimed: claimedJobs.length,
+    completed,
+    failedRetryable,
+    failedTerminal,
+    jobs
+  };
 }
 
 export async function runSearchMode(
