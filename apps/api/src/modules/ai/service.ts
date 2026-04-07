@@ -34,6 +34,8 @@ import * as settings from "../settings/repository.js";
 import * as onesSync from "../ones-sync/service.js";
 import * as githubKbService from "../github-kb/service.js";
 
+type SearchRuntimeDelivery = "interactive" | "async_job";
+
 function normalizeAction(action: string): OpenClawDecisionAction {
   if (action === "ask_info") return "ask_user";
   if (action === "auto_resolve") return "resolve";
@@ -1521,7 +1523,7 @@ export async function runDueSearchModeJobs(
   const requeued = await requeueStaleRunningSupportSearchJobs(15);
   const claimedJobs = await claimDueSupportSearchJobs({
     limit,
-    leaseMs: 60_000,
+    leaseMs: env.AI_SUPPORT_JOB_LEASE_MS,
     workerId: "support-search-worker"
   });
 
@@ -1531,62 +1533,15 @@ export async function runDueSearchModeJobs(
   const jobs: Array<{ id: string; sessionId: string; status: SupportSearchJob["status"] }> = [];
 
   for (const job of claimedJobs) {
-    if (!job.leaseKey) {
-      failedRetryable += 1;
-      jobs.push({ id: job.id, sessionId: job.sessionId, status: "failed_retryable" });
-      continue;
-    }
-
-    try {
-      await heartbeatSupportSearchJob({
-        jobId: job.id,
-        leaseKey: job.leaseKey,
-        stageState: {
-          currentStage: "run_search_mode",
-          lastCompletedStage: "job_claimed"
-        }
-      });
-
-      const requestConversation = Array.isArray(job.request.conversation)
-        ? (job.request.conversation as Array<{ role: "user" | "assistant"; content: string }>)
-        : [];
-      const requestAttachments = Array.isArray(job.request.attachments)
-        ? job.request.attachments.map((item) => String(item))
-        : [];
-      const result = await runSearchMode(String(job.request.query ?? job.query), adapter, {
-        sessionId: job.sessionId,
-        conversation: requestConversation,
-        answerLanguage: job.answerLanguage,
-        attachments: requestAttachments
-      });
-
-      await markSupportSearchJobSucceeded({
-        jobId: job.id,
-        leaseKey: job.leaseKey,
-        result,
-        stageState: {
-          currentStage: "completed",
-          lastCompletedStage: "result_persisted"
-        }
-      });
-
+    const status = await runClaimedSearchModeJob(job, adapter);
+    if (status === "completed") {
       completed += 1;
-      jobs.push({ id: job.id, sessionId: job.sessionId, status: "completed" });
-    } catch (error) {
-      const status = await markSupportSearchJobFailed({
-        jobId: job.id,
-        leaseKey: job.leaseKey,
-        errorMessage: error instanceof Error ? error.message : String(error),
-        retryable: true,
-        retryDelaySeconds: 5
-      });
-      if (status === "failed_terminal") {
-        failedTerminal += 1;
-      } else {
-        failedRetryable += 1;
-      }
-      jobs.push({ id: job.id, sessionId: job.sessionId, status });
+    } else if (status === "failed_terminal") {
+      failedTerminal += 1;
+    } else {
+      failedRetryable += 1;
     }
+    jobs.push({ id: job.id, sessionId: job.sessionId, status });
   }
 
   return {
@@ -1599,6 +1554,84 @@ export async function runDueSearchModeJobs(
   };
 }
 
+async function runClaimedSearchModeJob(
+  job: SupportSearchJob,
+  adapter: OpenClawAdapter
+): Promise<SupportSearchJob["status"]> {
+  if (!job.leaseKey) {
+    return "failed_retryable";
+  }
+
+  try {
+    await heartbeatSupportSearchJob({
+      jobId: job.id,
+      leaseKey: job.leaseKey,
+      leaseMs: env.AI_SUPPORT_JOB_LEASE_MS,
+      stageState: {
+        currentStage: "run_search_mode",
+        lastCompletedStage: "job_claimed"
+      }
+    });
+
+    const requestConversation = Array.isArray(job.request.conversation)
+      ? (job.request.conversation as Array<{ role: "user" | "assistant"; content: string }>)
+      : [];
+    const requestAttachments = Array.isArray(job.request.attachments)
+      ? job.request.attachments.map((item) => String(item))
+      : [];
+    const result = await runSearchMode(String(job.request.query ?? job.query), adapter, {
+      sessionId: job.sessionId,
+      conversation: requestConversation,
+      answerLanguage: job.answerLanguage,
+      attachments: requestAttachments,
+      runtimeDelivery: "async_job"
+    });
+
+    await markSupportSearchJobSucceeded({
+      jobId: job.id,
+      leaseKey: job.leaseKey,
+      result,
+      stageState: {
+        currentStage: "completed",
+        lastCompletedStage: "result_persisted"
+      }
+    });
+
+    return "completed";
+  } catch (error) {
+    return markSupportSearchJobFailed({
+      jobId: job.id,
+      leaseKey: job.leaseKey,
+      errorMessage: error instanceof Error ? error.message : String(error),
+      retryable: true,
+      retryDelaySeconds: 5
+    });
+  }
+}
+
+export async function driveSearchModeJob(jobId: string, adapter: OpenClawAdapter): Promise<SupportSearchJob | null> {
+  const current = await getSupportSearchJob(jobId);
+  if (!current) return null;
+  if (current.status === "completed" || current.status === "failed_terminal" || current.status === "cancelled") {
+    return current;
+  }
+  if (current.status === "running" || current.status === "partial_result_ready") {
+    return current;
+  }
+
+  const claimed = await claimDueSupportSearchJobs({
+    limit: 1,
+    leaseMs: env.AI_SUPPORT_JOB_LEASE_MS,
+    workerId: "support-search-drive",
+    jobId
+  });
+  if (claimed[0]) {
+    await runClaimedSearchModeJob(claimed[0], adapter);
+  }
+
+  return getSupportSearchJob(jobId);
+}
+
 export async function runSearchMode(
   query: string,
   adapter: OpenClawAdapter,
@@ -1608,13 +1641,18 @@ export async function runSearchMode(
     answerLanguage?: "zh" | "en";
     imageAttachments?: string[];
     attachments?: string[];
+    runtimeDelivery?: SearchRuntimeDelivery;
   }
 ): Promise<SearchModeResult> {
   const sessionId = options?.sessionId ?? crypto.randomUUID();
   const previousDialog = await aiRepo.getDialogState(sessionId);
   const currentRound = previousDialog?.clarification_round ?? 0;
   const searchIntent: "clarify" | "retrieval" = currentRound > 0 ? "clarify" : "retrieval";
-  const runtime = buildSearchRuntime({ intent: searchIntent, sessionId });
+  const runtime = buildSearchRuntime({
+    intent: searchIntent,
+    sessionId,
+    delivery: options?.runtimeDelivery ?? "interactive"
+  });
   const trimmedQuery = query.trim();
   const prevTranscript = previousDialog?.transcript;
   const resolvedQuery = trimmedQuery || (prevTranscript?.length ? prevTranscript[prevTranscript.length - 1].content : "") || "";

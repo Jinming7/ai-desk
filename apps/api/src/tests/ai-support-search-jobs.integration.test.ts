@@ -11,6 +11,29 @@ let baseUrl = "";
 let server: ReturnType<typeof app.listen> | null = null;
 const originalCronSecret = env.CRON_SECRET;
 
+function parseSse(text: string): Array<{ event: string; data: string }> {
+  return text
+    .trim()
+    .split("\n\n")
+    .map((block) => {
+      const event = block
+        .split("\n")
+        .find((line) => line.startsWith("event:"))
+        ?.slice("event:".length)
+        .trim();
+      const data = block
+        .split("\n")
+        .find((line) => line.startsWith("data:"))
+        ?.slice("data:".length)
+        .trim();
+      return {
+        event: event ?? "",
+        data: data ?? ""
+      };
+    })
+    .filter((event) => event.event.length > 0);
+}
+
 function assertSafeTestDatabase() {
   const url = process.env.DATABASE_URL ?? env.DATABASE_URL;
   if (!isSafeTestDatabaseUrl(url)) {
@@ -125,4 +148,83 @@ test("support search job submission dedupes identical requests onto the same que
 
   assert.equal(secondBody.job.id, firstBody.job.id);
   assert.equal(secondBody.job.status, "queued");
+});
+
+test("support search job SSE stream drives a queued job to completion and emits ordered snapshots", async () => {
+  const submitResponse = await fetch(`${baseUrl}/api/v1/ai/search/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query: "thisquerywillnotmatchkbx",
+      conversation: []
+    })
+  });
+
+  assert.equal(submitResponse.status, 202);
+  const submitted = (await submitResponse.json()) as {
+    job: { id: string; sessionId: string; status: string };
+  };
+
+  const streamResponse = await fetch(`${baseUrl}/api/v1/ai/search/jobs/${submitted.job.id}/events`, {
+    headers: {
+      Accept: "text/event-stream"
+    }
+  });
+
+  assert.equal(streamResponse.status, 200);
+  assert.equal(streamResponse.headers.get("content-type"), "text/event-stream; charset=utf-8");
+
+  const body = await streamResponse.text();
+  const events = parseSse(body);
+  const snapshots = events
+    .filter((event) => event.event === "job_snapshot")
+    .map((event) => JSON.parse(event.data) as { job: { status: string; result: { answer?: string } | null } });
+
+  assert.equal(snapshots.length >= 2, true);
+  assert.equal(snapshots[0]?.job.status, "queued");
+  assert.equal(snapshots.at(-1)?.job.status, "completed");
+  assert.equal(typeof snapshots.at(-1)?.job.result?.answer, "string");
+  assert.equal(events.at(-1)?.event, "job_completed");
+});
+
+test("support search polling fallback can drive a queued job and read the same completed job truth", async () => {
+  const submitResponse = await fetch(`${baseUrl}/api/v1/ai/search/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query: "thisquerywillnotmatchkbx",
+      conversation: []
+    })
+  });
+
+  assert.equal(submitResponse.status, 202);
+  const submitted = (await submitResponse.json()) as {
+    job: { id: string; sessionId: string; status: string };
+  };
+
+  const driveResponse = await fetch(`${baseUrl}/api/v1/ai/search/jobs/${submitted.job.id}/drive`, {
+    method: "POST"
+  });
+  assert.equal(driveResponse.status, 202);
+  const driven = (await driveResponse.json()) as {
+    job: { id: string; status: string; result: { session_id?: string; answer?: string } | null };
+  };
+
+  const statusResponse = await fetch(`${baseUrl}/api/v1/ai/search/jobs/${submitted.job.id}`);
+  assert.equal(statusResponse.status, 200);
+  const statusPayload = (await statusResponse.json()) as {
+    job: {
+      id: string;
+      sessionId: string;
+      status: string;
+      result: { session_id?: string; answer?: string } | null;
+    };
+  };
+
+  assert.equal(driven.job.id, submitted.job.id);
+  assert.equal(statusPayload.job.id, submitted.job.id);
+  assert.equal(statusPayload.job.status, "completed");
+  assert.equal(statusPayload.job.result?.session_id, submitted.job.sessionId);
+  assert.equal(driven.job.result?.session_id, statusPayload.job.result?.session_id);
+  assert.equal(driven.job.result?.answer, statusPayload.job.result?.answer);
 });

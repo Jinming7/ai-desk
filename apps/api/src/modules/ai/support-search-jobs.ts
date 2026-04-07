@@ -184,6 +184,7 @@ export async function claimDueSupportSearchJobs(input: {
   limit: number;
   leaseMs: number;
   workerId: string;
+  jobId?: string;
 }): Promise<SupportSearchJob[]> {
   const client = await pool.connect();
   try {
@@ -193,10 +194,11 @@ export async function claimDueSupportSearchJobs(input: {
        FROM ai_support_search_jobs
        WHERE status = ANY($1::text[])
          AND next_run_at <= NOW()
+         AND ($3::uuid IS NULL OR id = $3::uuid)
        ORDER BY attempts ASC, next_run_at ASC, created_at ASC
        LIMIT $2
        FOR UPDATE SKIP LOCKED`,
-      [["queued", "failed_retryable"], input.limit]
+      [["queued", "failed_retryable"], input.limit, input.jobId ?? null]
     );
 
     const claimed: SupportSearchJob[] = [];

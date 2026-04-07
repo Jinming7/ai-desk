@@ -59,6 +59,7 @@ import * as kbReleaseService from "./modules/github-kb/release/service.js";
 import { getAiTopology } from "./modules/ai/agent-router.js";
 import { preloadLocalDocsIndex } from "./modules/ai/local-docs.js";
 import { getAiCapabilities } from "./modules/ai/multimodal.js";
+import { streamSearchModeJob } from "./modules/ai/support-search-stream.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
 import { env } from "./config/env.js";
@@ -134,6 +135,10 @@ if (shouldStartBackgroundLoops()) {
   setInterval(() => {
     void onesSyncService.reconcileReadModel(20).catch(() => undefined);
   }, 5 * 60 * 1000);
+
+  setInterval(() => {
+    void aiService.runDueSearchModeJobs(1, aiAdapter).catch(() => undefined);
+  }, env.AI_SUPPORT_JOB_WORKER_INTERVAL_MS);
 
   if (env.GITHUB_KB_ENABLED) {
     void githubKbService.bootstrapRepositoryFromEnvIfConfigured().catch(() => undefined);
@@ -367,6 +372,40 @@ app.get(
       return;
     }
     res.json({ job });
+  })
+);
+
+app.post(
+  "/api/v1/ai/search/jobs/:id/drive",
+  asyncHandler(async (req, res) => {
+    if (env.NODE_ENV !== "test" && !hasOpenClawGatewayAuth()) {
+      res.status(503).json({ error: "OpenClaw gateway auth is not configured" });
+      return;
+    }
+    const id = z.string().uuid().parse(req.params.id);
+    const job = await aiService.driveSearchModeJob(id, aiAdapter);
+    if (!job) {
+      res.status(404).json({ error: "Search job not found" });
+      return;
+    }
+    res.status(202).json({ job });
+  })
+);
+
+app.get(
+  "/api/v1/ai/search/jobs/:id/events",
+  asyncHandler(async (req, res) => {
+    if (env.NODE_ENV !== "test" && !hasOpenClawGatewayAuth()) {
+      res.status(503).json({ error: "OpenClaw gateway auth is not configured" });
+      return;
+    }
+    const id = z.string().uuid().parse(req.params.id);
+    const job = await aiService.getSearchModeJob(id);
+    if (!job) {
+      res.status(404).json({ error: "Search job not found" });
+      return;
+    }
+    await streamSearchModeJob({ req, res, jobId: id, adapter: aiAdapter });
   })
 );
 

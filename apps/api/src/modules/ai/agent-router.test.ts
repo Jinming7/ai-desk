@@ -41,3 +41,26 @@ test("buildSearchRuntime keeps local runtime on broader retrieval budget", () =>
     else process.env.VERCEL = originalVercel;
   }
 });
+
+test("buildSearchRuntime gives async job delivery a larger serverless budget than interactive delivery", () => {
+  const originalVercel = process.env.VERCEL;
+  try {
+    process.env.VERCEL = "1";
+    const interactive = buildSearchRuntime({
+      intent: "retrieval",
+      sessionId: "interactive-runtime-budget"
+    });
+    const asyncJob = buildSearchRuntime({
+      intent: "retrieval",
+      sessionId: "job-runtime-budget",
+      delivery: "async_job"
+    });
+
+    assert.equal(interactive.overallTimeoutMs! < asyncJob.overallTimeoutMs!, true);
+    assert.equal(interactive.queryLimit! < asyncJob.queryLimit!, true);
+    assert.equal(asyncJob.allowRefinement, true);
+  } finally {
+    if (originalVercel === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = originalVercel;
+  }
+});

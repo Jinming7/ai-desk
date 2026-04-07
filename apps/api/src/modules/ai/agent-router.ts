@@ -328,6 +328,7 @@ function resolveStageBinding(stage: RoutedSupportStage): StageBinding {
 export function buildSearchRuntime(input: {
   intent: Exclude<AiAgentIntent, "execution">;
   sessionId: string;
+  delivery?: "interactive" | "async_job";
 }): OpenClawRuntimeContext {
   const searchAgentId = (input.intent === "clarify" ? env.OPENCLAW_AGENT_ID_CLARIFY : env.OPENCLAW_AGENT_ID_RETRIEVAL).trim();
   const searchAgentModel = (
@@ -338,6 +339,7 @@ export function buildSearchRuntime(input: {
   const fallbackAgentModel = searchAgentModel || globalDefaultModel();
   const prefix = env.OPENCLAW_AGENT_SESSION_PREFIX.trim() || "nf";
   const serverless = isServerlessRuntime();
+  const asyncJobDelivery = input.delivery === "async_job";
   return {
     intent: input.intent,
     agentId: fallbackAgentId,
@@ -345,16 +347,16 @@ export function buildSearchRuntime(input: {
     sessionKey: buildAgentScopedSessionKey(fallbackAgentId, `${prefix}:${input.intent}:${input.sessionId}`),
     ...(serverless
       ? {
-          overallTimeoutMs: 22000,
+          overallTimeoutMs: asyncJobDelivery ? env.AI_SUPPORT_JOB_TIMEOUT_MS : env.AI_SUPPORT_INTERACTIVE_TIMEOUT_MS,
           requestStartedAtMs: Date.now(),
           disableLocalDocs: true,
           allowMultiPassRetrieval: true,
           allowRefinement: true,
           kbTopK: 8,
-          queryLimit: 2
+          queryLimit: asyncJobDelivery ? 4 : 2
         }
       : {
-          overallTimeoutMs: 90000,
+          overallTimeoutMs: asyncJobDelivery ? env.AI_SUPPORT_JOB_TIMEOUT_MS : 90000,
           requestStartedAtMs: Date.now(),
           disableLocalDocs: true,
           allowMultiPassRetrieval: true,
@@ -377,7 +379,7 @@ export function resolveExecutionRuntime(sessionId: string): OpenClawRuntimeConte
     sessionKey: buildAgentScopedSessionKey(executionAgentId, `${prefix}:execution:${sessionId}`),
     ...(serverless
       ? {
-          overallTimeoutMs: 22000,
+          overallTimeoutMs: env.AI_SUPPORT_INTERACTIVE_TIMEOUT_MS,
           requestStartedAtMs: Date.now(),
           disableLocalDocs: true,
           allowMultiPassRetrieval: false,

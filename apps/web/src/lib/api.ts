@@ -54,6 +54,200 @@ function withInFlightDedup<T>(key: string, run: () => Promise<T>): Promise<T> {
   return promise;
 }
 
+type SupportSearchJobStatus =
+  | "queued"
+  | "running"
+  | "partial_result_ready"
+  | "completed"
+  | "failed_retryable"
+  | "failed_terminal"
+  | "cancelled";
+
+type SupportSearchJobView = {
+  id: string;
+  sessionId: string;
+  status: SupportSearchJobStatus;
+  result: SearchResult | null;
+  errorMessage: string | null;
+  updatedAt: string;
+};
+
+function isTerminalSupportSearchJob(status: SupportSearchJobStatus): boolean {
+  return status === "completed" || status === "failed_terminal" || status === "cancelled";
+}
+
+function supportsEventSource(): boolean {
+  return typeof window !== "undefined" && typeof window.EventSource === "function";
+}
+
+function normalizeSupportSearchJobFailure(job: SupportSearchJobView): Error {
+  const message = job.errorMessage?.trim();
+  if (message) return new Error(message);
+  if (job.status === "cancelled") {
+    return new Error("AI support request was cancelled before completion.");
+  }
+  if (job.status === "failed_terminal") {
+    return new Error("AI support request failed before a final answer could be produced.");
+  }
+  return new Error("AI support request did not finish successfully.");
+}
+
+function unwrapCompletedSupportSearchJob(job: SupportSearchJobView): SearchResult {
+  if (job.status !== "completed" || !job.result) {
+    throw normalizeSupportSearchJobFailure(job);
+  }
+  return job.result;
+}
+
+async function submitSearchKnowledgeJob(input: {
+  query: string;
+  imageAttachments?: string[];
+  attachments?: string[];
+  sessionId?: string;
+  conversation?: ConversationTurn[];
+  answerLanguage?: "zh" | "en";
+}): Promise<SupportSearchJobView> {
+  const res = await fetch(`${API}/api/v1/ai/search/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    try {
+      const parsed = JSON.parse(errorText) as { error?: unknown };
+      const message = typeof parsed.error === "string" ? parsed.error.trim() : "";
+      throw new Error(message || "AI support request failed");
+    } catch {
+      throw new Error(errorText.trim() || "AI support request failed");
+    }
+  }
+
+  const data = (await res.json()) as { job: SupportSearchJobView };
+  return data.job;
+}
+
+async function getSearchKnowledgeJob(jobId: string): Promise<SupportSearchJobView> {
+  const res = await fetch(`${API}/api/v1/ai/search/jobs/${jobId}`).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text.trim() || "Failed to load AI support job");
+  }
+  const data = (await res.json()) as { job: SupportSearchJobView };
+  return data.job;
+}
+
+async function driveSearchKnowledgeJob(jobId: string): Promise<SupportSearchJobView> {
+  const res = await fetch(`${API}/api/v1/ai/search/jobs/${jobId}/drive`, {
+    method: "POST"
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text.trim() || "Failed to start AI support job");
+  }
+  const data = (await res.json()) as { job: SupportSearchJobView };
+  return data.job;
+}
+
+async function waitForSearchKnowledgeJobViaSse(jobId: string): Promise<SupportSearchJobView> {
+  return new Promise<SupportSearchJobView>((resolve, reject) => {
+    const eventSource = new window.EventSource(`${API}/api/v1/ai/search/jobs/${jobId}/events`);
+    let settled = false;
+    let lastSnapshot: SupportSearchJobView | null = null;
+
+    const cleanup = () => {
+      eventSource.close();
+    };
+    const finishResolve = (job: SupportSearchJobView) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(job);
+    };
+    const finishReject = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const handleSnapshotPayload = (payload: unknown) => {
+      const job = (payload as { job?: SupportSearchJobView } | null)?.job;
+      if (!job) return;
+      lastSnapshot = job;
+      if (isTerminalSupportSearchJob(job.status)) {
+        if (job.status === "completed") {
+          finishResolve(job);
+          return;
+        }
+        finishReject(normalizeSupportSearchJobFailure(job));
+      }
+    };
+
+    eventSource.addEventListener("job_snapshot", (event) => {
+      handleSnapshotPayload(JSON.parse((event as MessageEvent<string>).data));
+    });
+    eventSource.addEventListener("job_completed", (event) => {
+      handleSnapshotPayload(JSON.parse((event as MessageEvent<string>).data));
+    });
+    eventSource.addEventListener("job_failed", (event) => {
+      handleSnapshotPayload(JSON.parse((event as MessageEvent<string>).data));
+    });
+    eventSource.onerror = () => {
+      if (lastSnapshot && isTerminalSupportSearchJob(lastSnapshot.status)) {
+        if (lastSnapshot.status === "completed") {
+          finishResolve(lastSnapshot);
+          return;
+        }
+        finishReject(normalizeSupportSearchJobFailure(lastSnapshot));
+        return;
+      }
+      finishReject(new Error("SSE unavailable"));
+    };
+  });
+}
+
+async function waitForSearchKnowledgeJobViaPolling(jobId: string): Promise<SupportSearchJobView> {
+  const deadline = Date.now() + 250_000;
+  let lastUpdatedAt = "";
+  let unchangedPolls = 0;
+
+  let current = await driveSearchKnowledgeJob(jobId);
+  while (Date.now() < deadline) {
+    if (isTerminalSupportSearchJob(current.status)) {
+      return current;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    current = await getSearchKnowledgeJob(jobId);
+
+    if (isTerminalSupportSearchJob(current.status)) {
+      return current;
+    }
+
+    if (current.updatedAt === lastUpdatedAt) {
+      unchangedPolls += 1;
+    } else {
+      unchangedPolls = 0;
+      lastUpdatedAt = current.updatedAt;
+    }
+
+    if ((current.status === "queued" || current.status === "failed_retryable") && unchangedPolls >= 3) {
+      current = await driveSearchKnowledgeJob(jobId);
+      unchangedPolls = 0;
+      lastUpdatedAt = current.updatedAt;
+    }
+  }
+
+  throw new Error("AI support request timed out before the async job completed.");
+}
+
 export async function listTickets(customerId?: string, status?: TicketStatus | "ALL"): Promise<Ticket[]> {
   const params = new URLSearchParams();
   if (customerId) params.set("customerId", customerId);
@@ -150,46 +344,21 @@ export async function searchKnowledge(input: {
   conversation?: ConversationTurn[];
   answerLanguage?: "zh" | "en";
 }): Promise<SearchResult> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    let res: Response;
+  return withInFlightDedup(`searchKnowledge:${JSON.stringify(input)}`, async () => {
+    const submitted = await submitSearchKnowledgeJob(input);
     try {
-      res = await fetch(`${API}/api/v1/ai/search`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input)
-      });
+      const job = supportsEventSource()
+        ? await waitForSearchKnowledgeJobViaSse(submitted.id).catch(() => waitForSearchKnowledgeJobViaPolling(submitted.id))
+        : await waitForSearchKnowledgeJobViaPolling(submitted.id);
+      return unwrapCompletedSupportSearchJob(job);
     } catch (error) {
       const message = error instanceof Error ? error.message.trim() : "";
-      throw new Error(message || "Local API is unavailable. Start the backend service and retry.");
+      if (!message || message === "SSE unavailable") {
+        throw new Error("AI support request failed");
+      }
+      throw new Error(message);
     }
-
-    if (res.ok) {
-      const data = await res.json();
-      return data.result;
-    }
-
-    const errorText = await res.text();
-    const normalized = errorText.toLowerCase();
-    const retryable =
-      normalized.includes("connection timeout") ||
-      normalized.includes("connection terminated") ||
-      normalized.includes("econnreset");
-    if (retryable && attempt === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 600));
-      continue;
-    }
-    if (retryable) {
-      throw new Error("Knowledge base is temporarily busy. Please retry in a few seconds.");
-    }
-    try {
-      const parsed = JSON.parse(errorText) as { error?: unknown };
-      const message = typeof parsed.error === "string" ? parsed.error.trim() : "";
-      throw new Error(message || "AI support request failed");
-    } catch {
-      throw new Error(errorText.trim() || "AI support request failed");
-    }
-  }
-  throw new Error("AI support request failed");
+  });
 }
 
 export async function getAiCapabilities(): Promise<AiCapabilities> {
