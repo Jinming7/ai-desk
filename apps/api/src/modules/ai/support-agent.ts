@@ -25,6 +25,7 @@ import type {
   SupportVerificationResult,
   TriageSupportInsight
 } from "./types.js";
+import { resolveSupportExecutionPlan } from "./support-execution-plan.js";
 import { resolveSearchReferenceEvidenceId, type SearchReference } from "./types.js";
 import { SearchOrchestrator } from "./search-orchestrator.js";
 import { resolveStageSpecificAgent } from "./agent-router.js";
@@ -2810,11 +2811,12 @@ function buildStructuredCaseFrameQuery(caseFrame: SupportCaseFrame): string | nu
   return segments.length ? segments.join(" ") : null;
 }
 
-function buildInitialRetrievalQueries(query: string, caseFrame: SupportCaseFrame, orchestrator: SearchOrchestrator): string[] {
+function buildInitialRetrievalQueries(query: string, caseFrame: SupportCaseFrame, seedQueries: string[] = []): string[] {
   const structuredCaseFrameQuery = buildStructuredCaseFrameQuery(caseFrame);
   const compactFocus = buildCompactFocusQuery(query, caseFrame);
   return uniqueStrings(
     [
+      ...seedQueries,
       structuredCaseFrameQuery,
       query,
       compactFocus,
@@ -3000,19 +3002,50 @@ export async function runSupportSearchAgent(input: {
     .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(casePlanStartedAt)) }))
     .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(casePlanStartedAt)) }));
   const plannerResult = await plannerPromise;
-  const mergedCaseFrame = mergeRouteAndEvidencePlan(plannerResult.value ?? fallbackCaseFrame(input.query), routeResult.route, evidencePlanResult.plan);
+  const executionPlan = resolveSupportExecutionPlan({
+    query: input.query,
+    routeResult: {
+      status: "completed",
+      value: routeResult.route
+    },
+    evidencePlanResult:
+      evidencePlanResult.timing.status === "completed"
+        ? {
+            status: "completed",
+            value: evidencePlanResult.plan
+          }
+        : {
+            status: "fallback"
+          },
+    casePlanResult:
+      plannerResult.value !== null
+        ? {
+            status: "completed",
+            value: plannerResult.value
+          }
+        : {
+            status: "fallback"
+          }
+  });
+  const mergedCaseFrame = mergeRouteAndEvidencePlan(executionPlan.caseFrame, executionPlan.route, executionPlan.evidencePlan);
   const stabilized = stabilizeSupportRouteAndCaseFrame({
     query: input.query,
-    route: routeResult.route,
+    route: executionPlan.route,
     caseFrame: mergedCaseFrame
   });
   const route = stabilized.route;
-  const caseFrame = stabilized.caseFrame;
+  const caseFrame = {
+    ...stabilized.caseFrame,
+    retrieval_queries: uniqueStrings(
+      [...executionPlan.retrievalPlan.baseQueries, ...stabilized.caseFrame.retrieval_queries],
+      8
+    )
+  };
   const stageBudget = normalizeStageBudget({
     route,
-    plan: evidencePlanResult.plan
+    plan: executionPlan.evidencePlan
   });
-  const baseQueries = buildInitialRetrievalQueries(input.query, caseFrame, orchestrator);
+  const baseQueries = buildInitialRetrievalQueries(input.query, caseFrame, executionPlan.retrievalPlan.baseQueries);
   const baseEvidenceStartedAt = performance.now();
   const baseEvidenceResult = await orchestrator
     .collectEvidence({
@@ -3662,7 +3695,7 @@ export async function runSupportSearchAgent(input: {
       follow_up_question: mode === "clarification" ? missingInfo[0] ?? supportAnswer.still_need_to_confirm[0] ?? null : null,
       internal_diagnostics: {
         route,
-        evidence_plan: evidencePlanResult.plan,
+        evidence_plan: executionPlan.evidencePlan,
         stage_budget: stageBudget,
         retrieval_queries_used: uniqueStrings(
           [
