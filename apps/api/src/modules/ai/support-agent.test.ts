@@ -1054,6 +1054,227 @@ title: "Rebuild indexes after migration"
   }
 });
 
+test("runSupportSearchAgent disables fast path for async job delivery and executes full verification/composition", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+  await writeFixture(
+    rootDir,
+    "docs/import-data-into-ones/rebuild-indexes-after-migration.mdx",
+    `---
+title: "Rebuild indexes after migration"
+---
+
+# Rebuild indexes after migration
+
+1. Open the migration tool.
+2. Run the rebuild indexes task.
+3. Verify the latest indexing job completed successfully.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "how_to_product",
+      specialist_agent: "howto-specialist"
+    }
+  });
+  adapter.writeHowToSpecialistAnswer = async () => ({
+    question_type: "how_to_product",
+    render_variant: "how_to",
+    direct_answer: "要重建索引，可以直接执行迁移工具里的 rebuild indexes 任务。",
+    claims: [
+      {
+        text: "可以通过迁移工具执行 rebuild indexes 任务来重建索引。",
+        kind: "verified_fact",
+        evidence_ids: ["local:docs/import-data-into-ones/rebuild-indexes-after-migration.mdx:root"],
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["执行 rebuild indexes。", "确认最新索引任务执行完成。"],
+    steps: ["打开迁移工具。", "执行 rebuild indexes 任务。", "确认最新索引任务执行完成。"],
+    unknowns: [],
+    escalation_needed: false
+  });
+  let judgeCalled = false;
+  let composeCalled = false;
+  let curateCalled = false;
+  let displaySelectorCalled = false;
+  adapter.judgeSupportAnswer = async (input) => {
+    judgeCalled = true;
+    return {
+      verdict: "verified",
+      summary: "The rebuild-indexes procedure is documented.",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: input.evidenceBundle.primary.map((item) => item.documentId),
+      display_citation_ids: input.evidenceBundle.primary.map((item) => item.documentId),
+      verified_claims: ["可以通过迁移工具执行 rebuild indexes 任务来重建索引。"],
+      claim_to_citation_map: [
+        {
+          text: "可以通过迁移工具执行 rebuild indexes 任务来重建索引。",
+          kind: "verified_fact",
+          verdict: "verified",
+          citation_ids: input.evidenceBundle.primary.map((item) => item.documentId)
+        }
+      ]
+    };
+  };
+  adapter.composeCustomerAnswer = async (input) => {
+    composeCalled = true;
+    return {
+      question_type: "how_to_product",
+      render_variant: "how_to",
+      direct_answer: input.supportedClaims[0]?.text ?? "",
+      sections: [],
+      why: [],
+      what_to_do_now: input.nextActions,
+      still_need_to_confirm: input.unknowns
+    };
+  };
+  adapter.curateSupportCitations = async (input) => {
+    curateCalled = true;
+    return {
+      display_citation_ids: Array.from(new Set(input.supportedClaims.flatMap((item) => item.citation_ids))).slice(0, 3)
+    };
+  };
+  adapter.selectDisplayCitations = async () => {
+    displaySelectorCalled = true;
+    throw new Error("fast-path selector should not be used for async job delivery");
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "怎么重建索引",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-async-job-no-fast-path",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    const stageTrace = result.result.internal_diagnostics?.stage_trace ?? [];
+    assert.equal(result.result.internal_diagnostics?.fast_path_used, false);
+    assert.equal(judgeCalled, true);
+    assert.equal(composeCalled, true);
+    assert.equal(curateCalled, true);
+    assert.equal(displaySelectorCalled, false);
+    assert.equal(stageTrace.find((item) => item.stage === "verification")?.status, "completed");
+    assert.equal(stageTrace.find((item) => item.stage === "answer_composition")?.status, "completed");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent disables fast path when runtime tightening is enabled", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  const originalRuntimeTightening = env.FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+  env.FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING = true;
+  await writeFixture(
+    rootDir,
+    "docs/import-data-into-ones/rebuild-indexes-after-migration.mdx",
+    `---
+title: "Rebuild indexes after migration"
+---
+
+# Rebuild indexes after migration
+
+1. Open the migration tool.
+2. Run the rebuild indexes task.
+3. Verify the latest indexing job completed successfully.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "how_to_product",
+      specialist_agent: "howto-specialist"
+    }
+  });
+  adapter.writeHowToSpecialistAnswer = async () => ({
+    question_type: "how_to_product",
+    render_variant: "how_to",
+    direct_answer: "要重建索引，可以直接执行迁移工具里的 rebuild indexes 任务。",
+    claims: [
+      {
+        text: "可以通过迁移工具执行 rebuild indexes 任务来重建索引。",
+        kind: "verified_fact",
+        evidence_ids: ["local:docs/import-data-into-ones/rebuild-indexes-after-migration.mdx:root"],
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["执行 rebuild indexes。", "确认最新索引任务执行完成。"],
+    steps: ["打开迁移工具。", "执行 rebuild indexes 任务。", "确认最新索引任务执行完成。"],
+    unknowns: [],
+    escalation_needed: false
+  });
+  let judgeCalled = false;
+  let composeCalled = false;
+  adapter.judgeSupportAnswer = async (input) => {
+    judgeCalled = true;
+    return {
+      verdict: "verified",
+      summary: "The rebuild-indexes procedure is documented.",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: input.evidenceBundle.primary.map((item) => item.documentId),
+      display_citation_ids: input.evidenceBundle.primary.map((item) => item.documentId),
+      verified_claims: ["可以通过迁移工具执行 rebuild indexes 任务来重建索引。"],
+      claim_to_citation_map: [
+        {
+          text: "可以通过迁移工具执行 rebuild indexes 任务来重建索引。",
+          kind: "verified_fact",
+          verdict: "verified",
+          citation_ids: input.evidenceBundle.primary.map((item) => item.documentId)
+        }
+      ]
+    };
+  };
+  adapter.composeCustomerAnswer = async (input) => {
+    composeCalled = true;
+    return {
+      question_type: "how_to_product",
+      render_variant: "how_to",
+      direct_answer: input.supportedClaims[0]?.text ?? "",
+      sections: [],
+      why: [],
+      what_to_do_now: input.nextActions,
+      still_need_to_confirm: input.unknowns
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "怎么重建索引",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-tightened-no-fast-path",
+      runtime: {
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(result.result.internal_diagnostics?.fast_path_used, false);
+    assert.equal(judgeCalled, true);
+    assert.equal(composeCalled, true);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    env.FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING = originalRuntimeTightening;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("runSupportSearchAgent keeps API answers structurally organized in fast path fallback", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;

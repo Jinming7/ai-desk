@@ -26,6 +26,7 @@ import type {
   TriageSupportInsight
 } from "./types.js";
 import { resolveSupportExecutionPlan } from "./support-execution-plan.js";
+import { resolveSupportRuntimePolicy } from "./support-runtime-policy.js";
 import { resolveSearchReferenceEvidenceId, type SearchReference } from "./types.js";
 import { SearchOrchestrator } from "./search-orchestrator.js";
 import { resolveStageSpecificAgent } from "./agent-router.js";
@@ -2949,6 +2950,7 @@ export async function runSupportSearchAgent(input: {
   const allowMultiPassRetrieval = input.runtime?.allowMultiPassRetrieval !== false;
   const allowRefinement = input.runtime?.allowRefinement !== false;
   const contextType = input.contextType ?? "search";
+  const runtimePolicy = resolveSupportRuntimePolicy(input.runtime);
 
   const routeStartedAt = performance.now();
   const routerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 32000, 5000, 12000), "router", `${input.idempotencyKey}:router`);
@@ -3334,13 +3336,15 @@ export async function runSupportSearchAgent(input: {
     evidenceBundle
   });
   const useFastAgentPath =
+    runtimePolicy.fastPathAllowed &&
     shouldUseFastAgentPath({
       route,
       caseFrame,
       evidenceBundle,
       draft: draftSupportAnswer,
       currentRound: input.currentRound
-    }) && hasEnoughBudget(input.runtime, 2500);
+    }) &&
+    hasEnoughBudget(input.runtime, 2500);
 
   const verifierStartedAt = performance.now();
   const verificationResult = useFastAgentPath
@@ -3715,6 +3719,7 @@ export async function runSupportSearchAgent(input: {
           evidenceCollection.references.map((item) => item.sourceType ?? "unknown"),
           6
         ),
+        runtime_policy: runtimePolicy,
         fast_path_used: useFastAgentPath,
         confirmed_facts: uniqueStrings(draftSupportAnswer.confirmed_facts ?? [], 4),
         stage_trace: stageTrace,

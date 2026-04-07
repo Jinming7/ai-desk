@@ -334,6 +334,12 @@ export interface SearchModeResult {
     specialist_skipped: boolean;
     specialists_used?: string[];
     evidence_sources?: string[];
+    runtime_policy?: {
+      deliveryMode: "interactive" | "async_job";
+      tighteningEnabled: boolean;
+      fastPathAllowed: boolean;
+      profile: "latency_optimized" | "quality_optimized" | "tightened";
+    };
     fast_path_used?: boolean;
     confirmed_facts?: string[];
     search_agents_used?: Array<{

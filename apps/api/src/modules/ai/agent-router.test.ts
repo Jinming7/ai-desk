@@ -59,6 +59,8 @@ test("buildSearchRuntime gives async job delivery a larger serverless budget tha
     assert.equal(interactive.overallTimeoutMs! < asyncJob.overallTimeoutMs!, true);
     assert.equal(interactive.queryLimit! < asyncJob.queryLimit!, true);
     assert.equal(asyncJob.allowRefinement, true);
+    assert.equal(interactive.deliveryMode, "interactive");
+    assert.equal(asyncJob.deliveryMode, "async_job");
   } finally {
     if (originalVercel === undefined) delete process.env.VERCEL;
     else process.env.VERCEL = originalVercel;

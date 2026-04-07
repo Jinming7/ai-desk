@@ -104,6 +104,7 @@ export interface OpenClawRuntimeContext {
   sessionKey?: string;
   model?: string;
   intent?: "retrieval" | "clarify" | "execution";
+  deliveryMode?: "interactive" | "async_job";
   stage?:
     | "router"
     | "evidence-planner"

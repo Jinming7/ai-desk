@@ -342,6 +342,7 @@ export function buildSearchRuntime(input: {
   const asyncJobDelivery = input.delivery === "async_job";
   return {
     intent: input.intent,
+    deliveryMode: input.delivery ?? "interactive",
     agentId: fallbackAgentId,
     model: fallbackAgentModel,
     sessionKey: buildAgentScopedSessionKey(fallbackAgentId, `${prefix}:${input.intent}:${input.sessionId}`),
@@ -374,6 +375,7 @@ export function resolveExecutionRuntime(sessionId: string): OpenClawRuntimeConte
   const serverless = isServerlessRuntime();
   return {
     intent: "execution",
+    deliveryMode: "interactive",
     agentId: executionAgentId,
     model: executionAgentModel,
     sessionKey: buildAgentScopedSessionKey(executionAgentId, `${prefix}:execution:${sessionId}`),
