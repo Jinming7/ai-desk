@@ -182,6 +182,183 @@ function createPlannerFailureAdapter(): OpenClawAdapter {
   };
 }
 
+function createUnifiedPlannerAdapter() {
+  const adapter = createPlannerFailureAdapter() as OpenClawAdapter & {
+    legacyCalls: string[];
+    planSupportExecution: (
+      input: OpenClawSupportPlannerInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{
+      route: SupportQuestionRoute;
+      caseFrame: {
+        goal: string;
+        symptom: string;
+        object: string;
+        action_type: string;
+        deployment_model: string;
+        product_area: string;
+        constraints: string[];
+        missing_critical_info: string[];
+        retrieval_queries: string[];
+        query_plan: {
+          concept_queries: string[];
+          object_queries: string[];
+          behavior_queries: string[];
+        };
+        question_type: SupportQuestionRoute["question_type"];
+        specialist_agent: SupportQuestionRoute["specialist_agent"];
+        answer_contract: string;
+        routing_confidence: number;
+      };
+      evidencePlan: {
+        query_plan: {
+          concept_queries: string[];
+          object_queries: string[];
+          behavior_queries: string[];
+        };
+        evidence_priority: string[];
+        required_doc_kinds: string[];
+        retrieval_rounds: number;
+        allow_refinement: boolean;
+        stop_after_grounded_evidence: boolean;
+      };
+    }>;
+  };
+
+  adapter.legacyCalls = [];
+  adapter.routeSupportQuestion = async (_input: OpenClawSupportRouterInput): Promise<SupportQuestionRoute> => {
+    adapter.legacyCalls.push("route");
+    throw new Error("legacy route should not be called when unified planner is available");
+  };
+  adapter.planSupportEvidence = async (_input: OpenClawSupportEvidencePlannerInput): Promise<never> => {
+    adapter.legacyCalls.push("evidence");
+    throw new Error("legacy evidence planner should not be called when unified planner is available");
+  };
+  adapter.planSupportCase = async (_input: OpenClawSupportPlannerInput): Promise<never> => {
+    adapter.legacyCalls.push("case");
+    throw new Error("legacy case planner should not be called when unified planner is available");
+  };
+  adapter.planSupportExecution = async (): Promise<{
+    route: SupportQuestionRoute;
+    caseFrame: {
+      goal: string;
+      symptom: string;
+      object: string;
+      action_type: string;
+      deployment_model: string;
+      product_area: string;
+      constraints: string[];
+      missing_critical_info: string[];
+      retrieval_queries: string[];
+      query_plan: {
+        concept_queries: string[];
+        object_queries: string[];
+        behavior_queries: string[];
+      };
+      question_type: SupportQuestionRoute["question_type"];
+      specialist_agent: SupportQuestionRoute["specialist_agent"];
+      answer_contract: string;
+      routing_confidence: number;
+    };
+    evidencePlan: {
+      query_plan: {
+        concept_queries: string[];
+        object_queries: string[];
+        behavior_queries: string[];
+      };
+      evidence_priority: string[];
+      required_doc_kinds: string[];
+      retrieval_rounds: number;
+      allow_refinement: boolean;
+      stop_after_grounded_evidence: boolean;
+    };
+  }> => ({
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: "Confirm which Linux distributions are officially supported.",
+      answer_contract:
+        "State the officially supported Linux distributions clearly, note any version constraints if documented, and distinguish official support from unsupported distributions.",
+      specialist_agent: "behavior-specialist",
+      routing_confidence: 0.96,
+      specialist_budget: 1
+    },
+    caseFrame: {
+      goal: "Confirm which Linux distributions are officially supported.",
+      symptom: "Need the official Linux support scope.",
+      object: "linux distributions",
+      action_type: "capability_confirmation",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: [
+        "supported operating systems",
+        "linux distributions",
+        "deployment environment requirements"
+      ],
+      query_plan: {
+        concept_queries: ["supported operating systems"],
+        object_queries: ["linux distributions"],
+        behavior_queries: ["officially supported"]
+      },
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract:
+        "State the officially supported Linux distributions clearly, note any version constraints if documented, and distinguish official support from unsupported distributions.",
+      routing_confidence: 0.96
+    },
+    evidencePlan: {
+      query_plan: {
+        concept_queries: ["supported operating systems"],
+        object_queries: ["linux distributions"],
+        behavior_queries: ["officially supported"]
+      },
+      evidence_priority: ["support matrix", "deployment guide"],
+      required_doc_kinds: ["product_guide", "rules"],
+      retrieval_rounds: 2,
+      allow_refinement: true,
+      stop_after_grounded_evidence: false
+    }
+  });
+
+  return adapter;
+}
+
+test("runSupportSearchAgent prefers the unified support execution planner over legacy planner stages", async () => {
+  const originalCollectEvidence = SearchOrchestrator.prototype.collectEvidence;
+  SearchOrchestrator.prototype.collectEvidence = async function collectEvidenceStub(input) {
+    return {
+      query: input.queries[0] ?? "",
+      answer: "",
+      confidence: 0.4,
+      references: [],
+      retrievalStatus: "no_results",
+      unresolvedReasonCode: "NO_MATCHING_KB",
+      resolvedQueries: input.queries,
+      fallbackUsed: false
+    };
+  };
+
+  try {
+    const adapter = createUnifiedPlannerAdapter();
+    const execution = await runSupportSearchAgent({
+      query: "Which Linux distributions are officially supported?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-execution-plan-unified-planner"
+    });
+
+    assert.deepEqual(adapter.legacyCalls, []);
+    const retrievalQueries = execution.result.internal_diagnostics?.retrieval_queries_used ?? [];
+    assert.equal(retrievalQueries.some((query) => /linux distributions|supported operating systems/i.test(query)), true);
+  } finally {
+    SearchOrchestrator.prototype.collectEvidence = originalCollectEvidence;
+  }
+});
+
 test("runSupportSearchAgent does not emit generic fallback retrieval queries when planner stages time out", async () => {
   const originalCollectEvidence = SearchOrchestrator.prototype.collectEvidence;
 

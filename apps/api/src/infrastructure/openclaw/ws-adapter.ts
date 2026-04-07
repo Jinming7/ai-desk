@@ -12,6 +12,8 @@ import type {
   OpenClawClassifyIntentInput,
   OpenClawClassifyIntentOutput,
   OpenClawRuntimeContext,
+  OpenClawSupportExecutionPlannerInput,
+  OpenClawSupportExecutionPlannerOutput,
   OpenClawSupportEvidencePlannerInput,
   OpenClawSupportEvidenceSelectorInput,
   OpenClawSupportPlannerInput,
@@ -269,6 +271,114 @@ function renderVariantFromQuestionType(
   }
 }
 
+function normalizeSupportRouteOutput(parsed: Record<string, unknown>, fallbackQuery: string): SupportQuestionRoute {
+  const question_type = normalizeQuestionType(parsed.question_type);
+  return {
+    question_type,
+    user_goal: typeof parsed.user_goal === "string" ? parsed.user_goal : fallbackQuery,
+    answer_contract:
+      typeof parsed.answer_contract === "string"
+        ? parsed.answer_contract
+        : question_type.startsWith("api_")
+        ? "Provide the exact API endpoint details first."
+        : "Provide the most useful support answer first.",
+    specialist_agent:
+      parsed.specialist_agent === "api-specialist" ||
+      parsed.specialist_agent === "howto-specialist" ||
+      parsed.specialist_agent === "behavior-specialist" ||
+      parsed.specialist_agent === "troubleshooting-specialist"
+        ? parsed.specialist_agent
+        : specialistFromQuestionType(question_type),
+    routing_confidence:
+      typeof parsed.routing_confidence === "number" && Number.isFinite(parsed.routing_confidence)
+        ? Math.max(0, Math.min(1, parsed.routing_confidence))
+        : 0.72,
+    specialist_budget:
+      typeof parsed.specialist_budget === "number" && Number.isFinite(parsed.specialist_budget)
+        ? Math.max(0, Math.round(parsed.specialist_budget))
+        : undefined
+  };
+}
+
+function normalizeSupportCaseFrameOutput(parsed: Partial<SupportCaseFrame>, fallbackQuery: string): SupportCaseFrame {
+  const queryPlan = (parsed.query_plan as unknown as Record<string, unknown> | undefined) ?? undefined;
+  return {
+    goal: typeof parsed.goal === "string" ? parsed.goal : fallbackQuery,
+    symptom: typeof parsed.symptom === "string" ? parsed.symptom : fallbackQuery,
+    object: typeof parsed.object === "string" ? parsed.object : "unspecified",
+    action_type: typeof parsed.action_type === "string" ? parsed.action_type : "troubleshooting",
+    deployment_model: typeof parsed.deployment_model === "string" ? parsed.deployment_model : "unknown",
+    product_area: typeof parsed.product_area === "string" ? parsed.product_area : "general",
+    constraints: Array.isArray(parsed.constraints) ? parsed.constraints.map((item) => String(item)) : [],
+    missing_critical_info: Array.isArray(parsed.missing_critical_info)
+      ? parsed.missing_critical_info.map((item) => String(item)).filter((item) => !isLowSignalMissingInfo(item))
+      : [],
+    retrieval_queries: Array.isArray(parsed.retrieval_queries)
+      ? parsed.retrieval_queries.map((item) => String(item)).filter(Boolean)
+      : [fallbackQuery],
+    query_plan:
+      queryPlan && typeof queryPlan === "object"
+        ? {
+            concept_queries: Array.isArray(queryPlan.concept_queries)
+              ? (queryPlan.concept_queries as unknown[]).map((item) => String(item)).filter(Boolean)
+              : [],
+            object_queries: Array.isArray(queryPlan.object_queries)
+              ? (queryPlan.object_queries as unknown[]).map((item) => String(item)).filter(Boolean)
+              : [],
+            behavior_queries: Array.isArray(queryPlan.behavior_queries)
+              ? (queryPlan.behavior_queries as unknown[]).map((item) => String(item)).filter(Boolean)
+              : []
+          }
+        : undefined,
+    question_type: normalizeQuestionType(parsed.question_type),
+    specialist_agent:
+      parsed.specialist_agent === "api-specialist" ||
+      parsed.specialist_agent === "howto-specialist" ||
+      parsed.specialist_agent === "behavior-specialist" ||
+      parsed.specialist_agent === "troubleshooting-specialist"
+        ? parsed.specialist_agent
+        : undefined,
+    answer_contract: typeof parsed.answer_contract === "string" ? parsed.answer_contract : undefined,
+    routing_confidence:
+      typeof parsed.routing_confidence === "number" && Number.isFinite(parsed.routing_confidence)
+        ? Math.max(0, Math.min(1, parsed.routing_confidence))
+        : undefined,
+    required_doc_kinds: Array.isArray(parsed.required_doc_kinds)
+      ? parsed.required_doc_kinds.map((item) => String(item)).filter(Boolean)
+      : undefined
+  };
+}
+
+function normalizeSupportEvidencePlanOutput(parsed: Record<string, unknown>): SupportEvidencePlan {
+  const query_plan = (parsed.query_plan as Record<string, unknown> | undefined) ?? {};
+  return {
+    query_plan: {
+      concept_queries: Array.isArray(query_plan.concept_queries)
+        ? query_plan.concept_queries.map((item) => String(item)).filter(Boolean)
+        : [],
+      object_queries: Array.isArray(query_plan.object_queries)
+        ? query_plan.object_queries.map((item) => String(item)).filter(Boolean)
+        : [],
+      behavior_queries: Array.isArray(query_plan.behavior_queries)
+        ? query_plan.behavior_queries.map((item) => String(item)).filter(Boolean)
+        : []
+    },
+    evidence_priority: Array.isArray(parsed.evidence_priority)
+      ? parsed.evidence_priority.map((item) => String(item)).filter(Boolean)
+      : [],
+    required_doc_kinds: Array.isArray(parsed.required_doc_kinds)
+      ? parsed.required_doc_kinds.map((item) => String(item)).filter(Boolean)
+      : [],
+    retrieval_rounds:
+      typeof parsed.retrieval_rounds === "number" && Number.isFinite(parsed.retrieval_rounds)
+        ? Math.max(1, Math.min(4, Math.round(parsed.retrieval_rounds)))
+        : undefined,
+    allow_refinement: typeof parsed.allow_refinement === "boolean" ? parsed.allow_refinement : undefined,
+    stop_after_grounded_evidence:
+      typeof parsed.stop_after_grounded_evidence === "boolean" ? parsed.stop_after_grounded_evidence : undefined
+  };
+}
+
 function compactTriageInsightForVerification(insight?: TriageSupportInsight) {
   if (!insight) return undefined;
   return {
@@ -517,33 +627,73 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     ].join("\n");
 
     const parsed = (await this.runJsonPrompt(prompt, `${idempotencyKey}:planner`, runtime, undefined, "planner")) as Partial<SupportCaseFrame>;
-    const queryPlan = (parsed.query_plan as unknown as Record<string, unknown> | undefined) ?? undefined;
+    return normalizeSupportCaseFrameOutput(parsed, input.query);
+  }
+
+  async planSupportExecution(
+    input: OpenClawSupportExecutionPlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportExecutionPlannerOutput> {
+    const prompt = [
+      "You are the canonical schema-first support execution planner for ONES.",
+      "Return ONLY valid JSON with keys:",
+      "route({question_type,user_goal,answer_contract,specialist_agent,routing_confidence,specialist_budget}),",
+      "case_frame({goal,symptom,object,action_type,deployment_model,product_area,constraints(string[]),missing_critical_info(string[]),retrieval_queries(string[]),query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),required_doc_kinds(string[])}),",
+      "evidence_plan({query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),evidence_priority(string[]),required_doc_kinds(string[]),retrieval_rounds(number),allow_refinement(boolean),stop_after_grounded_evidence(boolean)})",
+      "Rules:",
+      "- This is the single canonical planner output for the support pipeline. Keep all three sections mutually consistent.",
+      "- question_type must be one of: api_endpoint_lookup, api_field_lookup, api_scope_auth, how_to_product, why_behavior, troubleshooting, config_setup, capability_confirmation, data_export_reporting.",
+      "- specialist_agent must be one of: api-specialist, howto-specialist, behavior-specialist, troubleshooting-specialist.",
+      "- Keep user_goal concise and customer-oriented.",
+      "- Prefer a specific object and product_area over generic placeholders when the query already makes them clear.",
+      "- For private deployment, on-prem, OS/server-side, or ops-toolkit questions, set deployment_model=private_deployment unless the user explicitly says public cloud.",
+      "- Only put genuinely blocking items into missing_critical_info. If a best-effort grounded answer is possible, leave it empty.",
+      "- query_plan must optimize retrieval for documentation, not for generic web search.",
+      "- evidence_plan.required_doc_kinds must agree with the case frame and the routed question type.",
+      "- retrieval_rounds should be 1 or 2. allow_refinement should be true only when a second pass is useful.",
+      `context_type: ${input.contextType}`,
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      ...(input.conversationHistory?.length
+        ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
+        : []),
+      ...(input.ticketContext
+        ? [
+            `ticket_priority: ${input.ticketContext.priority}`,
+            `customer_meta: ${JSON.stringify(input.ticketContext.customerMeta)}`,
+            `ticket_history: ${JSON.stringify(input.ticketContext.history.slice(-6))}`
+          ]
+        : [])
+    ].join("\n");
+
+    const parsed = (await this.runJsonPrompt(prompt, `${idempotencyKey}:planner`, runtime, undefined, "planner")) as Record<string, unknown>;
+    const route = normalizeSupportRouteOutput(((parsed.route as Record<string, unknown> | undefined) ?? {}), input.query);
+    const rawCaseFrame = normalizeSupportCaseFrameOutput(
+      (((parsed.case_frame as Partial<SupportCaseFrame> | undefined) ?? {}) as Partial<SupportCaseFrame>),
+      input.query
+    );
+    const rawEvidencePlan = normalizeSupportEvidencePlanOutput(((parsed.evidence_plan as Record<string, unknown> | undefined) ?? {}));
     return {
-      goal: typeof parsed.goal === "string" ? parsed.goal : input.query,
-      symptom: typeof parsed.symptom === "string" ? parsed.symptom : input.query,
-      object: typeof parsed.object === "string" ? parsed.object : "unspecified",
-      action_type: typeof parsed.action_type === "string" ? parsed.action_type : "troubleshooting",
-      deployment_model: typeof parsed.deployment_model === "string" ? parsed.deployment_model : "unknown",
-      product_area: typeof parsed.product_area === "string" ? parsed.product_area : "general",
-      constraints: Array.isArray(parsed.constraints) ? parsed.constraints.map((item) => String(item)) : [],
-      missing_critical_info: Array.isArray(parsed.missing_critical_info)
-        ? parsed.missing_critical_info.map((item) => String(item)).filter((item) => !isLowSignalMissingInfo(item))
-        : [],
-      retrieval_queries: Array.isArray(parsed.retrieval_queries) ? parsed.retrieval_queries.map((item) => String(item)).filter(Boolean) : [input.query],
-      query_plan:
-        queryPlan && typeof queryPlan === "object"
-          ? {
-              concept_queries: Array.isArray(queryPlan.concept_queries)
-                ? (queryPlan.concept_queries as unknown[]).map((item) => String(item)).filter(Boolean)
-                : [],
-              object_queries: Array.isArray(queryPlan.object_queries)
-                ? (queryPlan.object_queries as unknown[]).map((item) => String(item)).filter(Boolean)
-                : [],
-              behavior_queries: Array.isArray(queryPlan.behavior_queries)
-                ? (queryPlan.behavior_queries as unknown[]).map((item) => String(item)).filter(Boolean)
-                : []
-            }
-      : undefined
+      route,
+      caseFrame: {
+        ...rawCaseFrame,
+        question_type: route.question_type,
+        specialist_agent: route.specialist_agent,
+        answer_contract: route.answer_contract,
+        routing_confidence: route.routing_confidence,
+        required_doc_kinds:
+          rawCaseFrame.required_doc_kinds && rawCaseFrame.required_doc_kinds.length > 0
+            ? rawCaseFrame.required_doc_kinds
+            : rawEvidencePlan.required_doc_kinds
+      },
+      evidencePlan: {
+        ...rawEvidencePlan,
+        required_doc_kinds:
+          rawEvidencePlan.required_doc_kinds.length > 0
+            ? rawEvidencePlan.required_doc_kinds
+            : rawCaseFrame.required_doc_kinds ?? []
+      }
     };
   }
 
@@ -574,28 +724,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     ].join("\n");
 
     const parsed = (await this.runJsonPrompt(prompt, `${idempotencyKey}:router`, runtime, undefined, "router")) as Record<string, unknown>;
-    const question_type = normalizeQuestionType(parsed.question_type);
-    return {
-      question_type,
-      user_goal: typeof parsed.user_goal === "string" ? parsed.user_goal : input.query,
-      answer_contract:
-        typeof parsed.answer_contract === "string"
-          ? parsed.answer_contract
-          : question_type.startsWith("api_")
-          ? "Provide the exact API endpoint details first."
-          : "Provide the most useful support answer first.",
-      specialist_agent:
-        parsed.specialist_agent === "api-specialist" ||
-        parsed.specialist_agent === "howto-specialist" ||
-        parsed.specialist_agent === "behavior-specialist" ||
-        parsed.specialist_agent === "troubleshooting-specialist"
-          ? parsed.specialist_agent
-          : specialistFromQuestionType(question_type),
-      routing_confidence:
-        typeof parsed.routing_confidence === "number" && Number.isFinite(parsed.routing_confidence)
-          ? Math.max(0, Math.min(1, parsed.routing_confidence))
-          : 0.72
-    };
+    return normalizeSupportRouteOutput(parsed, input.query);
   }
 
   async planSupportEvidence(
@@ -632,26 +761,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       undefined,
       "evidence-planner"
     )) as Record<string, unknown>;
-    const query_plan = (parsed.query_plan as Record<string, unknown> | undefined) ?? {};
-    return {
-      query_plan: {
-        concept_queries: Array.isArray(query_plan.concept_queries)
-          ? query_plan.concept_queries.map((item) => String(item)).filter(Boolean)
-          : [],
-        object_queries: Array.isArray(query_plan.object_queries)
-          ? query_plan.object_queries.map((item) => String(item)).filter(Boolean)
-          : [],
-        behavior_queries: Array.isArray(query_plan.behavior_queries)
-          ? query_plan.behavior_queries.map((item) => String(item)).filter(Boolean)
-          : []
-      },
-      evidence_priority: Array.isArray(parsed.evidence_priority)
-        ? parsed.evidence_priority.map((item) => String(item)).filter(Boolean)
-        : [],
-      required_doc_kinds: Array.isArray(parsed.required_doc_kinds)
-        ? parsed.required_doc_kinds.map((item) => String(item)).filter(Boolean)
-        : []
-    };
+    return normalizeSupportEvidencePlanOutput(parsed);
   }
 
   async writeApiSpecialistAnswer(

@@ -175,6 +175,14 @@ export interface OpenClawSupportPlannerInput {
   };
 }
 
+export interface OpenClawSupportExecutionPlannerInput extends OpenClawSupportPlannerInput {}
+
+export interface OpenClawSupportExecutionPlannerOutput {
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  evidencePlan: SupportEvidencePlan;
+}
+
 export interface OpenClawSupportRouterInput {
   contextType: "search" | "triage";
   language: "zh" | "en";
@@ -267,6 +275,11 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawClassifyIntentOutput>;
+  planSupportExecution?(
+    input: OpenClawSupportExecutionPlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportExecutionPlannerOutput>;
   planSupportCase(
     input: OpenClawSupportPlannerInput,
     idempotencyKey: string,

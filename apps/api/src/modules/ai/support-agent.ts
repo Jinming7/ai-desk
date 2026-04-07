@@ -2951,84 +2951,141 @@ export async function runSupportSearchAgent(input: {
   const allowRefinement = input.runtime?.allowRefinement !== false;
   const contextType = input.contextType ?? "search";
   const runtimePolicy = resolveSupportRuntimePolicy(input.runtime);
-
-  const routeStartedAt = performance.now();
-  const routerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 32000, 5000, 12000), "router", `${input.idempotencyKey}:router`);
-  const routeResult = await input.adapter
-    .routeSupportQuestion(
-      {
-        contextType,
-        language: input.language,
-        query: input.query,
-        conversationHistory: input.conversationHistory
-      },
-      `${input.idempotencyKey}:route`,
-      routerRuntime
-    )
-    .then((value) => ({ route: value, timing: stageTiming("completed", elapsedMs(routeStartedAt)) }))
-    .catch(() => ({ route: fallbackQuestionRoute(input.query), timing: stageTiming("fallback", elapsedMs(routeStartedAt)) }));
-  const evidencePlanStartedAt = performance.now();
-  const evidencePlannerRuntime = withStageRuntime(
-    buildStageRuntime(input.runtime, 26000, 4000, 10000),
-    "evidence-planner",
-    `${input.idempotencyKey}:evidence-planner`
-  );
-  const evidencePlanResult = await input.adapter
-    .planSupportEvidence(
-      {
-        contextType,
-        language: input.language,
-        query: input.query,
-        route: routeResult.route,
-        conversationHistory: input.conversationHistory
-      },
-      `${input.idempotencyKey}:evidence-plan`,
-      evidencePlannerRuntime
-    )
-    .then((value) => ({ plan: value, timing: stageTiming("completed", elapsedMs(evidencePlanStartedAt)) }))
-    .catch(() => ({ plan: fallbackEvidencePlan(input.query), timing: stageTiming("fallback", elapsedMs(evidencePlanStartedAt)) }));
-  const casePlanStartedAt = performance.now();
   const plannerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 22000, 5000, 14000), "planner", `${input.idempotencyKey}:planner`);
-  const plannerPromise = input.adapter
-    .planSupportCase(
-      {
-        contextType,
-        language: input.language,
-        query: input.query,
-        conversationHistory: input.conversationHistory,
-        ticketContext: input.ticketContext
-      },
-      `${input.idempotencyKey}:plan`,
-      plannerRuntime
-    )
-    .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(casePlanStartedAt)) }))
-    .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(casePlanStartedAt)) }));
-  const plannerResult = await plannerPromise;
-  const executionPlan = resolveSupportExecutionPlan({
-    query: input.query,
-    routeResult: {
-      status: "completed",
-      value: routeResult.route
-    },
-    evidencePlanResult:
-      evidencePlanResult.timing.status === "completed"
-        ? {
-            status: "completed",
-            value: evidencePlanResult.plan
-          }
-        : {
-            status: "fallback"
+  let routeResult: { route: SupportQuestionRoute; timing: SupportAgentStageTiming };
+  let evidencePlanResult: { plan: SupportEvidencePlan; timing: SupportAgentStageTiming };
+  let plannerResult: { value: SupportCaseFrame | null; timing: SupportAgentStageTiming };
+  let executionPlan: ReturnType<typeof resolveSupportExecutionPlan>;
+
+  const unifiedPlanStartedAt = performance.now();
+  const unifiedPlanResult = input.adapter.planSupportExecution
+    ? await input.adapter
+        .planSupportExecution(
+          {
+            contextType,
+            language: input.language,
+            query: input.query,
+            conversationHistory: input.conversationHistory,
+            ticketContext: input.ticketContext
           },
-    casePlanResult:
-      plannerResult.value !== null
-        ? {
-            status: "completed",
-            value: plannerResult.value
-          }
-        : {
+          `${input.idempotencyKey}:support-execution-plan`,
+          plannerRuntime
+        )
+        .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(unifiedPlanStartedAt)) }))
+        .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(unifiedPlanStartedAt)) }))
+    : null;
+
+  if (unifiedPlanResult?.value) {
+    const normalizedPlan = resolveSupportExecutionPlan({
+      query: input.query,
+      routeResult: {
+        status: "completed",
+        value: unifiedPlanResult.value.route
+      },
+      evidencePlanResult: {
+        status: "completed",
+        value: unifiedPlanResult.value.evidencePlan
+      },
+      casePlanResult: {
+        status: "completed",
+        value: unifiedPlanResult.value.caseFrame
+      }
+    });
+    executionPlan = normalizedPlan;
+    routeResult = {
+      route: normalizedPlan.route,
+      timing: stageTiming("completed", unifiedPlanResult.timing.duration_ms)
+    };
+    evidencePlanResult = {
+      plan: normalizedPlan.evidencePlan,
+      timing: stageTiming("completed", unifiedPlanResult.timing.duration_ms)
+    };
+    plannerResult = {
+      value: normalizedPlan.caseFrame,
+      timing: unifiedPlanResult.timing
+    };
+  } else {
+    const routeStartedAt = performance.now();
+    const routerRuntime = withStageRuntime(
+      buildStageRuntime(input.runtime, 32000, 5000, 12000),
+      "router",
+      `${input.idempotencyKey}:router`
+    );
+    routeResult = await input.adapter
+      .routeSupportQuestion(
+        {
+          contextType,
+          language: input.language,
+          query: input.query,
+          conversationHistory: input.conversationHistory
+        },
+        `${input.idempotencyKey}:route`,
+        routerRuntime
+      )
+      .then((value) => ({ route: value, timing: stageTiming("completed", elapsedMs(routeStartedAt)) }))
+      .catch(() => ({ route: fallbackQuestionRoute(input.query), timing: stageTiming("fallback", elapsedMs(routeStartedAt)) }));
+    const evidencePlanStartedAt = performance.now();
+    const evidencePlannerRuntime = withStageRuntime(
+      buildStageRuntime(input.runtime, 26000, 4000, 10000),
+      "evidence-planner",
+      `${input.idempotencyKey}:evidence-planner`
+    );
+    evidencePlanResult = await input.adapter
+      .planSupportEvidence(
+        {
+          contextType,
+          language: input.language,
+          query: input.query,
+          route: routeResult.route,
+          conversationHistory: input.conversationHistory
+        },
+        `${input.idempotencyKey}:evidence-plan`,
+        evidencePlannerRuntime
+      )
+      .then((value) => ({ plan: value, timing: stageTiming("completed", elapsedMs(evidencePlanStartedAt)) }))
+      .catch(() => ({ plan: fallbackEvidencePlan(input.query), timing: stageTiming("fallback", elapsedMs(evidencePlanStartedAt)) }));
+    const casePlanStartedAt = performance.now();
+    plannerResult = await input.adapter
+      .planSupportCase(
+        {
+          contextType,
+          language: input.language,
+          query: input.query,
+          conversationHistory: input.conversationHistory,
+          ticketContext: input.ticketContext
+        },
+        `${input.idempotencyKey}:plan`,
+        plannerRuntime
+      )
+      .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(casePlanStartedAt)) }))
+      .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(casePlanStartedAt)) }));
+    executionPlan = resolveSupportExecutionPlan({
+      query: input.query,
+      routeResult: {
+        status: "completed",
+        value: routeResult.route
+      },
+      evidencePlanResult:
+        evidencePlanResult.timing.status === "completed"
+          ? {
+              status: "completed",
+              value: evidencePlanResult.plan
+            }
+          : {
+              status: "fallback"
+            },
+      casePlanResult:
+        plannerResult.value !== null
+          ? {
+              status: "completed",
+              value: plannerResult.value
+            }
+          : {
             status: "fallback"
           }
-  });
+    });
+  }
+  const usedUnifiedPlanner = Boolean(unifiedPlanResult?.value);
   const mergedCaseFrame = mergeRouteAndEvidencePlan(executionPlan.caseFrame, executionPlan.route, executionPlan.evidencePlan);
   const stabilized = stabilizeSupportRouteAndCaseFrame({
     query: input.query,
@@ -3590,7 +3647,7 @@ export async function runSupportSearchAgent(input: {
       : "LOW_CONFIDENCE";
   const stageTimings: SupportAgentStageTimings = {
     total_ms: elapsedMs(runStartedAt),
-    planner: mergeStageTimings([routeResult.timing, evidencePlanResult.timing, plannerResult.timing]),
+    planner: usedUnifiedPlanner ? plannerResult.timing : mergeStageTimings([routeResult.timing, evidencePlanResult.timing, plannerResult.timing]),
     retrieval_base: baseEvidenceResult.timing,
     retrieval_extra: additionalTiming,
     writer: mergeStageTimings([specialistResult.timing, genericWriterResult.timing]),
@@ -3600,20 +3657,20 @@ export async function runSupportSearchAgent(input: {
     stageTraceEntry({
       stage: "route",
       timing: routeResult.timing,
-      runtimeStage: "router",
-      idempotencyKey: `${input.idempotencyKey}:route`
+      runtimeStage: usedUnifiedPlanner ? undefined : "router",
+      idempotencyKey: usedUnifiedPlanner ? `${input.idempotencyKey}:support-execution-plan` : `${input.idempotencyKey}:route`
     }),
     stageTraceEntry({
       stage: "evidence_plan",
       timing: evidencePlanResult.timing,
-      runtimeStage: "evidence-planner",
-      idempotencyKey: `${input.idempotencyKey}:evidence-plan`
+      runtimeStage: usedUnifiedPlanner ? undefined : "evidence-planner",
+      idempotencyKey: usedUnifiedPlanner ? `${input.idempotencyKey}:support-execution-plan` : `${input.idempotencyKey}:evidence-plan`
     }),
     stageTraceEntry({
       stage: "case_plan",
       timing: plannerResult.timing,
       runtimeStage: "planner",
-      idempotencyKey: `${input.idempotencyKey}:plan`
+      idempotencyKey: usedUnifiedPlanner ? `${input.idempotencyKey}:support-execution-plan` : `${input.idempotencyKey}:plan`
     }),
     stageTraceEntry({
       stage: "retrieval",
