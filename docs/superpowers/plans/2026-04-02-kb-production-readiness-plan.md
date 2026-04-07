@@ -61,7 +61,8 @@ The KB is only considered ready when all of the following are true:
 
 - one validated and published snapshot exists for the target scope
 - runtime retrieval resolves only through `kb_publications`
-- `kb_serving_versions` matches the current publication pointer
+- `kb_publications` is the canonical serving truth and `kb_serving_versions` is compatibility metadata only
+- if `kb_serving_versions` exists, it matches the current publication pointer
 - the current published build has non-zero counts for the required canonical artifact families
 - the current published build passes build validation with no blocking errors
 - retrieval and answer-path evaluation confirm publication-scoped reads and grounded citations
@@ -789,6 +790,29 @@ Expected:
 **Final gate:**
 
 - Only after cleanup verification passes should the KB be described as both production-usable and operationally clean.
+
+## Phase 7: Post-Baseline Hardening For Scale And Repairability
+
+**Outcome:** after the first production-safe publication path is stable, the KB substrate becomes easier to scale, diagnose, and repair without reintroducing serving risk.
+
+**Non-blocking note:** this phase is not required for the first truthful production cutover, but it is explicitly in scope and must not be forgotten.
+
+### Task 7.1: Replace fallback incremental rebuild with true delta build semantics
+
+**Files:**
+- Modify if needed: `apps/api/src/modules/github-kb/service.ts`
+- Modify if needed: `apps/api/src/modules/github-kb/source/manifest-builder.ts`
+- Modify if needed: `apps/api/src/tests/github-kb.integration.test.ts`
+
+- [ ] Stop treating incremental build requests as automatic `full_rebuild` fallback when the changed-snapshot scope is knowable.
+
+- [ ] Design and implement a delta path that:
+  - rebuilds only changed files / affected families
+  - preserves one coherent build snapshot and publication safety
+  - supports async embedding completion with gated publish
+  - does not require re-running identical preview/prod builds when a validated source snapshot is merely being promoted
+
+- [ ] Add focused regression coverage for restart safety, retry safety, and serving isolation under the new incremental path.
 
 ## Required Verification Matrix
 
