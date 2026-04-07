@@ -3457,6 +3457,40 @@ async function createDocsComFullSyncRun(input: {
 }> {
   const existing = await repo.findActiveFullSyncRun(input.registration.id, input.branch?.trim() || input.registration.default_branch);
   if (existing) {
+    if (existing.status === "running") {
+      const knowledgeSpace = input.knowledgeSpace ?? resolveRuntimeKnowledgeSpace();
+      const requestedFromEnv = input.requestedFromEnv ?? resolveRequestedFromEnv();
+      const buildVersion = buildFullRunBuildVersion(existing.target_head, existing.id);
+      const shards = await repo.listSyncRunShards(existing.id);
+
+      for (const shard of shards) {
+        if (shard.total_docs === 0 || shard.status === "succeeded" || shard.status === "failed") {
+          continue;
+        }
+        const cursor = String(shard.next_cursor ?? "").trim() || undefined;
+        await repo.enqueueSyncJob({
+          repoId: input.registration.id,
+          branch: existing.branch,
+          syncMode: "full",
+          source: "system",
+          idempotencyKey: `sync-continuation:full:${existing.id}:${shard.shard_key}:${existing.target_head}:${cursor ?? "start"}`,
+          beforeCommitSha: undefined,
+          afterCommitSha: existing.target_head,
+          payload: {
+            runId: existing.id,
+            shardKey: shard.shard_key,
+            targetHead: existing.target_head,
+            buildVersion,
+            sourceMode: "remote",
+            ...(cursor ? { cursor } : {}),
+            knowledgeSpace,
+            requestedFromEnv,
+            publicationMode: input.publicationMode,
+            embeddingMode: input.embeddingMode
+          }
+        });
+      }
+    }
     return {
       run: existing,
       shards: await repo.listSyncRunShards(existing.id),

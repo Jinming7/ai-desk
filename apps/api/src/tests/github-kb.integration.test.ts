@@ -2007,6 +2007,168 @@ test("docs-com full shard retries transient DB timeout without failing the full 
   }
 });
 
+test("docs-com full build start revives a dead-letter shard continuation on the active run instead of creating a new run", async () => {
+  const originalMirrorEnabled = env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR;
+  env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR = false;
+
+  try {
+    const registration = await githubRepo.upsertRepoRegistration({
+      repoOwner: "docs",
+      repoName: "docs-com",
+      repoUrl: "mock://docs/docs-com",
+      publicBaseUrl: "https://docs.ones.com",
+      defaultBranch: "master",
+      includePaths: ["docs/**/*.md", "docs/**/*.mdx", "open-docs/**/*.md", "open-docs/**/*.mdx", "deploy-docs/**/*.md", "deploy-docs/**/*.mdx"],
+      excludePaths: [],
+      pollingIntervalSeconds: 60,
+      createdBy: "test"
+    });
+
+    const targetHead = "mockc2";
+    const { run } = await githubRepo.createFullSyncRun({
+      repoId: registration.id,
+      branch: "master",
+      targetHead,
+      requestedBy: "test",
+      runReason: "resume-active-full-run",
+      sourceSnapshotTotal: 4,
+      manifestItems: [
+        {
+          path: "docs/example/a.mdx",
+          shardKey: "docs",
+          blobSha: "blob-doc-a",
+          sizeBytes: 32,
+          needsRebuild: true,
+          reuseReason: null
+        },
+        {
+          path: "docs/example/b.mdx",
+          shardKey: "docs",
+          blobSha: "blob-doc-b",
+          sizeBytes: 32,
+          needsRebuild: true,
+          reuseReason: null
+        },
+        {
+          path: "open-docs/example/c.mdx",
+          shardKey: "open-docs",
+          blobSha: "blob-open-c",
+          sizeBytes: 32,
+          needsRebuild: true,
+          reuseReason: null
+        },
+        {
+          path: "deploy-docs/example/d.mdx",
+          shardKey: "deploy-docs",
+          blobSha: "blob-deploy-d",
+          sizeBytes: 32,
+          needsRebuild: true,
+          reuseReason: null
+        }
+      ]
+    });
+
+    await githubRepo.updateManifestItemBuildStatus({
+      runId: run.id,
+      path: "docs/example/a.mdx",
+      status: "rebuilt"
+    });
+    await githubRepo.advanceSyncRunShard({
+      runId: run.id,
+      shardKey: "docs",
+      completedDelta: 1,
+      reusableDelta: 0,
+      rebuiltDelta: 1,
+      failedDelta: 0,
+      nextCursor: "docs/example/a.mdx",
+      status: "queued"
+    });
+    await githubRepo.advanceSyncRunShard({
+      runId: run.id,
+      shardKey: "open-docs",
+      completedDelta: 1,
+      reusableDelta: 0,
+      rebuiltDelta: 1,
+      failedDelta: 0,
+      nextCursor: null,
+      status: "succeeded"
+    });
+    await githubRepo.advanceSyncRunShard({
+      runId: run.id,
+      shardKey: "deploy-docs",
+      completedDelta: 1,
+      reusableDelta: 0,
+      rebuiltDelta: 1,
+      failedDelta: 0,
+      nextCursor: null,
+      status: "succeeded"
+    });
+
+    const resumeCursor = "docs/example/a.mdx";
+    const resumeJob = await githubRepo.enqueueSyncJob({
+      repoId: registration.id,
+      branch: "master",
+      syncMode: "full",
+      source: "system",
+      idempotencyKey: `sync-continuation:full:${run.id}:docs:${targetHead}:${resumeCursor}`,
+      afterCommitSha: targetHead,
+      payload: {
+        runId: run.id,
+        shardKey: "docs",
+        targetHead,
+        buildVersion: `${targetHead}:${run.id}`,
+        sourceMode: "remote",
+        cursor: resumeCursor,
+        publicationMode: "build_only",
+        embeddingMode: "best_effort",
+        knowledgeSpace: "support-local",
+        requestedFromEnv: "local"
+      }
+    });
+    await pool.query(
+      `UPDATE kb_sync_jobs
+       SET status = 'dead_letter',
+           attempts = max_attempts,
+           error_message = 'Unsupported repo host: git.ones.pro',
+           started_at = NOW(),
+           finished_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [resumeJob.id]
+    );
+
+    const result = await serviceModule.startKnowledgeBaseFullBuild({
+      repoId: registration.id,
+      branch: "master",
+      actor: "test"
+    });
+
+    assert.equal(result.fullRun?.id, run.id);
+    assert.equal(result.fullRun?.created, false);
+
+    const resumedJob = await pool.query<{ status: string; attempts: number; error_message: string | null }>(
+      `SELECT status, attempts, error_message
+         FROM kb_sync_jobs
+        WHERE id = $1`,
+      [resumeJob.id]
+    );
+    assert.equal(resumedJob.rowCount, 1);
+    assert.equal(resumedJob.rows[0]?.status, "queued");
+    assert.equal(resumedJob.rows[0]?.attempts, 0);
+    assert.equal(resumedJob.rows[0]?.error_message, null);
+
+    const runCount = await pool.query<{ total: string }>(
+      `SELECT COUNT(*)::text AS total
+         FROM kb_sync_runs
+        WHERE repo_id = $1`,
+      [registration.id]
+    );
+    assert.equal(runCount.rows[0]?.total, "1");
+  } finally {
+    env.GITHUB_KB_ENABLE_LOCAL_DOCS_MIRROR = originalMirrorEnabled;
+  }
+});
+
 test("generic remote direct build retries transient document indexing timeout within the same run", async (t) => {
   const registration = await createIsolationRegistration();
   const originalBatchSize = env.GITHUB_KB_REMOTE_SYNC_BATCH_SIZE;
