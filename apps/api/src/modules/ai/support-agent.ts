@@ -27,6 +27,7 @@ import type {
 } from "./types.js";
 import { resolveSupportExecutionPlan } from "./support-execution-plan.js";
 import { resolveSupportRuntimePolicy } from "./support-runtime-policy.js";
+import { filterSupportEvidenceByPolicy, getSupportEvidenceProfile, matchesSupportEvidencePolicy } from "./support-evidence-policy.js";
 import { resolveSearchReferenceEvidenceId, type SearchReference } from "./types.js";
 import { SearchOrchestrator } from "./search-orchestrator.js";
 import { resolveStageSpecificAgent } from "./agent-router.js";
@@ -158,6 +159,21 @@ function buildStageRuntime(
   };
 }
 
+type StageRuntimeBudget = {
+  reserveMs: number;
+  minimumTimeoutMs: number;
+  stageTimeoutMs: number;
+};
+
+function buildDeliveryAwareStageRuntime(
+  runtime: OpenClawRuntimeContext | undefined,
+  interactive: StageRuntimeBudget,
+  asyncJob: StageRuntimeBudget = interactive
+): OpenClawRuntimeContext | undefined {
+  const selected = runtime?.deliveryMode === "async_job" ? asyncJob : interactive;
+  return buildStageRuntime(runtime, selected.reserveMs, selected.minimumTimeoutMs, selected.stageTimeoutMs);
+}
+
 function sanitizeSessionPart(input: string): string {
   return input.replace(/[^a-zA-Z0-9:_-]/g, "_").slice(0, 120);
 }
@@ -234,6 +250,36 @@ type SupportQuerySignals = {
   wantsProcedure: boolean;
 };
 
+function canonicalSpecialistAgentForQuestionType(
+  questionType: SupportQuestionRoute["question_type"]
+): SupportQuestionRoute["specialist_agent"] {
+  switch (questionType) {
+    case "api_endpoint_lookup":
+    case "api_field_lookup":
+    case "api_scope_auth":
+      return "api-specialist";
+    case "how_to_product":
+    case "config_setup":
+    case "data_export_reporting":
+      return "howto-specialist";
+    case "why_behavior":
+    case "capability_confirmation":
+      return "behavior-specialist";
+    default:
+      return "troubleshooting-specialist";
+  }
+}
+
+function normalizeSupportQuestionRoute(route: SupportQuestionRoute): SupportQuestionRoute {
+  const specialist_agent = canonicalSpecialistAgentForQuestionType(route.question_type);
+  return route.specialist_agent === specialist_agent
+    ? route
+    : {
+        ...route,
+        specialist_agent
+      };
+}
+
 function hasCjkText(input: string): boolean {
   return /[\u3400-\u9FBF]/.test(input);
 }
@@ -296,7 +342,18 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   route: SupportQuestionRoute;
   caseFrame: SupportCaseFrame;
 }): { route: SupportQuestionRoute; caseFrame: SupportCaseFrame } {
+  const initialRoute = normalizeSupportQuestionRoute(input.route);
   const signals = analyzeSupportQuerySignals(input.query);
+  const apiShaped = isApiShapedQuery(input.query);
+  const nonApiFallbackRoute = fallbackQuestionRoute(input.query);
+  const normalizedRoute =
+    initialRoute.specialist_agent === "api-specialist" && !apiShaped
+      ? {
+          ...nonApiFallbackRoute,
+          specialist_budget: initialRoute.specialist_budget,
+          routing_confidence: Math.max(initialRoute.routing_confidence, nonApiFallbackRoute.routing_confidence)
+        }
+      : initialRoute;
   const architectureQuestion =
     (signals.privateDeploymentContext || /deployment documentation|部署文档/i.test(input.query)) &&
     (signals.deploymentArchitectureContext || signals.isolationContext || signals.infrastructureContext);
@@ -309,7 +366,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   const productArea =
     (input.caseFrame.product_area === "general" ||
       (input.caseFrame.product_area === "openapi" &&
-        !isApiShapedQuery(input.query) &&
+        !apiShaped &&
         (signals.accountRecoveryContext || signals.infrastructureContext || architectureQuestion))) &&
     (deploymentModel === "private_deployment" || signals.infrastructureContext || architectureQuestion)
       ? "deployment"
@@ -317,10 +374,14 @@ function stabilizeSupportRouteAndCaseFrame(input: {
         signals.integrationContext &&
         (input.caseFrame.action_type === "troubleshooting" || signals.troubleshootingContext)
       ? "integrations"
+      : input.caseFrame.product_area === "openapi" && normalizedRoute.specialist_agent !== "api-specialist" && !apiShaped
+      ? "general"
       : input.caseFrame.product_area;
   const shouldTreatAsHowTo =
     (signals.accountRecoveryContext && (signals.privateDeploymentContext || signals.infrastructureContext)) ||
-    (signals.wantsProcedure && deploymentModel === "private_deployment");
+    (signals.wantsProcedure &&
+      deploymentModel === "private_deployment" &&
+      normalizedRoute.question_type !== "capability_confirmation");
   const shouldPreserveIntegrationTroubleshooting =
     (productArea === "integrations" || input.caseFrame.product_area === "integrations" || signals.integrationContext) &&
     (input.caseFrame.action_type === "troubleshooting" || signals.troubleshootingContext);
@@ -328,8 +389,8 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     signals.apiContext &&
     !shouldPreserveIntegrationTroubleshooting &&
     (input.caseFrame.product_area === "openapi" ||
-      input.route.specialist_agent !== "api-specialist" ||
-      !String(input.route.question_type ?? "").startsWith("api_"));
+      normalizedRoute.specialist_agent !== "api-specialist" ||
+      !String(normalizedRoute.question_type ?? "").startsWith("api_"));
   const object =
     input.caseFrame.object === "unspecified" && signals.accountRecoveryContext
       ? localizedSupportLabel(input.query, "管理员密码重置", "administrator password reset")
@@ -385,7 +446,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   const route: SupportQuestionRoute =
     shouldForceApiRoute
       ? {
-          ...input.route,
+          ...normalizedRoute,
           question_type: inferApiQuestionType(input.query),
           specialist_agent: "api-specialist",
           answer_contract: "Give the exact API answer first.",
@@ -393,30 +454,30 @@ function stabilizeSupportRouteAndCaseFrame(input: {
         }
       : shouldPreserveIntegrationTroubleshooting
       ? {
-          ...input.route,
+          ...normalizedRoute,
           question_type: "troubleshooting",
           specialist_agent: "troubleshooting-specialist",
           answer_contract: "Give the most likely integration configuration cause first, then the direct checks to run now.",
           routing_confidence: Math.max(input.route.routing_confidence, 0.84)
         }
-      : shouldTreatAsHowTo && (input.route.question_type === "capability_confirmation" || input.route.specialist_agent === "behavior-specialist")
+      : shouldTreatAsHowTo && normalizedRoute.specialist_agent === "behavior-specialist"
       ? {
-          ...input.route,
+          ...normalizedRoute,
           question_type: "how_to_product",
           specialist_agent: "howto-specialist",
           answer_contract: "Provide the direct recovery steps and prerequisites first.",
           routing_confidence: Math.max(input.route.routing_confidence, 0.82)
         }
-      : architectureQuestion && input.route.specialist_agent !== "api-specialist"
+      : architectureQuestion && normalizedRoute.specialist_agent !== "api-specialist"
       ? {
-          ...input.route,
+          ...normalizedRoute,
           question_type: "capability_confirmation",
           specialist_agent: "behavior-specialist",
           answer_contract:
             "State the documented deployment architecture first, then clarify which components can be isolated or externalized and where documentation remains silent.",
           routing_confidence: Math.max(input.route.routing_confidence, 0.86)
         }
-      : input.route;
+      : normalizedRoute;
 
   caseFrame = {
     ...caseFrame,
@@ -445,14 +506,7 @@ function fallbackQuestionRoute(query: string): SupportQuestionRoute {
       : /\b(not work|failed|failure|error|报错|异常|失败)\b/i.test(query)
       ? "troubleshooting"
       : "capability_confirmation";
-  const specialist_agent: SupportQuestionRoute["specialist_agent"] =
-    question_type === "api_endpoint_lookup" || question_type === "api_field_lookup" || question_type === "api_scope_auth"
-      ? "api-specialist"
-      : question_type === "how_to_product"
-      ? "howto-specialist"
-      : question_type === "why_behavior" || question_type === "capability_confirmation"
-      ? "behavior-specialist"
-      : "troubleshooting-specialist";
+  const specialist_agent = canonicalSpecialistAgentForQuestionType(question_type);
   return {
     question_type,
     user_goal: query.trim(),
@@ -814,12 +868,17 @@ function buildEvidenceBundle(input: {
   const reranked = rerankReferencesForCaseFrame(input.references, input.query, input.caseFrame);
   const candidateReferences = filterReferencesByEvidencePolicy(reranked, input.caseFrame);
   const byId = new Map(candidateReferences.map((reference) => [resolveSearchReferenceEvidenceId(reference), reference] as const));
+  const citationAliasIndex = buildCitationAliasIndex(candidateReferences);
   const selectedPrimary =
     input.selection?.primary_ids
+      .map((id) => resolveCanonicalCitationId(id, citationAliasIndex))
+      .filter((id): id is string => Boolean(id))
       .map((id) => byId.get(id))
       .filter((item): item is SearchReference => Boolean(item)) ?? [];
   const selectedSupplemental =
     input.selection?.supplemental_ids
+      .map((id) => resolveCanonicalCitationId(id, citationAliasIndex))
+      .filter((id): id is string => Boolean(id))
       .map((id) => byId.get(id))
       .filter(
         (item): item is SearchReference =>
@@ -940,78 +999,6 @@ function canonicalDocsPath(input?: string): string {
     .replace(/^i18n\/[^/]+\/docusaurus-plugin-content-docs\/current\//i, "docs/");
 }
 
-type EvidencePolicy = {
-  strict: boolean;
-  allowedProductAreas: string[];
-  allowedEvidenceKinds: string[];
-  allowedDeploymentModels?: string[];
-  requiresPermissionSignal?: boolean;
-};
-
-function buildEvidencePolicy(caseFrame: SupportCaseFrame): EvidencePolicy | null {
-  if (String(caseFrame.question_type ?? "").startsWith("api_")) {
-    if (caseFrame.question_type === "api_scope_auth") {
-      return {
-        strict: true,
-        allowedProductAreas: ["openapi"],
-        allowedEvidenceKinds: ["api_operation", "capability", "constraint"],
-        requiresPermissionSignal: true
-      };
-    }
-    return {
-      strict: true,
-      allowedProductAreas: ["openapi"],
-      allowedEvidenceKinds: ["api_operation"]
-    };
-  }
-
-  const questionType = String(caseFrame.question_type ?? "");
-  const productArea = String(caseFrame.product_area ?? "").toLowerCase();
-  const deploymentModel = String(caseFrame.deployment_model ?? "").toLowerCase();
-  const deploymentScoped = productArea === "deployment" || deploymentModel === "private_deployment";
-
-  if (deploymentScoped) {
-    return {
-      strict: true,
-      allowedProductAreas: ["deployment"],
-      allowedEvidenceKinds:
-        questionType === "how_to_product" || questionType === "config_setup"
-          ? ["procedure", "troubleshooting", "constraint", "capability"]
-          : ["capability", "constraint", "procedure", "troubleshooting"],
-      allowedDeploymentModels: ["private_deployment"]
-    };
-  }
-
-  if (productArea === "integrations") {
-    return {
-      strict: true,
-      allowedProductAreas: ["integrations"],
-      allowedEvidenceKinds:
-        questionType === "troubleshooting"
-          ? ["troubleshooting", "procedure", "constraint", "capability"]
-          : ["procedure", "capability", "constraint", "troubleshooting"]
-    };
-  }
-
-  if (questionType === "how_to_product" || questionType === "config_setup" || questionType === "data_export_reporting") {
-    return {
-      strict: productArea !== "" && productArea !== "general" && productArea !== "unknown",
-      allowedProductAreas: productArea && productArea !== "general" && productArea !== "unknown" ? [productArea] : [],
-      allowedEvidenceKinds: ["procedure", "capability", "constraint", "troubleshooting"]
-    };
-  }
-
-  if (questionType === "why_behavior" || questionType === "capability_confirmation" || questionType === "troubleshooting") {
-    return {
-      strict: productArea !== "" && productArea !== "general" && productArea !== "unknown",
-      allowedProductAreas: productArea && productArea !== "general" && productArea !== "unknown" ? [productArea] : [],
-      allowedEvidenceKinds: ["capability", "constraint", "procedure", "troubleshooting"]
-    };
-  }
-
-  return null;
-}
-
 function getReferenceMetadataList(reference: SearchReference, key: string): string[] {
   const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
   const raw = metadata[key];
@@ -1030,17 +1017,17 @@ function getReferenceSupportProfile(reference: SearchReference): {
   prerequisites: string[];
   actions: string[];
 } {
-  const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
+  const profile = getSupportEvidenceProfile(reference);
   return {
-    title: String(reference.title ?? "").toLowerCase(),
-    heading: String(reference.headingPath ?? "").toLowerCase(),
-    snippet: String(reference.snippet ?? "").toLowerCase(),
-    evidenceKind: String(metadata.evidence_kind ?? "").toLowerCase(),
-    productArea: String(metadata.product_area ?? "").toLowerCase(),
-    deploymentModel: String(metadata.deployment_model ?? "").toLowerCase(),
-    permissions: getReferenceMetadataList(reference, "permissions").map((item) => item.toLowerCase()),
-    prerequisites: getReferenceMetadataList(reference, "prerequisites").map((item) => item.toLowerCase()),
-    actions: getReferenceMetadataList(reference, "actions").map((item) => item.toLowerCase())
+    title: profile.title,
+    heading: profile.heading,
+    snippet: profile.snippet,
+    evidenceKind: profile.evidenceKind,
+    productArea: profile.productArea,
+    deploymentModel: profile.deploymentModel,
+    permissions: profile.permissions,
+    prerequisites: profile.prerequisites,
+    actions: profile.actions
   };
 }
 
@@ -1066,28 +1053,11 @@ function referenceHasPermissionSignal(reference: SearchReference): boolean {
 }
 
 function isReferenceEligibleForCaseFrame(reference: SearchReference, caseFrame: SupportCaseFrame): boolean {
-  const policy = buildEvidencePolicy(caseFrame);
-  if (!policy) return true;
-  const profile = getReferenceSupportProfile(reference);
-  const appliesTo = getReferenceMetadataList(reference, "applies_to").map((item) => item.toLowerCase());
-  const productMatched = policy.allowedProductAreas.includes(profile.productArea);
-  const kindMatched = policy.allowedEvidenceKinds.includes(profile.evidenceKind);
-  const deploymentMatched =
-    !policy.allowedDeploymentModels?.length ||
-    policy.allowedDeploymentModels.includes(profile.deploymentModel) ||
-    appliesTo.some((item) => policy.allowedDeploymentModels?.includes(item));
-  const permissionMatched = policy.requiresPermissionSignal ? referenceHasPermissionSignal(reference) : true;
-  const topicalMatched =
-    (!policy.allowedProductAreas.length || productMatched) &&
-    (!policy.allowedEvidenceKinds.length || kindMatched);
-  return topicalMatched && deploymentMatched && permissionMatched ? true : !policy.strict;
+  return matchesSupportEvidencePolicy(reference, caseFrame);
 }
 
 function filterReferencesByEvidencePolicy(references: SearchReference[], caseFrame: SupportCaseFrame): SearchReference[] {
-  const policy = buildEvidencePolicy(caseFrame);
-  if (!policy?.strict) return references;
-  const eligible = references.filter((reference) => isReferenceEligibleForCaseFrame(reference, caseFrame));
-  return eligible.length > 0 ? eligible : references;
+  return filterSupportEvidenceByPolicy(references, caseFrame, (reference) => reference);
 }
 
 function resolveLocalDocsMirrorPath(reference: SearchReference): string | null {
@@ -1159,6 +1129,89 @@ function uniqueCitationIds(claims: SupportVerificationResult["claim_to_citation_
       .flatMap((claim) => claim.citation_ids),
     12
   );
+}
+
+function normalizeCitationAliasKey(value: string): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function resolveReferenceHeadingAlias(reference: SearchReference): string {
+  const heading = String(reference.headingPath ?? "").trim();
+  return heading || "ROOT";
+}
+
+function buildReferenceCitationAliases(reference: SearchReference, options?: { allowRootAlias?: boolean }): string[] {
+  const aliases = new Set<string>();
+  const canonicalEvidenceId = resolveSearchReferenceEvidenceId(reference);
+  const documentId = String(reference.documentId ?? "").trim();
+  const sourceUrl = String(reference.sourceUrl ?? "").trim();
+  const repoSourceUrl = String(reference.repoSourceUrl ?? "").trim();
+  const canonicalPath = canonicalDocsPath(reference.path);
+  const heading = resolveReferenceHeadingAlias(reference);
+  const headingLower = heading.toLowerCase();
+
+  for (const value of [canonicalEvidenceId, documentId, sourceUrl, repoSourceUrl]) {
+    if (value) aliases.add(value);
+  }
+
+  if (canonicalPath) {
+    aliases.add(`${canonicalPath}::${heading}`);
+    aliases.add(`${canonicalPath}::${headingLower}`);
+    aliases.add(`${canonicalPath}#${heading}`);
+    aliases.add(`${canonicalPath}#${headingLower}`);
+    aliases.add(`local:${canonicalPath}:${heading}`);
+    aliases.add(`local:${canonicalPath}:${headingLower}`);
+    if (options?.allowRootAlias) {
+      aliases.add(`${canonicalPath}::ROOT`);
+      aliases.add(`${canonicalPath}::root`);
+      aliases.add(`${canonicalPath}#ROOT`);
+      aliases.add(`${canonicalPath}#root`);
+      aliases.add(`local:${canonicalPath}:ROOT`);
+      aliases.add(`local:${canonicalPath}:root`);
+    }
+  }
+
+  return [...aliases];
+}
+
+type CitationAliasIndex = {
+  exact: Map<string, string>;
+  normalized: Map<string, string>;
+};
+
+function buildCitationAliasIndex(references: SearchReference[]): CitationAliasIndex {
+  const exact = new Map<string, string>();
+  const normalized = new Map<string, string>();
+  const referencesByCanonicalPath = new Map<string, SearchReference[]>();
+
+  for (const reference of references) {
+    const canonicalPath = canonicalDocsPath(reference.path);
+    if (!canonicalPath) continue;
+    const bucket = referencesByCanonicalPath.get(canonicalPath) ?? [];
+    bucket.push(reference);
+    referencesByCanonicalPath.set(canonicalPath, bucket);
+  }
+
+  for (const reference of references) {
+    const canonicalEvidenceId = resolveSearchReferenceEvidenceId(reference);
+    const canonicalPath = canonicalDocsPath(reference.path);
+    const allowRootAlias = canonicalPath ? (referencesByCanonicalPath.get(canonicalPath)?.length ?? 0) === 1 : false;
+    for (const alias of buildReferenceCitationAliases(reference, { allowRootAlias })) {
+      const trimmed = alias.trim();
+      if (!trimmed) continue;
+      if (!exact.has(trimmed)) exact.set(trimmed, canonicalEvidenceId);
+      const normalizedKey = normalizeCitationAliasKey(trimmed);
+      if (normalizedKey && !normalized.has(normalizedKey)) normalized.set(normalizedKey, canonicalEvidenceId);
+    }
+  }
+
+  return { exact, normalized };
+}
+
+function resolveCanonicalCitationId(citationId: string, aliasIndex: CitationAliasIndex): string | null {
+  const trimmed = String(citationId ?? "").trim();
+  if (!trimmed) return null;
+  return aliasIndex.exact.get(trimmed) ?? aliasIndex.normalized.get(normalizeCitationAliasKey(trimmed)) ?? null;
 }
 
 function collectFocusTerms(query: string, caseFrame: SupportCaseFrame): string[] {
@@ -1260,6 +1313,8 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
   const normalizedQuery = query.toLowerCase();
   const wantsListVariant =
     /列表|枚举|可选|全部|有哪些/.test(query) || /\b(list|enum|options|all statuses?)\b/.test(normalizedQuery);
+  const deploymentCapabilityQuestion =
+    caseFrame.product_area === "deployment" && caseFrame.question_type === "capability_confirmation";
   return [...references].sort((a, b) => {
     const scoreRef = (reference: SearchReference) => {
       const profile = getReferenceSupportProfile(reference);
@@ -1290,6 +1345,34 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
         else if (profile.evidenceKind === "constraint" || profile.evidenceKind === "capability") topicScore += 8;
         if (/\b(unified|shared|external|externalized|database|storage|topology|architecture|isolation|separate|separable)\b|统一|共享|外置|数据库|存储|拓扑|架构|隔离|独立/.test(semanticText)) {
           topicScore += 14;
+        }
+      }
+      if (deploymentCapabilityQuestion) {
+        const rootHeading = String(reference.headingPath ?? "").trim().toUpperCase() === "ROOT";
+        if (profile.evidenceKind === "constraint" || profile.evidenceKind === "capability") topicScore += 22;
+        if (profile.evidenceKind === "procedure") topicScore -= 10;
+        if (!rootHeading) topicScore += wantsListVariant ? 16 : 12;
+        if (
+          /\b(support matrix|compatibility|system requirements?|environment requirements?|operating system requirements?)\b|支持矩阵|兼容性|系统要求|环境要求|操作系统要求/.test(
+            semanticText
+          )
+        ) {
+          topicScore += 18;
+        }
+        if (
+          /\b(linux|ubuntu|red hat|centos|debian|rocky|anolis|euler|uos)\b|linux|ubuntu|red hat|centos|debian|rocky|发行版|欧拉|麒麟|统信/.test(
+            semanticText
+          )
+        ) {
+          topicScore += 12;
+        }
+        if (
+          rootHeading &&
+          /\b(overview|introduction|before install|before you install|read together)\b|本文描述|可配合.*阅读|安装之前|正式安装.*之前/.test(
+            semanticText
+          )
+        ) {
+          topicScore -= 20;
         }
       }
       if (caseFrame.product_area === "integrations") {
@@ -1373,14 +1456,16 @@ function sanitizeVerification(input: {
   verification: SupportVerificationResult;
   evidenceBundle: SupportEvidenceBundle;
 }): SupportVerificationResult {
-  const evidenceById = new Map(
-    [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental]
-      .filter((item) => item.authority === "canonical_visible")
-      .map((item) => [resolveSearchReferenceEvidenceId(item), item] as const)
+  const candidateReferences = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].filter(
+    (item) => item.authority === "canonical_visible"
   );
+  const evidenceById = new Map(candidateReferences.map((item) => [resolveSearchReferenceEvidenceId(item), item] as const));
+  const citationAliasIndex = buildCitationAliasIndex(candidateReferences);
   const sanitizedClaims = input.verification.claim_to_citation_map.map((claim) => {
     const validCitationIds = uniqueStrings(
-      claim.citation_ids.filter((citationId) => evidenceById.has(citationId)),
+      claim.citation_ids
+        .map((citationId) => resolveCanonicalCitationId(citationId, citationAliasIndex))
+        .filter((citationId): citationId is string => Boolean(citationId)),
       6
     );
     if ((claim.verdict === "verified" || claim.verdict === "supported_inference") && validCitationIds.length === 0) {
@@ -1404,6 +1489,8 @@ function sanitizeVerification(input: {
     [
       ...claimLinkedCitationIds,
       ...input.verification.display_citation_ids
+        .map((citationId) => resolveCanonicalCitationId(citationId, citationAliasIndex))
+        .filter((citationId): citationId is string => Boolean(citationId))
     ],
     6
   ).filter((citationId) => evidenceById.has(citationId) && claimLinkedCitationSet.has(citationId));
@@ -1608,6 +1695,14 @@ function pickBestVerificationCandidate(input: {
   const supportedCandidates = candidates.filter((candidate) => supportedVerificationClaims(candidate).length > 0);
   if (supportedCandidates.length > 0) {
     return [...supportedCandidates].sort(
+      (a, b) =>
+        scoreVerificationCandidate(b, input.evidenceBundle, input.query, input.caseFrame) -
+        scoreVerificationCandidate(a, input.evidenceBundle, input.query, input.caseFrame)
+    )[0];
+  }
+  const explicitlyReviewedCandidates = candidates.filter((candidate) => candidate.claim_to_citation_map.length > 0);
+  if (explicitlyReviewedCandidates.length > 0) {
+    return [...explicitlyReviewedCandidates].sort(
       (a, b) =>
         scoreVerificationCandidate(b, input.evidenceBundle, input.query, input.caseFrame) -
         scoreVerificationCandidate(a, input.evidenceBundle, input.query, input.caseFrame)
@@ -2111,6 +2206,170 @@ function scoreProcedureReference(reference: SearchReference, blocks: { steps: st
   return score;
 }
 
+type BehaviorEvidenceCandidate = {
+  fragment: string;
+  evidenceId: string;
+  score: number;
+  note: boolean;
+  reference: SearchReference;
+};
+
+function normalizeBehaviorEvidenceFragment(fragment: string): string {
+  return String(fragment ?? "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[-*•]\s*/, "")
+    .trim();
+}
+
+function looksLikeBehaviorEvidenceFragment(fragment: string): boolean {
+  const normalized = normalizeBehaviorEvidenceFragment(fragment);
+  if (!normalized || normalized.length < 12 || normalized.length > 220) return false;
+  if (/^(title:|description:|slug:|sidebar_|hide_|custom_edit_url:|import )/i.test(normalized)) return false;
+  return /(supports?|supported|available|only|requires?|required|recommended|must|cannot|not support|unsupported|compatible|compatibility|支持|可用|仅|只在|要求|推荐|必须|不能|不支持|兼容|环境要求|系统要求|适用)/i.test(
+    normalized
+  );
+}
+
+function isRecommendationLikeFragment(fragment: string): boolean {
+  return /(recommended|recommendation|建议|推荐)/i.test(fragment);
+}
+
+function collectBehaviorEvidenceFragments(reference: SearchReference): string[] {
+  const normalizedSnippet = normalizeBehaviorEvidenceFragment(reference.snippet);
+  const fragments = uniqueStrings(
+    normalizedSnippet
+      .split(/。|；|(?:\.\s+)|\n/)
+      .map((item) => normalizeBehaviorEvidenceFragment(item))
+      .filter(looksLikeBehaviorEvidenceFragment),
+    8
+  );
+  if (fragments.length > 0) return fragments;
+  return looksLikeBehaviorEvidenceFragment(normalizedSnippet) ? [normalizedSnippet] : [];
+}
+
+function scoreBehaviorEvidenceFragment(input: {
+  fragment: string;
+  reference: SearchReference;
+  query: string;
+  caseFrame: SupportCaseFrame;
+  primaryBoost: number;
+}): number {
+  const focusTerms = collectFocusTerms(input.query, input.caseFrame);
+  const haystack = `${input.reference.title} ${input.reference.headingPath ?? ""} ${input.fragment}`.toLowerCase();
+  const profile = getReferenceSupportProfile(input.reference);
+  let score = input.primaryBoost + Math.round(input.reference.score * 10);
+  if (profile.evidenceKind === "capability" || profile.evidenceKind === "constraint") score += 14;
+  else if (profile.evidenceKind === "procedure" || profile.evidenceKind === "troubleshooting") score += 6;
+  if (profile.productArea && profile.productArea === String(input.caseFrame.product_area ?? "").toLowerCase()) score += 10;
+  if (profile.deploymentModel && profile.deploymentModel === String(input.caseFrame.deployment_model ?? "").toLowerCase()) score += 8;
+  if (/(supports?|supported|available|only|requires?|required|recommended|must|cannot|not support|unsupported)/i.test(input.fragment)) score += 10;
+  if (/(支持|可用|仅|只在|要求|推荐|必须|不能|不支持|兼容|环境要求|系统要求)/.test(input.fragment)) score += 10;
+  if (isRecommendationLikeFragment(input.fragment)) score += 4;
+  for (const term of focusTerms) {
+    const normalized = term.toLowerCase();
+    if (!normalized) continue;
+    if (haystack.includes(normalized)) score += normalized.length >= 4 ? 6 : 3;
+  }
+  return score;
+}
+
+function formatBehaviorEvidenceSentence(language: "zh" | "en", fragment: string): string {
+  const normalized = normalizeBehaviorEvidenceFragment(fragment);
+  if (!normalized) return "";
+  const terminal = /[。.!?]$/.test(normalized) ? normalized : `${normalized}${hasCjkText(normalized) ? "。" : "."}`;
+  return language === "zh" ? `当前文档明确写到：${terminal}` : `The current documentation explicitly states: ${terminal}`;
+}
+
+function buildBehaviorRecommendation(language: "zh" | "en", fragment: string): string {
+  const normalized = normalizeBehaviorEvidenceFragment(fragment);
+  if (!normalized) return "";
+  const terminal = /[。.!?]$/.test(normalized) ? normalized : `${normalized}${hasCjkText(normalized) ? "。" : "."}`;
+  return language === "zh" ? `规划时优先参考：${terminal}` : `Use this documented recommendation as the planning baseline: ${terminal}`;
+}
+
+function isDeploymentArchitectureQuestion(query: string, caseFrame: SupportCaseFrame): boolean {
+  if (caseFrame.product_area !== "deployment") return false;
+  const signals = analyzeSupportQuerySignals(query);
+  return (
+    (signals.privateDeploymentContext || /deployment documentation|部署文档/i.test(query)) &&
+    (signals.deploymentArchitectureContext || signals.isolationContext || signals.infrastructureContext)
+  );
+}
+
+function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
+  language: "zh" | "en";
+  query: string;
+  draft: SpecialistDraftAnswer;
+  evidenceBundle: SupportEvidenceBundle;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+}): SpecialistDraftAnswer | null {
+  if (input.route.specialist_agent !== "behavior-specialist") return null;
+  if (hasGroundedDraftClaimsInEvidence(input.draft, input.evidenceBundle)) return null;
+  if (isDeploymentArchitectureQuestion(input.query, input.caseFrame)) return null;
+
+  const ranked = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].filter(
+    (reference) => reference.authority === "canonical_visible"
+  );
+  if (!ranked.length) return null;
+
+  const candidates = ranked
+    .flatMap((reference, index) => {
+      const primaryBoost = index < input.evidenceBundle.primary.length ? 24 : 10;
+      return collectBehaviorEvidenceFragments(reference).map((fragment) => ({
+        fragment,
+        evidenceId: resolveSearchReferenceEvidenceId(reference),
+        note: isRecommendationLikeFragment(fragment),
+        reference,
+        score: scoreBehaviorEvidenceFragment({
+          fragment,
+          reference,
+          query: input.query,
+          caseFrame: input.caseFrame,
+          primaryBoost
+        })
+      }));
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const selectedFacts = candidates
+    .filter((candidate) => !candidate.note)
+    .filter((candidate, index, all) => all.findIndex((item) => item.fragment === candidate.fragment) === index)
+    .slice(0, 2);
+  if (!selectedFacts.length) return null;
+
+  const selectedNote =
+    candidates.find(
+      (candidate) =>
+        candidate.note &&
+        !selectedFacts.some((fact) => fact.fragment === candidate.fragment || fact.evidenceId === candidate.evidenceId)
+    ) ?? null;
+
+  return {
+    ...input.draft,
+    render_variant: "behavior",
+    direct_answer: formatBehaviorEvidenceSentence(input.language, selectedFacts[0].fragment),
+    claims: selectedFacts.map((candidate) => ({
+      text:
+        input.language === "zh"
+          ? `《${candidate.reference.title}》明确写到：${normalizeBehaviorEvidenceFragment(candidate.fragment)}${/[。.!?]$/.test(candidate.fragment) ? "" : "。"}`
+          : `"${candidate.reference.title}" explicitly states: ${normalizeBehaviorEvidenceFragment(candidate.fragment)}${/[.?!]$/.test(candidate.fragment) ? "" : "."}`,
+      kind: "verified_fact" as const,
+      evidence_ids: [candidate.evidenceId],
+      authority: "canonical" as const
+    })),
+    next_actions: uniqueStrings(
+      [
+        selectedNote ? buildBehaviorRecommendation(input.language, selectedNote.fragment) : undefined,
+        ...input.draft.next_actions
+      ],
+      3
+    ),
+    unknowns: []
+  };
+}
+
 function recoverEvidenceAnchoredHowToDraft(input: {
   language: "zh" | "en";
   query: string;
@@ -2262,6 +2521,7 @@ function recoverEvidenceAnchoredHowToDraft(input: {
 
 function recoverEvidenceAnchoredDeploymentBehaviorDraft(input: {
   language: "zh" | "en";
+  query: string;
   draft: SpecialistDraftAnswer;
   evidenceBundle: SupportEvidenceBundle;
   route: SupportQuestionRoute;
@@ -2269,6 +2529,7 @@ function recoverEvidenceAnchoredDeploymentBehaviorDraft(input: {
 }): SpecialistDraftAnswer | null {
   if (input.route.specialist_agent !== "behavior-specialist") return null;
   if (input.caseFrame.product_area !== "deployment") return null;
+  if (!isDeploymentArchitectureQuestion(input.query, input.caseFrame)) return null;
   if (hasGroundedDraftClaimsInEvidence(input.draft, input.evidenceBundle)) return null;
 
   const ranked = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental]
@@ -2952,16 +3213,39 @@ export async function runSupportSearchAgent(input: {
   const contextType = input.contextType ?? "search";
   const runtimePolicy = resolveSupportRuntimePolicy(input.runtime);
   const unifiedPlannerRuntime = withStageRuntime(
-    buildStageRuntime(
+    buildDeliveryAwareStageRuntime(
       input.runtime,
-      input.runtime?.deliveryMode === "async_job" ? 60_000 : 22_000,
-      input.runtime?.deliveryMode === "async_job" ? 18_000 : 5_000,
-      input.runtime?.deliveryMode === "async_job" ? 30_000 : 14_000
+      {
+        reserveMs: 22_000,
+        minimumTimeoutMs: 5_000,
+        stageTimeoutMs: 14_000
+      },
+      {
+        reserveMs: 60_000,
+        minimumTimeoutMs: 18_000,
+        stageTimeoutMs: 30_000
+      }
     ),
     "planner",
     `${input.idempotencyKey}:support-execution-plan`
   );
-  const plannerRuntime = withStageRuntime(buildStageRuntime(input.runtime, 22000, 5000, 14000), "planner", `${input.idempotencyKey}:planner`);
+  const plannerRuntime = withStageRuntime(
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 22_000,
+        minimumTimeoutMs: 5_000,
+        stageTimeoutMs: 14_000
+      },
+      {
+        reserveMs: 24_000,
+        minimumTimeoutMs: 10_000,
+        stageTimeoutMs: 24_000
+      }
+    ),
+    "planner",
+    `${input.idempotencyKey}:planner`
+  );
   let routeResult: { route: SupportQuestionRoute; timing: SupportAgentStageTiming };
   let evidencePlanResult: { plan: SupportEvidencePlan; timing: SupportAgentStageTiming };
   let plannerResult: { value: SupportCaseFrame | null; timing: SupportAgentStageTiming };
@@ -3015,9 +3299,23 @@ export async function runSupportSearchAgent(input: {
       timing: unifiedPlanResult.timing
     };
   } else {
+    const useInteractiveLegacyRouteOnly =
+      input.runtime?.deliveryMode !== "async_job" && Boolean(input.adapter.planSupportExecution) && unifiedPlanResult !== null;
     const routeStartedAt = performance.now();
     const routerRuntime = withStageRuntime(
-      buildStageRuntime(input.runtime, 32000, 5000, 12000),
+      buildDeliveryAwareStageRuntime(
+        input.runtime,
+        {
+          reserveMs: useInteractiveLegacyRouteOnly ? 12_000 : 32_000,
+          minimumTimeoutMs: useInteractiveLegacyRouteOnly ? 3_000 : 5_000,
+          stageTimeoutMs: useInteractiveLegacyRouteOnly ? 6_000 : 12_000
+        },
+        {
+          reserveMs: 20_000,
+          minimumTimeoutMs: 8_000,
+          stageTimeoutMs: 20_000
+        }
+      ),
       "router",
       `${input.idempotencyKey}:router`
     );
@@ -3034,66 +3332,103 @@ export async function runSupportSearchAgent(input: {
       )
       .then((value) => ({ route: value, timing: stageTiming("completed", elapsedMs(routeStartedAt)) }))
       .catch(() => ({ route: fallbackQuestionRoute(input.query), timing: stageTiming("fallback", elapsedMs(routeStartedAt)) }));
-    const evidencePlanStartedAt = performance.now();
-    const evidencePlannerRuntime = withStageRuntime(
-      buildStageRuntime(input.runtime, 26000, 4000, 10000),
-      "evidence-planner",
-      `${input.idempotencyKey}:evidence-planner`
-    );
-    evidencePlanResult = await input.adapter
-      .planSupportEvidence(
-        {
-          contextType,
-          language: input.language,
-          query: input.query,
-          route: routeResult.route,
-          conversationHistory: input.conversationHistory
+
+    if (useInteractiveLegacyRouteOnly) {
+      evidencePlanResult = {
+        plan: fallbackEvidencePlan(input.query),
+        timing: skippedStageTiming()
+      };
+      plannerResult = {
+        value: null,
+        timing: skippedStageTiming()
+      };
+      executionPlan = resolveSupportExecutionPlan({
+        query: input.query,
+        routeResult: {
+          status: "completed",
+          value: routeResult.route
         },
-        `${input.idempotencyKey}:evidence-plan`,
-        evidencePlannerRuntime
-      )
-      .then((value) => ({ plan: value, timing: stageTiming("completed", elapsedMs(evidencePlanStartedAt)) }))
-      .catch(() => ({ plan: fallbackEvidencePlan(input.query), timing: stageTiming("fallback", elapsedMs(evidencePlanStartedAt)) }));
-    const casePlanStartedAt = performance.now();
-    plannerResult = await input.adapter
-      .planSupportCase(
-        {
-          contextType,
-          language: input.language,
-          query: input.query,
-          conversationHistory: input.conversationHistory,
-          ticketContext: input.ticketContext
+        evidencePlanResult: {
+          status: "fallback"
         },
-        `${input.idempotencyKey}:plan`,
-        plannerRuntime
-      )
-      .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(casePlanStartedAt)) }))
-      .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(casePlanStartedAt)) }));
-    executionPlan = resolveSupportExecutionPlan({
-      query: input.query,
-      routeResult: {
-        status: "completed",
-        value: routeResult.route
-      },
-      evidencePlanResult:
-        evidencePlanResult.timing.status === "completed"
-          ? {
-              status: "completed",
-              value: evidencePlanResult.plan
-            }
-          : {
-              status: "fallback"
-            },
-      casePlanResult:
-        plannerResult.value !== null
-          ? {
-              status: "completed",
-              value: plannerResult.value
-            }
-          : {
-            status: "fallback"
+        casePlanResult: {
+          status: "fallback"
+        }
+      });
+    } else {
+      const evidencePlanStartedAt = performance.now();
+      const evidencePlannerRuntime = withStageRuntime(
+        buildDeliveryAwareStageRuntime(
+          input.runtime,
+          {
+            reserveMs: 26_000,
+            minimumTimeoutMs: 4_000,
+            stageTimeoutMs: 10_000
+          },
+          {
+            reserveMs: 18_000,
+            minimumTimeoutMs: 8_000,
+            stageTimeoutMs: 20_000
           }
-    });
+        ),
+        "evidence-planner",
+        `${input.idempotencyKey}:evidence-planner`
+      );
+      evidencePlanResult = await input.adapter
+        .planSupportEvidence(
+          {
+            contextType,
+            language: input.language,
+            query: input.query,
+            route: routeResult.route,
+            conversationHistory: input.conversationHistory
+          },
+          `${input.idempotencyKey}:evidence-plan`,
+          evidencePlannerRuntime
+        )
+        .then((value) => ({ plan: value, timing: stageTiming("completed", elapsedMs(evidencePlanStartedAt)) }))
+        .catch(() => ({ plan: fallbackEvidencePlan(input.query), timing: stageTiming("fallback", elapsedMs(evidencePlanStartedAt)) }));
+      const casePlanStartedAt = performance.now();
+      plannerResult = await input.adapter
+        .planSupportCase(
+          {
+            contextType,
+            language: input.language,
+            query: input.query,
+            conversationHistory: input.conversationHistory,
+            ticketContext: input.ticketContext
+          },
+          `${input.idempotencyKey}:plan`,
+          plannerRuntime
+        )
+        .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(casePlanStartedAt)) }))
+        .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(casePlanStartedAt)) }));
+      executionPlan = resolveSupportExecutionPlan({
+        query: input.query,
+        routeResult: {
+          status: "completed",
+          value: routeResult.route
+        },
+        evidencePlanResult:
+          evidencePlanResult.timing.status === "completed"
+            ? {
+                status: "completed",
+                value: evidencePlanResult.plan
+              }
+            : {
+                status: "fallback"
+              },
+        casePlanResult:
+          plannerResult.value !== null
+            ? {
+                status: "completed",
+                value: plannerResult.value
+              }
+            : {
+              status: "fallback"
+            }
+      });
+    }
   }
   const usedUnifiedPlanner = Boolean(unifiedPlanResult?.value);
   const mergedCaseFrame = mergeRouteAndEvidencePlan(executionPlan.caseFrame, executionPlan.route, executionPlan.evidencePlan);
@@ -3206,7 +3541,19 @@ export async function runSupportSearchAgent(input: {
       : skippedStageTiming();
 
   const selectionRuntime = withStageRuntime(
-    buildStageRuntime(input.runtime, 22000, 4000, 12000),
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 22_000,
+        minimumTimeoutMs: 4_000,
+        stageTimeoutMs: 12_000
+      },
+      {
+        reserveMs: 12_000,
+        minimumTimeoutMs: 8_000,
+        stageTimeoutMs: 24_000
+      }
+    ),
     "support-evidence-selector",
     `${input.idempotencyKey}:evidence-selector`
   );
@@ -3246,15 +3593,29 @@ export async function runSupportSearchAgent(input: {
       .value
   });
   const shouldSkipWriterFamily = stageBudget.specialist_budget === 0;
+  const allowGroundedEvidenceShortCircuit = runtimePolicy.fastPathAllowed;
   const shouldSkipSpecialist =
     shouldSkipWriterFamily ||
-    (stageBudget.stop_after_grounded_evidence &&
+    (allowGroundedEvidenceShortCircuit &&
+      stageBudget.stop_after_grounded_evidence &&
       evidenceBundle.primary.length > 0 &&
       evidenceBundle.confidence >= env.AI_SEARCH_ANSWER_CONFIDENCE_THRESHOLD);
 
   const writerStartedAt = performance.now();
   const specialistRuntime = withStageRuntime(
-    buildStageRuntime(input.runtime, 12000, 5000, 18000),
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 12_000,
+        minimumTimeoutMs: 5_000,
+        stageTimeoutMs: 18_000
+      },
+      {
+        reserveMs: 10_000,
+        minimumTimeoutMs: 12_000,
+        stageTimeoutMs: 40_000
+      }
+    ),
     route.specialist_agent,
     `${input.idempotencyKey}:${route.specialist_agent}`
   );
@@ -3276,7 +3637,19 @@ export async function runSupportSearchAgent(input: {
     : { value: null, timing: stageTiming("skipped", elapsedMs(writerStartedAt)) };
   const genericWriterStartedAt = performance.now();
   const genericWriterRuntime = withExplicitStageRuntime({
-    runtime: buildStageRuntime(input.runtime, 9000, 4000, 12000),
+    runtime: buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 9_000,
+        minimumTimeoutMs: 4_000,
+        stageTimeoutMs: 12_000
+      },
+      {
+        reserveMs: 8_000,
+        minimumTimeoutMs: 10_000,
+        stageTimeoutMs: 28_000
+      }
+    ),
     stage: "support-writer",
     sessionSeed: `${input.idempotencyKey}:support-writer`,
     agentId: resolveStageSpecificAgent(route.specialist_agent).agentId,
@@ -3347,8 +3720,17 @@ export async function runSupportSearchAgent(input: {
       evidenceBundle,
       route
     }) ??
+    recoverEvidenceAnchoredBehaviorCapabilityDraft({
+      language: input.language,
+      query: input.query,
+      draft: rawDraftSupportAnswer,
+      evidenceBundle,
+      route,
+      caseFrame
+    }) ??
     recoverEvidenceAnchoredDeploymentBehaviorDraft({
       language: input.language,
+      query: input.query,
       draft: rawDraftSupportAnswer,
       evidenceBundle,
       route,
@@ -3418,7 +3800,19 @@ export async function runSupportSearchAgent(input: {
     ? { value: writerBoundVerification, timing: stageTiming("skipped", elapsedMs(verifierStartedAt)) }
     : await (async () => {
         const judgeRuntime = withStageRuntime(
-          buildStageRuntime(input.runtime, 5000, 6000, 25000),
+          buildDeliveryAwareStageRuntime(
+            input.runtime,
+            {
+              reserveMs: 5_000,
+              minimumTimeoutMs: 6_000,
+              stageTimeoutMs: 25_000
+            },
+            {
+              reserveMs: 7_000,
+              minimumTimeoutMs: 10_000,
+              stageTimeoutMs: 32_000
+            }
+          ),
           "evidence-judge",
           `${input.idempotencyKey}:evidence-judge`
         );
@@ -3474,7 +3868,19 @@ export async function runSupportSearchAgent(input: {
       : sanitizedVerification;
 
   const citationBinderRuntime = withStageRuntime(
-    buildStageRuntime(input.runtime, 3000, 5000, 16000),
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 3_000,
+        minimumTimeoutMs: 5_000,
+        stageTimeoutMs: 16_000
+      },
+      {
+        reserveMs: 6_000,
+        minimumTimeoutMs: 10_000,
+        stageTimeoutMs: 26_000
+      }
+    ),
     "support-citation-binder",
     `${input.idempotencyKey}:support-citation-binder`
   );
@@ -3518,7 +3924,19 @@ export async function runSupportSearchAgent(input: {
   });
 
   const displayCitationSelectorRuntime = withStageRuntime(
-    buildStageRuntime(input.runtime, 2500, 4000, 14000),
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 2_500,
+        minimumTimeoutMs: 4_000,
+        stageTimeoutMs: 14_000
+      },
+      {
+        reserveMs: 4_000,
+        minimumTimeoutMs: 8_000,
+        stageTimeoutMs: 22_000
+      }
+    ),
     useFastAgentPath ? "support-citation-selector" : "citation-curator",
     `${input.idempotencyKey}:${useFastAgentPath ? "support-citation-selector" : "citation-curator"}`
   );
@@ -3568,16 +3986,37 @@ export async function runSupportSearchAgent(input: {
       : preselectedVerification,
     evidenceBundle
   });
+  const supportedFinalClaims = supportedVerificationClaims(finalVerification);
+  const effectiveFinalVerification =
+    supportedFinalClaims.length > 0
+      ? finalVerification
+      : {
+          ...finalVerification,
+          verified_citation_ids: [],
+          display_citation_ids: []
+        };
 
-  const missingInfo = uniqueStrings([...finalVerification.missing_info, ...caseFrame.missing_critical_info], 3);
+  const missingInfo = uniqueStrings([...effectiveFinalVerification.missing_info, ...caseFrame.missing_critical_info], 3);
   const mode = resolveSupportMode({
-    verification: finalVerification,
+    verification: effectiveFinalVerification,
     references: evidenceCollection.references,
     currentRound: input.currentRound + 1,
     missingInfo
   });
   const answerComposerRuntime = withStageRuntime(
-    buildStageRuntime(input.runtime, 1500, 4000, 14000),
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 1_500,
+        minimumTimeoutMs: 4_000,
+        stageTimeoutMs: 14_000
+      },
+      {
+        reserveMs: 3_000,
+        minimumTimeoutMs: 10_000,
+        stageTimeoutMs: 26_000
+      }
+    ),
     "answer-composer",
     `${input.idempotencyKey}:answer-composer`
   );
@@ -3587,7 +4026,7 @@ export async function runSupportSearchAgent(input: {
     hasEnoughBudget(input.runtime, 4500) &&
     (mode === "clarification" ||
       mode === "handoff" ||
-      (supportedVerificationClaims(finalVerification).length > 0 && (mode === "grounded" || mode === "partial")));
+      (supportedFinalClaims.length > 0 && (mode === "grounded" || mode === "partial")));
   const composedSupportAnswer =
     shouldComposeCustomerAnswer
       ? await input.adapter
@@ -3600,8 +4039,8 @@ export async function runSupportSearchAgent(input: {
               route,
               caseFrame,
               draftSupportAnswer,
-              supportedClaims: supportedVerificationClaims(finalVerification),
-              nextActions: filterUnsupported(draftSupportAnswer.next_actions, finalVerification.unsupported_claims),
+              supportedClaims: supportedFinalClaims,
+              nextActions: filterUnsupported(draftSupportAnswer.next_actions, effectiveFinalVerification.unsupported_claims),
               unknowns: uniqueStrings([...draftSupportAnswer.unknowns, ...missingInfo], 4)
             },
             `${input.idempotencyKey}:answer-composer`,
@@ -3619,16 +4058,16 @@ export async function runSupportSearchAgent(input: {
     route,
     draft: draftSupportAnswer,
     verification: {
-      ...finalVerification,
-      unsupported_claims: finalVerification.unsupported_claims
+      ...effectiveFinalVerification,
+      unsupported_claims: effectiveFinalVerification.unsupported_claims
     },
     missingInfo,
     composed: composedSupportAnswer
   });
-  const structuredAnswer = buildStructuredAnswer(supportAnswer, finalVerification);
+  const structuredAnswer = buildStructuredAnswer(supportAnswer, effectiveFinalVerification);
   const citations = buildCitations({
     references: [...evidenceBundle.primary, ...evidenceBundle.supplemental],
-    verification: finalVerification
+    verification: effectiveFinalVerification
   });
 
   const handoffAfterClarificationExhausted =
@@ -3652,7 +4091,7 @@ export async function runSupportSearchAgent(input: {
       ? "KB_RETRIEVAL_UNAVAILABLE"
       : !evidenceCollection.references.length
       ? "NO_MATCHING_KB"
-      : finalVerification.verdict === "verified"
+      : effectiveFinalVerification.verdict === "verified"
       ? null
       : "LOW_CONFIDENCE";
   const stageTimings: SupportAgentStageTimings = {
@@ -3739,7 +4178,7 @@ export async function runSupportSearchAgent(input: {
   return {
     caseFrame,
     evidenceBundle,
-    verification: finalVerification,
+    verification: effectiveFinalVerification,
     stageTimings,
     result: {
       session_id: "",
@@ -3747,7 +4186,7 @@ export async function runSupportSearchAgent(input: {
       answer_language: input.language,
       case_frame: caseFrame,
       support_answer: supportAnswer,
-      verification: finalVerification,
+      verification: effectiveFinalVerification,
       structured_answer: structuredAnswer,
       confidence: evidenceCollection.confidence,
       suggested_next_step: mode === "grounded" ? "self_serve" : "submit_ticket",
@@ -3779,7 +4218,7 @@ export async function runSupportSearchAgent(input: {
           12
         ),
         retrieval_queries_refined: refinementEvidence?.resolvedQueries ?? [],
-        claim_graph: buildClaimGraph(finalVerification),
+        claim_graph: buildClaimGraph(effectiveFinalVerification),
         specialist_skipped: shouldSkipSpecialist,
         specialists_used: shouldSkipSpecialist ? [] : [route.specialist_agent],
         evidence_sources: uniqueStrings(

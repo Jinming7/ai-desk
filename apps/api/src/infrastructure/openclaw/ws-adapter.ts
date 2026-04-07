@@ -39,6 +39,7 @@ import type {
   TriageSupportInsight
 } from "../../modules/ai/types.js";
 import { resolveStageSpecificAgent } from "../../modules/ai/agent-router.js";
+import { assertRuntimeBudgetAvailable, capRuntimeTimeoutMs } from "../../modules/ai/runtime-budget.js";
 
 interface RpcReq {
   type: "req";
@@ -126,6 +127,7 @@ function compactEvidenceBundle(
   const supplementalLimit = options?.supplementalLimit ?? 2;
   const snippetMax = options?.snippetMax ?? 220;
   const trimReference = (reference: SupportEvidenceBundle["primary"][number]) => ({
+    evidenceId: reference.evidenceId ?? reference.documentId,
     documentId: reference.documentId,
     title: reference.title,
     headingPath: reference.headingPath,
@@ -399,11 +401,21 @@ function roundMs(value: number): number {
 }
 
 function resolveRuntimeTimeoutMs(runtime?: OpenClawRuntimeContext): number {
-  const configured = Number(runtime?.timeoutMs);
-  if (!Number.isFinite(configured) || configured <= 0) {
-    return env.OPENCLAW_AGENT_TIMEOUT_MS;
-  }
-  return Math.max(1000, Math.min(env.OPENCLAW_AGENT_TIMEOUT_MS, Math.round(configured)));
+  return capRuntimeTimeoutMs({
+    requestedTimeoutMs: runtime?.timeoutMs,
+    runtime,
+    defaultTimeoutMs: env.OPENCLAW_AGENT_TIMEOUT_MS,
+    minimumTimeoutMs: 1
+  });
+}
+
+function resolveMethodTimeoutMs(requestedTimeoutMs: number, runtime?: OpenClawRuntimeContext): number {
+  return capRuntimeTimeoutMs({
+    requestedTimeoutMs,
+    runtime,
+    defaultTimeoutMs: requestedTimeoutMs,
+    minimumTimeoutMs: 1
+  });
 }
 
 export class WsOpenClawAdapter implements OpenClawAdapter {
@@ -947,6 +959,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Every verified_fact or grounded_inference claim MUST include evidence_ids from the evidence bundle.",
       "- If you conclude that a syntax clause, API capability, or query behavior is supported or documented, attach the exact evidence_ids that mention it.",
       "- If you cannot attach evidence_ids for a factual capability claim, do not state that claim as fact.",
+      "- When you output evidence_ids, copy the exact evidenceId strings from evidence_bundle.primary or evidence_bundle.supplemental. Never invent path-based ids or rewrite them.",
       "- Use grounded_inference only when multiple canonical snippets strongly imply the conclusion.",
       "- Use operational_advice for safe next-step guidance.",
       "- unknown is for unresolved items that still need confirmation.",
@@ -1016,6 +1029,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Do not preserve broad claims when only a narrower claim is supported; narrow them instead and keep citation ids.",
       "- If an API operation doc clearly answers the main question, preserve that supported claim even if a nearby variant remains unresolved.",
       "- If the docs support a useful partial answer, keep the useful supported claim and move the unresolved part into missing_info instead of rejecting the whole answer.",
+      "- verified_citation_ids, display_citation_ids, and claim_to_citation_map[*].citation_ids must use the exact evidenceId strings from the evidence bundle.",
       "- display_citation_ids may be empty here; they will be curated later.",
       `language: ${input.language}`,
       `user_query: ${input.query}`,
@@ -1050,6 +1064,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- For claims about what the retrieved documentation does or does not show, cite the relevant syntax/reference document ids directly. If a syntax reference enumerates supported operators or clauses and does not mention ORDER BY / GROUP BY, that syntax reference can support a narrowly phrased claim like 'the retrieved syntax reference does not show ORDER BY / GROUP BY'.",
       "- When the evidence supports a limited conclusion, keep the claim narrow and still attach the best matching citation ids. Do not drop citation ids just because the claim is conservative.",
       "- unsupported_claims should contain only claims that truly cannot be supported from the evidence bundle.",
+      "- verified_citation_ids, display_citation_ids, and claim_to_citation_map[*].citation_ids must use the exact evidenceId strings from the evidence bundle.",
       "- display_citation_ids must contain only the 1 to 3 canonical citation ids that should be shown to the user.",
       "- Every display_citation_id must directly support at least one surviving verified or supported_inference claim.",
       "- verified: every factual claim is supported.",
@@ -1087,6 +1102,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Prefer narrow, documentation-backed claims over broad unsupported claims.",
       "- If a syntax/reference document enumerates supported syntax and does not mention ORDER BY / GROUP BY, you may cite it for a narrow claim such as 'the retrieved syntax reference does not show ORDER BY / GROUP BY'.",
       "- Any verified or supported_inference claim MUST include at least one citation id from the evidence bundle.",
+      "- verified_citation_ids, display_citation_ids, and claim_to_citation_map[*].citation_ids must use the exact evidenceId strings from the evidence bundle.",
       "- unsupported_claims should only list claims that cannot be supported even after narrowing them.",
       "- display_citation_ids must contain only the 1 to 3 canonical citation ids that should be shown to the user.",
       `language: ${input.language}`,
@@ -1125,6 +1141,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Prefer citations that directly discuss the same object, syntax, API, scope, or behavior as the user query.",
       "- Reject tangential same-domain documents.",
       "- Every selected citation id must support at least one supported claim.",
+      "- display_citation_ids must use the exact evidenceId strings from the evidence bundle and supported_claims.",
       "- Prefer citations that best support the direct answer first, then the why section.",
       `language: ${input.language}`,
       `user_query: ${input.query}`,
@@ -1170,6 +1187,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- Select 1 to 3 canonical citations that most directly support the final customer-facing answer.",
       "- Prefer citations that support the direct answer first, then the next most important section.",
       "- Do not include tangential same-domain docs.",
+      "- display_citation_ids must use the exact evidenceId strings from the evidence bundle and supported_claims.",
       `language: ${input.language}`,
       `user_query: ${input.query}`,
       `query_focus_terms: ${JSON.stringify(extractQueryFocusTerms({ query: input.query, caseFrame: input.caseFrame }))}`,
@@ -1531,6 +1549,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     });
     const prompt = [
       ...promptLines,
+      "- When you output claims[].evidence_ids, copy the exact evidenceId strings from evidence_bundle.primary or evidence_bundle.supplemental. Never invent path-based ids or rewrite them.",
       `language: ${input.language}`,
       `user_query: ${input.query}`,
       `route: ${JSON.stringify(input.route)}`,
@@ -1705,8 +1724,10 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     runtime?: OpenClawRuntimeContext,
     sessionKey?: string
   ): Promise<string> {
+    assertRuntimeBudgetAvailable(runtime, "OpenClaw agent");
     const agentRuntime = this.resolveAgentRuntime(runtime);
     const timeoutMs = resolveRuntimeTimeoutMs(runtime);
+    const methodTimeoutMs = resolveMethodTimeoutMs(timeoutMs, runtime);
     const payload = (await this.callMethod("agent", {
       agentId: agentRuntime.agentId,
       sessionKey: sessionKey ?? agentRuntime.sessionKey,
@@ -1714,7 +1735,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       timeout: timeoutMs,
       idempotencyKey,
       ...(agentRuntime.model ? { model: agentRuntime.model } : {})
-    })) as { runId?: string; status?: string; summary?: string };
+    }, methodTimeoutMs)) as { runId?: string; status?: string; summary?: string };
 
     if (!payload?.runId) {
       throw new Error("OpenClaw agent did not return runId");
@@ -1732,8 +1753,11 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     attachmentUrls?: string[],
     sessionKey?: string
   ): Promise<string> {
+    assertRuntimeBudgetAvailable(runtime, "OpenClaw chat.send");
     const agentRuntime = this.resolveAgentRuntime(runtime);
     const attachments = await this.buildChatAttachments(attachmentUrls);
+    const timeoutMs = resolveRuntimeTimeoutMs(runtime);
+    const methodTimeoutMs = resolveMethodTimeoutMs(timeoutMs, runtime);
     const payload = (await this.callMethod("chat.send", {
       sessionKey: sessionKey ?? agentRuntime.sessionKey,
       message,
@@ -1741,7 +1765,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       idempotencyKey,
       ...(agentRuntime.model ? { model: agentRuntime.model } : {}),
       ...(attachments.length ? { attachments } : {})
-    })) as { runId?: string; status?: string; summary?: string };
+    }, methodTimeoutMs)) as { runId?: string; status?: string; summary?: string };
 
     if (!payload?.runId) {
       throw new Error("OpenClaw chat.send did not return runId");
@@ -1801,12 +1825,14 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   }
 
   private async waitAgentRun(runId: string, sessionKey?: string, runtime?: OpenClawRuntimeContext): Promise<void> {
+    assertRuntimeBudgetAvailable(runtime, "OpenClaw agent.wait");
     const timeoutMs = resolveRuntimeTimeoutMs(runtime);
+    const methodTimeoutMs = resolveMethodTimeoutMs(timeoutMs, runtime);
     try {
       const payload = (await this.callMethod(
         "agent.wait",
         { runId, timeoutMs },
-        timeoutMs + 2000
+        methodTimeoutMs
       )) as { status?: string; error?: string };
 
       if (payload?.status === "ok") {
@@ -1956,10 +1982,11 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const ws = new WebSocket(env.OPENCLAW_WS_URL, wsOptions);
 
     return await new Promise<unknown>((resolve, reject) => {
+      const effectiveConnectTimeoutMs = Math.max(1, Math.min(env.OPENCLAW_CONNECT_TIMEOUT_MS, timeoutMs));
       const connectTimeout = setTimeout(() => {
         reject(new Error("OpenClaw connect timeout"));
         ws.close();
-      }, env.OPENCLAW_CONNECT_TIMEOUT_MS);
+      }, effectiveConnectTimeoutMs);
 
       let requestTimeout: NodeJS.Timeout | undefined;
 
