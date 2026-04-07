@@ -7,6 +7,7 @@ import { resolveRuntimeKnowledgeSpace } from "../github-kb/runtime-space.js";
 import { DefaultHybridRetrievalProvider } from "./hybrid-retrieval-provider.js";
 import { buildHybridRetrievalRequest, HybridRetrievalRuntime } from "./hybrid-retrieval.js";
 import { searchLocalDocs } from "./local-docs.js";
+import { resolveSupportHybridRetrievalFlag } from "./release/service.js";
 import type { SearchReference, SearchResponseEnvelope, SupportCaseFrame } from "./types.js";
 
 type SearchEvidenceCollection = SearchResponseEnvelope & {
@@ -505,7 +506,7 @@ export class SearchOrchestrator {
       return this.buildNoResults("", false);
     }
 
-    if (env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL) {
+    if (resolveSupportHybridRetrievalFlag()) {
       const hybrid = await this.hybridRuntime.retrieve(
         buildHybridRetrievalRequest({
           query: normalizedQueries[0],

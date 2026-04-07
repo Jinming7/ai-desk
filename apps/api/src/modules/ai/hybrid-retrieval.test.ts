@@ -475,6 +475,109 @@ test("hybrid request receives repo/branch when available", async () => {
   }
 });
 
+test("preview runtime defaults hybrid retrieval on when the raw env flag is unset", async () => {
+  const originalVercelEnv = process.env.VERCEL_ENV;
+  const originalRawFlag = process.env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL;
+  const originalEnvFlag = env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL;
+  let called = 0;
+
+  const hybridRuntime = {
+    async retrieve(request: HybridRetrievalRequest) {
+      called += 1;
+      return {
+        query: request.query,
+        references: [
+          {
+            documentId: "doc-preview-default",
+            evidenceId: "chunk-preview-default",
+            title: "Preview Default Hybrid",
+            snippet: "Preview should default hybrid retrieval on when the explicit flag is absent.",
+            sourceUrl: "https://docs.ones.com/open-docs/preview-hybrid-default",
+            repoSourceUrl: "https://github.com/BangWork/docs-com/blob/main/docs/preview-hybrid-default.md",
+            repo: "BangWork/docs-com",
+            branch: "main",
+            path: "docs/preview-hybrid-default.md",
+            commitSha: "abc1234",
+            headingPath: "Preview > Hybrid",
+            score: 0.91,
+            retrievedAt: new Date().toISOString(),
+            supportMetadata: {
+              authority: "canonical_visible",
+              source_type: "github_kb",
+              evidence_kind: "product_guide",
+              product_area: "general"
+            }
+          }
+        ],
+        confidence: 0.91,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        diagnostics: {
+          publication: {
+            knowledgeSpace: "support-preview",
+            repoId: "repo-1",
+            branch: "main",
+            publishedBuildVersion: "build-preview"
+          },
+          rewrites: request.rewrites,
+          requiredObjectTypes: request.requiredObjectTypes,
+          perChannelCounts: {
+            exact_signal: 0,
+            sparse_memory: 1,
+            sparse_citation: 0,
+            dense_citation: 0,
+            structured_artifact: 0,
+            relation_expansion: 0
+          },
+          channelTopIds: { sparse_memory: ["doc-preview-default"] },
+          fusionTopIds: ["doc-preview-default"],
+          rerankTopIds: ["doc-preview-default"],
+          groundingSuccessRate: 1,
+          evidenceGate: new DefaultHybridEvidenceGate().evaluate({
+            groundedEvidence: [
+              createEvidence({
+                candidateId: "doc-preview-default",
+                documentId: "doc-preview-default",
+                knowledgeSpace: "support-preview"
+              })
+            ],
+            topCandidates: [],
+            publishedBuildVersion: "build-preview",
+            caseFrame: createCaseFrame({ product_area: "general" })
+          }),
+          finalConfidence: 0.91
+        }
+      };
+    }
+  };
+
+  try {
+    process.env.VERCEL_ENV = "preview";
+    delete process.env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL;
+    env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL = false;
+
+    const orchestrator = new SearchOrchestrator({} as never, hybridRuntime as never);
+    const result = await orchestrator.collectEvidence({
+      queries: ["Which Linux distributions are officially supported?"],
+      idempotencyKey: "preview-default-hybrid-runtime",
+      answerLanguage: "en",
+      caseFrame: createCaseFrame({ product_area: "deployment", object: "linux distributions" }),
+      repoId: "repo-1",
+      branch: "main"
+    });
+
+    assert.equal(called, 1);
+    assert.equal(result.retrievalStatus, "grounded");
+    assert.equal(result.references[0]?.documentId, "doc-preview-default");
+  } finally {
+    if (originalVercelEnv === undefined) delete process.env.VERCEL_ENV;
+    else process.env.VERCEL_ENV = originalVercelEnv;
+    if (originalRawFlag === undefined) delete process.env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL;
+    else process.env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL = originalRawFlag;
+    env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL = originalEnvFlag;
+  }
+});
+
 test("resolvePublication uses scoped publication instead of ambiguous space-wide fallback", async () => {
   let getPublicationCalls = 0;
   let listPublicationCalls = 0;
