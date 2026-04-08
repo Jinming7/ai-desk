@@ -286,7 +286,7 @@ function createBudgetProbeAdapter(observedTimeoutMs: {
   };
 }
 
-test("runSupportSearchAgent gives async jobs wider downstream budgets than interactive caps", async () => {
+test("runSupportSearchAgent gives async jobs wider specialist budgets while retired citation stages stay local", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
   env.LOCAL_DOCS_COM_PATH = rootDir;
@@ -329,10 +329,9 @@ title: "Rebuild indexes after migration"
     });
 
     const observedSummary = JSON.stringify(observedTimeoutMs);
-    assert.equal((observedTimeoutMs.evidenceSelection ?? 0) > 12_000, true, observedSummary);
     assert.equal((observedTimeoutMs.specialist ?? 0) > 18_000, true, observedSummary);
-    assert.equal((observedTimeoutMs.citationBinding ?? 0) > 16_000, true, observedSummary);
-    assert.equal((observedTimeoutMs.answerComposer ?? 0) > 14_000, true, observedSummary);
+    assert.equal(observedTimeoutMs.evidenceSelection, undefined, observedSummary);
+    assert.equal(observedTimeoutMs.citationBinding, undefined, observedSummary);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

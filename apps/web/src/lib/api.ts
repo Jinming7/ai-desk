@@ -217,8 +217,10 @@ async function waitForSearchKnowledgeJobViaPolling(jobId: string): Promise<Suppo
   const deadline = Date.now() + 250_000;
   let lastUpdatedAt = "";
   let unchangedPolls = 0;
+  let lastDriveAt = 0;
 
   let current = await driveSearchKnowledgeJob(jobId);
+  lastDriveAt = Date.now();
   while (Date.now() < deadline) {
     if (isTerminalSupportSearchJob(current.status)) {
       return current;
@@ -238,8 +240,15 @@ async function waitForSearchKnowledgeJobViaPolling(jobId: string): Promise<Suppo
       lastUpdatedAt = current.updatedAt;
     }
 
-    if ((current.status === "queued" || current.status === "failed_retryable") && unchangedPolls >= 3) {
+    const shouldDriveQueuedJob = (current.status === "queued" || current.status === "failed_retryable") && unchangedPolls >= 3;
+    const shouldProbeRunningRecovery =
+      (current.status === "running" || current.status === "partial_result_ready") &&
+      unchangedPolls >= 20 &&
+      Date.now() - lastDriveAt >= 10_000;
+
+    if (shouldDriveQueuedJob || shouldProbeRunningRecovery) {
       current = await driveSearchKnowledgeJob(jobId);
+      lastDriveAt = Date.now();
       unchangedPolls = 0;
       lastUpdatedAt = current.updatedAt;
     }

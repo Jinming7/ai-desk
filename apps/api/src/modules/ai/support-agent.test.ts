@@ -1062,7 +1062,7 @@ write:project:issue-comment: Add, edit, delete issue comments
   }
 });
 
-test("runSupportSearchAgent uses fast multi-agent path for grounded how-to answers", async () => {
+test("runSupportSearchAgent uses fast multi-agent path for grounded how-to answers without retired citation selectors", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
   env.LOCAL_DOCS_COM_PATH = rootDir;
@@ -1154,7 +1154,7 @@ title: "Rebuild indexes after migration"
     assert.equal(judgeCalled, false);
     assert.equal(composeCalled, false);
     assert.equal(curateCalled, false);
-    assert.equal(displaySelectorCalled, true);
+    assert.equal(displaySelectorCalled, false);
     assert.equal(result.result.support_answer?.render_variant, "how_to");
     assert.deepEqual(
       result.result.support_answer?.sections.map((section) => section.title),
@@ -1277,11 +1277,12 @@ title: "Rebuild indexes after migration"
     const stageTrace = result.result.internal_diagnostics?.stage_trace ?? [];
     assert.equal(result.result.internal_diagnostics?.fast_path_used, false);
     assert.equal(judgeCalled, true);
-    assert.equal(composeCalled, true);
-    assert.equal(curateCalled, true);
+    assert.equal(composeCalled, false);
+    assert.equal(curateCalled, false);
     assert.equal(displaySelectorCalled, false);
     assert.equal(stageTrace.find((item) => item.stage === "verification")?.status, "completed");
     assert.equal(stageTrace.find((item) => item.stage === "answer_composition")?.status, "completed");
+    assert.match(result.result.answer, /rebuild indexes/);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });
@@ -1383,7 +1384,8 @@ title: "Rebuild indexes after migration"
 
     assert.equal(result.result.internal_diagnostics?.fast_path_used, false);
     assert.equal(judgeCalled, true);
-    assert.equal(composeCalled, true);
+    assert.equal(composeCalled, false);
+    assert.match(result.result.answer, /rebuild indexes/);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     env.FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING = originalRuntimeTightening;
@@ -2115,7 +2117,7 @@ The ONESQL syntax reference explicitly supports ORDER BY and GROUP BY clauses.
     assert.equal(result.stageTimings.writer.status, "skipped");
     assert.equal(diagnostics.specialist_skipped, true);
     assert.equal(stageTrace.find((item) => item.stage === "specialist")?.status, "skipped");
-    assert.equal(stageTrace.find((item) => item.stage === "generic_writer")?.status, "skipped");
+    assert.equal(stageTrace.some((item) => item.stage === "generic_writer"), false);
     assert.deepEqual(diagnostics.stage_budget, {
       retrieval_rounds: 1,
       allow_refinement: false,
@@ -2306,6 +2308,98 @@ ONES self-hosted deployment supports Ubuntu 18/20/24 and Red Hat 8+ for the serv
 
     assert.match(result.result.answer, /Ubuntu 18\/20\/24.*Red Hat 8\+/);
     assert.equal(result.result.support_answer?.mode, "grounded");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent prefers judge-preserved narrow behavior claims over a generic draft direct answer", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/docs/installation/linux-server/requirements.mdx",
+    `---
+title: "Linux server requirements"
+---
+
+# Linux server requirements
+
+ONES self-hosted deployment supports Ubuntu 18/20/24 and Red Hat 8+ for the server environment.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      specialist_budget: 1
+    },
+    evidencePlanOverride: {
+      retrieval_rounds: 1,
+      allow_refinement: false,
+      stop_after_grounded_evidence: false
+    }
+  });
+  adapter.planSupportCase = async (input) => ({
+    goal: input.query,
+    symptom: input.query,
+    object: "linux distributions",
+    action_type: "capability_confirmation",
+    deployment_model: "private_deployment",
+    product_area: "deployment",
+    constraints: [],
+    missing_critical_info: [],
+    retrieval_queries: ["supported operating systems", "linux distributions"],
+    query_plan: {
+      concept_queries: ["supported operating systems", "deployment requirements"],
+      object_queries: ["linux distributions", "server environment"],
+      behavior_queries: ["supported", "recommended"]
+    }
+  });
+  adapter.writeBehaviorSpecialistAnswer = async () => ({
+    question_type: "capability_confirmation",
+    render_variant: "behavior",
+    direct_answer: "I still need one critical detail before I can give a verified answer.",
+    claims: [],
+    next_actions: [],
+    unknowns: [],
+    escalation_needed: false
+  });
+  adapter.judgeSupportAnswer = async () => ({
+    verdict: "partial",
+    summary: "The current deployment requirements support a narrow answer.",
+    unsupported_claims: [],
+    missing_info: ["whether the question is about the server environment"],
+    verified_citation_ids: ["local:deploy-docs/docs/installation/linux-server/requirements.mdx:root"],
+    display_citation_ids: ["local:deploy-docs/docs/installation/linux-server/requirements.mdx:root"],
+    verified_claims: ["ONES 私有部署服务端支持 Ubuntu 18/20/24 与 Red Hat 8+。"],
+    claim_to_citation_map: [
+      {
+        text: "ONES 私有部署服务端支持 Ubuntu 18/20/24 与 Red Hat 8+。",
+        kind: "verified_fact",
+        verdict: "verified",
+        citation_ids: ["local:deploy-docs/docs/installation/linux-server/requirements.mdx:root"]
+      }
+    ]
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "ONES 支持哪些 Linux 发行版？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-judge-preserved-narrow-behavior-answer"
+    });
+
+    assert.match(result.result.answer, /Ubuntu 18\/20\/24.*Red Hat 8\+/);
+    assert.doesNotMatch(result.result.answer, /critical detail|verified answer|关键信息/);
+    assert.equal(result.result.support_answer?.mode, "partial");
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });
@@ -2788,7 +2882,7 @@ Microsoft Azure AD integration is available only in ONES.com Cloud.
   }
 });
 
-test("runSupportSearchAgent reports dedicated selector stages in orchestration trace instead of main fallback", async () => {
+test("runSupportSearchAgent omits retired selector stages from the live orchestration trace", async () => {
   const adapter = createAdapter({
     verification: {
       verdict: "unsupported",
@@ -2806,22 +2900,17 @@ test("runSupportSearchAgent reports dedicated selector stages in orchestration t
   });
 
   const trace = result.result.internal_diagnostics?.orchestration_trace ?? [];
-  const evidenceSelector = trace.find((item) => item.stage === "support-evidence-selector");
-  assert.ok(evidenceSelector);
-  assert.equal(evidenceSelector?.agent_id, "support-evidence-selector");
+  assert.equal(trace.some((item) => item.stage === "support-evidence-selector"), false);
 });
 
-test("AI topology exposes support-citation-binder as an explicit routed support stage", () => {
+test("AI topology excludes retired citation post-processing stages from the live support runtime", () => {
   const topology = getAiTopology();
-  const binder = topology.supportStages.stages.find((stage) => stage.stage === "support-citation-binder");
-
-  assert.ok(binder);
-  assert.equal(binder?.agentId, "support-citation-curator");
-  assert.equal(binder?.dedicated, false);
-  assert.equal(binder?.fallback, "stage_level_fallback");
+  assert.equal(topology.supportStages.stages.some((stage) => stage.stage === "support-citation-binder"), false);
+  assert.equal(topology.supportStages.stages.some((stage) => stage.stage === "citation-curator"), false);
+  assert.equal(topology.supportStages.stages.some((stage) => stage.stage === "support-citation-selector"), false);
 });
 
-test("support-citation-binder resolves to an explicit stage-level fallback instead of the global default agent", () => {
+test("retired support-citation-binder still resolves to the stage-level fallback when explicitly addressed", () => {
   const binding = resolveStageSpecificAgent("support-citation-binder");
 
   assert.equal(binding.agentId, "support-citation-curator");
@@ -3184,7 +3273,7 @@ The retrieved OpenAPI reference explicitly mentions ORDER BY and GROUP BY in the
   }
 });
 
-test("runSupportSearchAgent prefers citation binder output when verifier citations are tangential", async () => {
+test("runSupportSearchAgent reanchors tangential verifier citations onto the most relevant evidence", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
   env.LOCAL_DOCS_COM_PATH = rootDir;
@@ -3248,28 +3337,6 @@ This page is unrelated to ONESQL semantics.
       ]
     };
   };
-  adapter.bindSupportCitations = async (input) => {
-    const right = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].find((item) => /execute onesql query/i.test(item.title));
-    const rightId = right ? [resolveSearchReferenceEvidenceId(right)] : [];
-    return {
-      verdict: "verified",
-      summary: "The claim was rebound to the direct ONESQL syntax reference.",
-      unsupported_claims: [],
-      missing_info: [],
-      verified_citation_ids: rightId,
-      display_citation_ids: rightId,
-      verified_claims: ["The ONESQL syntax reference discusses ORDER BY and GROUP BY clauses."],
-      claim_to_citation_map: [
-        {
-          text: "The ONESQL syntax reference discusses ORDER BY and GROUP BY clauses.",
-          kind: "verified_fact",
-          verdict: "verified",
-          citation_ids: rightId
-        }
-      ]
-    };
-  };
-
   try {
     const result = await runSupportSearchAgent({
       query: "does ONESQL support ORDER BY and GROUP BY?",
@@ -3324,11 +3391,11 @@ If authorization returns page not found, verify Redirect URI, callback URL, and 
 
     assert.equal(adapter.calls.includes("routeSupportQuestion"), true);
     assert.equal(adapter.calls.includes("planSupportEvidence"), true);
-    assert.equal(adapter.calls.includes("selectSupportEvidence"), true);
+    assert.equal(adapter.calls.includes("selectSupportEvidence"), false);
     assert.equal(adapter.calls.includes("writeTroubleshootingSpecialistAnswer"), true);
     assert.equal(adapter.calls.includes("judgeSupportAnswer"), true);
-    assert.equal(adapter.calls.includes("curateSupportCitations") || adapter.calls.includes("selectDisplayCitations"), true);
-    assert.equal(adapter.calls.includes("composeCustomerAnswer"), true);
+    assert.equal(adapter.calls.includes("curateSupportCitations") || adapter.calls.includes("selectDisplayCitations"), false);
+    assert.equal(adapter.calls.includes("composeCustomerAnswer"), false);
     assert.equal(adapter.calls.includes("writeTriageInsight"), false);
     assert.equal(adapter.calls.includes("verifyTriageInsight"), false);
     assert.equal(result.analyzeOutput.action, "resolve");

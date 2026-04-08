@@ -430,15 +430,11 @@ export function getAiTopology(): AiTopologySnapshot {
     resolveStageBinding("router"),
     resolveStageBinding("evidence-planner"),
     resolveStageBinding("planner"),
-    resolveStageBinding("support-evidence-selector"),
     resolveStageBinding("api-specialist"),
     resolveStageBinding("howto-specialist"),
     resolveStageBinding("behavior-specialist"),
     resolveStageBinding("troubleshooting-specialist"),
     resolveStageBinding("evidence-judge"),
-    resolveStageBinding("support-citation-binder"),
-    resolveStageBinding("citation-curator"),
-    resolveStageBinding("support-citation-selector"),
     resolveStageBinding("answer-composer")
   ];
   const searchStages = [

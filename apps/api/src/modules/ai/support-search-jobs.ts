@@ -368,3 +368,30 @@ export async function requeueStaleRunningSupportSearchJobs(maxAgeMinutes: number
   );
   return result.rowCount ?? 0;
 }
+
+export async function requeueRecoverableSupportSearchJob(input: {
+  jobId: string;
+  staleAfterMs?: number;
+}): Promise<boolean> {
+  const staleAfterMs = Number.isFinite(input.staleAfterMs) ? Math.max(1_000, Math.floor(input.staleAfterMs ?? 60_000)) : 60_000;
+  const result = await pool.query(
+    `UPDATE ai_support_search_jobs
+     SET status = 'queued',
+         lease_key = NULL,
+         lease_expires_at = NULL,
+         worker_id = NULL,
+         error_message = COALESCE(NULLIF(error_message, ''), 'support search job recovered for re-drive'),
+         started_at = NULL,
+         next_run_at = NOW(),
+         updated_at = NOW()
+     WHERE id = $1
+       AND status IN ('running', 'partial_result_ready')
+       AND (
+         lease_expires_at IS NULL
+         OR lease_expires_at < NOW()
+         OR updated_at < NOW() - ($2::int * INTERVAL '1 millisecond')
+       )`,
+    [input.jobId, staleAfterMs]
+  );
+  return (result.rowCount ?? 0) > 0;
+}

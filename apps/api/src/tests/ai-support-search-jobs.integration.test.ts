@@ -10,6 +10,7 @@ import * as aiRepo from "../modules/ai/repository.js";
 let baseUrl = "";
 let server: ReturnType<typeof app.listen> | null = null;
 const originalCronSecret = env.CRON_SECRET;
+const SUPPORT_SEARCH_TEST_LOCK_KEY = 46080401;
 
 function parseSse(text: string): Array<{ event: string; data: string }> {
   return text
@@ -55,6 +56,7 @@ async function resetDb() {
 
 before(async () => {
   assertSafeTestDatabase();
+  await pool.query("SELECT pg_advisory_lock($1)", [SUPPORT_SEARCH_TEST_LOCK_KEY]);
   env.CRON_SECRET = "test-cron-secret";
   server = app.listen(0);
   await new Promise<void>((resolve) => server?.once("listening", () => resolve()));
@@ -65,6 +67,7 @@ before(async () => {
 after(async () => {
   env.CRON_SECRET = originalCronSecret;
   await new Promise<void>((resolve) => server?.close(() => resolve()));
+  await pool.query("SELECT pg_advisory_unlock($1)", [SUPPORT_SEARCH_TEST_LOCK_KEY]);
 });
 
 beforeEach(async () => {
@@ -227,4 +230,46 @@ test("support search polling fallback can drive a queued job and read the same c
   assert.equal(statusPayload.job.result?.session_id, submitted.job.sessionId);
   assert.equal(driven.job.result?.session_id, statusPayload.job.result?.session_id);
   assert.equal(driven.job.result?.answer, statusPayload.job.result?.answer);
+});
+
+test("support search drive endpoint can recover a stale running job and complete it", async () => {
+  const submitResponse = await fetch(`${baseUrl}/api/v1/ai/search/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query: "thisquerywillnotmatchkbx",
+      conversation: []
+    })
+  });
+
+  assert.equal(submitResponse.status, 202);
+  const submitted = (await submitResponse.json()) as {
+    job: { id: string; sessionId: string; status: string };
+  };
+
+  await pool.query(
+    `UPDATE ai_support_search_jobs
+     SET status = 'running',
+         lease_key = 'expired-lease',
+         lease_expires_at = NOW() - INTERVAL '2 minutes',
+         worker_id = 'dead-worker',
+         updated_at = NOW() - INTERVAL '2 minutes'
+     WHERE id = $1`,
+    [submitted.job.id]
+  );
+
+  const driveResponse = await fetch(`${baseUrl}/api/v1/ai/search/jobs/${submitted.job.id}/drive`, {
+    method: "POST"
+  });
+  assert.equal(driveResponse.status, 202);
+
+  const driven = (await driveResponse.json()) as {
+    job: { id: string; sessionId: string; status: string; result: { session_id?: string; answer?: string } | null };
+  };
+
+  assert.equal(driven.job.id, submitted.job.id);
+  assert.equal(driven.job.status, "completed");
+  assert.equal(driven.job.result?.session_id, submitted.job.sessionId);
+  assert.equal(typeof driven.job.result?.answer, "string");
+  assert.equal((driven.job.result?.answer ?? "").length > 0, true);
 });

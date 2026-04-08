@@ -195,24 +195,6 @@ function withStageRuntime(
   };
 }
 
-function withExplicitStageRuntime(input: {
-  runtime?: OpenClawRuntimeContext;
-  stage: NonNullable<OpenClawRuntimeContext["stage"]>;
-  sessionSeed: string;
-  agentId: string;
-  model?: string;
-}): OpenClawRuntimeContext {
-  const prefix = env.OPENCLAW_AGENT_SESSION_PREFIX.trim() || "nf";
-  const base = input.runtime ?? {};
-  return {
-    ...base,
-    stage: input.stage,
-    agentId: input.agentId,
-    model: input.model,
-    sessionKey: `agent:${input.agentId}:${sanitizeSessionPart(`${prefix}:${input.stage}:${input.sessionSeed}`)}`
-  };
-}
-
 function fallbackCaseFrame(query: string): SupportCaseFrame {
   const normalized = query.trim();
   return {
@@ -584,19 +566,14 @@ function buildClaimGraph(verification: SupportVerificationResult) {
 function buildOrchestrationTrace(input: {
   route: SupportQuestionRoute;
   specialistSkipped: boolean;
+  usedUnifiedPlanner: boolean;
+  verificationSkipped: boolean;
+  answerComposerUsed: boolean;
 }): Array<{ stage: string; agent_id: string; model?: string | null }> {
-  const stages: Array<string> = [
-    "router",
-    "evidence-planner",
-    "planner",
-    "support-evidence-selector",
-    "evidence-judge",
-    "citation-curator",
-    "answer-composer"
-  ];
-  if (!input.specialistSkipped) {
-    stages.splice(3, 0, input.route.specialist_agent);
-  }
+  const stages: Array<string> = input.usedUnifiedPlanner ? ["planner"] : ["router", "evidence-planner", "planner"];
+  if (!input.specialistSkipped) stages.push(input.route.specialist_agent);
+  if (!input.verificationSkipped) stages.push("evidence-judge");
+  if (input.answerComposerUsed) stages.push("answer-composer");
   return stages.map((stage) => {
     const resolved = resolveStageSpecificAgent(stage as NonNullable<OpenClawRuntimeContext["stage"]>);
     return {
@@ -1459,6 +1436,8 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
 function sanitizeVerification(input: {
   verification: SupportVerificationResult;
   evidenceBundle: SupportEvidenceBundle;
+  query: string;
+  caseFrame: SupportCaseFrame;
 }): SupportVerificationResult {
   const candidateReferences = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].filter(
     (item) => item.authority === "canonical_visible"
@@ -1507,7 +1486,7 @@ function sanitizeVerification(input: {
     ],
     12
   );
-  return {
+  const sanitized: SupportVerificationResult = {
     verdict:
       supportedClaims.length === 0
         ? "unsupported"
@@ -1522,6 +1501,13 @@ function sanitizeVerification(input: {
     verified_claims: supportedClaims.map((claim) => claim.text),
     claim_to_citation_map: sanitizedClaims
   };
+
+  return refineVerificationForAnswer({
+    verification: sanitized,
+    evidenceBundle: input.evidenceBundle,
+    query: input.query,
+    caseFrame: input.caseFrame
+  });
 }
 
 function buildCitations(input: {
@@ -1671,6 +1657,297 @@ function scoreReferenceTopicMatch(reference: SearchReference, focusTerms: string
   return topicScore;
 }
 
+const GENERIC_SUPPORT_SEARCH_TERMS = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "that",
+  "this",
+  "from",
+  "into",
+  "ones",
+  "onesql",
+  "openapi",
+  "scope",
+  "scopes",
+  "support",
+  "supports",
+  "supported",
+  "documentation",
+  "documented",
+  "current",
+  "query",
+  "queries",
+  "issue",
+  "issues",
+  "当前",
+  "文档",
+  "说明",
+  "支持",
+  "可以",
+  "需要"
+]);
+
+function extractSupportSearchTerms(value: string): string[] {
+  const normalized = String(value ?? "").toLowerCase();
+  const exactAscii = [...normalized.matchAll(/[a-z0-9:_./-]{2,}/g)].map((match) => match[0]);
+  const splitAscii = exactAscii.flatMap((token) => token.split(/[:/._-]+/).map((item) => item.trim()).filter((item) => item.length >= 3));
+  const cjk = [...normalized.matchAll(/[\u4e00-\u9fff]{2,}/g)].map((match) => match[0]);
+  return uniqueStrings([...exactAscii, ...splitAscii, ...cjk], 40);
+}
+
+function isGenericSupportSearchTerm(term: string): boolean {
+  const normalized = term.trim().toLowerCase();
+  return !normalized || normalized.length <= 2 || GENERIC_SUPPORT_SEARCH_TERMS.has(normalized);
+}
+
+function scoreSupportTextAgainstTerms(text: string, terms: string[]): number {
+  const normalizedText = text.toLowerCase();
+  let score = 0;
+  for (const term of terms) {
+    if (isGenericSupportSearchTerm(term)) continue;
+    if (normalizedText.includes(term)) {
+      score += /[:/._-]/.test(term) || term.length >= 6 ? 12 : 7;
+    } else if (/^[a-z0-9:_./-]{4,}$/i.test(term)) {
+      score -= 4;
+    }
+  }
+  return score;
+}
+
+function extractDocumentedScopeValue(text: string): string | null {
+  const match = String(text ?? "").match(/\b(?:read|write):[a-z0-9:_-]+\b/i);
+  return match?.[0]?.trim() || null;
+}
+
+function scoreClaimFocusFit(claimText: string, query: string, caseFrame: SupportCaseFrame): number {
+  const focusTerms = collectFocusTerms(query, caseFrame);
+  const focusText = focusTerms.join(" ").toLowerCase();
+  let score = 0;
+  for (const term of extractSupportSearchTerms(claimText)) {
+    if (isGenericSupportSearchTerm(term)) continue;
+    if (tokenMatchesFocus(term, focusText) || focusText.includes(term)) {
+      score += /^[a-z0-9:_./-]{4,}$/i.test(term) ? 8 : 4;
+    } else if (/^[a-z0-9:_./-]{4,}$/i.test(term)) {
+      score -= 4;
+    }
+  }
+  const scopeValue = extractDocumentedScopeValue(claimText);
+  if (scopeValue) {
+    const targetIntents = collectApiOperationIntents(query, caseFrame);
+    score += scorePermissionScopeFit(scopeValue, focusTerms);
+    score += scoreApiScopeAccessFit(scopeValue, targetIntents);
+  }
+  return score;
+}
+
+function scoreReferenceForSupportedClaim(input: {
+  reference: SearchReference;
+  claimText: string;
+  query: string;
+  caseFrame: SupportCaseFrame;
+}): number {
+  const profile = getReferenceSupportProfile(input.reference);
+  const semanticText = getReferenceSemanticText(input.reference).toLowerCase();
+  const focusTerms = collectFocusTerms(input.query, input.caseFrame);
+  const claimTerms = extractSupportSearchTerms(input.claimText);
+  let score = Math.round(input.reference.score * 10);
+  score += scoreReferenceTopicMatch(input.reference, focusTerms);
+  score += scoreSupportTextAgainstTerms(`${profile.title} ${profile.heading} ${semanticText}`, claimTerms);
+  for (const requiredDocKind of input.caseFrame.required_doc_kinds ?? []) {
+    score += scoreRequiredDocKindForReference(input.reference, requiredDocKind);
+  }
+  if (input.caseFrame.question_type === "api_scope_auth" && referenceHasPermissionSignal(input.reference)) {
+    score += 12;
+  }
+  if (String(input.caseFrame.question_type ?? "").startsWith("api_")) {
+    if (profile.productArea === "openapi") score += 12;
+    if (/\bonesql\b|syntax|query language|expression|reference/.test(semanticText)) score += 10;
+    if (profile.productArea && profile.productArea !== "openapi") score -= 10;
+    const operationSignature = extractApiOperationSignature(input.reference);
+    if (operationSignature.method || operationSignature.path) {
+      const targetIntents = collectApiOperationIntents(input.query, input.caseFrame);
+      score += scoreApiIntentAlignment(
+        targetIntents,
+        classifyApiOperationCandidate({
+          method: operationSignature.method,
+          path: operationSignature.path,
+          title: input.reference.title,
+          snippet: semanticText
+        })
+      );
+      score += scoreApiOperationTitleIntentFit(profile.title, targetIntents);
+    }
+  }
+  if (
+    String(input.reference.headingPath ?? "").toUpperCase() === "ROOT" &&
+    /overview|introduction|说明|介绍/.test(`${profile.title} ${profile.heading}`.toLowerCase())
+  ) {
+    score -= 8;
+  }
+  if (
+    input.caseFrame.question_type === "capability_confirmation" &&
+    /overview|introduction|部署说明|说明阅读/.test(semanticText) &&
+    !/ubuntu|red hat|centos|linux|requirement|requirements|操作系统|环境要求|支持/.test(semanticText)
+  ) {
+    score -= 10;
+  }
+  return score;
+}
+
+function reanchorSupportedClaimCitationIds(input: {
+  claimText: string;
+  citationIds: string[];
+  candidateReferences: SearchReference[];
+  evidenceById: Map<string, SearchReference>;
+  query: string;
+  caseFrame: SupportCaseFrame;
+}): string[] {
+  const scoredCandidates = input.candidateReferences
+    .map((reference) => ({
+      evidenceId: resolveSearchReferenceEvidenceId(reference),
+      score: scoreReferenceForSupportedClaim({
+        reference,
+        claimText: input.claimText,
+        query: input.query,
+        caseFrame: input.caseFrame
+      })
+    }))
+    .sort((left, right) => right.score - left.score);
+  if (!scoredCandidates.length) return uniqueStrings(input.citationIds, 2);
+
+  const currentCandidates = uniqueStrings(input.citationIds, 4)
+    .map((citationId) => {
+      const reference = input.evidenceById.get(citationId);
+      if (!reference) return null;
+      return {
+        evidenceId: citationId,
+        score: scoreReferenceForSupportedClaim({
+          reference,
+          claimText: input.claimText,
+          query: input.query,
+          caseFrame: input.caseFrame
+        })
+      };
+    })
+    .filter((item): item is { evidenceId: string; score: number } => Boolean(item))
+    .sort((left, right) => right.score - left.score);
+
+  const currentBestScore = currentCandidates[0]?.score ?? Number.NEGATIVE_INFINITY;
+  const bestOverall = scoredCandidates[0];
+  if (
+    input.citationIds.length > 0 &&
+    bestOverall.score >= 24 &&
+    (currentBestScore === Number.NEGATIVE_INFINITY || bestOverall.score >= currentBestScore + 16)
+  ) {
+    return [bestOverall.evidenceId];
+  }
+  const preferred = currentCandidates.length ? currentCandidates : scoredCandidates.filter((item) => item.score > 0);
+  return uniqueStrings(preferred.map((item) => item.evidenceId), 2);
+}
+
+function maxFocusedSupportedClaimCount(caseFrame: SupportCaseFrame): number {
+  switch (caseFrame.question_type) {
+    case "api_scope_auth":
+    case "api_endpoint_lookup":
+    case "api_field_lookup":
+    case "capability_confirmation":
+      return 1;
+    case "how_to_product":
+    case "config_setup":
+    case "troubleshooting":
+      return 2;
+    default:
+      return String(caseFrame.question_type ?? "").startsWith("api_") ? 1 : 2;
+  }
+}
+
+function refineVerificationForAnswer(input: {
+  verification: SupportVerificationResult;
+  evidenceBundle: SupportEvidenceBundle;
+  query: string;
+  caseFrame: SupportCaseFrame;
+}): SupportVerificationResult {
+  const candidateReferences = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].filter(
+    (item) => item.authority === "canonical_visible"
+  );
+  const evidenceById = new Map(candidateReferences.map((item) => [resolveSearchReferenceEvidenceId(item), item] as const));
+  const unsupportedClaims = input.verification.claim_to_citation_map.filter(
+    (claim) => claim.verdict !== "verified" && claim.verdict !== "supported_inference"
+  );
+  const rankedSupportedClaims = input.verification.claim_to_citation_map
+    .filter((claim) => (claim.verdict === "verified" || claim.verdict === "supported_inference") && claim.citation_ids.length > 0)
+    .map((claim) => {
+      const repairedCitationIds = reanchorSupportedClaimCitationIds({
+        claimText: claim.text,
+        citationIds: claim.citation_ids,
+        candidateReferences,
+        evidenceById,
+        query: input.query,
+        caseFrame: input.caseFrame
+      });
+      const bestCitationScore = repairedCitationIds.reduce((best, citationId) => {
+        const reference = evidenceById.get(citationId);
+        if (!reference) return best;
+        return Math.max(
+          best,
+          scoreReferenceForSupportedClaim({
+            reference,
+            claimText: claim.text,
+            query: input.query,
+            caseFrame: input.caseFrame
+          })
+        );
+      }, Number.NEGATIVE_INFINITY);
+      return {
+        claim: {
+          ...claim,
+          citation_ids: repairedCitationIds
+        },
+        score:
+          scoreClaimFocusFit(claim.text, input.query, input.caseFrame) +
+          (Number.isFinite(bestCitationScore) ? bestCitationScore : 0)
+      };
+    })
+    .sort((left, right) => right.score - left.score);
+
+  const maxClaims = maxFocusedSupportedClaimCount(input.caseFrame);
+  const topScore = rankedSupportedClaims[0]?.score ?? 0;
+  const focusedSupportedClaims = rankedSupportedClaims
+    .filter(({ score }, index) => index === 0 || (index < maxClaims && score >= topScore - 18))
+    .map((item) => item.claim);
+  const supportedClaims = focusedSupportedClaims.length
+    ? focusedSupportedClaims
+    : rankedSupportedClaims[0]
+    ? [rankedSupportedClaims[0].claim]
+    : [];
+  const supportedCitationIds = uniqueStrings(supportedClaims.flatMap((claim) => claim.citation_ids), 6);
+  const unsupportedTexts = uniqueStrings(
+    [
+      ...input.verification.unsupported_claims,
+      ...unsupportedClaims.map((claim) => claim.text)
+    ],
+    12
+  );
+
+  return {
+    verdict:
+      supportedClaims.length === 0
+        ? "unsupported"
+        : unsupportedTexts.length === 0 && input.verification.verdict === "verified"
+        ? "verified"
+        : "partial",
+    summary: input.verification.summary,
+    unsupported_claims: unsupportedTexts,
+    missing_info: input.verification.missing_info,
+    verified_citation_ids: supportedCitationIds,
+    display_citation_ids: uniqueStrings(supportedClaims.flatMap((claim) => claim.citation_ids), 3),
+    verified_claims: supportedClaims.map((claim) => claim.text),
+    claim_to_citation_map: [...supportedClaims, ...unsupportedClaims]
+  };
+}
+
 function scoreVerificationCandidate(
   verification: SupportVerificationResult,
   evidenceBundle: SupportEvidenceBundle,
@@ -1683,16 +1960,22 @@ function scoreVerificationCandidate(
       .filter((item) => item.authority === "canonical_visible")
       .map((item) => [resolveSearchReferenceEvidenceId(item), item] as const)
   );
-  const focusTerms = collectFocusTerms(query, caseFrame);
   let score = 0;
   score += supportedClaims.length * 40;
   score += verification.display_citation_ids.length * 18;
   score -= verification.unsupported_claims.length * 8;
-  for (const citationId of verification.display_citation_ids) {
-    const reference = evidenceById.get(citationId);
-    if (!reference) continue;
-    score += scoreReferenceTopicMatch(reference, focusTerms);
-    score += Math.round(reference.score * 10);
+  for (const claim of supportedClaims) {
+    score += scoreClaimFocusFit(claim.text, query, caseFrame);
+    for (const citationId of claim.citation_ids) {
+      const reference = evidenceById.get(citationId);
+      if (!reference) continue;
+      score += scoreReferenceForSupportedClaim({
+        reference,
+        claimText: claim.text,
+        query,
+        caseFrame
+      });
+    }
   }
   return score;
 }
@@ -1724,7 +2007,42 @@ function pickBestVerificationCandidate(input: {
         scoreVerificationCandidate(a, input.evidenceBundle, input.query, input.caseFrame)
     )[0];
   }
-  return supportedVerificationClaims(input.writerBound).length > 0 ? input.writerBound : input.primary;
+  return supportedVerificationClaims(input.writerBound).length > 0 && input.primary.claim_to_citation_map.length === 0
+    ? input.writerBound
+    : input.primary;
+}
+
+function preferWriterBoundVerificationForDelivery(input: {
+  selected: SupportVerificationResult;
+  writerBound: SupportVerificationResult;
+  evidenceBundle: SupportEvidenceBundle;
+  query: string;
+  caseFrame: SupportCaseFrame;
+}): SupportVerificationResult {
+  if (supportedVerificationClaims(input.selected).length === 0) {
+    return input.selected;
+  }
+  if (supportedVerificationClaims(input.writerBound).length === 0) {
+    return input.selected;
+  }
+  const selectedScore = scoreVerificationCandidate(input.selected, input.evidenceBundle, input.query, input.caseFrame);
+  const writerBoundScore = scoreVerificationCandidate(input.writerBound, input.evidenceBundle, input.query, input.caseFrame);
+  const shouldPreferWriterBound =
+    writerBoundScore >= selectedScore + 20 ||
+    (input.selected.display_citation_ids.length === 0 && writerBoundScore > selectedScore);
+  if (!shouldPreferWriterBound) {
+    return input.selected;
+  }
+  return {
+    ...input.selected,
+    verified_citation_ids: input.writerBound.verified_citation_ids,
+    display_citation_ids: input.writerBound.display_citation_ids,
+    verified_claims: input.writerBound.verified_claims,
+    claim_to_citation_map: [
+      ...supportedVerificationClaims(input.writerBound),
+      ...input.selected.claim_to_citation_map.filter((claim) => claim.verdict === "unsupported")
+    ]
+  };
 }
 
 function buildFallbackDirectAnswerFromSupportedClaims(input: {
@@ -1755,6 +2073,46 @@ function buildFallbackDirectAnswerFromSupportedClaims(input: {
       ? `${explicitVerdict}${leadingClaims.length > 1 ? ` ${leadingClaims.filter((item) => item !== explicitVerdict).join(" ")}` : ""}`
       : `Based on the current documentation, I can confirm this much: ${leadingClaims.join("; ")}. The remaining part is still not fully confirmed.`
     : leadingClaims.join("; ");
+}
+
+function isGenericUncertaintyDirectAnswer(value: string): boolean {
+  const normalized = normalizeComparableText(value);
+  if (!normalized) return false;
+  return /i still need|need one critical detail|missing detail|cannot confirm|could not confirm|unable to confirm|need further confirmation|not enough (verified )?evidence|还缺少|还需要|无法确认|不能确认|需要进一步确认|没有足够(的)?已验证证据|还不能给出可靠结论/.test(
+    normalized
+  );
+}
+
+function buildSupportedClaimsSections(input: {
+  language: "zh" | "en";
+  supportedClaims: SupportVerificationResult["claim_to_citation_map"];
+  stillNeedToConfirm: string[];
+  mode: SupportAnswer["mode"];
+}): SupportAnswer["sections"] {
+  const confirmedItems = uniqueStrings(
+    input.supportedClaims
+      .filter((claim) => claim.kind === "verified_fact" || claim.kind === "grounded_inference")
+      .map((claim) => claim.text),
+    4
+  );
+  if (!confirmedItems.length) return [];
+
+  return [
+    {
+      kind: "bullet_list",
+      title: localizedSectionTitle(input.language, "已确认事实", "Confirmed facts"),
+      items: confirmedItems
+    },
+    ...(input.mode === "partial" && input.stillNeedToConfirm.length
+      ? [
+          {
+            kind: "bullet_list" as const,
+            title: localizedSectionTitle(input.language, "还需要确认", "Still need to confirm"),
+            items: input.stillNeedToConfirm
+          }
+        ]
+      : [])
+  ];
 }
 
 function buildFallbackSectionsFromDraft(draft: SpecialistDraftAnswer, language: "zh" | "en"): SupportAnswer["sections"] {
@@ -1887,18 +2245,32 @@ function buildSupportAnswerFromDraft(input: {
     input.composed?.direct_answer?.trim() && !overlapsUnsupportedClaim(input.composed.direct_answer, input.verification.unsupported_claims)
       ? input.composed.direct_answer.trim()
       : "";
+  const supportedClaimDirectAnswer = buildFallbackDirectAnswerFromSupportedClaims({
+    language: input.language,
+    mode: input.mode,
+    supportedClaims,
+    fallback
+  });
+  const preferredDirectAnswerCandidate = safeComposedDirectAnswer || safeDraftDirectAnswer;
+  const shouldPreferSupportedClaimDirectAnswer =
+    supportedClaims.length > 0 &&
+    supportedClaimDirectAnswer.length > 0 &&
+    (input.draft.render_variant === "behavior" ||
+      !preferredDirectAnswerCandidate ||
+      isGenericUncertaintyDirectAnswer(preferredDirectAnswerCandidate));
   const directAnswer =
     input.mode === "grounded" || input.mode === "partial"
-      ? safeComposedDirectAnswer ||
-        safeDraftDirectAnswer ||
-        buildFallbackDirectAnswerFromSupportedClaims({
-          language: input.language,
-          mode: input.mode,
-          supportedClaims,
-          fallback
-        })
+      ? shouldPreferSupportedClaimDirectAnswer
+        ? supportedClaimDirectAnswer
+        : preferredDirectAnswerCandidate || supportedClaimDirectAnswer
       : safeComposedDirectAnswer || fallback.direct_answer;
   const fallbackSections = buildFallbackSectionsFromDraft(input.draft, input.language);
+  const supportedClaimSections = buildSupportedClaimsSections({
+    language: input.language,
+    supportedClaims,
+    stillNeedToConfirm,
+    mode: input.mode
+  });
   const minimalStructuredSections =
     input.mode === "clarification" && stillNeedToConfirm.length
       ? [
@@ -1928,8 +2300,12 @@ function buildSupportAnswerFromDraft(input: {
   const sections =
     input.composed?.sections?.length
       ? input.composed.sections
+      : supportedClaimSections.length && shouldPreferSupportedClaimDirectAnswer
+      ? supportedClaimSections
       : fallbackSections.length
       ? fallbackSections
+      : supportedClaimSections.length
+      ? supportedClaimSections
       : minimalStructuredSections.length
       ? minimalStructuredSections
       : fallback.sections;
@@ -3812,48 +4188,15 @@ export async function runSupportSearchAgent(input: {
       : skippedStageTiming();
   markStageCompleted("retrieval_extra");
 
-  const selectionRuntime = withStageRuntime(
-    buildDeliveryAwareStageRuntime(
-      input.runtime,
-      {
-        reserveMs: 22_000,
-        minimumTimeoutMs: 4_000,
-        stageTimeoutMs: 12_000
-      },
-      {
-        reserveMs: 12_000,
-        minimumTimeoutMs: 8_000,
-        stageTimeoutMs: 24_000
-      }
-    ),
-    "support-evidence-selector",
-    `${input.idempotencyKey}:evidence-selector`
-  );
   await reportStageProgress("evidence_selection");
   const evidenceSelectionStartedAt = performance.now();
-  const evidenceSelection =
-    evidenceCollection.references.length > 0 && hasEnoughBudget(input.runtime, 5000)
-      ? await input.adapter
-          .selectSupportEvidence(
-            {
-              contextType,
-              language: input.language,
-              query: input.query,
-              caseFrame,
-              references: evidenceCollection.references
-            },
-            `${input.idempotencyKey}:evidence-selector`,
-            selectionRuntime
-          )
-          .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(evidenceSelectionStartedAt), { reference_count: value.primary_ids.length + value.supplemental_ids.length }) }))
-          .catch(() => ({
-            value: fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame),
-            timing: stageTiming("fallback", elapsedMs(evidenceSelectionStartedAt), { reference_count: 0 })
-          }))
-      : {
-          value: fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame),
-          timing: stageTiming("skipped", elapsedMs(evidenceSelectionStartedAt), { reference_count: 0 })
-        };
+  const deterministicEvidenceSelection = fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame);
+  const evidenceSelection = {
+    value: deterministicEvidenceSelection,
+    timing: stageTiming("completed", elapsedMs(evidenceSelectionStartedAt), {
+      reference_count: deterministicEvidenceSelection.primary_ids.length + deterministicEvidenceSelection.supplemental_ids.length
+    })
+  };
   markStageCompleted("evidence_selection");
 
   const evidenceBundle = buildEvidenceBundle({
@@ -3910,68 +4253,8 @@ export async function runSupportSearchAgent(input: {
         .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(writerStartedAt)) }))
         .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(writerStartedAt)) }))
     : { value: null, timing: stageTiming("skipped", elapsedMs(writerStartedAt)) };
-  const genericWriterStartedAt = performance.now();
-  const genericWriterRuntime = withExplicitStageRuntime({
-    runtime: buildDeliveryAwareStageRuntime(
-      input.runtime,
-      {
-        reserveMs: 9_000,
-        minimumTimeoutMs: 4_000,
-        stageTimeoutMs: 12_000
-      },
-      {
-        reserveMs: 8_000,
-        minimumTimeoutMs: 10_000,
-        stageTimeoutMs: 28_000
-      }
-    ),
-    stage: "support-writer",
-    sessionSeed: `${input.idempotencyKey}:support-writer`,
-    agentId: resolveStageSpecificAgent(route.specialist_agent).agentId,
-    model: resolveStageSpecificAgent(route.specialist_agent).model
-  });
-  const genericWriterResult =
-    !shouldSkipWriterFamily &&
-    evidenceBundle.primary.length > 0 &&
-    hasEnoughBudget(input.runtime, 5000) &&
-    (!specialistResult.value || !hasGroundedDraftClaims(specialistResult.value))
-      ? await input.adapter
-          .writeSupportAnswer(
-            {
-              contextType,
-              language: input.language,
-              query: input.query,
-              caseFrame,
-              evidenceBundle,
-              conversationHistory: input.conversationHistory,
-              ticketContext: input.ticketContext
-            },
-            `${input.idempotencyKey}:support-writer`,
-            genericWriterRuntime
-          )
-          .then((value) => {
-            const routedDraft: SpecialistDraftAnswer = {
-              question_type: route.question_type,
-              render_variant:
-                route.specialist_agent === "api-specialist"
-                  ? ("api" as const)
-                  : route.specialist_agent === "howto-specialist"
-                  ? ("how_to" as const)
-                  : route.specialist_agent === "behavior-specialist"
-                  ? ("behavior" as const)
-                  : ("troubleshooting" as const),
-              ...value
-            };
-            return {
-              value: routedDraft,
-              timing: stageTiming("completed", elapsedMs(genericWriterStartedAt))
-            };
-          })
-          .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(genericWriterStartedAt)) }))
-      : { value: null, timing: stageTiming("skipped", elapsedMs(genericWriterStartedAt)) };
   const rawDraftSupportAnswer =
     specialistResult.value ??
-    genericWriterResult.value ??
     fallbackSpecialistDraftAnswer({
       language: input.language,
       route,
@@ -4058,7 +4341,9 @@ export async function runSupportSearchAgent(input: {
         citation_ids: claim.evidence_ids
       }))
     },
-    evidenceBundle
+    evidenceBundle,
+    query: input.query,
+    caseFrame
   });
   const useFastAgentPath =
     runtimePolicy.fastPathAllowed &&
@@ -4121,7 +4406,9 @@ export async function runSupportSearchAgent(input: {
     );
   const sanitizedVerification = sanitizeVerification({
     verification,
-    evidenceBundle
+    evidenceBundle,
+    query: input.query,
+    caseFrame
   });
   const supportedCoreClaims = supportedVerificationClaims(sanitizedVerification);
   const unsupportedCore = sanitizedVerification.unsupported_claims.some(
@@ -4145,128 +4432,25 @@ export async function runSupportSearchAgent(input: {
         }
       : sanitizedVerification;
 
-  const citationBinderRuntime = withStageRuntime(
-    buildDeliveryAwareStageRuntime(
-      input.runtime,
-      {
-        reserveMs: 3_000,
-        minimumTimeoutMs: 5_000,
-        stageTimeoutMs: 16_000
-      },
-      {
-        reserveMs: 6_000,
-        minimumTimeoutMs: 10_000,
-        stageTimeoutMs: 26_000
-      }
-    ),
-    "support-citation-binder",
-    `${input.idempotencyKey}:support-citation-binder`
-  );
-  await reportStageProgress("citation_binding");
-  const citationBinderStartedAt = performance.now();
-  const reboundVerification =
-    useFastAgentPath || !draftSupportAnswer.claims.length || !evidenceBundle.primary.length || !hasEnoughBudget(input.runtime, 5000)
-      ? null
-      : await input.adapter
-          .bindSupportCitations(
-            {
-              contextType,
-              language: input.language,
-              query: input.query,
-              caseFrame,
-              evidenceBundle,
-              draftSupportAnswer
-            },
-            `${input.idempotencyKey}:support-citation-binder`,
-            citationBinderRuntime
-          )
-          .catch(() => null);
-  const citationBinderTiming =
-    useFastAgentPath || !draftSupportAnswer.claims.length || !evidenceBundle.primary.length || !hasEnoughBudget(input.runtime, 5000)
-      ? skippedStageTiming()
-      : stageTiming(reboundVerification ? "completed" : "fallback", elapsedMs(citationBinderStartedAt), {
-          reference_count: reboundVerification?.verified_citation_ids.length ?? 0
-        });
-  const reboundSanitized = reboundVerification
-    ? sanitizeVerification({
-        verification: reboundVerification,
-        evidenceBundle
-      })
-    : null;
-  markStageCompleted("citation_binding");
   const preselectedVerification = pickBestVerificationCandidate({
     query: input.query,
     caseFrame,
     evidenceBundle,
     primary: effectiveVerification,
-    rebound: reboundSanitized,
+    rebound: null,
     writerBound: writerBoundVerification
   });
-
-  const displayCitationSelectorRuntime = withStageRuntime(
-    buildDeliveryAwareStageRuntime(
-      input.runtime,
-      {
-        reserveMs: 2_500,
-        minimumTimeoutMs: 4_000,
-        stageTimeoutMs: 14_000
-      },
-      {
-        reserveMs: 4_000,
-        minimumTimeoutMs: 8_000,
-        stageTimeoutMs: 22_000
-      }
-    ),
-    useFastAgentPath ? "support-citation-selector" : "citation-curator",
-    `${input.idempotencyKey}:${useFastAgentPath ? "support-citation-selector" : "citation-curator"}`
-  );
-  await reportStageProgress("citation_selection");
-  const citationSelectionStartedAt = performance.now();
-  const selectedDisplayCitations =
-    supportedVerificationClaims(preselectedVerification).length > 0 && hasEnoughBudget(input.runtime, 4500)
-      ? await (useFastAgentPath
-          ? input.adapter.selectDisplayCitations(
-                {
-                contextType,
-                language: input.language,
-                query: input.query,
-                caseFrame,
-                evidenceBundle,
-                supportedClaims: supportedVerificationClaims(preselectedVerification)
-              },
-              `${input.idempotencyKey}:support-citation-selector`,
-              displayCitationSelectorRuntime
-            )
-          : input.adapter.curateSupportCitations(
-                {
-                contextType,
-                language: input.language,
-                query: input.query,
-                caseFrame,
-                evidenceBundle,
-                supportedClaims: supportedVerificationClaims(preselectedVerification)
-              },
-              `${input.idempotencyKey}:citation-curator`,
-              displayCitationSelectorRuntime
-            ))
-          .catch(() => null)
-      : null;
-  const citationSelectionTiming =
-    supportedVerificationClaims(preselectedVerification).length > 0 && hasEnoughBudget(input.runtime, 4500)
-      ? stageTiming(selectedDisplayCitations ? "completed" : "fallback", elapsedMs(citationSelectionStartedAt), {
-          reference_count: selectedDisplayCitations?.display_citation_ids.length ?? 0
-        })
-      : skippedStageTiming();
-  markStageCompleted("citation_selection");
-
-  const finalVerification = sanitizeVerification({
-    verification: selectedDisplayCitations
-      ? {
-          ...preselectedVerification,
-          display_citation_ids: selectedDisplayCitations.display_citation_ids
-        }
-      : preselectedVerification,
-    evidenceBundle
+  const finalVerification = preferWriterBoundVerificationForDelivery({
+    selected: sanitizeVerification({
+      verification: preselectedVerification,
+      evidenceBundle,
+      query: input.query,
+      caseFrame
+    }),
+    writerBound: writerBoundVerification,
+    evidenceBundle,
+    query: input.query,
+    caseFrame
   });
   const supportedFinalClaims = supportedVerificationClaims(finalVerification);
   const effectiveFinalVerification =
@@ -4305,11 +4489,7 @@ export async function runSupportSearchAgent(input: {
   const answerComposerStartedAt = performance.now();
   await reportStageProgress("answer_composition");
   const shouldComposeCustomerAnswer =
-    !useFastAgentPath &&
-    hasEnoughBudget(input.runtime, 4500) &&
-    (mode === "clarification" ||
-      mode === "handoff" ||
-      (supportedFinalClaims.length > 0 && (mode === "grounded" || mode === "partial")));
+    (mode === "clarification" || mode === "handoff") && hasEnoughBudget(input.runtime, 4500);
   const composedSupportAnswer =
     shouldComposeCustomerAnswer
       ? await input.adapter
@@ -4331,11 +4511,6 @@ export async function runSupportSearchAgent(input: {
           )
           .catch(() => null)
       : null;
-  const answerComposerTiming =
-    shouldComposeCustomerAnswer
-      ? stageTiming(composedSupportAnswer ? "completed" : "fallback", elapsedMs(answerComposerStartedAt))
-      : skippedStageTiming();
-  markStageCompleted("answer_composition");
   const supportAnswer = buildSupportAnswerFromDraft({
     language: input.language,
     mode,
@@ -4348,6 +4523,10 @@ export async function runSupportSearchAgent(input: {
     missingInfo,
     composed: composedSupportAnswer
   });
+  const answerComposerTiming = shouldComposeCustomerAnswer
+    ? stageTiming(composedSupportAnswer ? "completed" : "fallback", elapsedMs(answerComposerStartedAt))
+    : stageTiming("completed", elapsedMs(answerComposerStartedAt));
+  markStageCompleted("answer_composition");
   const structuredAnswer = buildStructuredAnswer(supportAnswer, effectiveFinalVerification);
   const citations = buildCitations({
     references: [...evidenceBundle.primary, ...evidenceBundle.supplemental],
@@ -4383,8 +4562,8 @@ export async function runSupportSearchAgent(input: {
     planner: usedUnifiedPlanner ? plannerResult.timing : mergeStageTimings([routeResult.timing, evidencePlanResult.timing, plannerResult.timing]),
     retrieval_base: baseEvidenceResult.timing,
     retrieval_extra: additionalTiming,
-    writer: mergeStageTimings([specialistResult.timing, genericWriterResult.timing]),
-    verifier: mergeStageTimings([verificationResult.timing, citationBinderTiming, citationSelectionTiming])
+    writer: specialistResult.timing,
+    verifier: verificationResult.timing
   };
   const stageTrace: SupportAgentStageTraceEntry[] = [
     stageTraceEntry({
@@ -4418,7 +4597,6 @@ export async function runSupportSearchAgent(input: {
     stageTraceEntry({
       stage: "evidence_selection",
       timing: evidenceSelection.timing,
-      runtimeStage: "support-evidence-selector",
       idempotencyKey: `${input.idempotencyKey}:evidence-selector`
     }),
     stageTraceEntry({
@@ -4428,33 +4606,15 @@ export async function runSupportSearchAgent(input: {
       idempotencyKey: `${input.idempotencyKey}:specialist`
     }),
     stageTraceEntry({
-      stage: "generic_writer",
-      timing: genericWriterResult.timing,
-      runtimeStage: "support-writer",
-      idempotencyKey: `${input.idempotencyKey}:support-writer`
-    }),
-    stageTraceEntry({
       stage: "verification",
       timing: verificationResult.timing,
-      runtimeStage: "evidence-judge",
+      runtimeStage: useFastAgentPath ? undefined : "evidence-judge",
       idempotencyKey: `${input.idempotencyKey}:judge`
-    }),
-    stageTraceEntry({
-      stage: "citation_binding",
-      timing: citationBinderTiming,
-      runtimeStage: "support-citation-binder",
-      idempotencyKey: `${input.idempotencyKey}:support-citation-binder`
-    }),
-    stageTraceEntry({
-      stage: "citation_selection",
-      timing: citationSelectionTiming,
-      runtimeStage: useFastAgentPath ? "support-citation-selector" : "citation-curator",
-      idempotencyKey: `${input.idempotencyKey}:${useFastAgentPath ? "support-citation-selector" : "citation-curator"}`
     }),
     stageTraceEntry({
       stage: "answer_composition",
       timing: answerComposerTiming,
-      runtimeStage: "answer-composer",
+      runtimeStage: shouldComposeCustomerAnswer ? "answer-composer" : undefined,
       idempotencyKey: `${input.idempotencyKey}:answer-composer`
     })
   ];
@@ -4515,7 +4675,10 @@ export async function runSupportSearchAgent(input: {
         stage_trace: stageTrace,
         orchestration_trace: buildOrchestrationTrace({
           route,
-          specialistSkipped: shouldSkipSpecialist
+          specialistSkipped: shouldSkipSpecialist,
+          usedUnifiedPlanner,
+          verificationSkipped: useFastAgentPath,
+          answerComposerUsed: shouldComposeCustomerAnswer
         })
       }
     }

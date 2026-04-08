@@ -14,6 +14,7 @@ import {
   isSupportSearchJobLeaseInvalidError,
   markSupportSearchJobFailed,
   markSupportSearchJobSucceeded,
+  requeueRecoverableSupportSearchJob,
   requeueStaleRunningSupportSearchJobs,
   type SupportSearchJob
 } from "./support-search-jobs.js";
@@ -1747,7 +1748,13 @@ export async function driveSearchModeJob(jobId: string, adapter: OpenClawAdapter
     return current;
   }
   if (current.status === "running" || current.status === "partial_result_ready") {
-    return current;
+    const recovered = await requeueRecoverableSupportSearchJob({
+      jobId,
+      staleAfterMs: Math.max(5_000, env.AI_SUPPORT_JOB_LEASE_MS)
+    });
+    if (!recovered) {
+      return current;
+    }
   }
 
   const claimed = await claimDueSupportSearchJobs({

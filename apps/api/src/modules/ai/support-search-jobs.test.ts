@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { afterEach, before, test } from "node:test";
+import { after, afterEach, before, test } from "node:test";
 import { env, isSafeTestDatabaseUrl } from "../../config/env.js";
 import { pool } from "../../db/client.js";
 import {
@@ -11,8 +11,11 @@ import {
   heartbeatSupportSearchJob,
   markSupportSearchJobFailed,
   markSupportSearchJobSucceeded,
+  requeueRecoverableSupportSearchJob,
   requeueStaleRunningSupportSearchJobs
 } from "./support-search-jobs.js";
+
+const SUPPORT_SEARCH_TEST_LOCK_KEY = 46080401;
 
 function assertSafeTestDatabase() {
   const url = process.env.DATABASE_URL ?? env.DATABASE_URL;
@@ -33,8 +36,13 @@ async function resetSupportSearchJobs() {
   await pool.query("DELETE FROM ai_search_sessions");
 }
 
-before(() => {
+before(async () => {
   assertSafeTestDatabase();
+  await pool.query("SELECT pg_advisory_lock($1)", [SUPPORT_SEARCH_TEST_LOCK_KEY]);
+});
+
+after(async () => {
+  await pool.query("SELECT pg_advisory_unlock($1)", [SUPPORT_SEARCH_TEST_LOCK_KEY]);
 });
 
 afterEach(async () => {
@@ -201,4 +209,52 @@ test("requeueStaleRunningSupportSearchJobs returns expired running jobs back to 
   const repaired = await getSupportSearchJob(queued.id);
   assert.equal(repaired?.status, "queued");
   assert.equal(repaired?.leaseKey, null);
+});
+
+test("requeueRecoverableSupportSearchJob requeues a specific expired running job for manual re-drive", async () => {
+  const queued = await enqueueSupportSearchJob(buildJobInput());
+  const claimed = await claimDueSupportSearchJobs({
+    limit: 1,
+    leaseMs: 1_000,
+    workerId: "test-worker"
+  });
+
+  assert.equal(claimed.length, 1);
+  await pool.query(
+    `UPDATE ai_support_search_jobs
+     SET lease_expires_at = NOW() - INTERVAL '2 minutes',
+         updated_at = NOW() - INTERVAL '2 minutes'
+     WHERE id = $1`,
+    [queued.id]
+  );
+
+  const requeued = await requeueRecoverableSupportSearchJob({
+    jobId: queued.id,
+    staleAfterMs: 60_000
+  });
+
+  assert.equal(requeued, true);
+  const recovered = await getSupportSearchJob(queued.id);
+  assert.equal(recovered?.status, "queued");
+  assert.equal(recovered?.leaseKey, null);
+});
+
+test("requeueRecoverableSupportSearchJob leaves an actively leased running job untouched", async () => {
+  const queued = await enqueueSupportSearchJob(buildJobInput());
+  const claimed = await claimDueSupportSearchJobs({
+    limit: 1,
+    leaseMs: 60_000,
+    workerId: "test-worker"
+  });
+
+  assert.equal(claimed.length, 1);
+  const requeued = await requeueRecoverableSupportSearchJob({
+    jobId: queued.id,
+    staleAfterMs: 60_000
+  });
+
+  assert.equal(requeued, false);
+  const current = await getSupportSearchJob(queued.id);
+  assert.equal(current?.status, "running");
+  assert.equal(current?.leaseKey, claimed[0]?.leaseKey ?? null);
 });
