@@ -221,6 +221,7 @@ export interface SupportAgentStageTimings {
 }
 
 export type SupportAgentRuntimeStage =
+  | "support_main"
   | "route"
   | "evidence_plan"
   | "case_plan"
@@ -340,6 +341,7 @@ export interface SearchModeResult {
       fastPathAllowed: boolean;
       profile: "latency_optimized" | "quality_optimized" | "tightened";
     };
+    runtime_mode?: "legacy_multi_agent" | "single_agent";
     fast_path_used?: boolean;
     confirmed_facts?: string[];
     search_agents_used?: Array<{

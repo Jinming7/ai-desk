@@ -44,6 +44,7 @@ export const runtimeScenarioCaseSchema = z.object({
   requiredStages: z
     .array(
       z.enum([
+        "support_main",
         "route",
         "evidence_plan",
         "case_plan",
@@ -62,6 +63,7 @@ export const runtimeScenarioCaseSchema = z.object({
   forbiddenStages: z
     .array(
       z.enum([
+        "support_main",
         "route",
         "evidence_plan",
         "case_plan",
@@ -80,6 +82,7 @@ export const runtimeScenarioCaseSchema = z.object({
   allowedFallbackStages: z
     .array(
       z.enum([
+        "support_main",
         "route",
         "evidence_plan",
         "case_plan",
@@ -338,4 +341,3 @@ export interface BuildValidationEvaluationSummary {
 export type SourceFamilyMetricKey = KbSourceFamily | string;
 export type BuildFixtureStatus = KbBuildStatus;
 export type BuildFixtureKnowledgeSpace = KbKnowledgeSpace;
-

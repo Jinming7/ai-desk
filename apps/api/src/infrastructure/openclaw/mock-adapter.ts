@@ -4,6 +4,8 @@ import type {
   OpenClawAnalyzeOutput,
   OpenClawHealthCheckInput,
   OpenClawHealthCheckResult,
+  OpenClawSupportMainInput,
+  OpenClawSupportMainOutput,
   OpenClawSupportEvidencePlannerInput,
   OpenClawSupportAnswerComposerInput,
   OpenClawSupportCitationSelectorInput,
@@ -178,6 +180,78 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       steps: [],
       validation: [],
       suggested_next_step: "submit_ticket"
+    };
+  }
+
+  async runSupportMainAgent(
+    input: OpenClawSupportMainInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportMainOutput> {
+    const route = await this.routeSupportQuestion({
+      contextType: input.contextType,
+      language: input.language,
+      query: input.query,
+      conversationHistory: input.conversationHistory
+    }, `${input.query}:support-main:route`);
+    const caseFrame = await this.planSupportCase({
+      contextType: input.contextType,
+      language: input.language,
+      query: input.query,
+      conversationHistory: input.conversationHistory,
+      ticketContext: input.ticketContext
+    }, `${input.query}:support-main:case`);
+    const search = await this.searchKnowledge({
+      query: input.query,
+      topK: 3,
+      index: "public_kb"
+    }, `${input.query}:support-main`);
+    const references = search.hits.slice(0, 3).map((hit, index) => ({
+      reference_id: `mock-ref-${index + 1}`,
+      title: hit.title,
+      snippet: hit.snippet,
+      sourceUrl: hit.sourceUrl
+    }));
+    const primaryReference = references[0];
+
+    return {
+      route,
+      caseFrame: {
+        ...caseFrame,
+        question_type: route.question_type,
+        specialist_agent: route.specialist_agent,
+        answer_contract: route.answer_contract,
+        routing_confidence: route.routing_confidence
+      },
+      draftAnswer: {
+        question_type: route.question_type,
+        render_variant:
+          route.specialist_agent === "api-specialist"
+            ? "api"
+            : route.specialist_agent === "howto-specialist"
+            ? "how_to"
+            : route.specialist_agent === "behavior-specialist"
+            ? "behavior"
+            : "troubleshooting",
+        direct_answer:
+          primaryReference?.snippet ??
+          (input.language === "zh" ? "当前没有找到可验证的支持证据。" : "I could not verify the answer from support evidence yet."),
+        claims: primaryReference
+          ? [
+              {
+                text: primaryReference.snippet,
+                kind: "verified_fact",
+                reference_ids: [primaryReference.reference_id],
+                authority: "canonical"
+              }
+            ]
+          : [],
+        next_actions: [],
+        unknowns: caseFrame.missing_critical_info.slice(0, 3),
+        escalation_needed: false
+      },
+      references,
+      retrievalQueries: [input.query]
     };
   }
 

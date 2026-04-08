@@ -3642,3 +3642,162 @@ test("runSupportSearchAgent rejects ambiguous bare document ids when multiple ev
   );
   assert.equal(result.result.support_answer?.mode === "grounded", false);
 });
+
+test("runSupportSearchAgent single-agent runtime bypasses legacy stages and only keeps reconciled citations", async () => {
+  const originalSingleAgentRuntime = (env as { FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean })
+    .FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  (env as { FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean }).FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    runSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+  };
+
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy route stage must not run in single-agent mode");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run in single-agent mode");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run in single-agent mode");
+  };
+  adapter.writeApiSpecialistAnswer = async () => {
+    throw new Error("legacy specialist must not run in single-agent mode");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("legacy verifier must not run in single-agent mode");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("legacy answer composer must not run in single-agent mode");
+  };
+  adapter.runSupportMainAgent = async (_input, _idempotencyKey, _runtime) => ({
+    route: {
+      question_type: "api_scope_auth",
+      user_goal: "Find the required scope for the issue comment API.",
+      answer_contract: "Return the exact scope first.",
+      specialist_agent: "api-specialist",
+      routing_confidence: 0.96
+    },
+    caseFrame: {
+      goal: "Find the required scope for the issue comment API.",
+      symptom: "Scope lookup",
+      object: "issue comment API",
+      action_type: "lookup",
+      deployment_model: "shared",
+      product_area: "openapi",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["issue comment api scope"]
+    },
+    draftAnswer: {
+      question_type: "api_scope_auth",
+      render_variant: "api",
+      direct_answer: "The issue comment API requires the documented comment scope.",
+      claims: [
+        {
+          text: "The issue comment API requires write:project.",
+          kind: "verified_fact",
+          reference_ids: ["ref-comment-scope"],
+          authority: "canonical"
+        },
+        {
+          text: "The issue comment API also requires admin:workspace.",
+          kind: "verified_fact",
+          reference_ids: ["ref-nonexistent-scope"],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["Use write:project in the access token."],
+      unknowns: [],
+      escalation_needed: false,
+      auth_scope: ["write:project"]
+    },
+    references: [
+      {
+        reference_id: "ref-comment-scope",
+        title: "Add issue comment",
+        snippet: "Scope: write:project",
+        sourceUrl: "https://docs.ones.com/openapi/add-issue-comment",
+        path: "open-docs/docs/openapi/api/add-issue-comment.api.mdx",
+        headingPath: "Permissions"
+      }
+    ],
+    retrievalQueries: ["issue comment api scope"]
+  });
+
+  const validationReference: SearchReference = {
+    documentId: "doc:add-issue-comment",
+    evidenceId: "chunk:comment-scope",
+    title: "Add issue comment",
+    snippet: "Scope: write:project",
+    sourceUrl: "https://docs.ones.com/openapi/add-issue-comment",
+    path: "open-docs/docs/openapi/api/add-issue-comment.api.mdx",
+    headingPath: "Permissions",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.97,
+    retrievedAt: "2026-04-08T12:00:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.97,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("single-agent validation should not require refinement in this test");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "What scope is required for the issue comment API?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-single-agent-bypass"
+    });
+
+    assert.deepEqual(result.verification.verified_citation_ids, ["chunk:comment-scope"]);
+    assert.deepEqual(result.result.citations.map((item) => item.id), ["chunk:comment-scope"]);
+    assert.deepEqual(result.result.internal_diagnostics?.claim_graph?.map((item) => item.text), [
+      "The issue comment API requires write:project."
+    ]);
+    assert.equal((result.result.internal_diagnostics as { runtime_mode?: string } | undefined)?.runtime_mode, "single_agent");
+    assert.equal(
+      result.result.internal_diagnostics?.orchestration_trace?.some((item) => item.stage === "support-main"),
+      true
+    );
+    assert.equal(
+      result.result.internal_diagnostics?.orchestration_trace?.some((item) => item.stage === "router"),
+      false
+    );
+  } finally {
+    (env as { FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean }).FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME =
+      originalSingleAgentRuntime;
+  }
+});

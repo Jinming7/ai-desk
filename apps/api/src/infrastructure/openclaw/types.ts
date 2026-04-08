@@ -1,5 +1,6 @@
 import type {
   DraftSupportAnswer,
+  SupportClaimKind,
   SearchReference,
   SpecialistDraftAnswer,
   SupportAnswer,
@@ -8,6 +9,7 @@ import type {
   SupportEvidenceBundle,
   SupportEvidenceSelection,
   SupportQuestionRoute,
+  SupportRenderVariant,
   SupportVerificationClaim,
   SupportVerificationResult,
   TriageSupportInsight
@@ -106,6 +108,7 @@ export interface OpenClawRuntimeContext {
   intent?: "retrieval" | "clarify" | "execution";
   deliveryMode?: "interactive" | "async_job";
   stage?:
+    | "support-main"
     | "router"
     | "evidence-planner"
     | "support-evidence-selector"
@@ -240,6 +243,75 @@ export interface OpenClawSupportEvidenceSelectorInput {
   references: SearchReference[];
 }
 
+export interface OpenClawSupportMainInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+  ticketContext?: {
+    priority: string;
+    customerMeta: Record<string, unknown>;
+    history: Array<{ author: string; body: string; at: string }>;
+  };
+  knowledgeScope?: {
+    knowledgeSpace?: string;
+    repoId?: string;
+    branch?: string;
+  };
+}
+
+export interface OpenClawSupportMainReference {
+  reference_id: string;
+  title: string;
+  snippet: string;
+  sourceUrl: string;
+  path?: string;
+  headingPath?: string;
+  repoSourceUrl?: string;
+}
+
+export interface OpenClawSupportMainDraftClaim {
+  text: string;
+  kind: SupportClaimKind;
+  reference_ids: string[];
+  authority: "canonical" | "assistive";
+}
+
+export interface OpenClawSupportMainDraftAnswer {
+  question_type: SupportQuestionRoute["question_type"];
+  render_variant: SupportRenderVariant;
+  direct_answer: string;
+  claims: OpenClawSupportMainDraftClaim[];
+  next_actions: string[];
+  unknowns: string[];
+  escalation_needed: boolean;
+  api_method?: string;
+  api_path?: string;
+  required_params?: string[];
+  auth_scope?: string[];
+  response_field_hint?: string;
+  important_note?: string;
+  related_variant?: string;
+  steps?: string[];
+  prerequisites?: string[];
+  limits_or_notes?: string[];
+  most_likely_explanation?: string;
+  confirmed_facts?: string[];
+  what_to_check_next?: string[];
+  most_likely_causes?: string[];
+  recommended_checks?: string[];
+  required_followup_info?: string[];
+  when_to_handoff?: string;
+}
+
+export interface OpenClawSupportMainOutput {
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  draftAnswer: OpenClawSupportMainDraftAnswer;
+  references: OpenClawSupportMainReference[];
+  retrievalQueries: string[];
+}
+
 export interface OpenClawSupportCitationSelectorInput {
   contextType: "search" | "triage";
   language: "zh" | "en";
@@ -280,6 +352,11 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawSupportExecutionPlannerOutput>;
+  runSupportMainAgent?(
+    input: OpenClawSupportMainInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportMainOutput>;
   planSupportCase(
     input: OpenClawSupportPlannerInput,
     idempotencyKey: string,

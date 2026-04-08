@@ -12,6 +12,8 @@ import type {
   OpenClawClassifyIntentInput,
   OpenClawClassifyIntentOutput,
   OpenClawRuntimeContext,
+  OpenClawSupportMainInput,
+  OpenClawSupportMainOutput,
   OpenClawSupportExecutionPlannerInput,
   OpenClawSupportExecutionPlannerOutput,
   OpenClawSupportEvidencePlannerInput,
@@ -65,6 +67,7 @@ type OpenClawChatAttachment = {
 };
 
 type SessionLifecycleStage =
+  | "support-main"
   | "search-answer"
   | "router"
   | "evidence-planner"
@@ -272,6 +275,20 @@ function renderVariantFromQuestionType(
     default:
       return "troubleshooting";
   }
+}
+
+function normalizeSupportRenderVariant(
+  value: unknown,
+  questionType: SupportQuestionRoute["question_type"]
+): SpecialistDraftAnswer["render_variant"] {
+  return value === "api" ||
+    value === "how_to" ||
+    value === "behavior" ||
+    value === "troubleshooting" ||
+    value === "clarification" ||
+    value === "handoff"
+    ? value
+    : renderVariantFromQuestionType(questionType);
 }
 
 function normalizeSupportRouteOutput(parsed: Record<string, unknown>, fallbackQuery: string): SupportQuestionRoute {
@@ -707,6 +724,147 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
             ? rawEvidencePlan.required_doc_kinds
             : rawCaseFrame.required_doc_kinds ?? []
       }
+    };
+  }
+
+  async runSupportMainAgent(
+    input: OpenClawSupportMainInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportMainOutput> {
+    const prompt = [
+      "You are the single support-main agent for the ONES customer-facing support runtime.",
+      "You own retrieval and answer drafting inside one run, but every factual claim must stay reference-bound.",
+      "Return ONLY valid JSON with keys:",
+      "route({question_type,user_goal,answer_contract,specialist_agent,routing_confidence,specialist_budget}),",
+      "case_frame({goal,symptom,object,action_type,deployment_model,product_area,constraints(string[]),missing_critical_info(string[]),retrieval_queries(string[]),query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),required_doc_kinds(string[])}),",
+      "draft_answer({question_type,render_variant,direct_answer,claims([{text,kind(verified_fact|grounded_inference|operational_advice|unknown),reference_ids(string[]),authority(canonical|assistive)}]),next_actions(string[]),unknowns(string[]),escalation_needed(boolean),api_method,api_path,required_params(string[]),auth_scope(string[]),response_field_hint,important_note,related_variant,steps(string[]),prerequisites(string[]),limits_or_notes(string[]),most_likely_explanation,confirmed_facts(string[]),what_to_check_next(string[]),most_likely_causes(string[]),recommended_checks(string[]),required_followup_info(string[]),when_to_handoff}),",
+      "references([{reference_id,title,snippet,sourceUrl,path,headingPath,repoSourceUrl}]),",
+      "retrieval_queries(string[])",
+      "Rules:",
+      "- Retrieval remains agent-driven. You must retrieve and answer inside this run.",
+      "- reference_id is the only claim anchor. Every factual claim in draft_answer.claims must use reference_ids, never document ids.",
+      "- Every reference_id used by a claim must exist in references[].",
+      "- references must contain the strongest grounded sources you actually relied on.",
+      "- Prefer concise, high-signal references that can be reconciled to a published KB snapshot using sourceUrl/path/headingPath.",
+      "- Only put genuinely blocking items into missing_critical_info and unknowns.",
+      "- Keep route, case_frame, and draft_answer mutually consistent.",
+      "- Answer in the user's language.",
+      `context_type: ${input.contextType}`,
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      `knowledge_scope: ${JSON.stringify(input.knowledgeScope ?? {})}`,
+      ...(input.conversationHistory?.length
+        ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
+        : []),
+      ...(input.ticketContext
+        ? [
+            `ticket_priority: ${input.ticketContext.priority}`,
+            `customer_meta: ${JSON.stringify(input.ticketContext.customerMeta)}`,
+            `ticket_history: ${JSON.stringify(input.ticketContext.history.slice(-6))}`
+          ]
+        : [])
+    ].join("\n");
+
+    const parsed = (await this.runJsonPrompt(
+      prompt,
+      `${idempotencyKey}:support-main`,
+      runtime,
+      undefined,
+      "support-main"
+    )) as Record<string, unknown>;
+    const route = normalizeSupportRouteOutput(((parsed.route as Record<string, unknown> | undefined) ?? {}), input.query);
+    const rawCaseFrame = normalizeSupportCaseFrameOutput(
+      (((parsed.case_frame as Partial<SupportCaseFrame> | undefined) ?? {}) as Partial<SupportCaseFrame>),
+      input.query
+    );
+    const draft = ((parsed.draft_answer as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const references = Array.isArray(parsed.references)
+      ? parsed.references
+          .map((item) => item as Record<string, unknown>)
+          .map((item) => ({
+            reference_id: typeof item.reference_id === "string" ? item.reference_id : "",
+            title: typeof item.title === "string" ? item.title : "",
+            snippet: typeof item.snippet === "string" ? item.snippet : "",
+            sourceUrl: typeof item.sourceUrl === "string" ? item.sourceUrl : "",
+            path: typeof item.path === "string" ? item.path : undefined,
+            headingPath: typeof item.headingPath === "string" ? item.headingPath : undefined,
+            repoSourceUrl: typeof item.repoSourceUrl === "string" ? item.repoSourceUrl : undefined
+          }))
+          .filter((item) => item.reference_id)
+      : [];
+    const retrievalQueries = Array.isArray(parsed.retrieval_queries)
+      ? parsed.retrieval_queries.map((item) => String(item)).filter(Boolean)
+      : rawCaseFrame.retrieval_queries;
+
+    return {
+      route,
+      caseFrame: {
+        ...rawCaseFrame,
+        question_type: route.question_type,
+        specialist_agent: route.specialist_agent,
+        answer_contract: route.answer_contract,
+        routing_confidence: route.routing_confidence
+      },
+      draftAnswer: {
+        question_type: normalizeQuestionType(draft.question_type ?? route.question_type),
+        render_variant: normalizeSupportRenderVariant(draft.render_variant, route.question_type),
+        direct_answer: typeof draft.direct_answer === "string" ? draft.direct_answer : "",
+        claims: Array.isArray(draft.claims)
+          ? draft.claims
+              .map((item) => item as Record<string, unknown>)
+              .map((item) => ({
+                text: typeof item.text === "string" ? item.text : "",
+                kind: (
+                  item.kind === "grounded_inference"
+                    ? "grounded_inference"
+                    : item.kind === "operational_advice"
+                    ? "operational_advice"
+                    : item.kind === "unknown"
+                    ? "unknown"
+                    : "verified_fact"
+                ) as OpenClawSupportMainOutput["draftAnswer"]["claims"][number]["kind"],
+                reference_ids: Array.isArray(item.reference_ids)
+                  ? item.reference_ids.map((value) => String(value)).filter(Boolean)
+                  : [],
+                authority: (item.authority === "assistive" ? "assistive" : "canonical") as OpenClawSupportMainOutput["draftAnswer"]["claims"][number]["authority"]
+              }))
+              .filter((item) => item.text)
+          : [],
+        next_actions: Array.isArray(draft.next_actions) ? draft.next_actions.map((item) => String(item)).filter(Boolean) : [],
+        unknowns: Array.isArray(draft.unknowns) ? draft.unknowns.map((item) => String(item)).filter(Boolean) : [],
+        escalation_needed: Boolean(draft.escalation_needed),
+        api_method: typeof draft.api_method === "string" ? draft.api_method : undefined,
+        api_path: typeof draft.api_path === "string" ? draft.api_path : undefined,
+        required_params: Array.isArray(draft.required_params) ? draft.required_params.map((item) => String(item)).filter(Boolean) : undefined,
+        auth_scope: Array.isArray(draft.auth_scope) ? draft.auth_scope.map((item) => String(item)).filter(Boolean) : undefined,
+        response_field_hint: typeof draft.response_field_hint === "string" ? draft.response_field_hint : undefined,
+        important_note: typeof draft.important_note === "string" ? draft.important_note : undefined,
+        related_variant: typeof draft.related_variant === "string" ? draft.related_variant : undefined,
+        steps: Array.isArray(draft.steps) ? draft.steps.map((item) => String(item)).filter(Boolean) : undefined,
+        prerequisites: Array.isArray(draft.prerequisites) ? draft.prerequisites.map((item) => String(item)).filter(Boolean) : undefined,
+        limits_or_notes: Array.isArray(draft.limits_or_notes) ? draft.limits_or_notes.map((item) => String(item)).filter(Boolean) : undefined,
+        most_likely_explanation:
+          typeof draft.most_likely_explanation === "string" ? draft.most_likely_explanation : undefined,
+        confirmed_facts: Array.isArray(draft.confirmed_facts)
+          ? draft.confirmed_facts.map((item) => String(item)).filter(Boolean)
+          : undefined,
+        what_to_check_next: Array.isArray(draft.what_to_check_next)
+          ? draft.what_to_check_next.map((item) => String(item)).filter(Boolean)
+          : undefined,
+        most_likely_causes: Array.isArray(draft.most_likely_causes)
+          ? draft.most_likely_causes.map((item) => String(item)).filter(Boolean)
+          : undefined,
+        recommended_checks: Array.isArray(draft.recommended_checks)
+          ? draft.recommended_checks.map((item) => String(item)).filter(Boolean)
+          : undefined,
+        required_followup_info: Array.isArray(draft.required_followup_info)
+          ? draft.required_followup_info.map((item) => String(item)).filter(Boolean)
+          : undefined,
+        when_to_handoff: typeof draft.when_to_handoff === "string" ? draft.when_to_handoff : undefined
+      },
+      references,
+      retrievalQueries
     };
   }
 

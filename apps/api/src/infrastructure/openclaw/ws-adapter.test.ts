@@ -336,3 +336,111 @@ test("selectSupportEvidence falls back rejected ids to evidence ids instead of d
 
   assert.deepEqual(selection.rejected_ids, ["chunk:onesql-root", "chunk:onesql-order-by"]);
 });
+
+test("runSupportMainAgent parses structured references and claim reference ids", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    runSupportMainAgent: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+        knowledgeScope?: {
+          knowledgeSpace?: string;
+          repoId?: string;
+          branch?: string;
+        };
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{
+      route: {
+        question_type: string;
+        specialist_agent: string;
+      };
+      caseFrame: {
+        object: string;
+      };
+      draftAnswer: {
+        claims: Array<{ text: string; reference_ids: string[] }>;
+      };
+      references: Array<{ reference_id: string; sourceUrl: string }>;
+      retrievalQueries: string[];
+    }>;
+    runJsonPrompt: (prompt: string) => Promise<unknown>;
+  };
+  let capturedPrompt = "";
+
+  adapter.runJsonPrompt = async (prompt) => {
+    capturedPrompt = prompt;
+    return {
+      route: {
+        question_type: "api_scope_auth",
+        user_goal: "Find the required scope for the issue comment API.",
+        answer_contract: "Return the exact scope first.",
+        specialist_agent: "api-specialist",
+        routing_confidence: 0.94
+      },
+      case_frame: {
+        goal: "Find the required scope for the issue comment API.",
+        symptom: "Scope lookup",
+        object: "issue comment API",
+        action_type: "lookup",
+        deployment_model: "shared",
+        product_area: "openapi",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: ["issue comment api scope"]
+      },
+      draft_answer: {
+        question_type: "api_scope_auth",
+        render_variant: "api",
+        direct_answer: "Use the scope documented for the issue comment API.",
+        claims: [
+          {
+            text: "The issue comment API requires the documented comment scope.",
+            kind: "verified_fact",
+            reference_ids: ["ref-issue-comment-scope"],
+            authority: "canonical"
+          }
+        ],
+        next_actions: ["Use the documented scope value in the access token."],
+        unknowns: [],
+        escalation_needed: false,
+        auth_scope: ["write:project"]
+      },
+      references: [
+        {
+          reference_id: "ref-issue-comment-scope",
+          title: "Add issue comment",
+          snippet: "Scope: write:project",
+          sourceUrl: "https://docs.ones.com/openapi/add-issue-comment",
+          path: "open-docs/docs/openapi/api/add-issue-comment.api.mdx",
+          headingPath: "Permissions"
+        }
+      ],
+      retrieval_queries: ["issue comment api scope"]
+    };
+  };
+
+  const result = await adapter.runSupportMainAgent(
+    {
+      contextType: "search",
+      language: "en",
+      query: "What scope is required for the issue comment API?",
+      knowledgeScope: {
+        knowledgeSpace: "support-preview"
+      }
+    },
+    "ws-adapter:support-main"
+  );
+
+  assert.match(capturedPrompt, /reference_id/);
+  assert.match(capturedPrompt, /reference_ids/);
+  assert.match(capturedPrompt, /knowledge_scope/);
+  assert.equal(result.route.question_type, "api_scope_auth");
+  assert.equal(result.caseFrame.object, "issue comment API");
+  assert.deepEqual(result.draftAnswer.claims[0]?.reference_ids, ["ref-issue-comment-scope"]);
+  assert.equal(result.references[0]?.reference_id, "ref-issue-comment-scope");
+  assert.deepEqual(result.retrievalQueries, ["issue comment api scope"]);
+});

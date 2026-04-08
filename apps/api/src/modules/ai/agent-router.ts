@@ -15,6 +15,7 @@ function buildAgentScopedSessionKey(agentId: string, mainKey: string): string {
 
 type SupportStage = NonNullable<OpenClawRuntimeContext["stage"]>;
 type RoutedSupportStage =
+  | "support-main"
   | "router"
   | "evidence-planner"
   | "planner"
@@ -73,6 +74,7 @@ const DEFAULT_SEARCH_AGENT_IDS = {
 } as const;
 
 const DEFAULT_SUPPORT_STAGE_AGENT_IDS: Record<RoutedSupportStage, string> = {
+  "support-main": "support-main",
   router: "support-router",
   "evidence-planner": "support-evidence-planner",
   planner: "support-planner",
@@ -154,6 +156,11 @@ export function resolveStageSpecificAgent(stage: SupportStage, runtime?: OpenCla
 
   const stageBinding = (() => {
     switch (stage) {
+      case "support-main":
+        return {
+          agentId: env.OPENCLAW_AGENT_ID_SUPPORT_MAIN.trim(),
+          model: env.OPENCLAW_AGENT_MODEL_SUPPORT_MAIN.trim()
+        };
       case "router":
         return {
           agentId: env.OPENCLAW_AGENT_ID_ROUTER.trim(),
@@ -239,6 +246,8 @@ export function resolveStageSpecificAgent(stage: SupportStage, runtime?: OpenCla
 function resolveStageBinding(stage: RoutedSupportStage): StageBinding {
   const envAgentId = (() => {
     switch (stage) {
+      case "support-main":
+        return env.OPENCLAW_AGENT_ID_SUPPORT_MAIN.trim();
       case "router":
         return env.OPENCLAW_AGENT_ID_ROUTER.trim();
       case "evidence-planner":
@@ -269,6 +278,8 @@ function resolveStageBinding(stage: RoutedSupportStage): StageBinding {
   })();
   const envModel = (() => {
     switch (stage) {
+      case "support-main":
+        return env.OPENCLAW_AGENT_MODEL_SUPPORT_MAIN.trim();
       case "router":
         return env.OPENCLAW_AGENT_MODEL_ROUTER.trim();
       case "evidence-planner":
@@ -427,6 +438,7 @@ function buildTopologyHash(searchStages: SearchStageBinding[], supportStages: St
 
 export function getAiTopology(): AiTopologySnapshot {
   const supportStages = [
+    resolveStageBinding("support-main"),
     resolveStageBinding("router"),
     resolveStageBinding("evidence-planner"),
     resolveStageBinding("planner"),

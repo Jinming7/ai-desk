@@ -5,7 +5,8 @@ import { env } from "../../config/env.js";
 import type {
   OpenClawAdapter,
   OpenClawAnalyzeOutput,
-  OpenClawRuntimeContext
+  OpenClawRuntimeContext,
+  OpenClawSupportMainOutput
 } from "../../infrastructure/openclaw/types.js";
 import type {
   DraftSupportAnswer,
@@ -3743,6 +3744,755 @@ type SupportAgentStageProgress = {
   lastCompletedStage?: string;
 };
 
+type NormalizedSupportMainReference = {
+  reference_id: string;
+  title: string;
+  snippet: string;
+  sourceUrl: string;
+  path?: string;
+  headingPath?: string;
+  repoSourceUrl?: string;
+};
+
+type NormalizedSupportMainDraftClaim = {
+  text: string;
+  kind: SpecialistDraftAnswer["claims"][number]["kind"];
+  reference_ids: string[];
+  authority: SpecialistDraftAnswer["claims"][number]["authority"];
+};
+
+type NormalizedSupportMainDraftAnswer = Omit<SpecialistDraftAnswer, "claims"> & {
+  claims: NormalizedSupportMainDraftClaim[];
+};
+
+type NormalizedSupportMainResult = {
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  evidencePlan: SupportEvidencePlan;
+  draftAnswer: NormalizedSupportMainDraftAnswer;
+  references: NormalizedSupportMainReference[];
+  retrievalQueries: string[];
+};
+
+function normalizeSupportMainQuestionType(
+  value: unknown,
+  query: string
+): SupportQuestionRoute["question_type"] {
+  const fallback = fallbackQuestionRoute(query).question_type;
+  switch (value) {
+    case "api_endpoint_lookup":
+    case "api_field_lookup":
+    case "api_scope_auth":
+    case "how_to_product":
+    case "why_behavior":
+    case "troubleshooting":
+    case "config_setup":
+    case "capability_confirmation":
+    case "data_export_reporting":
+      return value;
+    default:
+      return fallback;
+  }
+}
+
+function normalizeSupportMainRenderVariant(
+  value: unknown,
+  route: SupportQuestionRoute
+): SpecialistDraftAnswer["render_variant"] {
+  return value === "api" ||
+    value === "how_to" ||
+    value === "behavior" ||
+    value === "troubleshooting" ||
+    value === "clarification" ||
+    value === "handoff"
+    ? value
+    : route.specialist_agent === "api-specialist"
+    ? "api"
+    : route.specialist_agent === "howto-specialist"
+    ? "how_to"
+    : route.specialist_agent === "behavior-specialist"
+    ? "behavior"
+    : "troubleshooting";
+}
+
+function normalizeSupportMainRoute(
+  value: unknown,
+  query: string
+): SupportQuestionRoute {
+  const fallback = fallbackQuestionRoute(query);
+  const parsed = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const question_type = normalizeSupportMainQuestionType(parsed.question_type, query);
+  return {
+    question_type,
+    user_goal: typeof parsed.user_goal === "string" ? parsed.user_goal : fallback.user_goal,
+    answer_contract: typeof parsed.answer_contract === "string" ? parsed.answer_contract : fallback.answer_contract,
+    specialist_agent:
+      parsed.specialist_agent === "api-specialist" ||
+      parsed.specialist_agent === "howto-specialist" ||
+      parsed.specialist_agent === "behavior-specialist" ||
+      parsed.specialist_agent === "troubleshooting-specialist"
+        ? parsed.specialist_agent
+        : canonicalSpecialistAgentForQuestionType(question_type),
+    routing_confidence:
+      typeof parsed.routing_confidence === "number" && Number.isFinite(parsed.routing_confidence)
+        ? Math.max(0, Math.min(1, parsed.routing_confidence))
+        : fallback.routing_confidence,
+    specialist_budget:
+      typeof parsed.specialist_budget === "number" && Number.isFinite(parsed.specialist_budget)
+        ? Math.max(0, Math.round(parsed.specialist_budget))
+        : fallback.specialist_budget
+  };
+}
+
+function normalizeSupportMainCaseFrame(
+  value: unknown,
+  query: string,
+  route: SupportQuestionRoute,
+  retrievalQueries: string[]
+): SupportCaseFrame {
+  const fallback = fallbackCaseFrame(query);
+  const parsed = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const queryPlan = parsed.query_plan && typeof parsed.query_plan === "object"
+    ? (parsed.query_plan as Record<string, unknown>)
+    : null;
+  return {
+    ...fallback,
+    goal: typeof parsed.goal === "string" ? parsed.goal : fallback.goal,
+    symptom: typeof parsed.symptom === "string" ? parsed.symptom : fallback.symptom,
+    object: typeof parsed.object === "string" ? parsed.object : fallback.object,
+    action_type: typeof parsed.action_type === "string" ? parsed.action_type : fallback.action_type,
+    deployment_model: typeof parsed.deployment_model === "string" ? parsed.deployment_model : fallback.deployment_model,
+    product_area: typeof parsed.product_area === "string" ? parsed.product_area : fallback.product_area,
+    constraints: Array.isArray(parsed.constraints) ? parsed.constraints.map((item) => String(item)).filter(Boolean) : [],
+    missing_critical_info: sanitizeMissingCriticalInfo(
+      Array.isArray(parsed.missing_critical_info) ? parsed.missing_critical_info.map((item) => String(item)) : [],
+      3
+    ),
+    retrieval_queries: uniqueStrings(
+      [
+        ...(Array.isArray(parsed.retrieval_queries) ? parsed.retrieval_queries.map((item) => String(item)) : []),
+        ...retrievalQueries,
+        query
+      ],
+      8
+    ),
+    query_plan:
+      queryPlan
+        ? {
+            concept_queries: Array.isArray(queryPlan.concept_queries)
+              ? queryPlan.concept_queries.map((item) => String(item)).filter(Boolean)
+              : [],
+            object_queries: Array.isArray(queryPlan.object_queries)
+              ? queryPlan.object_queries.map((item) => String(item)).filter(Boolean)
+              : [],
+            behavior_queries: Array.isArray(queryPlan.behavior_queries)
+              ? queryPlan.behavior_queries.map((item) => String(item)).filter(Boolean)
+              : []
+          }
+        : fallback.query_plan,
+    question_type: route.question_type,
+    specialist_agent: route.specialist_agent,
+    answer_contract: route.answer_contract,
+    routing_confidence: route.routing_confidence,
+    required_doc_kinds: Array.isArray(parsed.required_doc_kinds)
+      ? parsed.required_doc_kinds.map((item) => String(item)).filter(Boolean)
+      : undefined
+  };
+}
+
+function deriveSupportMainEvidencePlan(caseFrame: SupportCaseFrame, query: string, retrievalQueries: string[]): SupportEvidencePlan {
+  return {
+    query_plan: caseFrame.query_plan ?? {
+      concept_queries: uniqueStrings([...retrievalQueries, query], 4),
+      object_queries: uniqueStrings([caseFrame.object, ...retrievalQueries], 4),
+      behavior_queries: uniqueStrings([caseFrame.action_type, ...retrievalQueries], 4)
+    },
+    evidence_priority: caseFrame.evidence_priority ?? [],
+    required_doc_kinds: caseFrame.required_doc_kinds ?? [],
+    retrieval_rounds: 1,
+    allow_refinement: false,
+    stop_after_grounded_evidence: true
+  };
+}
+
+function normalizeSupportMainDraftAnswer(
+  value: unknown,
+  route: SupportQuestionRoute
+): NormalizedSupportMainDraftAnswer {
+  const parsed = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return {
+    question_type: normalizeSupportMainQuestionType(parsed.question_type, route.user_goal),
+    render_variant: normalizeSupportMainRenderVariant(parsed.render_variant, route),
+    direct_answer: typeof parsed.direct_answer === "string" ? parsed.direct_answer : "",
+    claims: Array.isArray(parsed.claims)
+      ? parsed.claims
+          .map((item) => item as Record<string, unknown>)
+          .map((item) => ({
+            text: typeof item.text === "string" ? item.text : "",
+            kind: (
+              item.kind === "grounded_inference"
+                ? "grounded_inference"
+                : item.kind === "operational_advice"
+                ? "operational_advice"
+                : item.kind === "unknown"
+                ? "unknown"
+                : "verified_fact"
+            ) as NormalizedSupportMainDraftClaim["kind"],
+            reference_ids: Array.isArray(item.reference_ids)
+              ? item.reference_ids.map((referenceId) => String(referenceId)).filter(Boolean)
+              : [],
+            authority: (item.authority === "assistive" ? "assistive" : "canonical") as NormalizedSupportMainDraftClaim["authority"]
+          }))
+          .filter((item) => item.text)
+      : [],
+    next_actions: Array.isArray(parsed.next_actions) ? parsed.next_actions.map((item) => String(item)).filter(Boolean) : [],
+    unknowns: Array.isArray(parsed.unknowns) ? parsed.unknowns.map((item) => String(item)).filter(Boolean) : [],
+    escalation_needed: Boolean(parsed.escalation_needed),
+    api_method: typeof parsed.api_method === "string" ? parsed.api_method : undefined,
+    api_path: typeof parsed.api_path === "string" ? parsed.api_path : undefined,
+    required_params: Array.isArray(parsed.required_params) ? parsed.required_params.map((item) => String(item)).filter(Boolean) : undefined,
+    auth_scope: Array.isArray(parsed.auth_scope) ? parsed.auth_scope.map((item) => String(item)).filter(Boolean) : undefined,
+    response_field_hint: typeof parsed.response_field_hint === "string" ? parsed.response_field_hint : undefined,
+    important_note: typeof parsed.important_note === "string" ? parsed.important_note : undefined,
+    related_variant: typeof parsed.related_variant === "string" ? parsed.related_variant : undefined,
+    steps: Array.isArray(parsed.steps) ? parsed.steps.map((item) => String(item)).filter(Boolean) : undefined,
+    prerequisites: Array.isArray(parsed.prerequisites) ? parsed.prerequisites.map((item) => String(item)).filter(Boolean) : undefined,
+    limits_or_notes: Array.isArray(parsed.limits_or_notes) ? parsed.limits_or_notes.map((item) => String(item)).filter(Boolean) : undefined,
+    most_likely_explanation:
+      typeof parsed.most_likely_explanation === "string" ? parsed.most_likely_explanation : undefined,
+    confirmed_facts: Array.isArray(parsed.confirmed_facts) ? parsed.confirmed_facts.map((item) => String(item)).filter(Boolean) : undefined,
+    what_to_check_next: Array.isArray(parsed.what_to_check_next)
+      ? parsed.what_to_check_next.map((item) => String(item)).filter(Boolean)
+      : undefined,
+    most_likely_causes: Array.isArray(parsed.most_likely_causes)
+      ? parsed.most_likely_causes.map((item) => String(item)).filter(Boolean)
+      : undefined,
+    recommended_checks: Array.isArray(parsed.recommended_checks)
+      ? parsed.recommended_checks.map((item) => String(item)).filter(Boolean)
+      : undefined,
+    required_followup_info: Array.isArray(parsed.required_followup_info)
+      ? parsed.required_followup_info.map((item) => String(item)).filter(Boolean)
+      : undefined,
+    when_to_handoff: typeof parsed.when_to_handoff === "string" ? parsed.when_to_handoff : undefined
+  };
+}
+
+function normalizeSupportMainReferences(value: unknown): NormalizedSupportMainReference[] {
+  return Array.isArray(value)
+    ? value
+        .map((item) => item as Record<string, unknown>)
+        .map((item) => ({
+          reference_id: typeof item.reference_id === "string" ? item.reference_id : "",
+          title: typeof item.title === "string" ? item.title : "",
+          snippet: typeof item.snippet === "string" ? item.snippet : "",
+          sourceUrl: typeof item.sourceUrl === "string" ? item.sourceUrl : "",
+          path: typeof item.path === "string" ? item.path : undefined,
+          headingPath: typeof item.headingPath === "string" ? item.headingPath : undefined,
+          repoSourceUrl: typeof item.repoSourceUrl === "string" ? item.repoSourceUrl : undefined
+        }))
+        .filter((item) => item.reference_id)
+    : [];
+}
+
+function normalizeSupportMainOutput(
+  value: OpenClawSupportMainOutput | Record<string, unknown> | unknown,
+  query: string
+): NormalizedSupportMainResult {
+  const parsed = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const route = normalizeSupportMainRoute(parsed.route, query);
+  const retrievalQueries = uniqueStrings(
+    [
+      ...(Array.isArray(parsed.retrievalQueries) ? parsed.retrievalQueries.map((item) => String(item)) : []),
+      ...(Array.isArray(parsed.retrieval_queries) ? parsed.retrieval_queries.map((item) => String(item)) : []),
+      query
+    ],
+    8
+  );
+  const caseFrame = normalizeSupportMainCaseFrame(parsed.caseFrame ?? parsed.case_frame, query, route, retrievalQueries);
+  return {
+    route,
+    caseFrame,
+    evidencePlan: deriveSupportMainEvidencePlan(caseFrame, query, retrievalQueries),
+    draftAnswer: normalizeSupportMainDraftAnswer(parsed.draftAnswer ?? parsed.draft_answer, route),
+    references: normalizeSupportMainReferences(parsed.references),
+    retrievalQueries
+  };
+}
+
+function normalizeSupportReferenceLocator(value: string | undefined): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[?#].*$/, "")
+    .replace(/\/+$/, "");
+}
+
+function normalizeSupportReferenceHeading(value: string | undefined): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function normalizeSupportReferenceText(value: string | undefined): string {
+  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function scoreSupportMainReferenceMatch(
+  agentReference: NormalizedSupportMainReference,
+  candidate: SearchReference
+): number {
+  let score = 0;
+  const agentPath = normalizeSupportReferenceLocator(agentReference.path);
+  const candidatePath = normalizeSupportReferenceLocator(candidate.path);
+  if (agentPath && candidatePath) {
+    if (agentPath === candidatePath) score += 90;
+    else if (candidatePath.endsWith(agentPath) || agentPath.endsWith(candidatePath)) score += 36;
+  }
+  const agentSourceUrl = normalizeSupportReferenceLocator(agentReference.sourceUrl);
+  const candidateSourceUrl = normalizeSupportReferenceLocator(candidate.sourceUrl);
+  if (agentSourceUrl && candidateSourceUrl) {
+    if (agentSourceUrl === candidateSourceUrl) score += 84;
+    else if (candidateSourceUrl.includes(agentSourceUrl) || agentSourceUrl.includes(candidateSourceUrl)) score += 24;
+  }
+  const agentRepoSourceUrl = normalizeSupportReferenceLocator(agentReference.repoSourceUrl);
+  const candidateRepoSourceUrl = normalizeSupportReferenceLocator(candidate.repoSourceUrl);
+  if (agentRepoSourceUrl && candidateRepoSourceUrl) {
+    if (agentRepoSourceUrl === candidateRepoSourceUrl) score += 84;
+    else if (candidateRepoSourceUrl.includes(agentRepoSourceUrl) || agentRepoSourceUrl.includes(candidateRepoSourceUrl)) score += 24;
+  }
+  const agentHeading = normalizeSupportReferenceHeading(agentReference.headingPath);
+  const candidateHeading = normalizeSupportReferenceHeading(candidate.headingPath);
+  if (agentHeading && candidateHeading) {
+    if (agentHeading === candidateHeading) score += 20;
+    else score -= 8;
+  }
+  const agentTitle = normalizeSupportReferenceText(agentReference.title);
+  const candidateTitle = normalizeSupportReferenceText(candidate.title);
+  if (agentTitle && candidateTitle) {
+    if (agentTitle === candidateTitle) score += 14;
+    else if (candidateTitle.includes(agentTitle) || agentTitle.includes(candidateTitle)) score += 6;
+  }
+  const agentSnippet = normalizeSupportReferenceText(agentReference.snippet).slice(0, 140);
+  const candidateSnippet = normalizeSupportReferenceText(candidate.snippet);
+  if (agentSnippet && candidateSnippet) {
+    if (candidateSnippet.includes(agentSnippet) || agentSnippet.includes(candidateSnippet.slice(0, agentSnippet.length))) {
+      score += 10;
+    }
+  }
+  return score;
+}
+
+function reconcileSupportMainReferences(input: {
+  agentReferences: NormalizedSupportMainReference[];
+  candidateReferences: SearchReference[];
+}) {
+  const referenceMap = new Map<string, SearchReference>();
+  const matchedReferences = new Map<string, SearchReference>();
+  const unresolvedReferenceIds: string[] = [];
+
+  for (const agentReference of input.agentReferences) {
+    const scored = input.candidateReferences
+      .map((candidate) => ({
+        candidate,
+        score: scoreSupportMainReferenceMatch(agentReference, candidate)
+      }))
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score);
+    const best = scored[0];
+    const second = scored[1];
+    const ambiguous =
+      Boolean(best) &&
+      Boolean(second) &&
+      resolveSearchReferenceEvidenceId(best.candidate) !== resolveSearchReferenceEvidenceId(second.candidate) &&
+      second.score >= best.score - 6;
+
+    if (!best || best.score < 60 || ambiguous) {
+      unresolvedReferenceIds.push(agentReference.reference_id);
+      continue;
+    }
+
+    const evidenceId = resolveSearchReferenceEvidenceId(best.candidate);
+    referenceMap.set(agentReference.reference_id, best.candidate);
+    matchedReferences.set(evidenceId, best.candidate);
+  }
+
+  return {
+    referenceMap,
+    matchedReferences: [...matchedReferences.values()],
+    unresolvedReferenceIds: uniqueStrings(unresolvedReferenceIds, 32)
+  };
+}
+
+function convertSupportMainDraftToSpecialistDraft(input: {
+  route: SupportQuestionRoute;
+  draftAnswer: NormalizedSupportMainDraftAnswer;
+  referenceMap: Map<string, SearchReference>;
+}): SpecialistDraftAnswer {
+  return {
+    ...input.draftAnswer,
+    question_type: input.draftAnswer.question_type ?? input.route.question_type,
+    render_variant: input.draftAnswer.render_variant ?? normalizeSupportMainRenderVariant(undefined, input.route),
+    claims: input.draftAnswer.claims.map((claim) => ({
+      text: claim.text,
+      kind: claim.kind,
+      authority: claim.authority,
+      evidence_ids: uniqueStrings(
+        claim.reference_ids
+          .map((referenceId) => input.referenceMap.get(referenceId))
+          .filter((reference): reference is SearchReference => Boolean(reference))
+          .map((reference) => resolveSearchReferenceEvidenceId(reference)),
+        6
+      )
+    }))
+  };
+}
+
+function buildSupportMainVerification(input: {
+  language: "zh" | "en";
+  draftAnswer: SpecialistDraftAnswer;
+  missingInfo: string[];
+}): SupportVerificationResult {
+  const supportedClaims = input.draftAnswer.claims
+    .filter(
+      (claim) =>
+        claim.evidence_ids.length > 0 &&
+        (claim.kind === "verified_fact" || claim.kind === "grounded_inference")
+    )
+    .map((claim) => ({
+      text: claim.text,
+      kind: claim.kind,
+      verdict: claim.kind === "grounded_inference" ? ("supported_inference" as const) : ("verified" as const),
+      citation_ids: claim.evidence_ids
+    }));
+  const unsupportedClaims = uniqueStrings(
+    input.draftAnswer.claims
+      .filter(
+        (claim) =>
+          claim.evidence_ids.length === 0 &&
+          (claim.kind === "verified_fact" || claim.kind === "grounded_inference")
+      )
+      .map((claim) => claim.text),
+    12
+  );
+  const verifiedCitationIds = uniqueStrings(supportedClaims.flatMap((claim) => claim.citation_ids), 6);
+  return {
+    verdict:
+      supportedClaims.length === 0
+        ? "unsupported"
+        : unsupportedClaims.length === 0 && input.missingInfo.length === 0
+        ? "verified"
+        : "partial",
+    summary:
+      input.language === "zh"
+        ? "support-main 输出已按已发布知识证据完成绑定。"
+        : "The support-main output was reconciled against published knowledge evidence.",
+    unsupported_claims: unsupportedClaims,
+    missing_info: input.missingInfo,
+    verified_citation_ids: verifiedCitationIds,
+    display_citation_ids: verifiedCitationIds.slice(0, 3),
+    verified_claims: supportedClaims.map((claim) => claim.text),
+    claim_to_citation_map: supportedClaims
+  };
+}
+
+function buildSupportMainOrchestrationTrace() {
+  const resolved = resolveStageSpecificAgent("support-main");
+  return [
+    {
+      stage: "support-main",
+      agent_id: resolved.agentId,
+      model: resolved.model ?? null
+    }
+  ];
+}
+
+async function runSingleAgentSupportSearch(input: {
+  query: string;
+  language: "zh" | "en";
+  currentRound: number;
+  conversationHistory: Array<{ role: "user" | "assistant"; content: string }>;
+  adapter: OpenClawAdapter;
+  runtime?: OpenClawRuntimeContext;
+  attachments?: string[];
+  repoId?: string;
+  branch?: string;
+  idempotencyKey: string;
+  contextType: "search" | "triage";
+  orchestrator: SupportSearchOrchestrator;
+  runtimePolicy: ReturnType<typeof resolveSupportRuntimePolicy>;
+  onStageProgress?: (progress: SupportAgentStageProgress) => Promise<void> | void;
+  ticketContext?: {
+    priority: string;
+    customerMeta: Record<string, unknown>;
+    history: Array<{ author: string; body: string; at: string }>;
+  };
+}): Promise<{
+  result: SearchModeResult;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  verification: SupportVerificationResult;
+  stageTimings: SupportAgentStageTimings;
+}> {
+  const runStartedAt = performance.now();
+  let lastCompletedStage: string | undefined;
+  const reportStageProgress = async (currentStage: string): Promise<void> => {
+    if (!input.onStageProgress) return;
+    await input.onStageProgress({ currentStage, lastCompletedStage });
+  };
+  const markStageCompleted = (stage: string): void => {
+    lastCompletedStage = stage;
+  };
+  const supportMainRuntime = withStageRuntime(
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 10_000,
+        minimumTimeoutMs: 6_000,
+        stageTimeoutMs: 18_000
+      },
+      {
+        reserveMs: 25_000,
+        minimumTimeoutMs: 18_000,
+        stageTimeoutMs: 60_000
+      }
+    ),
+    "support-main",
+    `${input.idempotencyKey}:support-main`
+  );
+
+  await reportStageProgress("support_main");
+  const supportMainStartedAt = performance.now();
+  const rawSupportMain = await input.adapter.runSupportMainAgent!(
+    {
+      contextType: input.contextType,
+      language: input.language,
+      query: input.query,
+      conversationHistory: input.conversationHistory,
+      ticketContext: input.ticketContext,
+      knowledgeScope: {
+        repoId: input.repoId,
+        branch: input.branch
+      }
+    },
+    `${input.idempotencyKey}:support-main`,
+    supportMainRuntime
+  );
+  const supportMainTiming = stageTiming("completed", elapsedMs(supportMainStartedAt));
+  markStageCompleted("support_main");
+
+  const normalized = normalizeSupportMainOutput(rawSupportMain, input.query);
+  const validationQueries = uniqueStrings(
+    [...normalized.retrievalQueries, ...normalized.caseFrame.retrieval_queries, input.query],
+    8
+  );
+
+  await reportStageProgress("retrieval_validation");
+  const validationStartedAt = performance.now();
+  const validationEvidenceResult = await input.orchestrator
+    .collectEvidence({
+      queries: validationQueries,
+      idempotencyKey: `${input.idempotencyKey}:support-main:validation`,
+      runtime: input.runtime,
+      answerLanguage: input.language,
+      attachments: input.attachments,
+      caseFrame: normalized.caseFrame,
+      repoId: input.repoId,
+      branch: input.branch
+    })
+    .then((value) => ({
+      value,
+      timing: stageTiming("completed", elapsedMs(validationStartedAt), {
+        query_count: validationQueries.length,
+        reference_count: value.references.length
+      })
+    }))
+    .catch(() => ({
+      value: {
+        query: input.query,
+        answer: "",
+        confidence: 0,
+        references: [],
+        retrievalStatus: "kb_unavailable" as const,
+        unresolvedReasonCode: "KB_RETRIEVAL_UNAVAILABLE" as const,
+        resolvedQueries: validationQueries,
+        fallbackUsed: true
+      },
+      timing: stageTiming("fallback", elapsedMs(validationStartedAt), {
+        query_count: validationQueries.length,
+        reference_count: 0
+      })
+    }));
+  markStageCompleted("retrieval_validation");
+
+  const reconciled = reconcileSupportMainReferences({
+    agentReferences: normalized.references,
+    candidateReferences: validationEvidenceResult.value.references
+  });
+  const draftSupportAnswer = convertSupportMainDraftToSpecialistDraft({
+    route: normalized.route,
+    draftAnswer: normalized.draftAnswer,
+    referenceMap: reconciled.referenceMap
+  });
+  const selectedPrimaryIds = uniqueStrings(
+    draftSupportAnswer.claims
+      .filter(
+        (claim) =>
+          claim.evidence_ids.length > 0 &&
+          (claim.kind === "verified_fact" || claim.kind === "grounded_inference")
+      )
+      .flatMap((claim) => claim.evidence_ids),
+    3
+  );
+  const selectedSupplementalIds = uniqueStrings(
+    reconciled.matchedReferences
+      .map((reference) => resolveSearchReferenceEvidenceId(reference))
+      .filter((evidenceId) => !selectedPrimaryIds.includes(evidenceId)),
+    5
+  );
+  const evidenceBundle = buildEvidenceBundle({
+    references: reconciled.matchedReferences,
+    confidence: validationEvidenceResult.value.confidence,
+    fallbackUsed: validationEvidenceResult.value.fallbackUsed,
+    resolvedQueries: validationEvidenceResult.value.resolvedQueries,
+    caseFrame: normalized.caseFrame,
+    query: input.query,
+    selection: {
+      primary_ids: selectedPrimaryIds,
+      supplemental_ids: selectedSupplementalIds,
+      rejected_ids: []
+    }
+  });
+  const verification = sanitizeVerification({
+    verification: buildSupportMainVerification({
+      language: input.language,
+      draftAnswer: draftSupportAnswer,
+      missingInfo: sanitizeMissingCriticalInfo([
+        ...normalized.caseFrame.missing_critical_info,
+        ...draftSupportAnswer.unknowns
+      ], 3)
+    }),
+    evidenceBundle,
+    query: input.query,
+    caseFrame: normalized.caseFrame
+  });
+  const missingInfo = sanitizeMissingCriticalInfo(
+    [...verification.missing_info, ...normalized.caseFrame.missing_critical_info, ...draftSupportAnswer.unknowns],
+    3
+  );
+  const mode = resolveSupportMode({
+    verification,
+    references: [...evidenceBundle.primary, ...evidenceBundle.supplemental],
+    currentRound: input.currentRound + 1,
+    missingInfo
+  });
+  const supportAnswer = buildSupportAnswerFromDraft({
+    language: input.language,
+    mode,
+    route: normalized.route,
+    draft: draftSupportAnswer,
+    verification,
+    missingInfo,
+    composed: null
+  });
+  const structuredAnswer = buildStructuredAnswer(supportAnswer, verification);
+  const citations = buildCitations({
+    references: [...evidenceBundle.primary, ...evidenceBundle.supplemental],
+    verification
+  });
+  const unresolvedReasonCode =
+    validationEvidenceResult.value.retrievalStatus === "kb_unavailable"
+      ? "KB_RETRIEVAL_UNAVAILABLE"
+      : verification.verified_citation_ids.length > 0
+      ? null
+      : reconciled.unresolvedReferenceIds.length > 0 || normalized.references.length > 0
+      ? "LOW_CONFIDENCE"
+      : "NO_MATCHING_KB";
+  const clarificationRound = mode === "clarification" ? input.currentRound + 1 : 0;
+  const state: SearchDialogState =
+    mode === "clarification"
+      ? input.currentRound > 0
+        ? "CLARIFICATION_IN_PROGRESS"
+        : "CLARIFICATION_REQUIRED"
+      : mode === "handoff"
+      ? "TICKET_HANDOFF_RECOMMENDED"
+      : "GROUNDABLE_ANSWER_READY";
+  const stageTimings: SupportAgentStageTimings = {
+    total_ms: elapsedMs(runStartedAt),
+    planner: skippedStageTiming(),
+    retrieval_base: validationEvidenceResult.timing,
+    retrieval_extra: skippedStageTiming(),
+    writer: supportMainTiming,
+    verifier: skippedStageTiming()
+  };
+  const stageTrace: SupportAgentStageTraceEntry[] = [
+    stageTraceEntry({
+      stage: "support_main",
+      timing: supportMainTiming,
+      runtimeStage: "support-main",
+      idempotencyKey: `${input.idempotencyKey}:support-main`
+    }),
+    stageTraceEntry({
+      stage: "retrieval",
+      timing: validationEvidenceResult.timing,
+      idempotencyKey: `${input.idempotencyKey}:support-main:validation`
+    })
+  ];
+
+  return {
+    caseFrame: normalized.caseFrame,
+    evidenceBundle,
+    verification,
+    stageTimings,
+    result: {
+      session_id: "",
+      answer: supportAnswer.direct_answer,
+      answer_language: input.language,
+      case_frame: normalized.caseFrame,
+      support_answer: supportAnswer,
+      verification,
+      structured_answer: structuredAnswer,
+      confidence: validationEvidenceResult.value.confidence,
+      suggested_next_step: mode === "grounded" ? "self_serve" : "submit_ticket",
+      retrieval_status:
+        validationEvidenceResult.value.retrievalStatus === "kb_unavailable"
+          ? "kb_unavailable"
+          : reconciled.matchedReferences.length
+          ? "grounded"
+          : "no_results",
+      unresolved_reason_code: unresolvedReasonCode,
+      references: [...evidenceBundle.primary, ...evidenceBundle.supplemental],
+      citations,
+      state,
+      clarification_round: clarificationRound,
+      show_create_ticket_now: mode === "handoff",
+      follow_up_question: mode === "clarification" ? missingInfo[0] ?? null : null,
+      internal_diagnostics: {
+        route: normalized.route,
+        evidence_plan: normalized.evidencePlan,
+        stage_budget: {
+          retrieval_rounds: 1,
+          allow_refinement: false,
+          stop_after_grounded_evidence: true,
+          specialist_budget: 0
+        },
+        retrieval_queries_used: validationQueries,
+        retrieval_queries_refined: [],
+        claim_graph: buildClaimGraph(verification),
+        specialist_skipped: true,
+        specialists_used: ["support-main"],
+        evidence_sources: uniqueStrings(
+          evidenceBundle.primary.concat(evidenceBundle.supplemental).map((item) => item.sourceType ?? "unknown"),
+          6
+        ),
+        runtime_policy: input.runtimePolicy,
+        runtime_mode: "single_agent",
+        fast_path_used: false,
+        confirmed_facts: uniqueStrings(draftSupportAnswer.confirmed_facts ?? [], 4),
+        stage_trace: stageTrace,
+        orchestration_trace: buildSupportMainOrchestrationTrace()
+      }
+    }
+  };
+}
+
 async function writeSpecialistDraft(input: {
   adapter: OpenClawAdapter;
   contextType: "search" | "triage";
@@ -3845,6 +4595,14 @@ export async function runSupportSearchAgent(input: {
   const allowRefinement = input.runtime?.allowRefinement !== false;
   const contextType = input.contextType ?? "search";
   const runtimePolicy = resolveSupportRuntimePolicy(input.runtime);
+  if (env.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME && input.adapter.runSupportMainAgent) {
+    return runSingleAgentSupportSearch({
+      ...input,
+      contextType,
+      orchestrator,
+      runtimePolicy
+    });
+  }
   let lastCompletedStage: string | undefined;
   const reportStageProgress = async (currentStage: string): Promise<void> => {
     if (!input.onStageProgress) return;

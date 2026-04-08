@@ -2,6 +2,7 @@ import type { SupportAgentRuntimeStage } from "../types.js";
 import type { RuntimeCaseScore, RuntimeEvaluationSummary, RuntimeObservation, RuntimeScenarioCase } from "./types.js";
 
 const STAGE_ORDER: SupportAgentRuntimeStage[] = [
+  "support_main",
   "route",
   "evidence_plan",
   "case_plan",
@@ -128,4 +129,3 @@ export function summarizeRuntimeResults(results: RuntimeCaseScore[]): RuntimeEva
     ])
   };
 }
-
