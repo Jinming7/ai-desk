@@ -5,8 +5,10 @@ import { env } from "../../config/env.js";
 import { detectMimeType, resolveAttachmentPath } from "../../modules/ai/multimodal.js";
 import {
   buildSignedOpenClawDevice,
+  clearOpenClawDeviceToken,
   loadOpenClawDeviceToken,
-  loadOrCreateOpenClawDeviceIdentity
+  loadOrCreateOpenClawDeviceIdentity,
+  storeOpenClawDeviceToken
 } from "./device-auth.js";
 import type {
   OpenClawAdapter,
@@ -448,19 +450,23 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   private readonly requestedScopes = env.OPENCLAW_REQUEST_SCOPES.split(",").map((item) => item.trim()).filter(Boolean);
   private readonly deviceIdentity = loadOrCreateOpenClawDeviceIdentity();
 
-  private buildConnectAuth(): {
+  private buildConnectAuth(options?: {
+    disableDeviceToken?: boolean;
+  }): {
     token?: string;
     password?: string;
     deviceToken?: string;
   } {
-    const deviceToken = loadOpenClawDeviceToken({
-      deviceId: this.deviceIdentity.deviceId,
-      role: "operator"
-    });
-    if (deviceToken) {
-      return {
-        deviceToken
-      };
+    if (!options?.disableDeviceToken) {
+      const deviceToken = loadOpenClawDeviceToken({
+        deviceId: this.deviceIdentity.deviceId,
+        role: "operator"
+      });
+      if (deviceToken) {
+        return {
+          deviceToken
+        };
+      }
     }
 
     const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || env.OPENCLAW_GATEWAY_TOKEN;
@@ -494,12 +500,47 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     });
   }
 
+  private maybePersistIssuedDeviceToken(connectPayload: unknown): void {
+    const value = (connectPayload ?? {}) as {
+      auth?: { deviceToken?: unknown; role?: unknown; scopes?: unknown };
+    };
+    const deviceToken =
+      typeof value.auth?.deviceToken === "string" && value.auth.deviceToken.trim()
+        ? value.auth.deviceToken.trim()
+        : null;
+    if (!deviceToken || process.env.OPENCLAW_DEVICE_TOKEN?.trim()) {
+      return;
+    }
+    const role = typeof value.auth?.role === "string" && value.auth.role.trim() ? value.auth.role.trim() : "operator";
+    const scopes = Array.isArray(value.auth?.scopes) ? value.auth.scopes.filter((item): item is string => typeof item === "string") : [];
+    storeOpenClawDeviceToken({
+      deviceId: this.deviceIdentity.deviceId,
+      role,
+      token: deviceToken,
+      scopes
+    });
+  }
+
+  private clearStoredDeviceToken(): void {
+    clearOpenClawDeviceToken({
+      deviceId: this.deviceIdentity.deviceId,
+      role: "operator"
+    });
+  }
+
+  private shouldRetryWithoutDeviceToken(error: unknown): boolean {
+    return error instanceof Error && error.message.toLowerCase().includes("device token mismatch");
+  }
+
   private buildConnectParams(input: {
     connectNonce: string;
     instanceSuffix?: string;
     userAgent: string;
+    disableDeviceToken?: boolean;
   }) {
-    const connectAuth = this.buildConnectAuth();
+    const connectAuth = this.buildConnectAuth({
+      disableDeviceToken: input.disableDeviceToken
+    });
     const auth = Object.keys(connectAuth).length > 0 ? connectAuth : undefined;
     const authToken =
       typeof connectAuth.token === "string" && connectAuth.token.trim()
@@ -2259,9 +2300,35 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   }
 
   private async callMethod(method: string, params: Record<string, unknown>, timeoutMs = env.OPENCLAW_METHOD_TIMEOUT_MS): Promise<unknown> {
+    try {
+      return await this.callMethodOnce(method, params, timeoutMs, { preferDeviceToken: true });
+    } catch (error) {
+      if (!this.shouldRetryWithoutDeviceToken(error)) {
+        throw error;
+      }
+      this.clearStoredDeviceToken();
+      return await this.callMethodOnce(method, params, timeoutMs, { preferDeviceToken: false });
+    }
+  }
+
+  private async callMethodOnce(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs: number,
+    options: { preferDeviceToken: boolean }
+  ): Promise<unknown> {
     const ws = this.createWebSocket(this.buildGatewayHeaders());
+    const connectAuth = this.buildConnectAuth({
+      disableDeviceToken: !options.preferDeviceToken
+    });
 
     return await new Promise<unknown>((resolve, reject) => {
+      if (!connectAuth.deviceToken && !connectAuth.token && !connectAuth.password) {
+        reject(new Error("OpenClaw gateway auth is not configured"));
+        ws.close();
+        return;
+      }
+
       const effectiveConnectTimeoutMs = Math.max(1, Math.min(env.OPENCLAW_CONNECT_TIMEOUT_MS, timeoutMs));
       const connectTimeout = setTimeout(() => {
         reject(new Error("OpenClaw connect timeout"));
@@ -2293,7 +2360,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
               method: "connect",
               params: this.buildConnectParams({
                 connectNonce,
-                userAgent: "ticket-core"
+                userAgent: "ticket-core",
+                disableDeviceToken: !options.preferDeviceToken
               })
             };
             ws.send(JSON.stringify(connectReq));
@@ -2308,6 +2376,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
             ws.close();
             return;
           }
+          this.maybePersistIssuedDeviceToken(data.payload);
 
           const requestId = "method-1";
           const request: RpcReq = {
@@ -2351,18 +2420,35 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
           clearTimeout(requestTimeout);
         }
       });
-
-      if (!env.OPENCLAW_GATEWAY_TOKEN && !env.OPENCLAW_BASIC_PASS) {
-        reject(new Error("OpenClaw gateway auth is not configured"));
-        ws.close();
-      }
     });
   }
 
   private async connectOnly(): Promise<void> {
+    try {
+      await this.connectOnlyOnce({ preferDeviceToken: true });
+      return;
+    } catch (error) {
+      if (!this.shouldRetryWithoutDeviceToken(error)) {
+        throw error;
+      }
+      this.clearStoredDeviceToken();
+      await this.connectOnlyOnce({ preferDeviceToken: false });
+    }
+  }
+
+  private async connectOnlyOnce(options: { preferDeviceToken: boolean }): Promise<void> {
     const ws = this.createWebSocket(this.buildGatewayHeaders());
+    const connectAuth = this.buildConnectAuth({
+      disableDeviceToken: !options.preferDeviceToken
+    });
 
     return await new Promise<void>((resolve, reject) => {
+      if (!connectAuth.deviceToken && !connectAuth.token && !connectAuth.password) {
+        reject(new Error("OpenClaw gateway auth is not configured"));
+        ws.close();
+        return;
+      }
+
       const timeout = setTimeout(() => {
         reject(new Error("OpenClaw health connect timeout"));
         ws.close();
@@ -2391,7 +2477,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
               params: this.buildConnectParams({
                 connectNonce,
                 instanceSuffix: "health",
-                userAgent: "ticket-core-health"
+                userAgent: "ticket-core-health",
+                disableDeviceToken: !options.preferDeviceToken
               })
             };
             ws.send(JSON.stringify(connectReq));
@@ -2405,6 +2492,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
             ws.close();
             return;
           }
+          this.maybePersistIssuedDeviceToken(data.payload);
           ws.close();
           resolve();
         }
@@ -2418,11 +2506,6 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       ws.on("close", () => {
         clearTimeout(timeout);
       });
-
-      if (!env.OPENCLAW_GATEWAY_TOKEN && !env.OPENCLAW_BASIC_PASS) {
-        reject(new Error("OpenClaw gateway auth is not configured"));
-        ws.close();
-      }
     });
   }
 

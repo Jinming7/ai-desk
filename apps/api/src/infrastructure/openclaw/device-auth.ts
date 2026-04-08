@@ -229,6 +229,60 @@ export function loadOpenClawDeviceToken(params: {
   return typeof entry?.token === "string" && entry.token.trim() ? entry.token.trim() : null;
 }
 
+export function storeOpenClawDeviceToken(params: {
+  deviceId: string;
+  role: string;
+  token: string;
+  scopes?: string[];
+  env?: NodeJS.ProcessEnv;
+}): void {
+  const effectiveEnv = params.env ?? process.env;
+  const filePath = resolveDeviceAuthPath(effectiveEnv);
+  const existing = readDeviceAuthStore(filePath);
+  const role = params.role.trim();
+  const next: OpenClawDeviceAuthStore = {
+    version: 1,
+    deviceId: params.deviceId,
+    tokens:
+      existing && existing.deviceId === params.deviceId && existing.tokens
+        ? { ...existing.tokens }
+        : {}
+  };
+  next.tokens[role] = {
+    token: params.token,
+    role,
+    scopes: Array.isArray(params.scopes) ? params.scopes.map((item) => item.trim()).filter(Boolean).sort() : [],
+    updatedAtMs: Date.now()
+  };
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(`${filePath}`, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+}
+
+export function clearOpenClawDeviceToken(params: {
+  deviceId: string;
+  role: string;
+  env?: NodeJS.ProcessEnv;
+}): void {
+  const effectiveEnv = params.env ?? process.env;
+  const filePath = resolveDeviceAuthPath(effectiveEnv);
+  const existing = readDeviceAuthStore(filePath);
+  if (!existing || existing.deviceId !== params.deviceId) {
+    return;
+  }
+  const role = params.role.trim();
+  if (!existing.tokens[role]) {
+    return;
+  }
+  const next: OpenClawDeviceAuthStore = {
+    version: 1,
+    deviceId: existing.deviceId,
+    tokens: { ...existing.tokens }
+  };
+  delete next.tokens[role];
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(`${filePath}`, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+}
+
 export function buildOpenClawDeviceAuthPayload(params: OpenClawDeviceAuthPayloadParams): string {
   return [
     "v2",

@@ -577,3 +577,60 @@ test("buildConnectParams prefers device-token auth when OPENCLAW_DEVICE_TOKEN is
     else process.env.OPENCLAW_DEVICE_TOKEN = original;
   }
 });
+
+test("callMethod retries once without device-token auth after a stale device token mismatch", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    callMethod: (method: string, params: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
+    callMethodOnce: (
+      method: string,
+      params: Record<string, unknown>,
+      timeoutMs: number,
+      options: { preferDeviceToken: boolean }
+    ) => Promise<unknown>;
+    clearStoredDeviceToken: () => void;
+  };
+  const attempts: boolean[] = [];
+  let cleared = 0;
+
+  adapter.callMethodOnce = async (_method, _params, _timeoutMs, options) => {
+    attempts.push(options.preferDeviceToken);
+    if (options.preferDeviceToken) {
+      throw new Error("OpenClaw connect failed: unauthorized: device token mismatch (rotate/reissue device token)");
+    }
+    return { ok: true };
+  };
+  adapter.clearStoredDeviceToken = () => {
+    cleared += 1;
+  };
+
+  const result = await adapter.callMethod("agents.list", {}, 2_000);
+
+  assert.deepEqual(attempts, [true, false]);
+  assert.equal(cleared, 1);
+  assert.deepEqual(result, { ok: true });
+});
+
+test("connectOnly retries once without device-token auth after a stale device token mismatch", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    connectOnly: () => Promise<void>;
+    connectOnlyOnce: (options: { preferDeviceToken: boolean }) => Promise<void>;
+    clearStoredDeviceToken: () => void;
+  };
+  const attempts: boolean[] = [];
+  let cleared = 0;
+
+  adapter.connectOnlyOnce = async (options) => {
+    attempts.push(options.preferDeviceToken);
+    if (options.preferDeviceToken) {
+      throw new Error("OpenClaw health connect failed: unauthorized: device token mismatch (rotate/reissue device token)");
+    }
+  };
+  adapter.clearStoredDeviceToken = () => {
+    cleared += 1;
+  };
+
+  await adapter.connectOnly();
+
+  assert.deepEqual(attempts, [true, false]);
+  assert.equal(cleared, 1);
+});
