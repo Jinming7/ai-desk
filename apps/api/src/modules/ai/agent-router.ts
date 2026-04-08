@@ -437,8 +437,10 @@ function buildTopologyHash(searchStages: SearchStageBinding[], supportStages: St
 }
 
 export function getAiTopology(): AiTopologySnapshot {
+  const includeSupportMain =
+    env.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME || Boolean(env.OPENCLAW_AGENT_ID_SUPPORT_MAIN.trim());
   const supportStages = [
-    resolveStageBinding("support-main"),
+    ...(includeSupportMain ? [resolveStageBinding("support-main")] : []),
     resolveStageBinding("router"),
     resolveStageBinding("evidence-planner"),
     resolveStageBinding("planner"),

@@ -2910,6 +2910,35 @@ test("AI topology excludes retired citation post-processing stages from the live
   assert.equal(topology.supportStages.stages.some((stage) => stage.stage === "support-citation-selector"), false);
 });
 
+test("AI topology only exposes support-main when single-agent runtime is enabled or explicitly configured", () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+
+  try {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = false;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "";
+
+    const defaultTopology = getAiTopology();
+    assert.equal(defaultTopology.supportStages.stages.some((stage) => stage.stage === "support-main"), false);
+
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+    const explicitBindingTopology = getAiTopology();
+    assert.equal(explicitBindingTopology.supportStages.stages.some((stage) => stage.stage === "support-main"), true);
+
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "";
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+    const singleAgentTopology = getAiTopology();
+    assert.equal(singleAgentTopology.supportStages.stages.some((stage) => stage.stage === "support-main"), true);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
 test("retired support-citation-binder still resolves to the stage-level fallback when explicitly addressed", () => {
   const binding = resolveStageSpecificAgent("support-citation-binder");
 
