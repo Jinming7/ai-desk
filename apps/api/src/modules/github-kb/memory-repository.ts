@@ -79,6 +79,49 @@ const EFFECTIVE_PUBLISHED_BUILD_JOIN = `
 const EFFECTIVE_BUILD_SPACE_SQL = `COALESCE(effective_build.knowledge_space, published_build.knowledge_space)`;
 const EFFECTIVE_BUILD_VERSION_SQL = `COALESCE(effective_build.build_version, published_build.build_version)`;
 
+function normalizeMemoryScopeKeySegment(value: string | null | undefined, fallback: string): string {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return normalized || fallback;
+}
+
+function buildMemoryScopeLockKey(input: {
+  knowledgeSpace: KbKnowledgeSpace;
+  repoId: string;
+  branch: string;
+  productArea?: string | null;
+  buildVersion?: string | null;
+}): string {
+  return [
+    "kb-memory-scope",
+    normalizeMemoryScopeKeySegment(input.knowledgeSpace, "unknown-space"),
+    normalizeMemoryScopeKeySegment(input.repoId, "unknown-repo"),
+    normalizeMemoryScopeKeySegment(input.branch, "unknown-branch"),
+    normalizeMemoryScopeKeySegment(input.productArea, "general"),
+    normalizeMemoryScopeKeySegment(input.buildVersion, "latest")
+  ].join(":");
+}
+
+export async function withMemoryScopeLock<T>(
+  input: {
+    knowledgeSpace: KbKnowledgeSpace;
+    repoId: string;
+    branch: string;
+    productArea?: string | null;
+    buildVersion?: string | null;
+  },
+  work: () => Promise<T>
+): Promise<T> {
+  const client = await pool.connect();
+  const lockKey = buildMemoryScopeLockKey(input);
+  try {
+    await client.query(`SELECT pg_advisory_lock(hashtext($1))`, [lockKey]);
+    return await work();
+  } finally {
+    await client.query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]).catch(() => undefined);
+    client.release();
+  }
+}
+
 export async function upsertMemoryEntry(input: MemoryEntryDraft): Promise<KbMemoryEntry> {
   const result = await pool.query<KbMemoryEntry>(
     `INSERT INTO kb_memory_entries (
@@ -1014,26 +1057,57 @@ export async function listActiveMemoryEntriesForScope(input: {
 
 export async function replaceRelationsForMemoryIds(memoryIds: string[], relations: MemoryRelationDraft[]): Promise<void> {
   const uniqueIds = [...new Set(memoryIds.filter(Boolean))];
-  if (uniqueIds.length) {
-    await pool.query(
-      `DELETE FROM kb_memory_relations
-       WHERE from_memory_id = ANY($1::uuid[]) OR to_memory_id = ANY($1::uuid[])`,
-      [uniqueIds]
-    );
-  }
-  for (const relation of relations) {
-    await pool.query(
-      `INSERT INTO kb_memory_relations (id, from_memory_id, to_memory_id, relation_type, weight, metadata_json)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-       ON CONFLICT (id)
-       DO UPDATE SET
-         from_memory_id = EXCLUDED.from_memory_id,
-         to_memory_id = EXCLUDED.to_memory_id,
-         relation_type = EXCLUDED.relation_type,
-         weight = EXCLUDED.weight,
-         metadata_json = EXCLUDED.metadata_json`,
-      [relation.id, relation.from_memory_id, relation.to_memory_id, relation.relation_type, relation.weight, toJson(relation.metadata_json ?? {})]
-    );
+  const relationRows = [...new Map(relations.filter((relation) => relation.id && relation.from_memory_id && relation.to_memory_id).map((relation) => [relation.id, relation])).values()];
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    if (uniqueIds.length) {
+      await client.query(
+        `DELETE FROM kb_memory_relations
+         WHERE from_memory_id = ANY($1::uuid[]) OR to_memory_id = ANY($1::uuid[])`,
+        [uniqueIds]
+      );
+    }
+    if (relationRows.length > 0) {
+      const values: unknown[] = [];
+      const relationPlaceholders = relationRows.map((relation, index) => {
+        const offset = index * 6;
+        values.push(
+          relation.id,
+          relation.from_memory_id,
+          relation.to_memory_id,
+          relation.relation_type,
+          relation.weight,
+          toJson(relation.metadata_json ?? {})
+        );
+        return `($${offset + 1}::uuid,$${offset + 2}::uuid,$${offset + 3}::uuid,$${offset + 4},$${offset + 5},$${offset + 6}::jsonb)`;
+      });
+      await client.query(
+        `INSERT INTO kb_memory_relations (id, from_memory_id, to_memory_id, relation_type, weight, metadata_json)
+         SELECT candidate.id, candidate.from_memory_id, candidate.to_memory_id, candidate.relation_type, candidate.weight, candidate.metadata_json
+         FROM (
+           VALUES ${relationPlaceholders.join(",")}
+         ) AS candidate(id, from_memory_id, to_memory_id, relation_type, weight, metadata_json)
+         INNER JOIN kb_memory_entries AS from_entry
+           ON from_entry.id = candidate.from_memory_id
+         INNER JOIN kb_memory_entries AS to_entry
+           ON to_entry.id = candidate.to_memory_id
+         ON CONFLICT (id)
+         DO UPDATE SET
+           from_memory_id = EXCLUDED.from_memory_id,
+           to_memory_id = EXCLUDED.to_memory_id,
+           relation_type = EXCLUDED.relation_type,
+           weight = EXCLUDED.weight,
+           metadata_json = EXCLUDED.metadata_json`,
+        values
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
   }
 }
 

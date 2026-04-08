@@ -23,14 +23,15 @@ import type {
   OpenClawSupportVerifierInput,
   OpenClawSupportWriterInput
 } from "../../infrastructure/openclaw/types.js";
-import type {
-  DraftSupportAnswer,
-  SpecialistDraftAnswer,
-  SupportCaseFrame,
-  SupportEvidencePlan,
-  SupportQuestionRoute,
-  SupportVerificationResult,
-  TriageSupportInsight
+import {
+  resolveSearchReferenceEvidenceId,
+  type DraftSupportAnswer,
+  type SpecialistDraftAnswer,
+  type SupportCaseFrame,
+  type SupportEvidencePlan,
+  type SupportQuestionRoute,
+  type SupportVerificationResult,
+  type TriageSupportInsight
 } from "./types.js";
 import { SearchOrchestrator } from "./search-orchestrator.js";
 
@@ -172,9 +173,9 @@ function createAdapter(searchKnowledgeCalls: { count: number }): OpenClawAdapter
       _runtime?: OpenClawRuntimeContext
     ) {
       return {
-        primary_ids: input.references.slice(0, 3).map((item) => item.documentId),
-        supplemental_ids: input.references.slice(3, 5).map((item) => item.documentId),
-        rejected_ids: input.references.slice(5).map((item) => item.documentId)
+        primary_ids: input.references.slice(0, 3).map((item) => resolveSearchReferenceEvidenceId(item)),
+        supplemental_ids: input.references.slice(3, 5).map((item) => resolveSearchReferenceEvidenceId(item)),
+        rejected_ids: input.references.slice(5).map((item) => resolveSearchReferenceEvidenceId(item))
       };
     },
     async verifySupportAnswer(
@@ -334,7 +335,7 @@ Scopes:
 
     assert.equal(searchKnowledgeCalls.count, 0);
     assert.equal(result.references.length, 0);
-    assert.equal(result.retrievalStatus, "no_results");
+    assert.equal(result.retrievalStatus, "kb_unavailable");
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

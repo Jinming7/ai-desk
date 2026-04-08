@@ -1158,6 +1158,31 @@ export async function handleTerminalGenericSyncJobFailure(input: {
     .catch(() => undefined);
 }
 
+export async function handleFailedFullSyncBuildState(input: {
+  job: SyncJob;
+  errorMessage: string;
+}): Promise<void> {
+  const payload = getFullRunPayload(input.job);
+  if (!payload) return;
+
+  const knowledgeSpace = resolveJobKnowledgeSpace(input.job);
+  const build = await githubKbServiceDeps.getBuildByVersion({
+    knowledgeSpace,
+    repoId: input.job.repo_id,
+    branch: input.job.branch,
+    buildVersion: payload.buildVersion
+  });
+  if (!build || !["building", "built"].includes(build.status)) {
+    return;
+  }
+  await githubKbServiceDeps.updateBuildStatus({
+    buildId: build.id,
+    status: "failed",
+    errorMessage: input.errorMessage,
+    finished: true
+  });
+}
+
 async function summarizeDocsComSourceCorpus(registration: RepoRegistration): Promise<DocsComSourceCorpusSnapshot> {
   const localMirrorProbe = await inspectLocalDocsMirror(registration);
   if (localMirrorProbe.state) {
@@ -1830,9 +1855,13 @@ function findMatches(input: string, pattern: RegExp, limit = 6): string[] {
   return uniqueStrings(matches, limit);
 }
 
-function inferProductArea(path: string, content: string): string {
+export function inferProductArea(path: string, content: string): string {
   const normalizedPath = path.toLowerCase();
   const normalizedContent = content.toLowerCase();
+  if (normalizedPath.startsWith("deploy-docs/") || normalizedPath.includes("/deploy-docs/")) return "deployment";
+  if (normalizedPath.includes("/openapi/") || normalizedPath.includes(".api.")) return "openapi";
+  if (normalizedPath.includes("/integrations/")) return "integrations";
+  if (normalizedPath.includes("/wiki/")) return "wiki";
   if (
     /<methodendpoint|<paramsitem|<schemaitem|\b(get|post|put|patch|delete)\s+\/[a-z0-9_/{}/.-]+|openapi|oauth|scope|token|credential/.test(
       normalizedContent
@@ -1848,14 +1877,16 @@ function inferProductArea(path: string, content: string): string {
   return "general";
 }
 
-function inferDeploymentModel(path: string, content: string): string {
+export function inferDeploymentModel(path: string, content: string): string {
+  const normalizedPath = path.toLowerCase();
   const normalizedContent = content.toLowerCase();
+  if (normalizedPath.startsWith("deploy-docs/") || normalizedPath.includes("/deploy-docs/")) return "private_deployment";
   if (/private deployment|self-hosted|私有部署|本地部署|on-prem|air-gapped|closed network|offline/i.test(content)) return "private_deployment";
   if (/public cloud|公有云|saas/i.test(content)) return "public_cloud";
   return "shared";
 }
 
-function inferEvidenceKind(path: string, title: string, content: string): string {
+export function inferEvidenceKind(path: string, title: string, content: string): string {
   const normalizedPath = path.toLowerCase();
   const normalizedTitle = title.toLowerCase();
   const normalizedContent = content.toLowerCase();
@@ -1864,7 +1895,13 @@ function inferEvidenceKind(path: string, title: string, content: string): string
     normalizedPath.includes(".api.")
   ) return "api_operation";
   if (normalizedPath.includes("/troubleshooting/") || /troubleshoot|troubleshooting|排查|故障/.test(normalizedTitle)) return "troubleshooting";
-  if (/limitation|限制|注意事项|not supported|unsupported/.test(normalizedContent)) return "constraint";
+  if (
+    /limitation|限制|注意事项|not supported|unsupported|不支持|support matrix|compatibility|requirements?|操作系统要求|系统要求|环境要求/.test(
+      `${normalizedTitle} ${normalizedContent}`
+    )
+  ) {
+    return "constraint";
+  }
   if (/how to|步骤|guide|配置|setup|configure/.test(normalizedTitle) || normalizedPath.includes("/guide/")) return "procedure";
   return "capability";
 }
@@ -1879,7 +1916,47 @@ function extractVersionScope(content: string): string[] {
   );
 }
 
-function extractSupportEvidenceMetadata(input: {
+function metadataList(record: Record<string, unknown>, key: string): string[] {
+  const raw = record[key];
+  return Array.isArray(raw) ? raw.map((item) => String(item ?? "").trim()).filter(Boolean) : [];
+}
+
+function evidenceKindPriority(value: string): number {
+  switch (value.trim().toLowerCase()) {
+    case "api_operation":
+      return 5;
+    case "troubleshooting":
+      return 4;
+    case "constraint":
+      return 3;
+    case "procedure":
+      return 2;
+    case "capability":
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function preferSpecificEvidenceKind(inferred: string, inherited: string): string {
+  return evidenceKindPriority(inferred) >= evidenceKindPriority(inherited) ? inferred || inherited : inherited;
+}
+
+function preferSpecificProductArea(inferred: string, inherited: string): string {
+  const normalizedInferred = inferred.trim().toLowerCase();
+  const normalizedInherited = inherited.trim().toLowerCase();
+  if (normalizedInferred && normalizedInferred !== "general") return inferred;
+  return inherited || inferred;
+}
+
+function preferSpecificDeploymentModel(inferred: string, inherited: string): string {
+  const normalizedInferred = inferred.trim().toLowerCase();
+  const normalizedInherited = inherited.trim().toLowerCase();
+  if (normalizedInferred && normalizedInferred !== "shared") return inferred;
+  return inherited || inferred;
+}
+
+export function extractSupportEvidenceMetadata(input: {
   path: string;
   title: string;
   content: string;
@@ -1896,7 +1973,8 @@ function extractSupportEvidenceMetadata(input: {
           Object.values(item).flatMap((value) => (Array.isArray(value) ? value.map((scope) => String(scope)) : []))
         )
       : []),
-    ...findMatches(input.content, /(?:scope|权限)[：:\s`]*([A-Za-z0-9:_-]+)/gi, 6)
+    ...findMatches(input.content, /^\s*[-*+]\s*([A-Za-z]+:[A-Za-z0-9:_-]+)\s*:/gim, 6),
+    ...findMatches(input.content, /\b(?:scope|scopes|权限)\b[：:\s`]+([A-Za-z]+:[A-Za-z0-9:_-]+)/gi, 6)
   ]);
   const appliesTo = uniqueStrings([
     deploymentModel === "public_cloud" ? "public_cloud" : undefined,
@@ -1924,19 +2002,25 @@ function extractSupportEvidenceMetadata(input: {
     ...findMatches(input.content, /\b(issue|comment|attachment|project|wiki|space|page|sprint|field|token|oauth|ticket)\b/gi, 6)
   ]);
   const versionScope = extractVersionScope(input.content);
+  const inheritedPermissions = metadataList(inherited, "permissions");
+  const inheritedPrerequisites = metadataList(inherited, "prerequisites");
+  const inheritedLimitations = metadataList(inherited, "limitations");
+  const inheritedActions = metadataList(inherited, "actions");
+  const inheritedObjects = metadataList(inherited, "objects");
+  const inheritedAppliesTo = metadataList(inherited, "applies_to");
 
   return {
     ...inherited,
-    evidence_kind: evidenceKind,
-    applies_to: appliesTo,
-    product_area: productArea,
-    deployment_model: deploymentModel,
-    objects,
-    actions,
-    permissions,
-    prerequisites,
-    limitations,
-    version_scope: versionScope
+    evidence_kind: preferSpecificEvidenceKind(evidenceKind, String(inherited.evidence_kind ?? "")),
+    applies_to: uniqueStrings([...inheritedAppliesTo, ...appliesTo], 6),
+    product_area: preferSpecificProductArea(productArea, String(inherited.product_area ?? "")),
+    deployment_model: preferSpecificDeploymentModel(deploymentModel, String(inherited.deployment_model ?? "")),
+    objects: uniqueStrings([...inheritedObjects, ...objects], 8),
+    actions: uniqueStrings([...inheritedActions, ...actions], 8),
+    permissions: uniqueStrings([...inheritedPermissions, ...permissions], 10),
+    prerequisites: uniqueStrings([...inheritedPrerequisites, ...prerequisites], 8),
+    limitations: uniqueStrings([...inheritedLimitations, ...limitations], 8),
+    version_scope: uniqueStrings([...metadataList(inherited, "version_scope"), ...versionScope], 6)
   };
 }
 
@@ -2878,6 +2962,10 @@ async function runDocsComFullSyncShardJob(job: SyncJob, registration: RepoRegist
     }
     await repo.markSyncRunShardFailed(run.id, payload.shardKey, (error as Error).message);
     await repo.markSyncRunFailed(run.id, (error as Error).message);
+    await handleFailedFullSyncBuildState({
+      job,
+      errorMessage: (error as Error).message
+    }).catch(() => undefined);
     await repo.releaseIngestLease(buildKnowledgeSpaceLeaseKey(knowledgeSpace, registration.id, run.branch), run.id).catch(() => undefined);
     throw error;
   }

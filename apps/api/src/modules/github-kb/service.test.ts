@@ -14,6 +14,7 @@ import {
   buildPollingSyncRequestFromPublication,
   buildQueryAnchoredSnippet,
   githubKbServiceDeps,
+  handleFailedFullSyncBuildState,
   handleTerminalGenericSyncJobFailure,
   resolveSyncExecutionId,
   ensureMarkdownCoverage,
@@ -233,6 +234,62 @@ test("buildGitLabSourceUrl uses the gitlab blob route", () => {
     buildGitLabSourceUrl!("https://git.ones.pro/docs/docs-com", "docs/api.md", "abc123"),
     "https://git.ones.pro/docs/docs-com/-/blob/abc123/docs/api.md"
   );
+});
+
+test("extractSupportEvidenceMetadata preserves deploy-docs private deployment semantics for requirements chunks", () => {
+  const extractSupportEvidenceMetadata = (serviceModule as Record<string, unknown>).extractSupportEvidenceMetadata as
+    | ((input: {
+        path: string;
+        title: string;
+        content: string;
+        inherited?: Record<string, unknown>;
+      }) => Record<string, unknown>)
+    | undefined;
+
+  assert.equal(typeof extractSupportEvidenceMetadata, "function");
+
+  const metadata = extractSupportEvidenceMetadata!({
+    path: "deploy-docs/quick-start/requirements.mdx",
+    title: "3. 操作系统要求",
+    content:
+      "只支持 Linux 4.* 以上内核的操作系统，支持 64 位 Ubuntu 18/20/24、64 位 Red Hat 8.0 及以上，不再支持 CentOS 7 系列。",
+    inherited: {
+      product_area: "deployment",
+      deployment_model: "private_deployment",
+      evidence_kind: "capability",
+      applies_to: ["deployment", "private_deployment"]
+    }
+  });
+
+  assert.equal(metadata.product_area, "deployment");
+  assert.equal(metadata.deployment_model, "private_deployment");
+  assert.notEqual(metadata.product_area, "general");
+  assert.notEqual(metadata.deployment_model, "shared");
+});
+
+test("extractSupportEvidenceMetadata does not invent pseudo scopes from scope headings", () => {
+  const extractSupportEvidenceMetadata = (serviceModule as Record<string, unknown>).extractSupportEvidenceMetadata as
+    | ((input: {
+        path: string;
+        title: string;
+        content: string;
+        inherited?: Record<string, unknown>;
+      }) => Record<string, unknown>)
+    | undefined;
+
+  assert.equal(typeof extractSupportEvidenceMetadata, "function");
+
+  const metadata = extractSupportEvidenceMetadata!({
+    path: "open-docs/docs/openapi/auth/scope.md",
+    title: "Scopes",
+    content: `# Scopes
+
+- write:project:issue: Add, edit, delete issues
+- write:project:issue-comment: Add, edit, delete issue comments
+`
+  });
+
+  assert.deepEqual(metadata.permissions, ["write:project:issue", "write:project:issue-comment"]);
 });
 
 test("withSyncJobHeartbeat refreshes long-running jobs until work completes", async () => {
@@ -536,6 +593,51 @@ test("handleTerminalGenericSyncJobFailure leaves retriable generic failures resu
   assert.equal(getBuildByVersion.mock.callCount(), 0);
   assert.equal(updateBuildStatus.mock.callCount(), 0);
   assert.equal(releaseIngestLease.mock.callCount(), 0);
+});
+
+test("handleFailedFullSyncBuildState marks failed full-sync builds as failed", async (t) => {
+  const job = buildSyncJob({
+    payload_json: {
+      knowledgeSpace: "support-local",
+      runId: "run-1",
+      shardKey: "docs",
+      targetHead: "shared-head",
+      buildVersion: "shared-head:full-run-1",
+      sourceMode: "remote"
+    }
+  });
+  const build = buildRecord({ build_version: "shared-head:full-run-1", status: "building" });
+  const calls: {
+    getBuildByVersion?: Record<string, unknown>;
+    updateBuildStatus?: Record<string, unknown>;
+  } = {};
+
+  t.mock.method(githubKbServiceDeps, "getBuildByVersion", async (input: Parameters<typeof githubKbServiceDeps.getBuildByVersion>[0]) => {
+    calls.getBuildByVersion = input;
+    return build;
+  });
+  t.mock.method(githubKbServiceDeps, "updateBuildStatus", async (input: Parameters<typeof githubKbServiceDeps.updateBuildStatus>[0]) => {
+    calls.updateBuildStatus = input as Record<string, unknown>;
+    return { ...build, status: "failed", error_message: "forced full sync failure", finished_at: new Date().toISOString() };
+  });
+
+  await handleFailedFullSyncBuildState({
+    job,
+    errorMessage: "forced full sync failure"
+  });
+
+  assert.deepEqual(calls.getBuildByVersion, {
+    knowledgeSpace: "support-local",
+    repoId: "repo-1",
+    branch: "main",
+    buildVersion: "shared-head:full-run-1"
+  });
+  assert.deepEqual(calls.updateBuildStatus, {
+    buildId: "build-1",
+    status: "failed",
+    errorMessage: "forced full sync failure",
+    finished: true
+  });
 });
 
 test("buildQueryAnchoredSnippet exposes later callback evidence instead of chunk prefix", () => {

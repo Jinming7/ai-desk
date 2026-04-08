@@ -24,17 +24,26 @@ import type {
   OpenClawSupportVerifierInput,
   OpenClawSupportWriterInput
 } from "../../infrastructure/openclaw/types.js";
-import { runSupportSearchAgent, runSupportTriageAgent } from "./support-agent.js";
-import type {
-  DraftSupportAnswer,
-  SpecialistDraftAnswer,
-  SupportCaseFrame,
-  SupportEvidencePlan,
-  SupportQuestionRoute,
-  SupportVerificationResult,
-  TriageSupportInsight
+import { searchLocalDocs } from "./local-docs.js";
+import { SearchOrchestrator } from "./search-orchestrator.js";
+import {
+  runSupportSearchAgent as coreRunSupportSearchAgent,
+  runSupportTriageAgent as coreRunSupportTriageAgent
+} from "./support-agent.js";
+import {
+  resolveSearchReferenceEvidenceId,
+  type DraftSupportAnswer,
+  type SearchReference,
+  type SpecialistDraftAnswer,
+  type SupportCaseFrame,
+  type SupportEvidencePlan,
+  type SupportQuestionRoute,
+  type SupportVerificationResult,
+  type TriageSupportInsight
 } from "./types.js";
 import { getAiTopology, resolveStageSpecificAgent } from "./agent-router.js";
+
+const DEFAULT_TEST_LOCAL_DOCS_PATH = env.LOCAL_DOCS_COM_PATH;
 
 async function createFixtureRoot(): Promise<string> {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "support-agent-test-"));
@@ -162,9 +171,9 @@ function createAdapter(options: {
       _runtime?: OpenClawRuntimeContext
     ) {
       return {
-        primary_ids: input.references.slice(0, 3).map((item) => item.documentId),
-        supplemental_ids: input.references.slice(3, 5).map((item) => item.documentId),
-        rejected_ids: input.references.slice(5).map((item) => item.documentId)
+        primary_ids: input.references.slice(0, 3).map((item) => resolveSearchReferenceEvidenceId(item)),
+        supplemental_ids: input.references.slice(3, 5).map((item) => resolveSearchReferenceEvidenceId(item)),
+        rejected_ids: input.references.slice(5).map((item) => resolveSearchReferenceEvidenceId(item))
       };
     },
     async writeSupportAnswer(
@@ -339,6 +348,104 @@ function createAdapter(options: {
   };
 }
 
+function createFixtureBackedSearchOrchestrator(adapter: OpenClawAdapter) {
+  const hybridRuntime = {
+    async retrieve(request: {
+      query: string;
+      answerLanguage: "zh" | "en";
+      topK: number;
+      rewrites: string[];
+      requiredObjectTypes: string[];
+      knowledgeSpace: string;
+      repoId?: string;
+      branch?: string;
+    }) {
+      const hits = await searchLocalDocs(request.query, request.answerLanguage, request.topK).catch(() => []);
+      const retrievedAt = new Date().toISOString();
+      const references: SearchReference[] = hits.map((hit) => ({
+        documentId: hit.documentId,
+        title: hit.title,
+        snippet: hit.snippet,
+        sourceUrl: hit.sourceUrl,
+        repoSourceUrl: hit.repoSourceUrl,
+        repo: hit.repo,
+        branch: hit.branch,
+        path: hit.path,
+        commitSha: hit.commitSha,
+        headingPath: hit.headingPath,
+        supportMetadata: {
+          ...(hit.supportMetadata ?? {}),
+          authority: "canonical_visible",
+          source_type: "local_docs"
+        },
+        authority: "canonical_visible",
+        sourceType: "local_docs",
+        score: hit.score,
+        retrievedAt
+      }));
+      const topIds = references.map((item) => resolveSearchReferenceEvidenceId(item)).slice(0, request.topK);
+      return {
+        query: request.query,
+        references,
+        confidence: references[0]?.score ?? 0,
+        retrievalStatus: references.length ? ("grounded" as const) : ("no_results" as const),
+        unresolvedReasonCode: references.length ? null : ("NO_MATCHING_KB" as const),
+        diagnostics: {
+          publication: {
+            knowledgeSpace: request.knowledgeSpace,
+            repoId: request.repoId ?? "fixture-local-docs",
+            branch: request.branch ?? "main",
+            publishedBuildVersion: "fixture-local-docs"
+          },
+          rewrites: request.rewrites,
+          requiredObjectTypes: request.requiredObjectTypes,
+          perChannelCounts: references.length ? { structured_artifact: references.length } : {},
+          channelTopIds: references.length ? { structured_artifact: topIds } : {},
+          fusionTopIds: topIds,
+          rerankTopIds: topIds,
+          groundingSuccessRate: references.length ? 1 : 0,
+          evidenceGate: {
+            verdict: references.length ? ("grounded" as const) : ("insufficient" as const),
+            reasons: references.length ? [] : ["no_fixture_match"],
+            evidenceFamilies: references.length ? ["local_docs"] : []
+          },
+          finalConfidence: references[0]?.score ?? 0
+        }
+      };
+    }
+  };
+
+  return new SearchOrchestrator(adapter, hybridRuntime as never);
+}
+
+async function runSupportSearchAgent(input: Parameters<typeof coreRunSupportSearchAgent>[0]) {
+  const orchestrator =
+    input.orchestrator ??
+    (env.LOCAL_DOCS_COM_PATH !== DEFAULT_TEST_LOCAL_DOCS_PATH ? createFixtureBackedSearchOrchestrator(input.adapter) : undefined);
+  return coreRunSupportSearchAgent(
+    orchestrator
+      ? {
+          ...input,
+          orchestrator
+        }
+      : input
+  );
+}
+
+async function runSupportTriageAgent(input: Parameters<typeof coreRunSupportTriageAgent>[0]) {
+  const orchestrator =
+    input.orchestrator ??
+    (env.LOCAL_DOCS_COM_PATH !== DEFAULT_TEST_LOCAL_DOCS_PATH ? createFixtureBackedSearchOrchestrator(input.adapter) : undefined);
+  return coreRunSupportTriageAgent(
+    orchestrator
+      ? {
+          ...input,
+          orchestrator
+        }
+      : input
+  );
+}
+
 function createStageRecordingAdapter(options?: {
   failRoute?: boolean;
   failEvidencePlan?: boolean;
@@ -453,7 +560,7 @@ function createStageRecordingAdapter(options?: {
     async selectSupportEvidence(input: OpenClawSupportEvidenceSelectorInput) {
       record("selectSupportEvidence");
       return {
-        primary_ids: input.references.slice(0, 1).map((item) => item.documentId),
+        primary_ids: input.references.slice(0, 1).map((item) => resolveSearchReferenceEvidenceId(item)),
         supplemental_ids: [],
         rejected_ids: []
       };
@@ -504,7 +611,7 @@ function createStageRecordingAdapter(options?: {
           {
             text: "Callback and Redirect URI must be consistent.",
             kind: "verified_fact",
-            evidence_ids: input.evidenceBundle.primary.map((item) => item.documentId).slice(0, 1),
+            evidence_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)).slice(0, 1),
             authority: "canonical"
           }
         ],
@@ -527,7 +634,7 @@ function createStageRecordingAdapter(options?: {
     },
     async judgeSupportAnswer(input: OpenClawSupportVerifierInput): Promise<SupportVerificationResult> {
       record("judgeSupportAnswer");
-      const citationIds = input.evidenceBundle.primary.map((item) => item.documentId).slice(0, 1);
+      const citationIds = input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)).slice(0, 1);
       return {
         verdict: citationIds.length ? "verified" : "unsupported",
         summary: "verified",
@@ -906,7 +1013,7 @@ write:project:issue-comment: Add, edit, delete issue comments
   const originalVerify = adapter.verifySupportAnswer;
   adapter.verifySupportAnswer = async (input, idempotencyKey, runtime) => {
     const cited = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental][0];
-    const verifiedId = cited?.documentId ? [cited.documentId] : [];
+    const verifiedId = cited ? [resolveSearchReferenceEvidenceId(cited)] : [];
     return {
       ...(await originalVerify(input, idempotencyKey, runtime)),
       verdict: "partial",
@@ -938,7 +1045,16 @@ write:project:issue-comment: Add, edit, delete issue comments
 
     assert.equal(result.result.support_answer?.mode, "grounded");
     assert.equal(result.result.verification?.verdict, "verified");
-    assert.ok(result.result.support_answer?.what_to_do_now.includes("Request an OAuth token with the `write:project:issue-comment` scope."));
+    assert.equal(
+      result.result.support_answer?.what_to_do_now.some(
+        (step) => /Request an OAuth token/i.test(step) && /write:project:issue-comment/.test(step)
+      ),
+      true
+    );
+    assert.equal(
+      result.result.support_answer?.what_to_do_now.some((step) => /Authorization header/i.test(step)),
+      false
+    );
     assert.equal(result.result.unresolved_reason_code, null);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
@@ -1107,15 +1223,15 @@ title: "Rebuild indexes after migration"
       summary: "The rebuild-indexes procedure is documented.",
       unsupported_claims: [],
       missing_info: [],
-      verified_citation_ids: input.evidenceBundle.primary.map((item) => item.documentId),
-      display_citation_ids: input.evidenceBundle.primary.map((item) => item.documentId),
+      verified_citation_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)),
+      display_citation_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)),
       verified_claims: ["可以通过迁移工具执行 rebuild indexes 任务来重建索引。"],
       claim_to_citation_map: [
         {
           text: "可以通过迁移工具执行 rebuild indexes 任务来重建索引。",
           kind: "verified_fact",
           verdict: "verified",
-          citation_ids: input.evidenceBundle.primary.map((item) => item.documentId)
+          citation_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item))
         }
       ]
     };
@@ -1225,15 +1341,15 @@ title: "Rebuild indexes after migration"
       summary: "The rebuild-indexes procedure is documented.",
       unsupported_claims: [],
       missing_info: [],
-      verified_citation_ids: input.evidenceBundle.primary.map((item) => item.documentId),
-      display_citation_ids: input.evidenceBundle.primary.map((item) => item.documentId),
+      verified_citation_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)),
+      display_citation_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)),
       verified_claims: ["可以通过迁移工具执行 rebuild indexes 任务来重建索引。"],
       claim_to_citation_map: [
         {
           text: "可以通过迁移工具执行 rebuild indexes 任务来重建索引。",
           kind: "verified_fact",
           verdict: "verified",
-          citation_ids: input.evidenceBundle.primary.map((item) => item.documentId)
+          citation_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item))
         }
       ]
     };
@@ -1333,6 +1449,85 @@ title: "Update a issue"
       result.result.support_answer?.sections.map((section) => section.title),
       ["接口信息", "必填参数及获取方式", "关键说明"]
     );
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent recovers the documented create-issue scope instead of drifting to sibling API scopes", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/create-a-issue.api.mdx",
+    `---
+title: "Create an issue"
+---
+
+# Create an issue
+
+通过 POST /project/issues 创建工作项。
+需要 OAuth scope: write:project:issue
+`
+  );
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/create-a-issue-comment.api.mdx",
+    `---
+title: "Create issue comment"
+---
+
+# Create issue comment
+
+通过 POST /project/issues/{issueID}/comments 创建工作项评论。
+需要 OAuth scope: write:project:issue-comment
+`
+  );
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/auth/scope.md",
+    `# Scopes
+
+## Issue
+
+- write:project:issue: Add, edit, delete issues
+- write:project:issue-comment: Add, edit, delete issue comments
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "api_scope_auth",
+      specialist_agent: "api-specialist",
+      answer_contract: "Provide the exact API scope first."
+    },
+    evidencePlanOverride: {
+      required_doc_kinds: ["openapi/api", "permissions"],
+      retrieval_rounds: 2,
+      allow_refinement: true,
+      stop_after_grounded_evidence: false
+    }
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "OpenAPI 创建 issue 需要哪些 scope？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-create-issue-scope-recovery"
+    });
+
+    assert.match(result.result.answer, /write:project:issue/);
+    assert.doesNotMatch(result.result.answer, /write:project:issue-comment/);
+    assert.equal(result.result.support_answer?.render_variant, "api");
+    assert.equal(result.result.citations.length > 0, true);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });
@@ -1884,7 +2079,7 @@ The ONESQL syntax reference explicitly supports ORDER BY and GROUP BY clauses.
     const cited = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].find((item) =>
       /execute onesql query/i.test(item.title)
     );
-    const verifiedId = cited?.documentId ? [cited.documentId] : [];
+    const verifiedId = cited ? [resolveSearchReferenceEvidenceId(cited)] : [];
     return {
       verdict: "verified",
       summary: "The cited ONESQL syntax page directly supports the answer.",
@@ -1936,6 +2131,657 @@ The ONESQL syntax reference explicitly supports ORDER BY and GROUP BY clauses.
         has_citation: true
       }
     ]);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent keeps the route specialist active for async-job quality runs even when evidence is already grounded", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/docs/installation/linux-server/requirements.mdx",
+    `---
+title: "Linux server requirements"
+---
+
+# Linux server requirements
+
+ONES self-hosted deployment supports Ubuntu 18/20/24 and Red Hat 8+ for the server environment.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      specialist_budget: 1
+    },
+    evidencePlanOverride: {
+      retrieval_rounds: 1,
+      allow_refinement: false,
+      stop_after_grounded_evidence: true
+    },
+    verification: {
+      verdict: "verified",
+      summary: "The Linux support statement is grounded in the deployment requirements page.",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: ["local:deploy-docs/docs/installation/linux-server/requirements.mdx:root"],
+      display_citation_ids: ["local:deploy-docs/docs/installation/linux-server/requirements.mdx:root"],
+      verified_claims: ["ONES 私有部署服务端支持 Ubuntu 18/20/24 与 Red Hat 8+。"],
+      claim_to_citation_map: [
+        {
+          text: "ONES 私有部署服务端支持 Ubuntu 18/20/24 与 Red Hat 8+。",
+          kind: "verified_fact",
+          verdict: "verified",
+          citation_ids: ["local:deploy-docs/docs/installation/linux-server/requirements.mdx:root"]
+        }
+      ]
+    }
+  });
+  let specialistCalled = false;
+  adapter.writeBehaviorSpecialistAnswer = async () => {
+    specialistCalled = true;
+    return {
+      question_type: "capability_confirmation",
+      render_variant: "behavior",
+      direct_answer: "当前文档明确支持 Ubuntu 18/20/24 与 Red Hat 8+ 作为 ONES 私有部署服务端 Linux 环境。",
+      claims: [
+        {
+          text: "ONES 私有部署服务端支持 Ubuntu 18/20/24 与 Red Hat 8+。",
+          kind: "verified_fact",
+          evidence_ids: ["local:deploy-docs/docs/installation/linux-server/requirements.mdx:root"],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["如果你要做正式部署，优先按 Ubuntu 22.04 或 Red Hat 8+ 规划环境。"],
+      unknowns: [],
+      escalation_needed: false
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "ONES 支持哪些 Linux 发行版？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-async-specialist-not-skipped",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    const stageTrace = result.result.internal_diagnostics?.stage_trace ?? [];
+    assert.equal(specialistCalled, true);
+    assert.equal(stageTrace.find((item) => item.stage === "specialist")?.status, "completed");
+    assert.match(result.result.answer, /Ubuntu 18\/20\/24.*Red Hat 8\+/);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent preserves a grounded specialist answer when downstream judge and citation stages fall back", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/docs/installation/linux-server/requirements.mdx",
+    `---
+title: "Linux server requirements"
+---
+
+# Linux server requirements
+
+ONES self-hosted deployment supports Ubuntu 18/20/24 and Red Hat 8+ for the server environment.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      specialist_budget: 1
+    },
+    evidencePlanOverride: {
+      retrieval_rounds: 1,
+      allow_refinement: false,
+      stop_after_grounded_evidence: true
+    }
+  });
+  adapter.writeBehaviorSpecialistAnswer = async () => ({
+    question_type: "capability_confirmation",
+    render_variant: "behavior",
+    direct_answer: "当前文档明确支持 Ubuntu 18/20/24 与 Red Hat 8+ 作为 ONES 私有部署服务端 Linux 环境。",
+    claims: [
+      {
+        text: "ONES 私有部署服务端支持 Ubuntu 18/20/24 与 Red Hat 8+。",
+        kind: "verified_fact",
+        evidence_ids: ["local:deploy-docs/docs/installation/linux-server/requirements.mdx:root"],
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["正式部署优先按 Ubuntu 22.04 或 Red Hat 8+ 规划环境。"],
+    unknowns: [],
+    escalation_needed: false
+  });
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge timeout");
+  };
+  adapter.bindSupportCitations = async () => {
+    throw new Error("citation binder timeout");
+  };
+  adapter.curateSupportCitations = async () => {
+    throw new Error("citation curator timeout");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("answer composer timeout");
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "ONES 支持哪些 Linux 发行版？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-preserve-specialist-answer-on-downstream-fallback",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.match(result.result.answer, /Ubuntu 18\/20\/24.*Red Hat 8\+/);
+    assert.equal(result.result.support_answer?.mode, "grounded");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent recovers a grounded capability answer from deployment requirements evidence when behavior drafts are generic", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/docs/installation/linux-server/requirements.mdx",
+    `---
+title: "Linux server requirements"
+---
+
+# Linux server requirements
+
+ONES self-hosted deployment supports Ubuntu 18/20/24 and Red Hat 8+ for the server environment.
+Recommended: Ubuntu 22.04 Server.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract: "State the supported Linux distributions first."
+    },
+    evidencePlanOverride: {
+      required_doc_kinds: ["deployment_runbook", "product_guide", "rules"],
+      retrieval_rounds: 1,
+      allow_refinement: false
+    }
+  });
+  adapter.planSupportCase = async (input) => ({
+    goal: input.query,
+    symptom: input.query,
+    object: "linux distributions",
+    action_type: "capability_confirmation",
+    deployment_model: "private_deployment",
+    product_area: "deployment",
+    constraints: [],
+    missing_critical_info: [],
+    retrieval_queries: ["supported operating systems", "linux distributions"],
+    query_plan: {
+      concept_queries: ["supported operating systems", "deployment requirements"],
+      object_queries: ["linux distributions", "server environment"],
+      behavior_queries: ["supported", "recommended"]
+    }
+  });
+  adapter.writeBehaviorSpecialistAnswer = async () => ({
+    question_type: "capability_confirmation",
+    render_variant: "behavior",
+    direct_answer: "I still need one critical detail before I can give a verified answer.",
+    claims: [],
+    next_actions: [],
+    unknowns: [],
+    escalation_needed: false
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "ONES 支持哪些 Linux 发行版？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-capability-salvage-linux-support"
+    });
+
+    assert.match(result.result.answer, /Ubuntu 18\/20\/24.*Red Hat 8\+/);
+    assert.equal(result.result.support_answer?.mode, "grounded");
+    assert.equal(result.result.citations.length > 0, true);
+    assert.match(result.result.citations[0]?.title ?? "", /Linux server requirements/i);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent prefers object-specific requirements evidence over generic deployment introductions for capability salvage", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/prepare/deployment-flow.md",
+    `---
+title: "ONES 私有部署说明"
+---
+
+# ONES 私有部署说明
+
+本文描述在私有部署 ONES(K3s版本)前所需准备的系统环境要求，可配合部署说明阅读。
+`
+  );
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/prepare/deployment-requirements.md",
+    `---
+title: "ONES 私有部署环境要求"
+---
+
+# ONES 私有部署环境要求
+
+## 操作系统要求
+
+只支持 Linux 4.* 以上内核的操作系统，最佳实践为 Ubuntu 22.04 server，支持 64 位 Ubuntu 18/20/24、64 位 Red Hat 8.0 及以上，不再支持 CentOS 7 系列。
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract: "State the supported Linux distributions first."
+    },
+    evidencePlanOverride: {
+      required_doc_kinds: ["deployment_runbook", "product_guide", "rules"],
+      retrieval_rounds: 2,
+      allow_refinement: true
+    }
+  });
+  adapter.planSupportCase = async (input) => ({
+    goal: input.query,
+    symptom: input.query,
+    object: "linux distributions",
+    action_type: "capability_confirmation",
+    deployment_model: "private_deployment",
+    product_area: "deployment",
+    constraints: [],
+    missing_critical_info: [],
+    retrieval_queries: ["ONES Linux 发行版 支持", "ONES 部署环境 Linux 要求", "操作系统要求"],
+    query_plan: {
+      concept_queries: ["supported operating systems", "deployment requirements"],
+      object_queries: ["linux distributions", "Ubuntu Red Hat CentOS"],
+      behavior_queries: ["supported", "recommended"]
+    }
+  });
+  adapter.writeBehaviorSpecialistAnswer = async () => ({
+    question_type: "capability_confirmation",
+    render_variant: "behavior",
+    direct_answer: "I still need one critical detail before I can give a verified answer.",
+    claims: [],
+    next_actions: [],
+    unknowns: [],
+    escalation_needed: false
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "ONES 支持哪些 Linux 发行版？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-capability-salvage-specificity"
+    });
+
+    assert.match(result.result.answer, /Ubuntu 18\/20\/24.*Red Hat 8/);
+    assert.doesNotMatch(result.result.answer, /可配合部署说明阅读/);
+    assert.equal(result.result.support_answer?.mode, "grounded");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent canonicalizes planner capability routes onto the behavior specialist", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/prepare/deployment-requirements.md",
+    `---
+title: "ONES 私有部署环境要求"
+---
+
+# ONES 私有部署环境要求
+
+## 操作系统要求
+
+**（1）操作系统**：只支持Linux 4.* 以上内核的操作系统，最佳实践为Ubuntu 22.04 server，支持64位 Ubuntu 18/20/24、64位Red Hat 8.0及以上等操作系统；不再支持Centos7系列。
+`
+  );
+
+  const adapter = createAdapter({});
+  adapter.planSupportExecution = async () => ({
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: "确认 ONES 支持哪些 Linux 发行版",
+      answer_contract: "基于官方文档给出受支持的 Linux 发行版清单，并注明适用范围与版本限制。",
+      specialist_agent: "howto-specialist",
+      routing_confidence: 0.96
+    },
+    caseFrame: {
+      goal: "确认 ONES 官方支持的 Linux 发行版范围",
+      symptom: "用户需要在部署前确认可用的 Linux 系统发行版",
+      object: "ONES 私有部署运行环境中的 Linux 发行版支持列表",
+      action_type: "capability_confirmation",
+      deployment_model: "private_deployment",
+      product_area: "deployment_environment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["ONES Linux 发行版 支持 私有部署"],
+      query_plan: {
+        concept_queries: ["ONES 私有部署 系统要求 操作系统"],
+        object_queries: ["ONES 支持的 Linux 发行版"],
+        behavior_queries: ["ONES 安装环境要求 Linux 版本"]
+      },
+      question_type: "capability_confirmation",
+      specialist_agent: "howto-specialist",
+      answer_contract: "基于官方文档给出受支持的 Linux 发行版清单，并注明适用范围与版本限制。",
+      routing_confidence: 0.96,
+      required_doc_kinds: ["product_guide", "rules"]
+    },
+    evidencePlan: {
+      query_plan: {
+        concept_queries: ["ONES 私有部署 系统要求 操作系统"],
+        object_queries: ["ONES 支持的 Linux 发行版"],
+        behavior_queries: ["ONES 安装环境要求 Linux 版本"]
+      },
+      evidence_priority: ["系统要求/环境要求", "部署文档"],
+      required_doc_kinds: ["product_guide", "rules"],
+      retrieval_rounds: 1,
+      allow_refinement: false,
+      stop_after_grounded_evidence: true
+    }
+  });
+
+  let behaviorCalled = false;
+  let howtoCalled = false;
+  adapter.writeBehaviorSpecialistAnswer = async () => {
+    behaviorCalled = true;
+    return {
+      question_type: "capability_confirmation",
+      render_variant: "behavior",
+      direct_answer: "I still need one critical detail before I can give a verified answer.",
+      claims: [],
+      next_actions: [],
+      unknowns: [],
+      escalation_needed: false
+    };
+  };
+  adapter.writeHowToSpecialistAnswer = async () => {
+    howtoCalled = true;
+    return {
+      question_type: "how_to_product",
+      render_variant: "how_to",
+      direct_answer: "可以先按部署步骤处理。",
+      claims: [],
+      next_actions: [],
+      unknowns: [],
+      escalation_needed: false
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "ONES 支持哪些 Linux 发行版？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-canonicalize-capability-specialist",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(behaviorCalled, true);
+    assert.equal(howtoCalled, false);
+    assert.deepEqual(result.result.internal_diagnostics?.specialists_used, ["behavior-specialist"]);
+    assert.match(result.result.answer, /Ubuntu 18\/20\/24.*Red Hat 8/);
+    assert.equal(result.result.support_answer?.mode, "grounded");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent grounds free-form planner deployment taxonomy instead of tripping strict policy fallback", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/prepare/deployment-requirements.md",
+    `---
+title: "ONES 私有部署环境要求"
+---
+
+# ONES 私有部署环境要求
+
+## 操作系统要求
+
+只支持 Linux 4.* 以上内核的操作系统，最佳实践为 Ubuntu 22.04 server，支持 64 位 Ubuntu 18/20/24、64 位 Red Hat 8.0 及以上，不再支持 CentOS 7 系列。
+`
+  );
+
+  const adapter = createAdapter({});
+  adapter.planSupportExecution = async () => ({
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: "确认 ONES 支持的 Linux 发行版范围",
+      answer_contract: "基于官方文档给出受支持的 Linux 发行版清单，并注明版本范围、安装/部署前提及是否区分服务端与客户端支持。",
+      specialist_agent: "behavior-specialist",
+      routing_confidence: 0.95
+    },
+    caseFrame: {
+      goal: "确认 ONES 支持哪些 Linux 发行版",
+      symptom: "用户需要了解 ONES 的 Linux 兼容性/支持范围",
+      object: "Linux 发行版支持列表",
+      action_type: "support_matrix_lookup",
+      deployment_model: "private_deployment",
+      product_area: "部署安装与系统兼容性",
+      constraints: [
+        "需要以官方文档中的兼容性/环境要求为准",
+        "优先查找安装部署、系统要求、支持矩阵类文档",
+        "需要区分是否为服务端部署支持，而非泛指浏览器访问端"
+      ],
+      missing_critical_info: [],
+      retrieval_queries: [
+        "ONES Linux 发行版 支持",
+        "ONES 部署环境 Linux 要求",
+        "ONES 安装 文档 操作系统 支持"
+      ],
+      query_plan: {
+        concept_queries: ["兼容性要求 操作系统 支持矩阵", "部署环境 前置条件 系统要求"],
+        object_queries: ["Linux 发行版", "私有部署 服务端 操作系统"],
+        behavior_queries: ["支持哪些发行版", "最低版本/推荐版本"]
+      },
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract: "基于官方文档给出受支持的 Linux 发行版清单，并注明版本范围、安装/部署前提及是否区分服务端与客户端支持。",
+      routing_confidence: 0.95,
+      required_doc_kinds: ["产品部署文档", "安装指南", "系统要求/环境要求", "兼容性或支持矩阵"]
+    },
+    evidencePlan: {
+      query_plan: {
+        concept_queries: ["兼容性要求 操作系统 支持矩阵", "部署环境 前置条件 系统要求"],
+        object_queries: ["Linux 发行版", "私有部署 服务端 操作系统"],
+        behavior_queries: ["支持哪些发行版", "最低版本/推荐版本"]
+      },
+      evidence_priority: ["官方部署安装文档中的系统要求章节", "官方兼容性/支持矩阵文档"],
+      required_doc_kinds: ["产品部署文档", "安装指南", "系统要求/环境要求", "兼容性或支持矩阵"],
+      retrieval_rounds: 2,
+      allow_refinement: true,
+      stop_after_grounded_evidence: true
+    }
+  });
+
+  adapter.writeBehaviorSpecialistAnswer = async () => ({
+    question_type: "capability_confirmation",
+    render_variant: "behavior",
+    direct_answer: "现有文档已说明受支持的 Linux 发行版范围。",
+    claims: [
+      {
+        text: "ONES 私有部署支持 Ubuntu 18/20/24 和 Red Hat 8.0 及以上，不再支持 CentOS 7。",
+        kind: "verified_fact",
+        evidence_ids: [],
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["部署前确认服务器操作系统版本。"],
+    unknowns: [],
+    escalation_needed: false
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "ONES 支持哪些 Linux 发行版？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-live-taxonomy-normalization",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(result.result.retrieval_status, "grounded");
+    assert.equal(result.result.unresolved_reason_code, null);
+    assert.equal(result.caseFrame.product_area, "deployment");
+    assert.match(result.result.answer, /Ubuntu 18\/20\/24.*Red Hat 8/);
+    assert.equal(result.result.references.length > 0, true);
+    assert.equal(String(result.result.references[0]?.supportMetadata?.product_area ?? ""), "deployment");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent recovers a grounded capability answer for product availability questions when behavior drafts are generic", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "docs/admin/account-integration/third-party-integration/azure-ad-and-ones.mdx",
+    `---
+title: "Azure AD & ONES.com"
+---
+
+# Azure AD & ONES.com
+
+Microsoft Azure AD integration is available only in ONES.com Cloud.
+`
+  );
+
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract: "State the documented product availability first."
+    },
+    evidencePlanOverride: {
+      required_doc_kinds: ["product_guide", "rules"],
+      retrieval_rounds: 1,
+      allow_refinement: false
+    }
+  });
+  adapter.planSupportCase = async (input) => ({
+    goal: input.query,
+    symptom: input.query,
+    object: "Azure AD integration",
+    action_type: "capability_confirmation",
+    deployment_model: "private_deployment",
+    product_area: "integrations",
+    constraints: [],
+    missing_critical_info: [],
+    retrieval_queries: ["Azure AD integration", "ONES.com Cloud", "private deployment"],
+    query_plan: {
+      concept_queries: ["Azure AD integration", "product availability"],
+      object_queries: ["Azure AD integration", "ONES.com Cloud"],
+      behavior_queries: ["available only", "supported"]
+    }
+  });
+  adapter.writeBehaviorSpecialistAnswer = async () => ({
+    question_type: "capability_confirmation",
+    render_variant: "behavior",
+    direct_answer: "I still need one critical detail before I can give a verified answer.",
+    claims: [],
+    next_actions: [],
+    unknowns: [],
+    escalation_needed: false
+  });
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "私有部署支持 Azure AD 集成吗？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-capability-salvage-product-availability"
+    });
+
+    assert.match(result.result.answer, /Azure AD.*ONES\.com Cloud/);
+    assert.ok(["grounded", "partial"].includes(String(result.result.support_answer?.mode ?? "")));
+    assert.equal(result.result.citations.length > 0, true);
+    assert.match(result.result.citations[0]?.title ?? "", /Azure AD & ONES\.com/i);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });
@@ -2148,7 +2994,7 @@ This note mentions ONESQL ORDER BY GROUP BY only as unrelated glossary text.
     const cited = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].find((item) =>
       /execute onesql query/i.test(item.title)
     );
-    const verifiedId = cited?.documentId ? [cited.documentId] : [];
+    const verifiedId = cited ? [resolveSearchReferenceEvidenceId(cited)] : [];
     return {
       ...(await originalVerify(input, idempotencyKey, runtime)),
       verdict: "verified",
@@ -2293,7 +3139,7 @@ The retrieved OpenAPI reference explicitly mentions ORDER BY and GROUP BY in the
   });
   adapter.verifySupportAnswer = async (input) => {
     const cited = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental][0];
-    const verifiedId = cited?.documentId ? [cited.documentId] : [];
+    const verifiedId = cited ? [resolveSearchReferenceEvidenceId(cited)] : [];
     return {
       verdict: "partial",
       summary: "Only the syntax-reference claim is supported.",
@@ -2383,7 +3229,7 @@ This page is unrelated to ONESQL semantics.
   });
   adapter.verifySupportAnswer = async (input) => {
     const wrong = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].find((item) => /baseurl/i.test(item.title));
-    const wrongId = wrong?.documentId ? [wrong.documentId] : [];
+    const wrongId = wrong ? [resolveSearchReferenceEvidenceId(wrong)] : [];
     return {
       verdict: "verified",
       summary: "The verifier returned a weak tangential citation.",
@@ -2404,7 +3250,7 @@ This page is unrelated to ONESQL semantics.
   };
   adapter.bindSupportCitations = async (input) => {
     const right = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].find((item) => /execute onesql query/i.test(item.title));
-    const rightId = right?.documentId ? [right.documentId] : [];
+    const rightId = right ? [resolveSearchReferenceEvidenceId(right)] : [];
     return {
       verdict: "verified",
       summary: "The claim was rebound to the direct ONESQL syntax reference.",
@@ -2541,6 +3387,59 @@ If authorization returns page not found, verify Redirect URI, callback URL, and 
     assert.equal(retrievalTrace?.status, "completed");
     assert.equal(typeof routeTrace?.duration_ms, "number");
     assert.equal(typeof retrievalTrace?.reference_count, "number");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("runSupportSearchAgent skips legacy evidence and case planner fallback after unified planner failure in interactive mode", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  const rootDir = await createFixtureRoot();
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+  const adapter = createStageRecordingAdapter();
+  adapter.planSupportExecution = async () => {
+    adapter.calls.push("planSupportExecution");
+    throw new Error("unified planner failed");
+  };
+
+  try {
+    await writeFixture(
+      rootDir,
+      "docs/integrations/github-callback.mdx",
+      `---
+title: "GitHub callback troubleshooting"
+---
+
+# GitHub callback troubleshooting
+
+If authorization returns page not found, verify Redirect URI, callback URL, and baseURL are consistent.
+`
+    );
+    const result = await runSupportSearchAgent({
+      query: "GitHub callback page not found after authorization",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-unified-planner-interactive-fallback",
+      runtime: {
+        deliveryMode: "interactive",
+        overallTimeoutMs: 22000,
+        requestStartedAtMs: Date.now(),
+        allowMultiPassRetrieval: false,
+        allowRefinement: false
+      }
+    });
+
+    const stageTrace = result.result.internal_diagnostics?.stage_trace ?? [];
+    assert.equal(adapter.calls.includes("planSupportExecution"), true);
+    assert.equal(adapter.calls.includes("routeSupportQuestion"), true);
+    assert.equal(adapter.calls.includes("planSupportEvidence"), false);
+    assert.equal(adapter.calls.includes("planSupportCase"), false);
+    assert.equal(result.result.retrieval_status, "grounded");
+    assert.equal(stageTrace.find((item) => item.stage === "evidence_plan")?.status, "skipped");
+    assert.equal(stageTrace.find((item) => item.stage === "case_plan")?.status, "skipped");
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

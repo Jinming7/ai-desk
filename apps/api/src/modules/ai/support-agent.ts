@@ -1545,9 +1545,21 @@ function buildCitations(input: {
     selected.push(item);
     if (selected.length >= 3) break;
   }
+  const normalizeCitationTitle = (reference: SearchReference): string => {
+    const rawTitle = String(reference.title ?? "").trim();
+    if (!/^(get|post|put|patch|delete)\s+\//i.test(rawTitle)) return rawTitle;
+    const canonicalPath = canonicalDocsPath(reference.path) || String(reference.path ?? "").trim();
+    const basename = canonicalPath.split("/").pop() ?? "";
+    const derived = basename
+      .replace(/\.(?:api\.)?mdx?$/i, "")
+      .replace(/^\d+[-_]?/, "")
+      .replace(/[_-]+/g, " ")
+      .trim();
+    return derived ? derived.replace(/\b[a-z]/g, (char) => char.toUpperCase()) : rawTitle;
+  };
   return selected.map((item) => ({
     id: resolveSearchReferenceEvidenceId(item),
-    title: item.title,
+    title: normalizeCitationTitle(item),
     excerpt: item.snippet,
     score: item.score,
     source_url: item.sourceUrl,
@@ -2643,13 +2655,27 @@ type ApiEvidenceCandidate = {
   fieldName?: string;
   method?: string;
   path?: string;
+  scopeValue?: string;
+  requiredParams?: string[];
+  candidateCategory?: "operation" | "field" | "narrative" | "permission";
 };
 
 type ApiOperationIntent = "create" | "read" | "list" | "update" | "delete" | "execute";
 
 function expandApiSemanticFocusTerms(query: string, caseFrame: SupportCaseFrame): string[] {
   const raw = `${query} ${caseFrame.goal} ${caseFrame.object} ${caseFrame.symptom}`.toLowerCase();
-  const expanded = new Set<string>(collectFocusTerms(query, caseFrame));
+  const authFocusedQuery =
+    caseFrame.question_type === "api_scope_auth" || /(token|oauth|scope|权限|鉴权|授权|auth|authorization)/i.test(query);
+  const fieldFocusedQuery =
+    caseFrame.question_type === "api_field_lookup" || /(field|fields|schema|property|properties|字段|属性)/i.test(query);
+  const expanded = new Set<string>(
+    collectFocusTerms(query, caseFrame).filter((term) => {
+      const normalized = term.toLowerCase();
+      if (!authFocusedQuery && /token|oauth|scope|auth|authorization/.test(normalized)) return false;
+      if (!fieldFocusedQuery && /field|fields|issuefield|issuefields|schema|property|properties/.test(normalized)) return false;
+      return true;
+    })
+  );
   const add = (values: string[]) => values.forEach((value) => expanded.add(value));
 
   if (/(标识|id|uuid|identifier|唯一)/i.test(raw)) add(["标识", "id", "uuid", "identifier", "项目id", "属性uuid"]);
@@ -2746,7 +2772,8 @@ function extractApiFieldCandidates(reference: SearchReference, language: "zh" | 
       kind: "verified_fact",
       authority: "canonical",
       score: 0,
-      fieldName
+      fieldName,
+      candidateCategory: "field"
     });
   }
   return candidates;
@@ -2771,10 +2798,68 @@ function extractApiNarrativeCandidates(reference: SearchReference, language: "zh
       evidenceId: resolveSearchReferenceEvidenceId(reference),
       kind: "verified_fact",
       authority: "canonical",
-      score: 0
+      score: 0,
+      candidateCategory: "narrative"
     });
   }
   return candidates;
+}
+
+function extractApiPermissionCandidates(reference: SearchReference, language: "zh" | "en"): ApiEvidenceCandidate[] {
+  const source = buildApiExtractionSource(reference);
+  const profile = getReferenceSupportProfile(reference);
+  const operation = extractApiOperationSignature(reference);
+  const permissionEntries = new Map<string, { scope: string; description?: string }>();
+  const normalizeScopeValue = (value: string): string | null => {
+    const normalized = String(value ?? "")
+      .trim()
+      .replace(/^[`'"]+/, "")
+      .replace(/[`'",.;]+$/, "");
+    return /^[A-Za-z]+:[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*$/.test(normalized) ? normalized : null;
+  };
+  const addPermission = (scope: string, description?: string) => {
+    const normalizedScope = normalizeScopeValue(scope);
+    if (!normalizedScope) return;
+    const existing = permissionEntries.get(normalizedScope);
+    const normalizedDescription = String(description ?? "").trim();
+    permissionEntries.set(normalizedScope, {
+      scope: normalizedScope,
+      description: existing?.description || normalizedDescription || undefined
+    });
+  };
+
+  for (const scope of profile.permissions) {
+    addPermission(scope);
+  }
+  for (const prerequisite of profile.prerequisites) {
+    const match = prerequisite.match(/^scope:(.+)$/i);
+    if (match) addPermission(match[1] ?? "");
+  }
+  for (const match of source.matchAll(/^\s*[-*+]\s*((?:read|write):[A-Za-z0-9:_-]+)\s*:\s*([^\n]+)/gim)) {
+    addPermission(String(match[1] ?? ""), String(match[2] ?? ""));
+  }
+  for (const match of source.matchAll(/\b(?:scope|scopes|权限|鉴权)\b[：:\s`]+([A-Za-z]+:[A-Za-z0-9:_-]+)/gim)) {
+    addPermission(String(match[1] ?? ""));
+  }
+
+  return [...permissionEntries.values()].map(({ scope, description }) => ({
+    text:
+      language === "zh"
+        ? description
+          ? `文档写明 \`${scope}\` 用于 ${description.replace(/[。.]$/, "")}。`
+          : `当前文档写明所需 OAuth scope 是 \`${scope}\`。`
+        : description
+        ? `The documentation states that \`${scope}\` is used for ${description.replace(/[.。]$/, "")}.`
+        : `The documentation states that the required OAuth scope is \`${scope}\`.`,
+    evidenceId: resolveSearchReferenceEvidenceId(reference),
+    kind: "verified_fact",
+    authority: "canonical",
+    score: 0,
+    method: operation.method,
+    path: operation.path,
+    scopeValue: scope,
+    candidateCategory: "permission"
+  }));
 }
 
 function extractApiRequestParamNames(reference: SearchReference): string[] {
@@ -2842,12 +2927,103 @@ function scoreApiIntentAlignment(targetIntents: Set<ApiOperationIntent>, candida
   return score;
 }
 
+function scorePermissionScopeFit(scopeValue: string, focusTerms: string[]): number {
+  const focusText = focusTerms.join(" ").toLowerCase();
+  const genericTokens = new Set(["read", "write", "project", "projects", "oauth", "scope", "scopes", "api", "openapi"]);
+  const scopeTokens = uniqueStrings(
+    scopeValue
+      .toLowerCase()
+      .split(/[:/._-]+/)
+      .map((item) => item.trim())
+      .filter(Boolean),
+    8
+  );
+  let score = 0;
+  for (const token of scopeTokens) {
+    if (genericTokens.has(token)) continue;
+    score += focusText.includes(token) ? 14 : -8;
+  }
+  return score;
+}
+
+function scoreApiScopeAccessFit(scopeValue: string, targetIntents: Set<ApiOperationIntent>): number {
+  const normalizedScope = scopeValue.toLowerCase();
+  const writeScope = normalizedScope.startsWith("write:");
+  const readScope = normalizedScope.startsWith("read:");
+  if (targetIntents.has("create") || targetIntents.has("update") || targetIntents.has("delete") || targetIntents.has("execute")) {
+    if (writeScope) return 20;
+    if (readScope) return -18;
+  }
+  if (targetIntents.has("read") || targetIntents.has("list")) {
+    if (readScope) return 10;
+    if (writeScope) return -4;
+  }
+  return 0;
+}
+
+function tokenMatchesFocus(token: string, focusText: string): boolean {
+  if (!token) return false;
+  if (focusText.includes(token)) return true;
+  if (token.endsWith("s") && token.length > 3 && focusText.includes(token.slice(0, -1))) return true;
+  if (!token.endsWith("s") && token.length > 3 && focusText.includes(`${token}s`)) return true;
+  return false;
+}
+
+function scoreApiOperationFocusFit(candidate: ApiEvidenceCandidate, reference: SearchReference, focusTerms: string[]): number {
+  if (!candidate.path) return 0;
+  const focusText = focusTerms.join(" ").toLowerCase();
+  const genericTokens = new Set([
+    "api",
+    "openapi",
+    "project",
+    "projects",
+    "teamid",
+    "issueid",
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete"
+  ]);
+  const tokenize = (value: string): string[] =>
+    uniqueStrings(
+      value
+        .replace(/([a-z])([A-Z])/g, "$1 $2")
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((token) => token.length >= 3),
+      20
+    );
+  const candidateTokens = uniqueStrings(
+    [...tokenize(candidate.path), ...tokenize(reference.title), ...tokenize(candidate.text)],
+    20
+  );
+  let score = 0;
+  for (const token of candidateTokens) {
+    if (genericTokens.has(token)) continue;
+    score += tokenMatchesFocus(token, focusText) ? 10 : -6;
+  }
+  return score;
+}
+
+function scoreApiOperationTitleIntentFit(title: string, targetIntents: Set<ApiOperationIntent>): number {
+  const normalizedTitle = String(title ?? "").toLowerCase();
+  let score = 0;
+  if (targetIntents.has("create") && /(create|新增|新建|添加)/.test(normalizedTitle)) score += 18;
+  if (targetIntents.has("update") && /(update|更新|修改|变更|edit|patch)/.test(normalizedTitle)) score += 18;
+  if (targetIntents.has("delete") && /(delete|删除|移除|remove)/.test(normalizedTitle)) score += 18;
+  if (targetIntents.has("list") && /(list|列表|status list|枚举)/.test(normalizedTitle)) score += 16;
+  if (targetIntents.has("read") && /(get|detail|详情|获取)/.test(normalizedTitle)) score += 12;
+  return score;
+}
+
 function scoreApiEvidenceCandidate(
   candidate: ApiEvidenceCandidate,
   focusTerms: string[],
   reference: SearchReference,
   primaryBoost: number,
-  targetIntents: Set<ApiOperationIntent>
+  targetIntents: Set<ApiOperationIntent>,
+  caseFrame: SupportCaseFrame
 ): number {
   const haystack = `${candidate.text} ${candidate.fieldName ?? ""} ${candidate.method ?? ""} ${candidate.path ?? ""} ${reference.title} ${reference.headingPath ?? ""} ${reference.path ?? ""}`.toLowerCase();
   let score = primaryBoost + Math.round(reference.score * 10);
@@ -2868,6 +3044,19 @@ function scoreApiEvidenceCandidate(
   if (wantsMember && /项目|project/i.test(candidate.text) && !/成员|member|user|owner|assignee/i.test(candidate.text)) score -= 6;
   if (/(返回包含|returns?)/i.test(candidate.text)) score += 4;
   if (candidate.method && candidate.path) score += 6;
+  if (candidate.scopeValue) {
+    score += caseFrame.question_type === "api_scope_auth" ? 54 : 18;
+    score += scorePermissionScopeFit(candidate.scopeValue, focusTerms);
+    score += scoreApiScopeAccessFit(candidate.scopeValue, targetIntents);
+    score += scoreApiOperationFocusFit(candidate, reference, focusTerms);
+  }
+  if (candidate.candidateCategory === "operation") {
+    score += scoreApiOperationFocusFit(candidate, reference, focusTerms);
+    score += scoreApiOperationTitleIntentFit(reference.title, targetIntents);
+    if (/^(get|post|put|patch|delete)\s+\//i.test(String(reference.title ?? "").trim())) {
+      score -= 8;
+    }
+  }
   score += scoreApiIntentAlignment(
     targetIntents,
     classifyApiOperationCandidate({
@@ -2877,6 +3066,13 @@ function scoreApiEvidenceCandidate(
       snippet: candidate.text
     })
   );
+  if (
+    caseFrame.question_type === "api_scope_auth" &&
+    candidate.scopeValue == null &&
+    /oauth2\/token|access[_ -]?token|authorization|authorize\b/.test(haystack)
+  ) {
+    score -= 28;
+  }
   return score;
 }
 
@@ -2900,15 +3096,12 @@ function recoverEvidenceAnchoredApiDraft(input: {
   const targetIntents = collectApiOperationIntents(input.query, input.caseFrame);
   const wantsIdentifier = focusTerms.some((term) => /标识|id|uuid|identifier/i.test(term));
   const scoredClaims: ApiEvidenceCandidate[] = [];
-  let topOperationMethod = "";
-  let topOperationPath = "";
-  let topOperationScore = -1;
-  let requiredParams: string[] = [];
 
   ranked.forEach((reference, index) => {
     const primaryBoost = index < input.evidenceBundle.primary.length ? 24 : 10;
     const operation = extractApiOperationSignature(reference);
     if (operation.method && operation.path) {
+      const operationRequiredParams = extractApiRequestParamNames(reference);
       const operationCandidate: ApiEvidenceCandidate = {
         text:
           input.language === "zh"
@@ -2919,29 +3112,29 @@ function recoverEvidenceAnchoredApiDraft(input: {
         authority: "canonical",
         score: 0,
         method: operation.method,
-        path: operation.path
+        path: operation.path,
+        requiredParams: operationRequiredParams,
+        candidateCategory: "operation"
       };
-      operationCandidate.score = scoreApiEvidenceCandidate(operationCandidate, focusTerms, reference, primaryBoost, targetIntents);
+      operationCandidate.score = scoreApiEvidenceCandidate(operationCandidate, focusTerms, reference, primaryBoost, targetIntents, input.caseFrame);
       scoredClaims.push(operationCandidate);
-      if (operationCandidate.score > topOperationScore) {
-        topOperationMethod = operation.method;
-        topOperationPath = operation.path;
-        topOperationScore = operationCandidate.score;
-        requiredParams = extractApiRequestParamNames(reference);
-      }
     }
 
     extractApiFieldCandidates(reference, input.language).forEach((candidate) => {
-      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost, targetIntents);
+      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost, targetIntents, input.caseFrame);
       scoredClaims.push(candidate);
     });
     extractApiNarrativeCandidates(reference, input.language).forEach((candidate) => {
-      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost, targetIntents);
+      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost, targetIntents, input.caseFrame);
+      scoredClaims.push(candidate);
+    });
+    extractApiPermissionCandidates(reference, input.language).forEach((candidate) => {
+      candidate.score = scoreApiEvidenceCandidate(candidate, focusTerms, reference, primaryBoost, targetIntents, input.caseFrame);
       scoredClaims.push(candidate);
     });
   });
 
-  const selectedClaims = scoredClaims
+  const rankedCandidates = scoredClaims
     .sort((a, b) => {
       const aIdentifierBoost =
         wantsIdentifier && /字段 (?:id|uuid)|field (?:id|uuid)|项目id|属性uuid/i.test(a.text) ? 50 : 0;
@@ -2949,7 +3142,9 @@ function recoverEvidenceAnchoredApiDraft(input: {
         wantsIdentifier && /字段 (?:id|uuid)|field (?:id|uuid)|项目id|属性uuid/i.test(b.text) ? 50 : 0;
       return b.score + bIdentifierBoost - (a.score + aIdentifierBoost);
     })
-    .filter((candidate, index, all) => all.findIndex((item) => item.text === candidate.text) === index)
+    .filter((candidate, index, all) => all.findIndex((item) => item.text === candidate.text) === index);
+
+  const selectedClaims = rankedCandidates
     .slice(0, 3)
     .map((candidate) => ({
       text: candidate.text,
@@ -2959,6 +3154,10 @@ function recoverEvidenceAnchoredApiDraft(input: {
     }));
 
   if (!selectedClaims.length) return null;
+  const selectedPermissionCandidates = rankedCandidates.filter((candidate) => candidate.scopeValue).slice(0, 3);
+  const rankedOperationCandidate = rankedCandidates.find(
+    (candidate) => candidate.candidateCategory === "operation" && candidate.method && candidate.path
+  );
   const anchorEvidenceId = selectedClaims[0]?.evidence_ids[0];
   const identifierClaim = wantsIdentifier
     ? selectedClaims.find((claim) => /字段 (?:id|uuid)|field (?:id|uuid)|项目id|属性uuid/i.test(claim.text))
@@ -2984,12 +3183,37 @@ function recoverEvidenceAnchoredApiDraft(input: {
       return raw;
     }
   })();
-  const operationMethod = topOperationMethod || input.draft.api_method || undefined;
-  const operationPath = topOperationPath || draftOperationPath || undefined;
+  const preferredPermissionOperation = selectedPermissionCandidates.find(
+    (candidate) => Boolean(candidate.method) && Boolean(candidate.path)
+  );
+  const operationMethod =
+    input.route.question_type === "api_scope_auth"
+      ? preferredPermissionOperation?.method || input.draft.api_method || undefined
+      : rankedOperationCandidate?.method || input.draft.api_method || undefined;
+  const operationPath =
+    input.route.question_type === "api_scope_auth"
+      ? preferredPermissionOperation?.path || draftOperationPath || undefined
+      : rankedOperationCandidate?.path || draftOperationPath || undefined;
   const operationLabel = operationMethod && operationPath ? `${operationMethod} ${operationPath}` : "";
-  const resolvedRequiredParams = requiredParams.length > 0 ? requiredParams : (input.draft.required_params ?? []);
+  const resolvedRequiredParams =
+    input.route.question_type === "api_scope_auth"
+      ? preferredPermissionOperation?.requiredParams?.length
+        ? preferredPermissionOperation.requiredParams
+        : (input.draft.required_params ?? [])
+      : rankedOperationCandidate?.requiredParams?.length
+      ? rankedOperationCandidate.requiredParams
+      : (input.draft.required_params ?? []);
+  const resolvedAuthScope = uniqueStrings(
+    selectedPermissionCandidates.map((candidate) => (candidate.scopeValue ? `\`${candidate.scopeValue}\`` : undefined)),
+    3
+  );
+  const leadingPermissionScope = selectedPermissionCandidates[0]?.scopeValue;
   const directAnswer =
-    input.language === "zh"
+    input.route.question_type === "api_scope_auth" && leadingPermissionScope
+      ? input.language === "zh"
+        ? `当前文档写明所需 OAuth scope 是 \`${leadingPermissionScope}\`。`
+        : `The documentation states that the required OAuth scope is \`${leadingPermissionScope}\`.`
+      : input.language === "zh"
       ? operationLabel
         ? `${directAnswerLead}${directAnswerLead.includes(operationLabel) ? "" : ` 对应接口是 ${operationLabel}。`}`.trim()
         : directAnswerLead
@@ -2998,7 +3222,23 @@ function recoverEvidenceAnchoredApiDraft(input: {
       : directAnswerLead;
 
   const nextActions =
-    input.language === "zh"
+    input.route.question_type === "api_scope_auth" && resolvedAuthScope.length > 0
+      ? input.language === "zh"
+        ? uniqueStrings(
+            [
+              `先申请包含 ${resolvedAuthScope.join(" / ")} 的 OAuth token。`,
+              operationLabel ? `再按 ${operationLabel} 这个接口发起调用。` : ""
+            ],
+            3
+          )
+        : uniqueStrings(
+            [
+              `Request an OAuth token that includes ${resolvedAuthScope.join(" / ")}.`,
+              operationLabel ? `Then call ${operationLabel}.` : ""
+            ],
+            3
+          )
+      : input.language === "zh"
       ? uniqueStrings(
           [
             operationLabel ? `优先按 ${operationLabel} 这个接口核对调用。` : "",
@@ -3027,6 +3267,7 @@ function recoverEvidenceAnchoredApiDraft(input: {
     api_method: operationMethod,
     api_path: operationPath,
     required_params: resolvedRequiredParams,
+    auth_scope: resolvedAuthScope.length > 0 ? resolvedAuthScope : input.draft.auth_scope,
     response_field_hint: responseFieldHint
   };
 }
@@ -3092,7 +3333,7 @@ function buildInitialRetrievalQueries(query: string, caseFrame: SupportCaseFrame
 function combineRetrievalQueries(
   query: string,
   caseFrame: SupportCaseFrame,
-  orchestrator: SearchOrchestrator,
+  orchestrator: Pick<SearchOrchestrator, "normalizeQuery">,
   baseQueries: string[] = []
 ): string[] {
   const apiBridge = buildApiRetrievalBridgeQuery(query, caseFrame);
@@ -3111,6 +3352,11 @@ function combineRetrievalQueries(
     return normalized !== orchestrator.normalizeQuery(query) && !excludedQueries.has(normalized);
   });
 }
+
+type SupportSearchOrchestrator = Pick<
+  SearchOrchestrator,
+  "collectEvidence" | "combineEvidenceCollections" | "refineEvidence" | "normalizeQuery"
+>;
 
 async function writeSpecialistDraft(input: {
   adapter: OpenClawAdapter;
@@ -3194,6 +3440,7 @@ export async function runSupportSearchAgent(input: {
   branch?: string;
   idempotencyKey: string;
   contextType?: "search" | "triage";
+  orchestrator?: SupportSearchOrchestrator;
   ticketContext?: {
     priority: string;
     customerMeta: Record<string, unknown>;
@@ -3207,7 +3454,7 @@ export async function runSupportSearchAgent(input: {
   stageTimings: SupportAgentStageTimings;
 }> {
   const runStartedAt = performance.now();
-  const orchestrator = new SearchOrchestrator(input.adapter);
+  const orchestrator = input.orchestrator ?? new SearchOrchestrator(input.adapter);
   const allowMultiPassRetrieval = input.runtime?.allowMultiPassRetrieval !== false;
   const allowRefinement = input.runtime?.allowRefinement !== false;
   const contextType = input.contextType ?? "search";
@@ -4316,6 +4563,7 @@ export async function runSupportTriageAgent(input: {
   attachments?: string[];
   repoId?: string;
   branch?: string;
+  orchestrator?: SupportSearchOrchestrator;
 }): Promise<{
   analyzeOutput: OpenClawAnalyzeOutput & Record<string, unknown>;
   caseFrame: SupportCaseFrame;
@@ -4336,6 +4584,7 @@ export async function runSupportTriageAgent(input: {
     attachments: input.attachments,
     repoId: input.repoId,
     branch: input.branch,
+    orchestrator: input.orchestrator,
     idempotencyKey: input.idempotencyKey,
     contextType: "triage",
     ticketContext: {

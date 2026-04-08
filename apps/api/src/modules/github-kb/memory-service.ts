@@ -326,62 +326,74 @@ export async function syncDocumentMemoryGraph(input: {
   if (!env.FEATURE_KB_MEMORY_GRAPH) return;
   const buildVersion = input.buildVersion?.trim() || buildMemoryBuildVersion(input.commitSha);
   const activationMode = input.activationMode ?? "immediate";
-  await memoryRepo.deactivateMemoryArtifactsByDocument(input.docId);
-  await memoryRepo.deleteBuildScopedMemoryEntriesForDocument(input.docId, buildVersion);
+  const productArea = String(input.docSupportEvidence.product_area ?? "general") || "general";
+  await memoryRepo.withMemoryScopeLock(
+    {
+      knowledgeSpace: input.knowledgeSpace,
+      repoId: input.repoId,
+      branch: input.branch,
+      productArea,
+      buildVersion: activationMode === "staged" ? buildVersion : undefined
+    },
+    async () => {
+      await memoryRepo.deactivateMemoryArtifactsByDocument(input.docId);
+      await memoryRepo.deleteBuildScopedMemoryEntriesForDocument(input.docId, buildVersion);
 
-  const entries =
-    input.memoryEntries && input.memoryEntries.length
-      ? input.memoryEntries
-      : extractMemoryEntriesForDocument({
-          repoId: input.repoId,
-          knowledgeSpace: input.knowledgeSpace,
-          branch: input.branch,
-          docId: input.docId,
-          path: input.path,
-          title: input.title,
-          buildVersion,
-          docSupportEvidence: input.docSupportEvidence,
-          chunks: input.chunks
-        });
+      const entries =
+        input.memoryEntries && input.memoryEntries.length
+          ? input.memoryEntries
+          : extractMemoryEntriesForDocument({
+              repoId: input.repoId,
+              knowledgeSpace: input.knowledgeSpace,
+              branch: input.branch,
+              docId: input.docId,
+              path: input.path,
+              title: input.title,
+              buildVersion,
+              docSupportEvidence: input.docSupportEvidence,
+              chunks: input.chunks
+            });
 
-  for (const entry of entries) {
-    await memoryRepo.upsertMemoryEntry(entry);
-    await memoryRepo.replaceMemoryAliases(entry.id, entry.aliases);
-    await memoryRepo.replaceMemorySignals(entry.id, entry.signals);
-    await memoryRepo.replaceMemorySources(entry.id, entry.sources);
-    await memoryRepo.replaceMemoryCitations(entry.id, entry.citations ?? []);
-  }
+      for (const entry of entries) {
+        await memoryRepo.upsertMemoryEntry(entry);
+        await memoryRepo.replaceMemoryAliases(entry.id, entry.aliases);
+        await memoryRepo.replaceMemorySignals(entry.id, entry.signals);
+        await memoryRepo.replaceMemorySources(entry.id, entry.sources);
+        await memoryRepo.replaceMemoryCitations(entry.id, entry.citations ?? []);
+      }
 
-  if (activationMode === "immediate") {
-    await memoryRepo.markPriorBuildVersionInactive(input.repoId, input.branch, input.path, buildVersion);
-  }
+      if (activationMode === "immediate") {
+        await memoryRepo.markPriorBuildVersionInactive(input.repoId, input.branch, input.path, buildVersion);
+      }
 
-  const scopeEntries = await memoryRepo.listActiveMemoryEntriesForScope({
-    knowledgeSpace: input.knowledgeSpace,
-    repoId: input.repoId,
-    branch: input.branch,
-    productArea: String(input.docSupportEvidence.product_area ?? "general") || "general",
-    buildVersion: activationMode === "staged" ? buildVersion : undefined,
-    limit: 200
-  });
+      const scopeEntries = await memoryRepo.listActiveMemoryEntriesForScope({
+        knowledgeSpace: input.knowledgeSpace,
+        repoId: input.repoId,
+        branch: input.branch,
+        productArea,
+        buildVersion: activationMode === "staged" ? buildVersion : undefined,
+        limit: 200
+      });
 
-  if (env.FEATURE_KB_MEMORY_RELATION_EXPANSION) {
-    const relations = buildRelationDrafts(scopeEntries);
-    await memoryRepo.replaceRelationsForMemoryIds(scopeEntries.map((item) => item.id), relations);
-  }
+      if (env.FEATURE_KB_MEMORY_RELATION_EXPANSION) {
+        const relations = buildRelationDrafts(scopeEntries);
+        await memoryRepo.replaceRelationsForMemoryIds(scopeEntries.map((item) => item.id), relations);
+      }
 
-  if (env.FEATURE_KB_MEMORY_PROFILES) {
-    const profiles = buildProfileDrafts(scopeEntries, buildVersion);
-    await memoryRepo.upsertMemoryProfiles(profiles);
-    if (activationMode === "immediate") {
-      await memoryRepo.deactivatePriorProfiles(
-        input.repoId,
-        input.branch,
-        buildVersion,
-        profiles.map((item) => item.profile_key)
-      );
+      if (env.FEATURE_KB_MEMORY_PROFILES) {
+        const profiles = buildProfileDrafts(scopeEntries, buildVersion);
+        await memoryRepo.upsertMemoryProfiles(profiles);
+        if (activationMode === "immediate") {
+          await memoryRepo.deactivatePriorProfiles(
+            input.repoId,
+            input.branch,
+            buildVersion,
+            profiles.map((item) => item.profile_key)
+          );
+        }
+      }
     }
-  }
+  );
 }
 
 export async function retrieveGroundedMemoryHits(input: {
