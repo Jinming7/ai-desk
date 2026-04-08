@@ -4,6 +4,7 @@ import { afterEach, before, test } from "node:test";
 import { env, isSafeTestDatabaseUrl } from "../../config/env.js";
 import { pool } from "../../db/client.js";
 import {
+  SUPPORT_SEARCH_JOB_LEASE_INVALID_MESSAGE,
   claimDueSupportSearchJobs,
   enqueueSupportSearchJob,
   getSupportSearchJob,
@@ -143,6 +144,38 @@ test("support search jobs can be claimed, heartbeated, retried, and completed du
   const completed = await getSupportSearchJob(reclaimed[0].id);
   assert.equal(completed?.status, "completed");
   assert.equal(completed?.result?.answer, "Supported Linux distributions are documented in the deployment requirements guide.");
+});
+
+test("heartbeatSupportSearchJob rejects once the running lease is no longer owned by the worker", async () => {
+  const queued = await enqueueSupportSearchJob(buildJobInput());
+  const claimed = await claimDueSupportSearchJobs({
+    limit: 1,
+    leaseMs: 60_000,
+    workerId: "test-worker"
+  });
+
+  assert.equal(claimed.length, 1);
+  assert.ok(claimed[0].leaseKey);
+
+  await pool.query(
+    `UPDATE ai_support_search_jobs
+     SET lease_key = $2,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [queued.id, "replacement-lease"]
+  );
+
+  await assert.rejects(
+    heartbeatSupportSearchJob({
+      jobId: claimed[0].id,
+      leaseKey: claimed[0].leaseKey!,
+      stageState: {
+        currentStage: "planner",
+        lastCompletedStage: "route"
+      }
+    }),
+    new RegExp(SUPPORT_SEARCH_JOB_LEASE_INVALID_MESSAGE, "i")
+  );
 });
 
 test("requeueStaleRunningSupportSearchJobs returns expired running jobs back to queued state", async () => {

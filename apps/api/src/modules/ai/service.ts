@@ -11,6 +11,7 @@ import {
   enqueueSupportSearchJob,
   getSupportSearchJob,
   heartbeatSupportSearchJob,
+  isSupportSearchJobLeaseInvalidError,
   markSupportSearchJobFailed,
   markSupportSearchJobSucceeded,
   requeueStaleRunningSupportSearchJobs,
@@ -1638,6 +1639,45 @@ export async function runDueSearchModeJobs(
   };
 }
 
+type ResolveClaimedSearchModeJobFailureDeps = {
+  getSupportSearchJob: (jobId: string) => Promise<SupportSearchJob | null>;
+  markSupportSearchJobFailed: typeof markSupportSearchJobFailed;
+};
+
+export async function resolveClaimedSearchModeJobFailureStatus(
+  input: {
+    job: SupportSearchJob;
+    error: unknown;
+    retryable: boolean;
+    retryDelaySeconds?: number;
+  },
+  deps: ResolveClaimedSearchModeJobFailureDeps = {
+    getSupportSearchJob,
+    markSupportSearchJobFailed
+  }
+): Promise<SupportSearchJob["status"]> {
+  if (isSupportSearchJobLeaseInvalidError(input.error)) {
+    const current = await deps.getSupportSearchJob(input.job.id);
+    return current?.status ?? "failed_retryable";
+  }
+
+  try {
+    return await deps.markSupportSearchJobFailed({
+      jobId: input.job.id,
+      leaseKey: input.job.leaseKey ?? "",
+      errorMessage: input.error instanceof Error ? input.error.message : String(input.error),
+      retryable: input.retryable,
+      retryDelaySeconds: input.retryDelaySeconds
+    });
+  } catch (markError) {
+    if (isSupportSearchJobLeaseInvalidError(markError)) {
+      const current = await deps.getSupportSearchJob(input.job.id);
+      return current?.status ?? "failed_retryable";
+    }
+    throw markError;
+  }
+}
+
 async function runClaimedSearchModeJob(
   job: SupportSearchJob,
   adapter: OpenClawAdapter
@@ -1691,10 +1731,9 @@ async function runClaimedSearchModeJob(
 
     return "completed";
   } catch (error) {
-    return markSupportSearchJobFailed({
-      jobId: job.id,
-      leaseKey: job.leaseKey,
-      errorMessage: error instanceof Error ? error.message : String(error),
+    return resolveClaimedSearchModeJobFailureStatus({
+      job,
+      error,
       retryable: true,
       retryDelaySeconds: 5
     });

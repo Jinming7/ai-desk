@@ -59,6 +59,11 @@ export interface SupportSearchJob {
 }
 
 const ACTIVE_JOB_STATUSES: SupportSearchJobStatus[] = ["queued", "running", "partial_result_ready", "failed_retryable"];
+export const SUPPORT_SEARCH_JOB_LEASE_INVALID_MESSAGE = "Support search job lease is no longer valid";
+
+export function isSupportSearchJobLeaseInvalidError(error: unknown): boolean {
+  return error instanceof Error && error.message === SUPPORT_SEARCH_JOB_LEASE_INVALID_MESSAGE;
+}
 
 function normalizeTimestamp(value: Date | string | null | undefined): string | null {
   if (!value) return null;
@@ -243,7 +248,7 @@ export async function heartbeatSupportSearchJob(input: {
   stageState?: Record<string, unknown>;
   leaseMs?: number;
 }): Promise<void> {
-  await pool.query(
+  const result = await pool.query(
     `UPDATE ai_support_search_jobs
      SET stage_state_json = COALESCE($3::jsonb, stage_state_json),
          lease_expires_at = NOW() + ($4::int * INTERVAL '1 millisecond'),
@@ -253,6 +258,9 @@ export async function heartbeatSupportSearchJob(input: {
        AND status = 'running'`,
     [input.jobId, input.leaseKey, input.stageState ? JSON.stringify(input.stageState) : null, input.leaseMs ?? 60_000]
   );
+  if ((result.rowCount ?? 0) === 0) {
+    throw new Error(SUPPORT_SEARCH_JOB_LEASE_INVALID_MESSAGE);
+  }
 }
 
 export async function markSupportSearchJobFailed(input: {
@@ -277,7 +285,7 @@ export async function markSupportSearchJobFailed(input: {
       throw new Error("Support search job not found");
     }
     if (job.lease_key !== input.leaseKey || job.status !== "running") {
-      throw new Error("Support search job lease is no longer valid");
+      throw new Error(SUPPORT_SEARCH_JOB_LEASE_INVALID_MESSAGE);
     }
 
     const attempts = job.attempts + 1;
@@ -335,7 +343,7 @@ export async function markSupportSearchJobSucceeded(input: {
     [input.jobId, input.leaseKey, JSON.stringify(input.result), input.stageState ? JSON.stringify(input.stageState) : null]
   );
   if ((result.rowCount ?? 0) === 0) {
-    throw new Error("Support search job lease is no longer valid");
+    throw new Error(SUPPORT_SEARCH_JOB_LEASE_INVALID_MESSAGE);
   }
 }
 
