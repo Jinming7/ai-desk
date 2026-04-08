@@ -274,6 +274,14 @@ function createBudgetProbeAdapter(observedTimeoutMs: {
     },
     async verifyTriageInsight(): Promise<SupportVerificationResult> {
       return verifiedResult;
+    },
+    async healthCheck() {
+      return {
+        ok: true,
+        mode: "mock" as const,
+        configuredAgents: [],
+        reachableAgents: []
+      };
     }
   };
 }

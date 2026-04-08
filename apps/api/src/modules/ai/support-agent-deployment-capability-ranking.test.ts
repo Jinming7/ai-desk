@@ -201,20 +201,34 @@ function createDeploymentCapabilityAdapter(): OpenClawAdapter {
       throw new Error("troubleshooting specialist should not be used");
     },
     async judgeSupportAnswer(input: OpenClawSupportVerifierInput): Promise<SupportVerificationResult> {
-      const claim = input.draftSupportAnswer.claims[0];
+      const draft = input.draftSupportAnswer;
+      if (!draft) {
+        return buildVerifiedResult({
+          evidenceIds: [],
+          claimText: ""
+        });
+      }
+      const claim = draft.claims[0];
       return buildVerifiedResult({
         evidenceIds: claim?.evidence_ids ?? [],
-        claimText: claim?.text ?? input.draftSupportAnswer.direct_answer
+        claimText: claim?.text ?? draft.direct_answer
       });
     },
     async verifySupportAnswer(input: OpenClawSupportVerifierInput): Promise<SupportVerificationResult> {
       return this.judgeSupportAnswer(input, "", undefined);
     },
     async bindSupportCitations(input: OpenClawSupportVerifierInput): Promise<SupportVerificationResult> {
-      const claim = input.draftSupportAnswer.claims[0];
+      const draft = input.draftSupportAnswer;
+      if (!draft) {
+        return buildVerifiedResult({
+          evidenceIds: [],
+          claimText: ""
+        });
+      }
+      const claim = draft.claims[0];
       return buildVerifiedResult({
         evidenceIds: claim?.evidence_ids ?? [],
-        claimText: claim?.text ?? input.draftSupportAnswer.direct_answer
+        claimText: claim?.text ?? draft.direct_answer
       });
     },
     async selectDisplayCitations(input: OpenClawSupportCitationSelectorInput): Promise<{ display_citation_ids: string[] }> {
@@ -267,6 +281,14 @@ function createDeploymentCapabilityAdapter(): OpenClawAdapter {
         evidenceIds: [],
         claimText: ""
       });
+    },
+    async healthCheck() {
+      return {
+        ok: true,
+        mode: "mock" as const,
+        configuredAgents: [],
+        reachableAgents: []
+      };
     }
   };
 }
