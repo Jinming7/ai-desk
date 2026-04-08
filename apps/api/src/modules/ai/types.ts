@@ -222,6 +222,8 @@ export interface SupportAgentStageTimings {
 
 export type SupportAgentRuntimeStage =
   | "support_main"
+  | "support_main_plan"
+  | "support_main_draft"
   | "route"
   | "evidence_plan"
   | "case_plan"

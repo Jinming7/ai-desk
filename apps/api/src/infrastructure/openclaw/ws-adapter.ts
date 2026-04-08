@@ -12,8 +12,10 @@ import type {
   OpenClawClassifyIntentInput,
   OpenClawClassifyIntentOutput,
   OpenClawRuntimeContext,
-  OpenClawSupportMainInput,
-  OpenClawSupportMainOutput,
+  OpenClawSupportMainDraftInput,
+  OpenClawSupportMainDraftOutput,
+  OpenClawSupportMainPlanInput,
+  OpenClawSupportMainPlanOutput,
   OpenClawSupportExecutionPlannerInput,
   OpenClawSupportExecutionPlannerOutput,
   OpenClawSupportEvidencePlannerInput,
@@ -727,28 +729,24 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  async runSupportMainAgent(
-    input: OpenClawSupportMainInput,
+  async planSupportMainAgent(
+    input: OpenClawSupportMainPlanInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
-  ): Promise<OpenClawSupportMainOutput> {
+  ): Promise<OpenClawSupportMainPlanOutput> {
     const prompt = [
       "You are the single support-main agent for the ONES customer-facing support runtime.",
-      "You own retrieval and answer drafting inside one run, but every factual claim must stay reference-bound.",
+      "Stage: plan.",
       "Return ONLY valid JSON with keys:",
       "route({question_type,user_goal,answer_contract,specialist_agent,routing_confidence,specialist_budget}),",
       "case_frame({goal,symptom,object,action_type,deployment_model,product_area,constraints(string[]),missing_critical_info(string[]),retrieval_queries(string[]),query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),required_doc_kinds(string[])}),",
-      "draft_answer({question_type,render_variant,direct_answer,claims([{text,kind(verified_fact|grounded_inference|operational_advice|unknown),reference_ids(string[]),authority(canonical|assistive)}]),next_actions(string[]),unknowns(string[]),escalation_needed(boolean),api_method,api_path,required_params(string[]),auth_scope(string[]),response_field_hint,important_note,related_variant,steps(string[]),prerequisites(string[]),limits_or_notes(string[]),most_likely_explanation,confirmed_facts(string[]),what_to_check_next(string[]),most_likely_causes(string[]),recommended_checks(string[]),required_followup_info(string[]),when_to_handoff}),",
-      "references([{reference_id,title,snippet,sourceUrl,path,headingPath,repoSourceUrl}]),",
       "retrieval_queries(string[])",
       "Rules:",
-      "- Retrieval remains agent-driven. You must retrieve and answer inside this run.",
-      "- reference_id is the only claim anchor. Every factual claim in draft_answer.claims must use reference_ids, never document ids.",
-      "- Every reference_id used by a claim must exist in references[].",
-      "- references must contain the strongest grounded sources you actually relied on.",
-      "- Prefer concise, high-signal references that can be reconciled to a published KB snapshot using sourceUrl/path/headingPath.",
+      "- Do not draft the customer answer in this stage.",
+      "- Do not retrieve inside this run. Produce retrieval queries only for the backend published-KB retrieval step.",
+      "- retrieval_queries must be specific, object-aware, and suitable for published-snapshot grounding.",
       "- Only put genuinely blocking items into missing_critical_info and unknowns.",
-      "- Keep route, case_frame, and draft_answer mutually consistent.",
+      "- Keep route, case_frame, and retrieval_queries mutually consistent.",
       "- Answer in the user's language.",
       `context_type: ${input.contextType}`,
       `language: ${input.language}`,
@@ -768,7 +766,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
     const parsed = (await this.runJsonPrompt(
       prompt,
-      `${idempotencyKey}:support-main`,
+      `${idempotencyKey}:support-main:plan`,
       runtime,
       undefined,
       "support-main"
@@ -778,21 +776,6 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       (((parsed.case_frame as Partial<SupportCaseFrame> | undefined) ?? {}) as Partial<SupportCaseFrame>),
       input.query
     );
-    const draft = ((parsed.draft_answer as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    const references = Array.isArray(parsed.references)
-      ? parsed.references
-          .map((item) => item as Record<string, unknown>)
-          .map((item) => ({
-            reference_id: typeof item.reference_id === "string" ? item.reference_id : "",
-            title: typeof item.title === "string" ? item.title : "",
-            snippet: typeof item.snippet === "string" ? item.snippet : "",
-            sourceUrl: typeof item.sourceUrl === "string" ? item.sourceUrl : "",
-            path: typeof item.path === "string" ? item.path : undefined,
-            headingPath: typeof item.headingPath === "string" ? item.headingPath : undefined,
-            repoSourceUrl: typeof item.repoSourceUrl === "string" ? item.repoSourceUrl : undefined
-          }))
-          .filter((item) => item.reference_id)
-      : [];
     const retrievalQueries = Array.isArray(parsed.retrieval_queries)
       ? parsed.retrieval_queries.map((item) => String(item)).filter(Boolean)
       : rawCaseFrame.retrieval_queries;
@@ -806,9 +789,73 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         answer_contract: route.answer_contract,
         routing_confidence: route.routing_confidence
       },
+      retrievalQueries
+    };
+  }
+
+  async draftSupportMainAgent(
+    input: OpenClawSupportMainDraftInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportMainDraftOutput> {
+    const prompt = [
+      "You are the single support-main agent for the ONES customer-facing support runtime.",
+      "Stage: draft.",
+      "Return ONLY valid JSON with keys:",
+      "draft_answer({question_type,render_variant,direct_answer,claims([{text,kind(verified_fact|grounded_inference|operational_advice|unknown),reference_ids(string[]),authority(canonical|assistive)}]),next_actions(string[]),unknowns(string[]),escalation_needed(boolean),api_method,api_path,required_params(string[]),auth_scope(string[]),response_field_hint,important_note,related_variant,steps(string[]),prerequisites(string[]),limits_or_notes(string[]),most_likely_explanation,confirmed_facts(string[]),what_to_check_next(string[]),most_likely_causes(string[]),recommended_checks(string[]),required_followup_info(string[]),when_to_handoff})",
+      "Rules:",
+      "- Use ONLY provided_evidence. Do not retrieve.",
+      "- reference_id is the only claim anchor. Every factual claim in draft_answer.claims must use reference_ids from provided_evidence.",
+      "- Never invent reference_ids. Never use evidence_id as a claim reference.",
+      "- If the evidence is insufficient, keep unknowns narrow and factual.",
+      "- Do not expose internal reasoning labels.",
+      "- Answer in the user's language.",
+      `context_type: ${input.contextType}`,
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      `route: ${JSON.stringify(input.route)}`,
+      `case_frame: ${JSON.stringify(input.caseFrame)}`,
+      `knowledge_scope: ${JSON.stringify(input.knowledgeScope ?? {})}`,
+      `provided_evidence: ${JSON.stringify(
+        input.providedEvidence.map((item) => ({
+          reference_id: item.reference_id,
+          evidence_id: item.evidence_id,
+          title: item.title,
+          snippet: item.snippet,
+          sourceUrl: item.sourceUrl,
+          path: item.path,
+          headingPath: item.headingPath,
+          repoSourceUrl: item.repoSourceUrl,
+          authority: item.authority,
+          sourceType: item.sourceType,
+          metadata: compactSupportMetadata(item.metadata)
+        }))
+      )}`,
+      ...(input.conversationHistory?.length
+        ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
+        : []),
+      ...(input.ticketContext
+        ? [
+            `ticket_priority: ${input.ticketContext.priority}`,
+            `customer_meta: ${JSON.stringify(input.ticketContext.customerMeta)}`,
+            `ticket_history: ${JSON.stringify(input.ticketContext.history.slice(-6))}`
+          ]
+        : [])
+    ].join("\n");
+
+    const parsed = (await this.runJsonPrompt(
+      prompt,
+      `${idempotencyKey}:support-main:draft`,
+      runtime,
+      undefined,
+      "support-main"
+    )) as Record<string, unknown>;
+    const draft = ((parsed.draft_answer as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+
+    return {
       draftAnswer: {
-        question_type: normalizeQuestionType(draft.question_type ?? route.question_type),
-        render_variant: normalizeSupportRenderVariant(draft.render_variant, route.question_type),
+        question_type: normalizeQuestionType(draft.question_type ?? input.route.question_type),
+        render_variant: normalizeSupportRenderVariant(draft.render_variant, input.route.question_type),
         direct_answer: typeof draft.direct_answer === "string" ? draft.direct_answer : "",
         claims: Array.isArray(draft.claims)
           ? draft.claims
@@ -823,11 +870,11 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
                     : item.kind === "unknown"
                     ? "unknown"
                     : "verified_fact"
-                ) as OpenClawSupportMainOutput["draftAnswer"]["claims"][number]["kind"],
+                ) as OpenClawSupportMainDraftOutput["draftAnswer"]["claims"][number]["kind"],
                 reference_ids: Array.isArray(item.reference_ids)
                   ? item.reference_ids.map((value) => String(value)).filter(Boolean)
                   : [],
-                authority: (item.authority === "assistive" ? "assistive" : "canonical") as OpenClawSupportMainOutput["draftAnswer"]["claims"][number]["authority"]
+                authority: (item.authority === "assistive" ? "assistive" : "canonical") as OpenClawSupportMainDraftOutput["draftAnswer"]["claims"][number]["authority"]
               }))
               .filter((item) => item.text)
           : [],
@@ -862,9 +909,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
           ? draft.required_followup_info.map((item) => String(item)).filter(Boolean)
           : undefined,
         when_to_handoff: typeof draft.when_to_handoff === "string" ? draft.when_to_handoff : undefined
-      },
-      references,
-      retrievalQueries
+      }
     };
   }
 

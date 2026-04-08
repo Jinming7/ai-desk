@@ -6,7 +6,9 @@ import type {
   OpenClawAdapter,
   OpenClawAnalyzeOutput,
   OpenClawRuntimeContext,
-  OpenClawSupportMainOutput
+  OpenClawSupportMainDraftOutput,
+  OpenClawSupportMainPlanOutput,
+  OpenClawSupportMainProvidedEvidence
 } from "../../infrastructure/openclaw/types.js";
 import type {
   DraftSupportAnswer,
@@ -3744,16 +3746,6 @@ type SupportAgentStageProgress = {
   lastCompletedStage?: string;
 };
 
-type NormalizedSupportMainReference = {
-  reference_id: string;
-  title: string;
-  snippet: string;
-  sourceUrl: string;
-  path?: string;
-  headingPath?: string;
-  repoSourceUrl?: string;
-};
-
 type NormalizedSupportMainDraftClaim = {
   text: string;
   kind: SpecialistDraftAnswer["claims"][number]["kind"];
@@ -3765,12 +3757,10 @@ type NormalizedSupportMainDraftAnswer = Omit<SpecialistDraftAnswer, "claims"> & 
   claims: NormalizedSupportMainDraftClaim[];
 };
 
-type NormalizedSupportMainResult = {
+type NormalizedSupportMainPlanResult = {
   route: SupportQuestionRoute;
   caseFrame: SupportCaseFrame;
   evidencePlan: SupportEvidencePlan;
-  draftAnswer: NormalizedSupportMainDraftAnswer;
-  references: NormalizedSupportMainReference[];
   retrievalQueries: string[];
 };
 
@@ -3977,27 +3967,10 @@ function normalizeSupportMainDraftAnswer(
   };
 }
 
-function normalizeSupportMainReferences(value: unknown): NormalizedSupportMainReference[] {
-  return Array.isArray(value)
-    ? value
-        .map((item) => item as Record<string, unknown>)
-        .map((item) => ({
-          reference_id: typeof item.reference_id === "string" ? item.reference_id : "",
-          title: typeof item.title === "string" ? item.title : "",
-          snippet: typeof item.snippet === "string" ? item.snippet : "",
-          sourceUrl: typeof item.sourceUrl === "string" ? item.sourceUrl : "",
-          path: typeof item.path === "string" ? item.path : undefined,
-          headingPath: typeof item.headingPath === "string" ? item.headingPath : undefined,
-          repoSourceUrl: typeof item.repoSourceUrl === "string" ? item.repoSourceUrl : undefined
-        }))
-        .filter((item) => item.reference_id)
-    : [];
-}
-
-function normalizeSupportMainOutput(
-  value: OpenClawSupportMainOutput | Record<string, unknown> | unknown,
+function normalizeSupportMainPlanOutput(
+  value: OpenClawSupportMainPlanOutput | Record<string, unknown> | unknown,
   query: string
-): NormalizedSupportMainResult {
+): NormalizedSupportMainPlanResult {
   const parsed = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
   const route = normalizeSupportMainRoute(parsed.route, query);
   const retrievalQueries = uniqueStrings(
@@ -4013,111 +3986,58 @@ function normalizeSupportMainOutput(
     route,
     caseFrame,
     evidencePlan: deriveSupportMainEvidencePlan(caseFrame, query, retrievalQueries),
-    draftAnswer: normalizeSupportMainDraftAnswer(parsed.draftAnswer ?? parsed.draft_answer, route),
-    references: normalizeSupportMainReferences(parsed.references),
     retrievalQueries
   };
 }
 
-function normalizeSupportReferenceLocator(value: string | undefined): string {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[?#].*$/, "")
-    .replace(/\/+$/, "");
+function normalizeSupportMainDraftOutput(
+  value: OpenClawSupportMainDraftOutput | Record<string, unknown> | unknown,
+  route: SupportQuestionRoute
+): { draftAnswer: NormalizedSupportMainDraftAnswer } {
+  const parsed = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return {
+    draftAnswer: normalizeSupportMainDraftAnswer(parsed.draftAnswer ?? parsed.draft_answer, route)
+  };
 }
 
-function normalizeSupportReferenceHeading(value: string | undefined): string {
-  return String(value ?? "").trim().toLowerCase();
+function mergeSupportReferenceMetadata(reference: SearchReference): Record<string, unknown> | undefined {
+  const merged = {
+    ...(((reference.supportMetadata ?? {}) as Record<string, unknown>) ?? {}),
+    ...(((reference.chunkMetadata ?? {}) as Record<string, unknown>) ?? {}),
+    ...(((reference.docMetadata ?? {}) as Record<string, unknown>) ?? {})
+  };
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-function normalizeSupportReferenceText(value: string | undefined): string {
-  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function scoreSupportMainReferenceMatch(
-  agentReference: NormalizedSupportMainReference,
-  candidate: SearchReference
-): number {
-  let score = 0;
-  const agentPath = normalizeSupportReferenceLocator(agentReference.path);
-  const candidatePath = normalizeSupportReferenceLocator(candidate.path);
-  if (agentPath && candidatePath) {
-    if (agentPath === candidatePath) score += 90;
-    else if (candidatePath.endsWith(agentPath) || agentPath.endsWith(candidatePath)) score += 36;
-  }
-  const agentSourceUrl = normalizeSupportReferenceLocator(agentReference.sourceUrl);
-  const candidateSourceUrl = normalizeSupportReferenceLocator(candidate.sourceUrl);
-  if (agentSourceUrl && candidateSourceUrl) {
-    if (agentSourceUrl === candidateSourceUrl) score += 84;
-    else if (candidateSourceUrl.includes(agentSourceUrl) || agentSourceUrl.includes(candidateSourceUrl)) score += 24;
-  }
-  const agentRepoSourceUrl = normalizeSupportReferenceLocator(agentReference.repoSourceUrl);
-  const candidateRepoSourceUrl = normalizeSupportReferenceLocator(candidate.repoSourceUrl);
-  if (agentRepoSourceUrl && candidateRepoSourceUrl) {
-    if (agentRepoSourceUrl === candidateRepoSourceUrl) score += 84;
-    else if (candidateRepoSourceUrl.includes(agentRepoSourceUrl) || agentRepoSourceUrl.includes(candidateRepoSourceUrl)) score += 24;
-  }
-  const agentHeading = normalizeSupportReferenceHeading(agentReference.headingPath);
-  const candidateHeading = normalizeSupportReferenceHeading(candidate.headingPath);
-  if (agentHeading && candidateHeading) {
-    if (agentHeading === candidateHeading) score += 20;
-    else score -= 8;
-  }
-  const agentTitle = normalizeSupportReferenceText(agentReference.title);
-  const candidateTitle = normalizeSupportReferenceText(candidate.title);
-  if (agentTitle && candidateTitle) {
-    if (agentTitle === candidateTitle) score += 14;
-    else if (candidateTitle.includes(agentTitle) || agentTitle.includes(candidateTitle)) score += 6;
-  }
-  const agentSnippet = normalizeSupportReferenceText(agentReference.snippet).slice(0, 140);
-  const candidateSnippet = normalizeSupportReferenceText(candidate.snippet);
-  if (agentSnippet && candidateSnippet) {
-    if (candidateSnippet.includes(agentSnippet) || agentSnippet.includes(candidateSnippet.slice(0, agentSnippet.length))) {
-      score += 10;
-    }
-  }
-  return score;
-}
-
-function reconcileSupportMainReferences(input: {
-  agentReferences: NormalizedSupportMainReference[];
-  candidateReferences: SearchReference[];
-}) {
+function buildSupportMainProvidedEvidence(input: { references: SearchReference[]; limit?: number }): {
+  providedEvidence: OpenClawSupportMainProvidedEvidence[];
+  referenceMap: Map<string, SearchReference>;
+  visibleReferences: SearchReference[];
+} {
+  const visibleReferences = input.references.slice(0, input.limit ?? 8);
   const referenceMap = new Map<string, SearchReference>();
-  const matchedReferences = new Map<string, SearchReference>();
-  const unresolvedReferenceIds: string[] = [];
-
-  for (const agentReference of input.agentReferences) {
-    const scored = input.candidateReferences
-      .map((candidate) => ({
-        candidate,
-        score: scoreSupportMainReferenceMatch(agentReference, candidate)
-      }))
-      .filter((item) => item.score > 0)
-      .sort((left, right) => right.score - left.score);
-    const best = scored[0];
-    const second = scored[1];
-    const ambiguous =
-      Boolean(best) &&
-      Boolean(second) &&
-      resolveSearchReferenceEvidenceId(best.candidate) !== resolveSearchReferenceEvidenceId(second.candidate) &&
-      second.score >= best.score - 6;
-
-    if (!best || best.score < 60 || ambiguous) {
-      unresolvedReferenceIds.push(agentReference.reference_id);
-      continue;
-    }
-
-    const evidenceId = resolveSearchReferenceEvidenceId(best.candidate);
-    referenceMap.set(agentReference.reference_id, best.candidate);
-    matchedReferences.set(evidenceId, best.candidate);
-  }
+  const providedEvidence = visibleReferences.map((reference, index) => {
+    const referenceId = `support-main-ref-${index + 1}`;
+    referenceMap.set(referenceId, reference);
+    return {
+      reference_id: referenceId,
+      evidence_id: resolveSearchReferenceEvidenceId(reference),
+      title: reference.title,
+      snippet: reference.snippet,
+      sourceUrl: reference.sourceUrl,
+      path: reference.path,
+      headingPath: reference.headingPath,
+      repoSourceUrl: reference.repoSourceUrl,
+      authority: reference.authority,
+      sourceType: reference.sourceType,
+      metadata: mergeSupportReferenceMetadata(reference)
+    };
+  });
 
   return {
+    providedEvidence,
     referenceMap,
-    matchedReferences: [...matchedReferences.values()],
-    unresolvedReferenceIds: uniqueStrings(unresolvedReferenceIds, 32)
+    visibleReferences
   };
 }
 
@@ -4197,7 +4117,12 @@ function buildSupportMainOrchestrationTrace() {
   const resolved = resolveStageSpecificAgent("support-main");
   return [
     {
-      stage: "support-main",
+      stage: "support_main_plan",
+      agent_id: resolved.agentId,
+      model: resolved.model ?? null
+    },
+    {
+      stage: "support_main_draft",
       agent_id: resolved.agentId,
       model: resolved.model ?? null
     }
@@ -4240,7 +4165,7 @@ async function runSingleAgentSupportSearch(input: {
   const markStageCompleted = (stage: string): void => {
     lastCompletedStage = stage;
   };
-  const supportMainRuntime = withStageRuntime(
+  const supportMainPlanRuntime = withStageRuntime(
     buildDeliveryAwareStageRuntime(
       input.runtime,
       {
@@ -4255,12 +4180,12 @@ async function runSingleAgentSupportSearch(input: {
       }
     ),
     "support-main",
-    `${input.idempotencyKey}:support-main`
+    `${input.idempotencyKey}:support-main:plan`
   );
 
-  await reportStageProgress("support_main");
-  const supportMainStartedAt = performance.now();
-  const rawSupportMain = await input.adapter.runSupportMainAgent!(
+  await reportStageProgress("support_main_plan");
+  const supportMainPlanStartedAt = performance.now();
+  const rawSupportMainPlan = await input.adapter.planSupportMainAgent!(
     {
       contextType: input.contextType,
       language: input.language,
@@ -4272,15 +4197,15 @@ async function runSingleAgentSupportSearch(input: {
         branch: input.branch
       }
     },
-    `${input.idempotencyKey}:support-main`,
-    supportMainRuntime
+    `${input.idempotencyKey}:support-main:plan`,
+    supportMainPlanRuntime
   );
-  const supportMainTiming = stageTiming("completed", elapsedMs(supportMainStartedAt));
-  markStageCompleted("support_main");
+  const supportMainPlanTiming = stageTiming("completed", elapsedMs(supportMainPlanStartedAt));
+  markStageCompleted("support_main_plan");
 
-  const normalized = normalizeSupportMainOutput(rawSupportMain, input.query);
+  const normalizedPlan = normalizeSupportMainPlanOutput(rawSupportMainPlan, input.query);
   const validationQueries = uniqueStrings(
-    [...normalized.retrievalQueries, ...normalized.caseFrame.retrieval_queries, input.query],
+    [...normalizedPlan.retrievalQueries, ...normalizedPlan.caseFrame.retrieval_queries, input.query],
     8
   );
 
@@ -4293,7 +4218,7 @@ async function runSingleAgentSupportSearch(input: {
       runtime: input.runtime,
       answerLanguage: input.language,
       attachments: input.attachments,
-      caseFrame: normalized.caseFrame,
+      caseFrame: normalizedPlan.caseFrame,
       repoId: input.repoId,
       branch: input.branch
     })
@@ -4322,14 +4247,58 @@ async function runSingleAgentSupportSearch(input: {
     }));
   markStageCompleted("retrieval_validation");
 
-  const reconciled = reconcileSupportMainReferences({
-    agentReferences: normalized.references,
-    candidateReferences: validationEvidenceResult.value.references
+  const draftEvidence = buildSupportMainProvidedEvidence({
+    references: validationEvidenceResult.value.references,
+    limit: 8
   });
+  const supportMainDraftRuntime = withStageRuntime(
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 10_000,
+        minimumTimeoutMs: 6_000,
+        stageTimeoutMs: 18_000
+      },
+      {
+        reserveMs: 25_000,
+        minimumTimeoutMs: 18_000,
+        stageTimeoutMs: 60_000
+      }
+    ),
+    "support-main",
+    `${input.idempotencyKey}:support-main:draft`
+  );
+
+  await reportStageProgress("support_main_draft");
+  const supportMainDraftStartedAt = performance.now();
+  const rawSupportMainDraft = await input.adapter.draftSupportMainAgent!(
+    {
+      contextType: input.contextType,
+      language: input.language,
+      query: input.query,
+      conversationHistory: input.conversationHistory,
+      ticketContext: input.ticketContext,
+      knowledgeScope: {
+        repoId: input.repoId,
+        branch: input.branch
+      },
+      route: normalizedPlan.route,
+      caseFrame: normalizedPlan.caseFrame,
+      providedEvidence: draftEvidence.providedEvidence
+    },
+    `${input.idempotencyKey}:support-main:draft`,
+    supportMainDraftRuntime
+  );
+  const supportMainDraftTiming = stageTiming("completed", elapsedMs(supportMainDraftStartedAt), {
+    reference_count: draftEvidence.providedEvidence.length
+  });
+  markStageCompleted("support_main_draft");
+
+  const normalizedDraft = normalizeSupportMainDraftOutput(rawSupportMainDraft, normalizedPlan.route);
   const draftSupportAnswer = convertSupportMainDraftToSpecialistDraft({
-    route: normalized.route,
-    draftAnswer: normalized.draftAnswer,
-    referenceMap: reconciled.referenceMap
+    route: normalizedPlan.route,
+    draftAnswer: normalizedDraft.draftAnswer,
+    referenceMap: draftEvidence.referenceMap
   });
   const selectedPrimaryIds = uniqueStrings(
     draftSupportAnswer.claims
@@ -4342,17 +4311,17 @@ async function runSingleAgentSupportSearch(input: {
     3
   );
   const selectedSupplementalIds = uniqueStrings(
-    reconciled.matchedReferences
+    draftEvidence.visibleReferences
       .map((reference) => resolveSearchReferenceEvidenceId(reference))
       .filter((evidenceId) => !selectedPrimaryIds.includes(evidenceId)),
     5
   );
   const evidenceBundle = buildEvidenceBundle({
-    references: reconciled.matchedReferences,
+    references: draftEvidence.visibleReferences,
     confidence: validationEvidenceResult.value.confidence,
     fallbackUsed: validationEvidenceResult.value.fallbackUsed,
     resolvedQueries: validationEvidenceResult.value.resolvedQueries,
-    caseFrame: normalized.caseFrame,
+    caseFrame: normalizedPlan.caseFrame,
     query: input.query,
     selection: {
       primary_ids: selectedPrimaryIds,
@@ -4365,16 +4334,16 @@ async function runSingleAgentSupportSearch(input: {
       language: input.language,
       draftAnswer: draftSupportAnswer,
       missingInfo: sanitizeMissingCriticalInfo([
-        ...normalized.caseFrame.missing_critical_info,
+        ...normalizedPlan.caseFrame.missing_critical_info,
         ...draftSupportAnswer.unknowns
       ], 3)
     }),
     evidenceBundle,
     query: input.query,
-    caseFrame: normalized.caseFrame
+    caseFrame: normalizedPlan.caseFrame
   });
   const missingInfo = sanitizeMissingCriticalInfo(
-    [...verification.missing_info, ...normalized.caseFrame.missing_critical_info, ...draftSupportAnswer.unknowns],
+    [...verification.missing_info, ...normalizedPlan.caseFrame.missing_critical_info, ...draftSupportAnswer.unknowns],
     3
   );
   const mode = resolveSupportMode({
@@ -4386,7 +4355,7 @@ async function runSingleAgentSupportSearch(input: {
   const supportAnswer = buildSupportAnswerFromDraft({
     language: input.language,
     mode,
-    route: normalized.route,
+    route: normalizedPlan.route,
     draft: draftSupportAnswer,
     verification,
     missingInfo,
@@ -4402,7 +4371,7 @@ async function runSingleAgentSupportSearch(input: {
       ? "KB_RETRIEVAL_UNAVAILABLE"
       : verification.verified_citation_ids.length > 0
       ? null
-      : reconciled.unresolvedReferenceIds.length > 0 || normalized.references.length > 0
+      : draftEvidence.visibleReferences.length > 0
       ? "LOW_CONFIDENCE"
       : "NO_MATCHING_KB";
   const clarificationRound = mode === "clarification" ? input.currentRound + 1 : 0;
@@ -4416,28 +4385,34 @@ async function runSingleAgentSupportSearch(input: {
       : "GROUNDABLE_ANSWER_READY";
   const stageTimings: SupportAgentStageTimings = {
     total_ms: elapsedMs(runStartedAt),
-    planner: skippedStageTiming(),
+    planner: supportMainPlanTiming,
     retrieval_base: validationEvidenceResult.timing,
     retrieval_extra: skippedStageTiming(),
-    writer: supportMainTiming,
+    writer: supportMainDraftTiming,
     verifier: skippedStageTiming()
   };
   const stageTrace: SupportAgentStageTraceEntry[] = [
     stageTraceEntry({
-      stage: "support_main",
-      timing: supportMainTiming,
+      stage: "support_main_plan",
+      timing: supportMainPlanTiming,
       runtimeStage: "support-main",
-      idempotencyKey: `${input.idempotencyKey}:support-main`
+      idempotencyKey: `${input.idempotencyKey}:support-main:plan`
     }),
     stageTraceEntry({
       stage: "retrieval",
       timing: validationEvidenceResult.timing,
       idempotencyKey: `${input.idempotencyKey}:support-main:validation`
+    }),
+    stageTraceEntry({
+      stage: "support_main_draft",
+      timing: supportMainDraftTiming,
+      runtimeStage: "support-main",
+      idempotencyKey: `${input.idempotencyKey}:support-main:draft`
     })
   ];
 
   return {
-    caseFrame: normalized.caseFrame,
+    caseFrame: normalizedPlan.caseFrame,
     evidenceBundle,
     verification,
     stageTimings,
@@ -4445,7 +4420,7 @@ async function runSingleAgentSupportSearch(input: {
       session_id: "",
       answer: supportAnswer.direct_answer,
       answer_language: input.language,
-      case_frame: normalized.caseFrame,
+      case_frame: normalizedPlan.caseFrame,
       support_answer: supportAnswer,
       verification,
       structured_answer: structuredAnswer,
@@ -4454,7 +4429,7 @@ async function runSingleAgentSupportSearch(input: {
       retrieval_status:
         validationEvidenceResult.value.retrievalStatus === "kb_unavailable"
           ? "kb_unavailable"
-          : reconciled.matchedReferences.length
+          : draftEvidence.visibleReferences.length
           ? "grounded"
           : "no_results",
       unresolved_reason_code: unresolvedReasonCode,
@@ -4465,8 +4440,8 @@ async function runSingleAgentSupportSearch(input: {
       show_create_ticket_now: mode === "handoff",
       follow_up_question: mode === "clarification" ? missingInfo[0] ?? null : null,
       internal_diagnostics: {
-        route: normalized.route,
-        evidence_plan: normalized.evidencePlan,
+        route: normalizedPlan.route,
+        evidence_plan: normalizedPlan.evidencePlan,
         stage_budget: {
           retrieval_rounds: 1,
           allow_refinement: false,
@@ -4595,7 +4570,7 @@ export async function runSupportSearchAgent(input: {
   const allowRefinement = input.runtime?.allowRefinement !== false;
   const contextType = input.contextType ?? "search";
   const runtimePolicy = resolveSupportRuntimePolicy(input.runtime);
-  if (env.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME && input.adapter.runSupportMainAgent) {
+  if (env.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME && input.adapter.planSupportMainAgent && input.adapter.draftSupportMainAgent) {
     return runSingleAgentSupportSearch({
       ...input,
       contextType,

@@ -3672,13 +3672,13 @@ test("runSupportSearchAgent rejects ambiguous bare document ids when multiple ev
   assert.equal(result.result.support_answer?.mode === "grounded", false);
 });
 
-test("runSupportSearchAgent single-agent runtime bypasses legacy stages and only keeps reconciled citations", async () => {
+test("runSupportSearchAgent single-agent runtime uses support-main plan plus draft stages and only keeps provided-evidence citations", async () => {
   const originalSingleAgentRuntime = (env as { FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean })
     .FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
   (env as { FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean }).FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
 
   const adapter = createAdapter({}) as OpenClawAdapter & {
-    runSupportMainAgent?: (
+    planSupportMainAgent?: (
       input: {
         contextType: "search" | "triage";
         language: "zh" | "en";
@@ -3687,7 +3687,22 @@ test("runSupportSearchAgent single-agent runtime bypasses legacy stages and only
       idempotencyKey: string,
       runtime?: OpenClawRuntimeContext
     ) => Promise<unknown>;
+    draftSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        providedEvidence: Array<{
+          reference_id: string;
+          evidence_id: string;
+          sourceUrl: string;
+        }>;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
   };
+  let observedProvidedEvidence: Array<{ reference_id: string; evidence_id: string; sourceUrl: string }> = [];
 
   adapter.routeSupportQuestion = async () => {
     throw new Error("legacy route stage must not run in single-agent mode");
@@ -3707,7 +3722,7 @@ test("runSupportSearchAgent single-agent runtime bypasses legacy stages and only
   adapter.composeCustomerAnswer = async () => {
     throw new Error("legacy answer composer must not run in single-agent mode");
   };
-  adapter.runSupportMainAgent = async (_input, _idempotencyKey, _runtime) => ({
+  adapter.planSupportMainAgent = async (_input, _idempotencyKey, _runtime) => ({
     route: {
       question_type: "api_scope_auth",
       user_goal: "Find the required scope for the issue comment API.",
@@ -3726,7 +3741,12 @@ test("runSupportSearchAgent single-agent runtime bypasses legacy stages and only
       missing_critical_info: [],
       retrieval_queries: ["issue comment api scope"]
     },
-    draftAnswer: {
+    retrievalQueries: ["issue comment api scope"]
+  });
+  adapter.draftSupportMainAgent = async (input, _idempotencyKey, _runtime) => {
+    observedProvidedEvidence = input.providedEvidence;
+    return {
+      draftAnswer: {
       question_type: "api_scope_auth",
       render_variant: "api",
       direct_answer: "The issue comment API requires the documented comment scope.",
@@ -3734,7 +3754,7 @@ test("runSupportSearchAgent single-agent runtime bypasses legacy stages and only
         {
           text: "The issue comment API requires write:project.",
           kind: "verified_fact",
-          reference_ids: ["ref-comment-scope"],
+          reference_ids: [input.providedEvidence[0]?.reference_id ?? ""],
           authority: "canonical"
         },
         {
@@ -3748,19 +3768,9 @@ test("runSupportSearchAgent single-agent runtime bypasses legacy stages and only
       unknowns: [],
       escalation_needed: false,
       auth_scope: ["write:project"]
-    },
-    references: [
-      {
-        reference_id: "ref-comment-scope",
-        title: "Add issue comment",
-        snippet: "Scope: write:project",
-        sourceUrl: "https://docs.ones.com/openapi/add-issue-comment",
-        path: "open-docs/docs/openapi/api/add-issue-comment.api.mdx",
-        headingPath: "Permissions"
       }
-    ],
-    retrievalQueries: ["issue comment api scope"]
-  });
+    };
+  };
 
   const validationReference: SearchReference = {
     documentId: "doc:add-issue-comment",
@@ -3816,9 +3826,16 @@ test("runSupportSearchAgent single-agent runtime bypasses legacy stages and only
     assert.deepEqual(result.result.internal_diagnostics?.claim_graph?.map((item) => item.text), [
       "The issue comment API requires write:project."
     ]);
+    assert.equal(observedProvidedEvidence.length, 1);
+    assert.equal(observedProvidedEvidence[0]?.evidence_id, "chunk:comment-scope");
+    assert.equal(observedProvidedEvidence[0]?.sourceUrl, validationReference.sourceUrl);
     assert.equal((result.result.internal_diagnostics as { runtime_mode?: string } | undefined)?.runtime_mode, "single_agent");
     assert.equal(
-      result.result.internal_diagnostics?.orchestration_trace?.some((item) => item.stage === "support-main"),
+      result.result.internal_diagnostics?.orchestration_trace?.some((item) => item.stage === "support_main_plan"),
+      true
+    );
+    assert.equal(
+      result.result.internal_diagnostics?.orchestration_trace?.some((item) => item.stage === "support_main_draft"),
       true
     );
     assert.equal(

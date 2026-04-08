@@ -4,8 +4,10 @@ import type {
   OpenClawAnalyzeOutput,
   OpenClawHealthCheckInput,
   OpenClawHealthCheckResult,
-  OpenClawSupportMainInput,
-  OpenClawSupportMainOutput,
+  OpenClawSupportMainDraftInput,
+  OpenClawSupportMainDraftOutput,
+  OpenClawSupportMainPlanInput,
+  OpenClawSupportMainPlanOutput,
   OpenClawSupportEvidencePlannerInput,
   OpenClawSupportAnswerComposerInput,
   OpenClawSupportCitationSelectorInput,
@@ -183,11 +185,11 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  async runSupportMainAgent(
-    input: OpenClawSupportMainInput,
+  async planSupportMainAgent(
+    input: OpenClawSupportMainPlanInput,
     _idempotencyKey: string,
     _runtime?: OpenClawRuntimeContext
-  ): Promise<OpenClawSupportMainOutput> {
+  ): Promise<OpenClawSupportMainPlanOutput> {
     const route = await this.routeSupportQuestion({
       contextType: input.contextType,
       language: input.language,
@@ -201,18 +203,6 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       conversationHistory: input.conversationHistory,
       ticketContext: input.ticketContext
     }, `${input.query}:support-main:case`);
-    const search = await this.searchKnowledge({
-      query: input.query,
-      topK: 3,
-      index: "public_kb"
-    }, `${input.query}:support-main`);
-    const references = search.hits.slice(0, 3).map((hit, index) => ({
-      reference_id: `mock-ref-${index + 1}`,
-      title: hit.title,
-      snippet: hit.snippet,
-      sourceUrl: hit.sourceUrl
-    }));
-    const primaryReference = references[0];
 
     return {
       route,
@@ -223,14 +213,26 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
         answer_contract: route.answer_contract,
         routing_confidence: route.routing_confidence
       },
+      retrievalQueries: [input.query]
+    };
+  }
+
+  async draftSupportMainAgent(
+    input: OpenClawSupportMainDraftInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportMainDraftOutput> {
+    const primaryReference = input.providedEvidence[0];
+
+    return {
       draftAnswer: {
-        question_type: route.question_type,
+        question_type: input.route.question_type,
         render_variant:
-          route.specialist_agent === "api-specialist"
+          input.route.specialist_agent === "api-specialist"
             ? "api"
-            : route.specialist_agent === "howto-specialist"
+            : input.route.specialist_agent === "howto-specialist"
             ? "how_to"
-            : route.specialist_agent === "behavior-specialist"
+            : input.route.specialist_agent === "behavior-specialist"
             ? "behavior"
             : "troubleshooting",
         direct_answer:
@@ -247,11 +249,9 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
             ]
           : [],
         next_actions: [],
-        unknowns: caseFrame.missing_critical_info.slice(0, 3),
+        unknowns: input.caseFrame.missing_critical_info.slice(0, 3),
         escalation_needed: false
-      },
-      references,
-      retrievalQueries: [input.query]
+      }
     };
   }
 

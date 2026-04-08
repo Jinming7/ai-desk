@@ -45,12 +45,14 @@ export const runtimeScenarioCaseSchema = z.object({
     .array(
       z.enum([
         "support_main",
+        "support_main_plan",
         "route",
         "evidence_plan",
         "case_plan",
         "retrieval",
         "retrieval_refine",
         "evidence_selection",
+        "support_main_draft",
         "specialist",
         "generic_writer",
         "verification",
@@ -64,12 +66,14 @@ export const runtimeScenarioCaseSchema = z.object({
     .array(
       z.enum([
         "support_main",
+        "support_main_plan",
         "route",
         "evidence_plan",
         "case_plan",
         "retrieval",
         "retrieval_refine",
         "evidence_selection",
+        "support_main_draft",
         "specialist",
         "generic_writer",
         "verification",
@@ -83,12 +87,14 @@ export const runtimeScenarioCaseSchema = z.object({
     .array(
       z.enum([
         "support_main",
+        "support_main_plan",
         "route",
         "evidence_plan",
         "case_plan",
         "retrieval",
         "retrieval_refine",
         "evidence_selection",
+        "support_main_draft",
         "specialist",
         "generic_writer",
         "verification",

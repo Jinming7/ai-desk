@@ -243,7 +243,7 @@ export interface OpenClawSupportEvidenceSelectorInput {
   references: SearchReference[];
 }
 
-export interface OpenClawSupportMainInput {
+export interface OpenClawSupportMainPlanInput {
   contextType: "search" | "triage";
   language: "zh" | "en";
   query: string;
@@ -260,14 +260,24 @@ export interface OpenClawSupportMainInput {
   };
 }
 
-export interface OpenClawSupportMainReference {
+export interface OpenClawSupportMainProvidedEvidence {
   reference_id: string;
+  evidence_id: string;
   title: string;
   snippet: string;
   sourceUrl: string;
   path?: string;
   headingPath?: string;
   repoSourceUrl?: string;
+  authority?: SearchReference["authority"];
+  sourceType?: SearchReference["sourceType"];
+  metadata?: Record<string, unknown>;
+}
+
+export interface OpenClawSupportMainDraftInput extends OpenClawSupportMainPlanInput {
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  providedEvidence: OpenClawSupportMainProvidedEvidence[];
 }
 
 export interface OpenClawSupportMainDraftClaim {
@@ -304,12 +314,14 @@ export interface OpenClawSupportMainDraftAnswer {
   when_to_handoff?: string;
 }
 
-export interface OpenClawSupportMainOutput {
+export interface OpenClawSupportMainPlanOutput {
   route: SupportQuestionRoute;
   caseFrame: SupportCaseFrame;
-  draftAnswer: OpenClawSupportMainDraftAnswer;
-  references: OpenClawSupportMainReference[];
   retrievalQueries: string[];
+}
+
+export interface OpenClawSupportMainDraftOutput {
+  draftAnswer: OpenClawSupportMainDraftAnswer;
 }
 
 export interface OpenClawSupportCitationSelectorInput {
@@ -352,11 +364,16 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawSupportExecutionPlannerOutput>;
-  runSupportMainAgent?(
-    input: OpenClawSupportMainInput,
+  planSupportMainAgent?(
+    input: OpenClawSupportMainPlanInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
-  ): Promise<OpenClawSupportMainOutput>;
+  ): Promise<OpenClawSupportMainPlanOutput>;
+  draftSupportMainAgent?(
+    input: OpenClawSupportMainDraftInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportMainDraftOutput>;
   planSupportCase(
     input: OpenClawSupportPlannerInput,
     idempotencyKey: string,
