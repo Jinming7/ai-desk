@@ -114,6 +114,10 @@ function executionFallbackModel() {
   return env.OPENCLAW_AGENT_MODEL_EXECUTION.trim() || env.OPENCLAW_AGENT_MODEL.trim() || undefined;
 }
 
+export function isSupportMainRuntimeEnabled(): boolean {
+  return env.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME || Boolean(env.OPENCLAW_AGENT_ID_SUPPORT_MAIN.trim());
+}
+
 function resolveSearchStageBinding(stage: SearchStage): SearchStageBinding {
   const envAgentId =
     stage === "retrieval"
@@ -437,10 +441,8 @@ function buildTopologyHash(searchStages: SearchStageBinding[], supportStages: St
 }
 
 export function getAiTopology(): AiTopologySnapshot {
-  const includeSupportMain =
-    env.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME || Boolean(env.OPENCLAW_AGENT_ID_SUPPORT_MAIN.trim());
   const supportStages = [
-    ...(includeSupportMain ? [resolveStageBinding("support-main")] : []),
+    ...(isSupportMainRuntimeEnabled() ? [resolveStageBinding("support-main")] : []),
     resolveStageBinding("router"),
     resolveStageBinding("evidence-planner"),
     resolveStageBinding("planner"),

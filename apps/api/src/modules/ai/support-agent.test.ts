@@ -3847,3 +3847,608 @@ test("runSupportSearchAgent single-agent runtime uses support-main plan plus dra
       originalSingleAgentRuntime;
   }
 });
+
+test("runSupportSearchAgent uses support-main execution when support-main is explicitly configured even without the feature flag", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = false;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    draftSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        providedEvidence: Array<{
+          reference_id: string;
+          evidence_id: string;
+          sourceUrl: string;
+        }>;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+  };
+
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy route stage must not run when support-main is explicitly configured");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when support-main is explicitly configured");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when support-main is explicitly configured");
+  };
+  adapter.writeApiSpecialistAnswer = async () => {
+    throw new Error("legacy specialist must not run when support-main is explicitly configured");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("legacy verifier must not run when support-main is explicitly configured");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("legacy answer composer must not run when support-main is explicitly configured");
+  };
+  adapter.planSupportMainAgent = async () => ({
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: "Confirm whether private deployment capacity expansion is supported.",
+      answer_contract: "Answer directly and cite the published support knowledge.",
+      specialist_agent: "behavior-specialist",
+      routing_confidence: 0.95
+    },
+    caseFrame: {
+      goal: "Confirm whether private deployment capacity expansion is supported.",
+      symptom: "Capability confirmation",
+      object: "private deployment capacity expansion",
+      action_type: "lookup",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["private deployment capacity expansion support"]
+    },
+    retrievalQueries: ["private deployment capacity expansion support"]
+  });
+  adapter.draftSupportMainAgent = async (input) => ({
+    draftAnswer: {
+      question_type: "capability_confirmation",
+      render_variant: "behavior",
+      direct_answer: "Private deployment supports capacity expansion when the deployment plan and operating conditions match the documented guidance.",
+      claims: [
+        {
+          text: "The published deployment guidance confirms private deployment capacity expansion support.",
+          kind: "verified_fact",
+          reference_ids: [input.providedEvidence[0]?.reference_id ?? ""],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["Check the current deployment mode and operating constraints against the documented guidance."],
+      unknowns: [],
+      escalation_needed: false
+    }
+  });
+
+  const validationReference: SearchReference = {
+    documentId: "doc:private-deployment-capacity",
+    evidenceId: "chunk:private-deployment-capacity",
+    title: "Private deployment capacity expansion",
+    snippet: "Private deployment supports capacity expansion under the documented operating guidance.",
+    sourceUrl: "https://docs.ones.com/private-deployment/capacity-expansion",
+    path: "docs/private-deployment/capacity-expansion.mdx",
+    headingPath: "Capacity expansion",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.98,
+    retrievedAt: "2026-04-08T12:30:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence() {
+      return {
+        query: "private deployment capacity expansion support",
+        answer: "",
+        confidence: 0.98,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: ["private deployment capacity expansion support"],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("single-agent validation should not require refinement in this test");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "私有化部署是否支持容量扩容？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-single-agent-explicit-binding"
+    });
+
+    assert.equal((result.result.internal_diagnostics as { runtime_mode?: string } | undefined)?.runtime_mode, "single_agent");
+    assert.equal(
+      result.result.internal_diagnostics?.orchestration_trace?.some((item) => item.stage === "support_main_plan"),
+      true
+    );
+    assert.equal(
+      result.result.internal_diagnostics?.orchestration_trace?.some((item) => item.stage === "router"),
+      false
+    );
+    assert.deepEqual(result.verification.verified_citation_ids, ["chunk:private-deployment-capacity"]);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
+test("runSupportSearchAgent single-agent canonicalizes free-form planner metadata before retrieval", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    draftSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        providedEvidence: Array<{
+          reference_id: string;
+          evidence_id: string;
+          sourceUrl: string;
+        }>;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+  };
+  let observedCaseFrame: SupportCaseFrame | undefined;
+
+  adapter.planSupportMainAgent = async () => ({
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: "确认私有化部署是否支持容量扩容",
+      answer_contract: "直接回答是否支持以及适用边界。",
+      specialist_agent: "behavior-specialist",
+      routing_confidence: 0.94
+    },
+    caseFrame: {
+      goal: "判断 ONES 私有化部署是否支持容量扩容",
+      symptom: "用户咨询私有化部署场景下的容量扩展能力",
+      object: "ONES 私有化部署",
+      action_type: "容量扩容咨询",
+      deployment_model: "私有化部署",
+      product_area: "部署与运维/容量规划",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: [
+        "ONES 私有化部署 容量扩容 是否支持",
+        "ONES 私有化部署 扩容 指南"
+      ],
+      required_doc_kinds: ["私有化部署文档", "运维手册", "系统架构说明", "版本发布说明"]
+    },
+    retrievalQueries: ["ONES 私有化部署 容量扩容 是否支持", "ONES 私有化部署 扩容 指南"]
+  });
+  adapter.draftSupportMainAgent = async (input) => ({
+    draftAnswer: {
+      question_type: "capability_confirmation",
+      render_variant: "behavior",
+      direct_answer: "私有化部署支持容量扩容，具体边界取决于部署架构与资源条件。",
+      claims: [
+        {
+          text: "私有化部署支持容量扩容，具体边界取决于部署架构与资源条件。",
+          kind: "verified_fact",
+          reference_ids: [input.providedEvidence[0]?.reference_id ?? ""],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["核对部署架构和资源规划约束。"],
+      unknowns: [],
+      escalation_needed: false
+    }
+  });
+
+  const validationReference: SearchReference = {
+    documentId: "doc:deployment-flow",
+    evidenceId: "chunk:deployment-flow",
+    title: "ONES 私有部署说明",
+    snippet: "私有化部署支持在满足架构和资源条件时进行扩容。",
+    sourceUrl: "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-flow",
+    path: "deploy/prepare/deployment-flow",
+    headingPath: "扩容",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.96,
+    retrievedAt: "2026-04-08T14:00:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { caseFrame?: SupportCaseFrame }) {
+      observedCaseFrame = input.caseFrame;
+      return {
+        query: "ONES 私有化部署 容量扩容 是否支持",
+        answer: "",
+        confidence: 0.96,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: ["ONES 私有化部署 容量扩容 是否支持"],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("single-agent validation should not require refinement in this test");
+    }
+  };
+
+  try {
+    await coreRunSupportSearchAgent({
+      query: "私有化部署是否支持容量扩容？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-single-agent-canonicalization"
+    });
+
+    assert.equal(observedCaseFrame?.product_area, "deployment");
+    assert.deepEqual(observedCaseFrame?.required_doc_kinds, ["deployment_runbook", "product_guide", "rules"]);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
+test("runSupportSearchAgent single-agent falls back capability questions away from troubleshooting routing", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    draftSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        route: SupportQuestionRoute;
+        providedEvidence: Array<{
+          reference_id: string;
+          evidence_id: string;
+          sourceUrl: string;
+        }>;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+  };
+  let observedRoute: SupportQuestionRoute | undefined;
+
+  adapter.planSupportMainAgent = async () => ({
+    route: {
+      question_type: "troubleshooting",
+      user_goal: "确认私有化部署是否支持容量扩容",
+      answer_contract: "直接回答是否支持。",
+      specialist_agent: "troubleshooting-specialist",
+      routing_confidence: 0.93
+    },
+    caseFrame: {
+      goal: "判断 ONES 私有化部署是否支持容量扩容",
+      symptom: "用户咨询私有化部署场景下的容量扩展能力",
+      object: "ONES 私有化部署",
+      action_type: "容量扩容咨询",
+      deployment_model: "私有化部署",
+      product_area: "部署与运维/容量规划",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["ONES 私有化部署 容量扩容 是否支持"],
+      required_doc_kinds: ["私有化部署文档", "安装部署指南", "版本发布说明"]
+    },
+    retrievalQueries: ["ONES 私有化部署 容量扩容 是否支持"]
+  });
+  adapter.draftSupportMainAgent = async (input) => {
+    observedRoute = input.route;
+    return {
+      draftAnswer: {
+        question_type: input.route.question_type,
+        render_variant: "behavior",
+        direct_answer:
+          input.route.question_type === "capability_confirmation"
+            ? "支持，但需要结合部署架构和资源条件判断具体扩容方式。"
+            : "我只能确认一个局部排查事实。",
+        claims: [
+          {
+            text:
+              input.route.question_type === "capability_confirmation"
+                ? "已发布部署文档表明私有化部署支持容量相关扩展，但需要结合架构和资源条件评估。"
+                : "已发布部署文档只说明了某个局部资源要求。",
+            kind: "verified_fact",
+            reference_ids: [input.providedEvidence[0]?.reference_id ?? ""],
+            authority: "canonical"
+          }
+        ],
+        next_actions: ["核对部署架构和资源条件。"],
+        unknowns: [],
+        escalation_needed: false
+      }
+    };
+  };
+
+  const validationReference: SearchReference = {
+    documentId: "doc:deployment-capacity",
+    evidenceId: "chunk:deployment-capacity",
+    title: "部署扩展要求",
+    snippet: "私有化部署支持容量相关扩展，但需要结合部署架构和资源条件评估。",
+    sourceUrl: "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements",
+    path: "deploy/prepare/deployment-requirements",
+    headingPath: "部署扩展要求",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.97,
+    retrievedAt: "2026-04-08T15:00:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence() {
+      return {
+        query: "ONES 私有化部署 容量扩容 是否支持",
+        answer: "",
+        confidence: 0.97,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: ["ONES 私有化部署 容量扩容 是否支持"],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("single-agent validation should not require refinement in this test");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "私有化部署是否支持容量扩容？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-single-agent-route-fallback"
+    });
+
+    assert.equal(observedRoute?.question_type, "capability_confirmation");
+    assert.equal(observedRoute?.specialist_agent, "behavior-specialist");
+    assert.match(result.result.answer, /支持/);
+    assert.equal(
+      (result.result.internal_diagnostics as { route?: SupportQuestionRoute } | undefined)?.route?.question_type,
+      "capability_confirmation"
+    );
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
+test("runSupportSearchAgent single-agent keeps broad partial capability answers instead of collapsing to one narrow claim", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    draftSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        providedEvidence: Array<{
+          reference_id: string;
+          evidence_id: string;
+          sourceUrl: string;
+        }>;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => ({
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: "确认私有化部署是否支持容量扩容",
+      answer_contract: "先直接回答是否支持，再说明当前文档能直接确认的范围与限制。",
+      specialist_agent: "behavior-specialist",
+      routing_confidence: 0.96
+    },
+    caseFrame: {
+      goal: "确认私有化部署是否支持容量扩容",
+      symptom: "能力确认咨询",
+      object: "私有化部署容量扩容",
+      action_type: "capability_confirmation",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["ONES 私有化部署 容量扩容 是否支持"],
+      required_doc_kinds: ["deployment_runbook", "product_guide", "troubleshooting"]
+    },
+    retrievalQueries: ["ONES 私有化部署 容量扩容 是否支持"]
+  });
+  adapter.draftSupportMainAgent = async (input) => ({
+    draftAnswer: {
+      question_type: "capability_confirmation",
+      render_variant: "behavior",
+      direct_answer:
+        "当前文档可以确认私有化部署在存储与资源规划层面具备扩容前提，但未看到所有组件统一扩容流程的直接说明。",
+      claims: [
+        {
+          text: "文档要求根据使用量配置合适的磁盘空间，说明私有化部署需要按规模规划容量。",
+          kind: "verified_fact",
+          reference_ids: [input.providedEvidence[0]?.reference_id ?? ""],
+          authority: "canonical"
+        },
+        {
+          text: "文档建议物理机磁盘使用 LVM 管理，便于扩容。",
+          kind: "verified_fact",
+          reference_ids: [input.providedEvidence[0]?.reference_id ?? ""],
+          authority: "canonical"
+        },
+        {
+          text: "现有证据可以支持私有化部署在存储与资源规划层面具备扩容前提，但未覆盖所有组件统一扩容流程。",
+          kind: "grounded_inference",
+          reference_ids: [input.providedEvidence[0]?.reference_id ?? ""],
+          authority: "assistive"
+        }
+      ],
+      next_actions: ["先确认要扩的是磁盘/存储，还是计算与节点资源。"],
+      unknowns: ["当前文档未覆盖所有组件的统一扩容步骤。"],
+      escalation_needed: false,
+      most_likely_explanation:
+        "从当前文档看，私有化部署至少在存储与资源规划层面具备扩容前提，但仍需按具体对象确认边界。",
+      confirmed_facts: [
+        "文档要求根据使用量配置合适的磁盘空间。",
+        "文档建议物理机磁盘使用 LVM 管理，便于扩容。"
+      ],
+      what_to_check_next: ["继续核对具体扩容对象对应的部署与运维文档。"]
+    }
+  });
+
+  const validationReference: SearchReference = {
+    documentId: "doc:storage-requirements",
+    evidenceId: "chunk:storage-requirements",
+    title: "存储资源要求",
+    snippet:
+      "根据使用量配置合适的磁盘空间；如果是物理机磁盘，使用 LVM 管理，便于扩容；单机版数据量达到 500G 及以上时推荐外置 OSS 或 NFS 存储。",
+    sourceUrl: "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements",
+    path: "deploy-docs/prepare/deployment-requirements.md",
+    headingPath: "ONES 私有部署环境要求 > 存储资源要求",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.98,
+    retrievedAt: "2026-04-08T18:40:57.615Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence() {
+      return {
+        query: "ONES 私有化部署 容量扩容 是否支持",
+        answer: "",
+        confidence: 0.98,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: ["ONES 私有化部署 容量扩容 是否支持"],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("single-agent validation should not require refinement in this test");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "私有化部署是否支持容量扩容？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-single-agent-broad-capability-answer"
+    });
+
+    assert.match(result.result.answer, /存储与资源规划层面具备扩容前提/);
+    assert.ok(result.verification.verified_claims.length >= 2);
+    assert.ok((result.result.internal_diagnostics?.claim_graph?.length ?? 0) >= 2);
+    assert.equal(result.result.support_answer?.render_variant, "behavior");
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});

@@ -250,7 +250,10 @@ function canonicalizeRequiredDocKinds(values: string[], canonicalProductArea: st
       ) {
         result.push("product_guide");
       }
-      if (normalized === "rules" || /rules?|constraint|compatibility|support matrix|版本说明|限制|规则|支持矩阵|兼容性/.test(normalized)) {
+      if (
+        normalized === "rules" ||
+        /rules?|constraint|compatibility|support matrix|版本(?:发布)?说明|限制|规则|支持矩阵|兼容性/.test(normalized)
+      ) {
         result.push("rules");
       }
       if (normalized === "troubleshooting" || /故障|排查|troubleshooting/.test(normalized)) {
@@ -341,6 +344,15 @@ function normalizePlannerOutput(input: {
     caseFrame,
     evidencePlan
   };
+}
+
+export function canonicalizeSupportPlannerArtifacts(input: {
+  query: string;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  evidencePlan: SupportEvidencePlan;
+}): { caseFrame: SupportCaseFrame; evidencePlan: SupportEvidencePlan } {
+  return normalizePlannerOutput(input);
 }
 
 function buildRetrievalPlan(query: string, caseFrame: SupportCaseFrame, evidencePlan: SupportEvidencePlan) {

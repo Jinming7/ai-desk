@@ -28,12 +28,12 @@ import type {
   SupportVerificationResult,
   TriageSupportInsight
 } from "./types.js";
-import { resolveSupportExecutionPlan } from "./support-execution-plan.js";
+import { canonicalizeSupportPlannerArtifacts, resolveSupportExecutionPlan } from "./support-execution-plan.js";
 import { resolveSupportRuntimePolicy } from "./support-runtime-policy.js";
 import { filterSupportEvidenceByPolicy, getSupportEvidenceProfile, matchesSupportEvidencePolicy } from "./support-evidence-policy.js";
 import { resolveSearchReferenceEvidenceId, type SearchReference } from "./types.js";
 import { SearchOrchestrator } from "./search-orchestrator.js";
-import { resolveStageSpecificAgent } from "./agent-router.js";
+import { isSupportMainRuntimeEnabled, resolveStageSpecificAgent } from "./agent-router.js";
 
 function uniqueStrings(input: Array<string | undefined | null>, limit = 6): string[] {
   const seen = new Set<string>();
@@ -1855,8 +1855,9 @@ function maxFocusedSupportedClaimCount(caseFrame: SupportCaseFrame): number {
     case "api_scope_auth":
     case "api_endpoint_lookup":
     case "api_field_lookup":
-    case "capability_confirmation":
       return 1;
+    case "capability_confirmation":
+      return caseFrame.product_area === "deployment" ? 3 : 1;
     case "how_to_product":
     case "config_setup":
     case "troubleshooting":
@@ -2255,9 +2256,15 @@ function buildSupportAnswerFromDraft(input: {
     fallback
   });
   const preferredDirectAnswerCandidate = safeComposedDirectAnswer || safeDraftDirectAnswer;
+  const shouldPreserveBroadCapabilityDraftAnswer =
+    input.route.question_type === "capability_confirmation" &&
+    input.mode === "partial" &&
+    safeDraftDirectAnswer.length > 0 &&
+    !isGenericUncertaintyDirectAnswer(safeDraftDirectAnswer);
   const shouldPreferSupportedClaimDirectAnswer =
     supportedClaims.length > 0 &&
     supportedClaimDirectAnswer.length > 0 &&
+    !shouldPreserveBroadCapabilityDraftAnswer &&
     (input.draft.render_variant === "behavior" ||
       !preferredDirectAnswerCandidate ||
       isGenericUncertaintyDirectAnswer(preferredDirectAnswerCandidate));
@@ -3811,18 +3818,27 @@ function normalizeSupportMainRoute(
 ): SupportQuestionRoute {
   const fallback = fallbackQuestionRoute(query);
   const parsed = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-  const question_type = normalizeSupportMainQuestionType(parsed.question_type, query);
+  const parsedQuestionType = normalizeSupportMainQuestionType(parsed.question_type, query);
+  const question_type =
+    parsedQuestionType === "troubleshooting" && fallback.question_type === "capability_confirmation"
+      ? "capability_confirmation"
+      : parsedQuestionType;
+  const parsedSpecialistAgent =
+    parsed.specialist_agent === "api-specialist" ||
+    parsed.specialist_agent === "howto-specialist" ||
+    parsed.specialist_agent === "behavior-specialist" ||
+    parsed.specialist_agent === "troubleshooting-specialist"
+      ? parsed.specialist_agent
+      : null;
+  const canonicalSpecialistAgent = canonicalSpecialistAgentForQuestionType(question_type);
   return {
     question_type,
     user_goal: typeof parsed.user_goal === "string" ? parsed.user_goal : fallback.user_goal,
     answer_contract: typeof parsed.answer_contract === "string" ? parsed.answer_contract : fallback.answer_contract,
     specialist_agent:
-      parsed.specialist_agent === "api-specialist" ||
-      parsed.specialist_agent === "howto-specialist" ||
-      parsed.specialist_agent === "behavior-specialist" ||
-      parsed.specialist_agent === "troubleshooting-specialist"
-        ? parsed.specialist_agent
-        : canonicalSpecialistAgentForQuestionType(question_type),
+      parsedSpecialistAgent && parsedQuestionType === question_type && parsedSpecialistAgent === canonicalSpecialistAgent
+        ? parsedSpecialistAgent
+        : canonicalSpecialistAgent,
     routing_confidence:
       typeof parsed.routing_confidence === "number" && Number.isFinite(parsed.routing_confidence)
         ? Math.max(0, Math.min(1, parsed.routing_confidence))
@@ -3982,10 +3998,17 @@ function normalizeSupportMainPlanOutput(
     8
   );
   const caseFrame = normalizeSupportMainCaseFrame(parsed.caseFrame ?? parsed.case_frame, query, route, retrievalQueries);
-  return {
+  const evidencePlan = deriveSupportMainEvidencePlan(caseFrame, query, retrievalQueries);
+  const canonicalized = canonicalizeSupportPlannerArtifacts({
+    query,
     route,
     caseFrame,
-    evidencePlan: deriveSupportMainEvidencePlan(caseFrame, query, retrievalQueries),
+    evidencePlan
+  });
+  return {
+    route,
+    caseFrame: canonicalized.caseFrame,
+    evidencePlan: canonicalized.evidencePlan,
     retrievalQueries
   };
 }
@@ -4570,7 +4593,7 @@ export async function runSupportSearchAgent(input: {
   const allowRefinement = input.runtime?.allowRefinement !== false;
   const contextType = input.contextType ?? "search";
   const runtimePolicy = resolveSupportRuntimePolicy(input.runtime);
-  if (env.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME && input.adapter.planSupportMainAgent && input.adapter.draftSupportMainAgent) {
+  if (isSupportMainRuntimeEnabled() && input.adapter.planSupportMainAgent && input.adapter.draftSupportMainAgent) {
     return runSingleAgentSupportSearch({
       ...input,
       contextType,
