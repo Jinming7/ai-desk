@@ -509,3 +509,71 @@ test("draftSupportMainAgent parses claim reference ids from provided evidence wi
   assert.match(capturedPrompt, /Do not retrieve/i);
   assert.deepEqual(result.draftAnswer.claims[0]?.reference_ids, ["ref-issue-comment-scope"]);
 });
+
+test("buildConnectParams includes a nonce-signed device payload for the live gateway", () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    buildConnectParams: (input: {
+      connectNonce: string;
+      instanceSuffix?: string;
+      userAgent: string;
+    }) => {
+      client: { id: string; mode: string; instanceId: string };
+      role: string;
+      scopes: string[];
+      auth?: Record<string, unknown>;
+      device: {
+        id: string;
+        publicKey: string;
+        signature: string;
+        signedAt: number;
+        nonce: string;
+      };
+    };
+  };
+
+  const params = adapter.buildConnectParams({
+    connectNonce: "nonce-live-1",
+    instanceSuffix: "health",
+    userAgent: "ticket-core-health"
+  });
+
+  assert.equal(params.client.id, "gateway-client");
+  assert.equal(params.client.mode, "backend");
+  assert.equal(params.client.instanceId.endsWith("-health"), true);
+  assert.equal(params.role, "operator");
+  assert.equal(params.scopes.includes("operator.admin"), true);
+  assert.equal(typeof params.auth, "object");
+  assert.equal(typeof params.device.id, "string");
+  assert.equal(typeof params.device.publicKey, "string");
+  assert.equal(typeof params.device.signature, "string");
+  assert.equal(params.device.nonce, "nonce-live-1");
+  assert.equal(typeof params.device.signedAt, "number");
+});
+
+test("buildConnectParams prefers device-token auth when OPENCLAW_DEVICE_TOKEN is present", () => {
+  const original = process.env.OPENCLAW_DEVICE_TOKEN;
+  process.env.OPENCLAW_DEVICE_TOKEN = "device-token-123";
+
+  try {
+    const adapter = new WsOpenClawAdapter() as never as {
+      buildConnectParams: (input: {
+        connectNonce: string;
+        userAgent: string;
+      }) => {
+        auth?: Record<string, unknown>;
+      };
+    };
+
+    const params = adapter.buildConnectParams({
+      connectNonce: "nonce-live-2",
+      userAgent: "ticket-core"
+    });
+
+    assert.deepEqual(params.auth, {
+      deviceToken: "device-token-123"
+    });
+  } finally {
+    if (original === undefined) delete process.env.OPENCLAW_DEVICE_TOKEN;
+    else process.env.OPENCLAW_DEVICE_TOKEN = original;
+  }
+});

@@ -3,6 +3,11 @@ import fs from "node:fs/promises";
 import { WebSocket } from "ws";
 import { env } from "../../config/env.js";
 import { detectMimeType, resolveAttachmentPath } from "../../modules/ai/multimodal.js";
+import {
+  buildSignedOpenClawDevice,
+  loadOpenClawDeviceToken,
+  loadOrCreateOpenClawDeviceIdentity
+} from "./device-auth.js";
 import type {
   OpenClawAdapter,
   OpenClawAnalyzeInput,
@@ -441,11 +446,98 @@ function resolveMethodTimeoutMs(requestedTimeoutMs: number, runtime?: OpenClawRu
 export class WsOpenClawAdapter implements OpenClawAdapter {
   private consecutiveFailures = 0;
   private readonly requestedScopes = env.OPENCLAW_REQUEST_SCOPES.split(",").map((item) => item.trim()).filter(Boolean);
+  private readonly deviceIdentity = loadOrCreateOpenClawDeviceIdentity();
 
-  private buildConnectAuth() {
+  private buildConnectAuth(): {
+    token?: string;
+    password?: string;
+    deviceToken?: string;
+  } {
+    const deviceToken = loadOpenClawDeviceToken({
+      deviceId: this.deviceIdentity.deviceId,
+      role: "operator"
+    });
+    if (deviceToken) {
+      return {
+        deviceToken
+      };
+    }
+
+    const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || env.OPENCLAW_GATEWAY_TOKEN;
+    const basicPass = process.env.OPENCLAW_BASIC_PASS?.trim() || env.OPENCLAW_BASIC_PASS;
     return {
-      ...(env.OPENCLAW_GATEWAY_TOKEN ? { token: env.OPENCLAW_GATEWAY_TOKEN } : {}),
-      ...(env.OPENCLAW_BASIC_PASS ? { password: env.OPENCLAW_BASIC_PASS } : {})
+      ...(gatewayToken ? { token: gatewayToken } : {}),
+      ...(basicPass ? { password: basicPass } : {})
+    };
+  }
+
+  private buildGatewayHeaders(): Record<string, string> {
+    const authHeader =
+      env.OPENCLAW_BASIC_USER && env.OPENCLAW_BASIC_PASS
+        ? `Basic ${Buffer.from(`${env.OPENCLAW_BASIC_USER}:${env.OPENCLAW_BASIC_PASS}`).toString("base64")}`
+        : undefined;
+
+    const headers: Record<string, string> = {};
+    if (authHeader) {
+      headers.Authorization = authHeader;
+    }
+    if (env.OPENCLAW_CLIENT_ORIGIN) {
+      headers.Origin = env.OPENCLAW_CLIENT_ORIGIN;
+    }
+    return headers;
+  }
+
+  private createWebSocket(headers: Record<string, string>): WebSocket {
+    return new WebSocket(env.OPENCLAW_WS_URL, {
+      headers: Object.keys(headers).length ? headers : undefined,
+      rejectUnauthorized: !env.OPENCLAW_ALLOW_SELF_SIGNED
+    });
+  }
+
+  private buildConnectParams(input: {
+    connectNonce: string;
+    instanceSuffix?: string;
+    userAgent: string;
+  }) {
+    const connectAuth = this.buildConnectAuth();
+    const auth = Object.keys(connectAuth).length > 0 ? connectAuth : undefined;
+    const authToken =
+      typeof connectAuth.token === "string" && connectAuth.token.trim()
+        ? connectAuth.token.trim()
+        : typeof connectAuth.deviceToken === "string" && connectAuth.deviceToken.trim()
+          ? connectAuth.deviceToken.trim()
+          : null;
+    const signedAtMs = Date.now();
+    const instanceId = input.instanceSuffix
+      ? `${env.OPENCLAW_CLIENT_INSTANCE_ID}-${input.instanceSuffix}`
+      : env.OPENCLAW_CLIENT_INSTANCE_ID;
+
+    return {
+      minProtocol: 3,
+      maxProtocol: 3,
+      client: {
+        id: env.OPENCLAW_CLIENT_ID,
+        version: env.OPENCLAW_CLIENT_VERSION,
+        platform: env.OPENCLAW_CLIENT_PLATFORM,
+        mode: env.OPENCLAW_CLIENT_MODE,
+        instanceId
+      },
+      role: "operator",
+      scopes: this.requestedScopes,
+      caps: [],
+      ...(auth ? { auth } : {}),
+      userAgent: input.userAgent,
+      locale: "en-US",
+      device: buildSignedOpenClawDevice({
+        identity: this.deviceIdentity,
+        clientId: env.OPENCLAW_CLIENT_ID,
+        clientMode: env.OPENCLAW_CLIENT_MODE,
+        role: "operator",
+        scopes: this.requestedScopes,
+        signedAtMs,
+        token: authToken,
+        nonce: input.connectNonce
+      })
     };
   }
 
@@ -2167,25 +2259,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   }
 
   private async callMethod(method: string, params: Record<string, unknown>, timeoutMs = env.OPENCLAW_METHOD_TIMEOUT_MS): Promise<unknown> {
-    const authHeader =
-      env.OPENCLAW_BASIC_USER && env.OPENCLAW_BASIC_PASS
-        ? `Basic ${Buffer.from(`${env.OPENCLAW_BASIC_USER}:${env.OPENCLAW_BASIC_PASS}`).toString("base64")}`
-        : undefined;
-
-    const headers: Record<string, string> = {};
-    if (authHeader) {
-      headers.Authorization = authHeader;
-    }
-    if (env.OPENCLAW_CLIENT_ORIGIN) {
-      headers.Origin = env.OPENCLAW_CLIENT_ORIGIN;
-    }
-
-    const wsOptions = {
-      headers: Object.keys(headers).length ? headers : undefined,
-      rejectUnauthorized: !env.OPENCLAW_ALLOW_SELF_SIGNED
-    };
-
-    const ws = new WebSocket(env.OPENCLAW_WS_URL, wsOptions);
+    const ws = this.createWebSocket(this.buildGatewayHeaders());
 
     return await new Promise<unknown>((resolve, reject) => {
       const effectiveConnectTimeoutMs = Math.max(1, Math.min(env.OPENCLAW_CONNECT_TIMEOUT_MS, timeoutMs));
@@ -2196,44 +2270,41 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
       let requestTimeout: NodeJS.Timeout | undefined;
 
-      ws.on("open", () => {
-        const connectReq: RpcReq = {
-          type: "req",
-          id: "connect-1",
-          method: "connect",
-          params: {
-            minProtocol: 3,
-            maxProtocol: 3,
-            client: {
-              id: env.OPENCLAW_CLIENT_ID,
-              version: env.OPENCLAW_CLIENT_VERSION,
-              platform: env.OPENCLAW_CLIENT_PLATFORM,
-              mode: env.OPENCLAW_CLIENT_MODE,
-              instanceId: env.OPENCLAW_CLIENT_INSTANCE_ID
-            },
-            role: "operator",
-            scopes: this.requestedScopes,
-            caps: [],
-            auth: this.buildConnectAuth(),
-            userAgent: "ticket-core",
-            locale: "en-US"
-          }
-        };
-
-        ws.send(JSON.stringify(connectReq));
-      });
+      ws.on("open", () => {});
 
       ws.on("message", (raw) => {
-        const data = JSON.parse(String(raw)) as RpcRes | { type: "event"; event: string };
+        const data = JSON.parse(String(raw)) as RpcRes | { type: "event"; event: string; payload?: { nonce?: unknown } };
 
         if (data.type === "event") {
+          if (data.event === "connect.challenge") {
+            const connectNonce =
+              typeof data.payload?.nonce === "string" && data.payload.nonce.trim().length > 0
+                ? data.payload.nonce.trim()
+                : null;
+            if (!connectNonce) {
+              clearTimeout(connectTimeout);
+              reject(new Error("OpenClaw connect challenge missing nonce"));
+              ws.close();
+              return;
+            }
+            const connectReq: RpcReq = {
+              type: "req",
+              id: "connect-1",
+              method: "connect",
+              params: this.buildConnectParams({
+                connectNonce,
+                userAgent: "ticket-core"
+              })
+            };
+            ws.send(JSON.stringify(connectReq));
+          }
           return;
         }
 
         if (data.type === "res" && data.id === "connect-1") {
           clearTimeout(connectTimeout);
           if (!data.ok) {
-            reject(new Error(`OpenClaw connect failed: ${data.error?.code ?? "UNKNOWN"}`));
+            reject(new Error(`OpenClaw connect failed: ${data.error?.message ?? data.error?.code ?? "UNKNOWN"}`));
             ws.close();
             return;
           }
@@ -2289,23 +2360,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   }
 
   private async connectOnly(): Promise<void> {
-    const authHeader =
-      env.OPENCLAW_BASIC_USER && env.OPENCLAW_BASIC_PASS
-        ? `Basic ${Buffer.from(`${env.OPENCLAW_BASIC_USER}:${env.OPENCLAW_BASIC_PASS}`).toString("base64")}`
-        : undefined;
-
-    const headers: Record<string, string> = {};
-    if (authHeader) {
-      headers.Authorization = authHeader;
-    }
-    if (env.OPENCLAW_CLIENT_ORIGIN) {
-      headers.Origin = env.OPENCLAW_CLIENT_ORIGIN;
-    }
-
-    const ws = new WebSocket(env.OPENCLAW_WS_URL, {
-      headers: Object.keys(headers).length ? headers : undefined,
-      rejectUnauthorized: !env.OPENCLAW_ALLOW_SELF_SIGNED
-    });
+    const ws = this.createWebSocket(this.buildGatewayHeaders());
 
     return await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -2313,39 +2368,40 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         ws.close();
       }, env.OPENCLAW_CONNECT_TIMEOUT_MS);
 
-      ws.on("open", () => {
-        const connectReq: RpcReq = {
-          type: "req",
-          id: "health-connect",
-          method: "connect",
-          params: {
-            minProtocol: 3,
-            maxProtocol: 3,
-            client: {
-              id: env.OPENCLAW_CLIENT_ID,
-              version: env.OPENCLAW_CLIENT_VERSION,
-              platform: env.OPENCLAW_CLIENT_PLATFORM,
-              mode: env.OPENCLAW_CLIENT_MODE,
-              instanceId: `${env.OPENCLAW_CLIENT_INSTANCE_ID}-health`
-            },
-            role: "operator",
-            scopes: this.requestedScopes,
-            caps: [],
-            auth: this.buildConnectAuth(),
-            userAgent: "ticket-core-health",
-            locale: "en-US"
-          }
-        };
-        ws.send(JSON.stringify(connectReq));
-      });
+      ws.on("open", () => {});
 
       ws.on("message", (raw) => {
-        const data = JSON.parse(String(raw)) as RpcRes | { type: "event"; event: string };
-        if (data.type === "event") return;
+        const data = JSON.parse(String(raw)) as RpcRes | { type: "event"; event: string; payload?: { nonce?: unknown } };
+        if (data.type === "event") {
+          if (data.event === "connect.challenge") {
+            const connectNonce =
+              typeof data.payload?.nonce === "string" && data.payload.nonce.trim().length > 0
+                ? data.payload.nonce.trim()
+                : null;
+            if (!connectNonce) {
+              clearTimeout(timeout);
+              reject(new Error("OpenClaw health connect challenge missing nonce"));
+              ws.close();
+              return;
+            }
+            const connectReq: RpcReq = {
+              type: "req",
+              id: "health-connect",
+              method: "connect",
+              params: this.buildConnectParams({
+                connectNonce,
+                instanceSuffix: "health",
+                userAgent: "ticket-core-health"
+              })
+            };
+            ws.send(JSON.stringify(connectReq));
+          }
+          return;
+        }
         if (data.type === "res" && data.id === "health-connect") {
           clearTimeout(timeout);
           if (!data.ok) {
-            reject(new Error(`OpenClaw health connect failed: ${data.error?.code ?? "UNKNOWN"}`));
+            reject(new Error(`OpenClaw health connect failed: ${data.error?.message ?? data.error?.code ?? "UNKNOWN"}`));
             ws.close();
             return;
           }
