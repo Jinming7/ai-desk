@@ -4,7 +4,7 @@
 
 **Goal:** Replace the user-facing multi-agent support request path with a single OpenClaw support agent that performs OpenClaw-driven retrieval and returns grounded customer answers that remain bound to the published KB snapshot.
 
-**Architecture:** First harden the retrieval transport contract so OpenClaw retrieval results carry publication-safe evidence identity. Then add a feature-flagged single-agent support runtime path that bypasses the old planner/router/specialist chain while preserving backend citation validation and KB publication safety. Finally align the live cloud agent instructions and verify end to end with business queries.
+**Architecture:** Replace the current multi-agent support hot path with one OpenClaw `support-main` run that returns a structured answer draft, claims, references, and retrieval queries. The backend reconciles those returned references against the active published KB snapshot, maps them onto canonical evidence ids, and only then materializes the customer-facing answer. Finally align the live cloud agent instructions and verify the simplified runtime end to end with business queries.
 
 **Tech Stack:** Node.js 20.20.1, TypeScript, Express API, OpenClaw WS adapter, PostgreSQL-backed KB publication runtime, node:test, Vercel preview runtime, live Alibaba Cloud OpenClaw gateway.
 
@@ -65,79 +65,96 @@ git add docs/superpowers/specs/2026-04-08-support-single-agent-runtime-design.md
 git commit -m "docs: define single-agent support runtime plan"
 ```
 
-### Task 2: Retrieval Contract Hardening
+### Task 2: Single-Agent Contract And Reference Reconciliation
 
 **Files:**
 - Modify: `apps/api/src/infrastructure/openclaw/types.ts`
 - Modify: `apps/api/src/infrastructure/openclaw/ws-adapter.ts`
-- Modify: `apps/api/src/modules/ai/search-orchestrator.ts`
+- Modify: `apps/api/src/modules/ai/support-agent.ts`
+- Modify: `apps/api/src/modules/ai/types.ts`
 - Test: `apps/api/src/infrastructure/openclaw/ws-adapter.test.ts`
-- Test: `apps/api/src/modules/ai/hybrid-retrieval.test.ts`
+- Test: `apps/api/src/modules/ai/support-agent.test.ts`
 
-- [ ] **Step 1: Write failing transport tests for scoped retrieval identity**
+- [ ] **Step 1: Write failing contract tests for the single-agent output schema**
 
 Add tests that require:
 
 ```ts
-searchKnowledge(...)
+runSupportMainAgent(...)
 ```
 
-to preserve:
+to parse and preserve:
 
 ```ts
-knowledgeSpace
-repoId
-branch
-publicationId || buildVersion
-evidenceId
-documentId
-path
-headingPath
-supportMetadata
+reference_id
+references[]
+retrieval_queries[]
+claims[].reference_ids
+missing_critical_info[]
+question_type
+render_variant
 ```
 
-- [ ] **Step 2: Run the focused tests and verify they fail for the intended reason**
+- [ ] **Step 2: Write failing reconciliation tests for published-snapshot grounding**
+
+Add tests that require:
+
+```ts
+runSupportSearchAgent(...)
+```
+
+to:
+
+```ts
+- accept only claims whose reference_ids reconcile to published evidence
+- downgrade unresolved or ambiguous references
+- expose canonical evidence ids only after reconciliation
+- bypass old planner/router/specialist/judge/composer stages when single-agent mode is enabled
+```
+
+- [ ] **Step 3: Run the focused tests and verify they fail for the intended reason**
 
 Run:
 
 ```bash
 npx tsx --test apps/api/src/infrastructure/openclaw/ws-adapter.test.ts
-npx tsx --test apps/api/src/modules/ai/hybrid-retrieval.test.ts
+npx tsx --test apps/api/src/modules/ai/support-agent.test.ts
 ```
 
 Expected:
 
-- new assertions fail because the current retrieval contract does not yet carry the required fields
+- new assertions fail because the single-agent contract and reconciliation path do not exist yet
 
-- [ ] **Step 3: Implement minimal transport changes**
+- [ ] **Step 4: Implement minimal contract and reconciliation changes**
 
 Required implementation scope:
 
 ```text
-- extend OpenClawSearchInput and OpenClawSearchResultItem
-- update ws-adapter searchKnowledge parsing
-- preserve backward compatibility when older payload fields are missing
-- map richer retrieval hits through SearchOrchestrator.toReference(...)
+- add OpenClawSupportMain input/output types
+- add OpenClawAdapter.runSupportMainAgent(...)
+- implement ws-adapter single-agent JSON prompt + parsing
+- add backend reconciliation from agent-returned references to canonical published evidence ids
+- ensure unresolved references cannot survive as verified delivery
 ```
 
-- [ ] **Step 4: Re-run focused tests and verify they pass**
+- [ ] **Step 5: Re-run focused tests and verify they pass**
 
 Run:
 
 ```bash
 npx tsx --test apps/api/src/infrastructure/openclaw/ws-adapter.test.ts
-npx tsx --test apps/api/src/modules/ai/hybrid-retrieval.test.ts
+npx tsx --test apps/api/src/modules/ai/support-agent.test.ts
 ```
 
 Expected:
 
-- focused retrieval transport tests pass
+- focused single-agent contract tests pass
 
-- [ ] **Step 5: Commit milestone**
+- [ ] **Step 6: Commit milestone**
 
 ```bash
-git add apps/api/src/infrastructure/openclaw/types.ts apps/api/src/infrastructure/openclaw/ws-adapter.ts apps/api/src/modules/ai/search-orchestrator.ts apps/api/src/infrastructure/openclaw/ws-adapter.test.ts apps/api/src/modules/ai/hybrid-retrieval.test.ts
-git commit -m "fix: harden support retrieval transport contract"
+git add apps/api/src/infrastructure/openclaw/types.ts apps/api/src/infrastructure/openclaw/ws-adapter.ts apps/api/src/modules/ai/support-agent.ts apps/api/src/modules/ai/types.ts apps/api/src/infrastructure/openclaw/ws-adapter.test.ts apps/api/src/modules/ai/support-agent.test.ts
+git commit -m "fix: add single-agent support contract"
 ```
 
 ### Task 3: Single-Agent Runtime Path
@@ -145,9 +162,10 @@ git commit -m "fix: harden support retrieval transport contract"
 **Files:**
 - Modify: `apps/api/src/modules/ai/support-agent.ts`
 - Modify: `apps/api/src/modules/ai/agent-router.ts`
-- Modify: `apps/api/src/infrastructure/openclaw/types.ts`
-- Modify: `apps/api/src/infrastructure/openclaw/ws-adapter.ts`
+- Modify: `apps/api/src/modules/ai/support-runtime-policy.ts`
 - Modify: `apps/api/src/config/env.ts`
+- Modify: `apps/api/src/infrastructure/openclaw/types.ts`
+- Modify: `apps/api/src/infrastructure/openclaw/mock-adapter.ts`
 - Test: `apps/api/src/modules/ai/support-agent.test.ts`
 - Test: `apps/api/src/modules/ai/support-agent-runtime-budget.test.ts`
 
@@ -157,6 +175,7 @@ Add tests that prove:
 
 ```ts
 - FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME=true bypasses route/evidence-plan/planner/specialist/judge/composer stages
+- single-agent mode emits runtime_mode=single_agent diagnostics
 - single-agent mode still returns structured support answers
 - single-agent mode still rejects unsupported uncited factual claims
 ```
@@ -180,10 +199,9 @@ Required implementation scope:
 
 ```text
 - add FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME
-- add a new adapter method boundary for the support-main agent
+- add stage binding for support-main
 - implement single-agent runtime path in support-agent.ts
 - keep backend citation and unsupported-claim validation
-- emit diagnostics showing runtime_mode=single_agent
 - leave current path available behind the flag as rollback fallback
 ```
 
@@ -203,11 +221,69 @@ Expected:
 - [ ] **Step 5: Commit milestone**
 
 ```bash
-git add apps/api/src/modules/ai/support-agent.ts apps/api/src/modules/ai/agent-router.ts apps/api/src/infrastructure/openclaw/types.ts apps/api/src/infrastructure/openclaw/ws-adapter.ts apps/api/src/config/env.ts apps/api/src/modules/ai/support-agent.test.ts apps/api/src/modules/ai/support-agent-runtime-budget.test.ts
+git add apps/api/src/modules/ai/support-agent.ts apps/api/src/modules/ai/agent-router.ts apps/api/src/modules/ai/support-runtime-policy.ts apps/api/src/config/env.ts apps/api/src/infrastructure/openclaw/types.ts apps/api/src/infrastructure/openclaw/mock-adapter.ts apps/api/src/modules/ai/support-agent.test.ts apps/api/src/modules/ai/support-agent-runtime-budget.test.ts
 git commit -m "feat: add single-agent support runtime"
 ```
 
-### Task 4: Live OpenClaw Agent Alignment
+### Task 4: Runtime Stability And Timeout Closure
+
+**Files:**
+- Modify: `apps/api/src/modules/ai/service.ts`
+- Modify: `apps/api/src/modules/ai/support-search-jobs.ts`
+- Modify: `apps/api/src/modules/ai/support-agent.ts`
+- Test: `apps/api/src/modules/ai/support-agent-runtime-budget.test.ts`
+
+- [ ] **Step 1: Write failing tests for terminal-state timing**
+
+Add tests that prove:
+
+```ts
+- single-agent interactive requests do not keep the front-end polling indefinitely
+- async jobs keep heartbeats aligned with stage progress and terminate inside the configured budget
+```
+
+- [ ] **Step 2: Run focused tests and verify they fail first**
+
+Run:
+
+```bash
+npx tsx --test apps/api/src/modules/ai/support-agent-runtime-budget.test.ts
+```
+
+Expected:
+
+- the new budget/terminal-state assertions fail before the fix
+
+- [ ] **Step 3: Implement the minimal timeout-closure changes**
+
+Required implementation scope:
+
+```text
+- ensure simplified runtime reports stage progress coherently
+- ensure async jobs cannot remain stuck in non-terminal state past the configured window
+- keep front-end polling and job lifecycle aligned
+```
+
+- [ ] **Step 4: Re-run focused tests and verify they pass**
+
+Run:
+
+```bash
+npx tsx --test apps/api/src/modules/ai/support-agent-runtime-budget.test.ts
+```
+
+Expected:
+
+- terminal-state timing tests pass
+
+- [ ] **Step 5: Commit milestone**
+
+```bash
+git add apps/api/src/modules/ai/service.ts apps/api/src/modules/ai/support-search-jobs.ts apps/api/src/modules/ai/support-agent.ts apps/api/src/modules/ai/support-agent-runtime-budget.test.ts
+git commit -m "fix: close support runtime timeout gaps"
+```
+
+### Task 5: Live OpenClaw Agent Alignment
 
 **Files:**
 - Modify: live cloud OpenClaw `agent.md` for the selected support-main agent
@@ -230,7 +306,8 @@ Required instruction content:
 
 ```text
 - retrieve before answering
-- cite only exact evidence ids returned by retrieval
+- return stable references with reference_id/title/sourceUrl/path/headingPath/snippet
+- bind each factual claim to returned reference_ids
 - do not confirm unsupported capabilities
 - ask only minimum blocking clarification
 - answer in support-engineer structure
@@ -243,7 +320,7 @@ Run a live authenticated probe and confirm:
 
 ```text
 - single agent session is used
-- retrieval output carries usable evidence identity
+- returned references reconcile cleanly to the published KB snapshot
 - answer output follows the required schema
 ```
 
@@ -254,7 +331,7 @@ git add <only local reproducibility docs if any>
 git commit -m "chore: align live support agent contract"
 ```
 
-### Task 5: Full Verification And Production Readiness Review
+### Task 6: Full Verification And Production Readiness Review
 
 **Files:**
 - Modify: any final fixes required by the gates above
@@ -269,7 +346,6 @@ npm --workspace @nexusflow/api run build
 npx tsx --test apps/api/src/infrastructure/openclaw/ws-adapter.test.ts
 npx tsx --test apps/api/src/modules/ai/support-agent.test.ts
 npx tsx --test apps/api/src/modules/ai/support-agent-runtime-budget.test.ts
-npx tsx --test apps/api/src/modules/ai/hybrid-retrieval.test.ts
 ```
 
 Expected:
@@ -292,7 +368,7 @@ Expected:
 
 - answers are grounded
 - citations are coherent
-- stage diagnostics show single-agent runtime mode
+- diagnostics show single-agent runtime mode
 
 - [ ] **Step 3: Review live OpenClaw traces**
 
@@ -300,7 +376,7 @@ Verify:
 
 ```text
 - no retired multi-agent request path is still active
-- citation ids in the final answer match retrieved references
+- claim-level reference bindings reconcile to delivered citation ids
 - no unsupported capability conclusion leaks through
 ```
 
@@ -319,6 +395,6 @@ The final review must explicitly answer:
 - what is included
 - what is intentionally not included
 - what verification passed
-- what residual risks remain
-- whether the branch is safe to deploy
+- what verification did not run
+- whether support-agent can honestly be called production-ready
 ```

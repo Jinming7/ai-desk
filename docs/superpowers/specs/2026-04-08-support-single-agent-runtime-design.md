@@ -2,7 +2,7 @@
 
 Date: 2026-04-08
 
-Status: proposed
+Status: proposed, revised after live cloud probe
 
 ## 1. Goal
 
@@ -65,28 +65,27 @@ Current `runSupportSearchAgent()` behavior still includes:
 
 Even after some deterministic recovery hardening, the request path still crosses multiple semantic stages and can drift after retrieval.
 
-### 4.3 Current OpenClaw contract gaps
+### 4.3 Current live cloud OpenClaw reality
 
-Current `OpenClawSearchInput` only carries:
+Live cloud probing against `wss://47.250.122.37/` confirmed:
 
-- `query`
-- `topK`
-- `index`
-- `attachments`
+1. the gateway does not expose RPC method `kb.search`
+2. current `WsOpenClawAdapter.searchKnowledge()` therefore falls back to `searchViaChat(...)`
+3. `searchViaChat(...)` only returns weak retrieval fields (`id`, `title`, `snippet`, `score`, `sourceUrl`)
+4. existing live support/search agents can be listed and pinged, but current multi-agent topology remains active
+5. tested candidate agents are not currently safe drop-in replacements for end-to-end support answering
 
-Current `OpenClawSearchOutput` only carries:
+This means the old assumption "Phase 1 should harden `kb.search` transport first" is no longer accurate for the live production source of truth.
 
-- `id`
-- `title`
-- `snippet`
-- `score`
-- `sourceUrl`
+### 4.4 Current OpenClaw contract gaps
 
-This is not enough for production-grade single-agent grounding because it lacks:
+The real live contract gap is not just missing typed fields on `OpenClawSearchOutput`.
 
-1. explicit runtime serving scope (`knowledge_space`, publication/build boundary)
-2. chunk-level evidence identity
-3. path / heading / metadata needed for answer-quality validation
+The live production gap is:
+
+1. no production-safe single-agent support contract exists yet
+2. live chat-based retrieval output does not carry backend-verifiable publication-bound evidence identity
+3. the backend currently has no dedicated reconciliation layer that maps agent-returned references back onto the active published KB snapshot
 
 ## 5. Options Evaluated
 
@@ -145,32 +144,25 @@ These old agent ids may remain temporarily for compatibility during rollout, but
 
 ### 6.2 Retrieval model
 
-Retrieval must remain OpenClaw-driven.
+Retrieval must remain OpenClaw-driven, but the live gateway cannot currently be treated as a typed KB RPC.
 
-Required production contract:
+The production-safe model is therefore:
 
-`OpenClawSearchInput` must be extended with:
+1. the single support agent performs retrieval and answering inside one OpenClaw run
+2. the agent must return structured references for the evidence it used
+3. the backend reconciles those references against the active published KB snapshot before delivery
 
-- `knowledgeSpace`
-- `repoId`
-- `branch`
-- `publicationId` or `buildVersion`
-- `requiredDocKinds`
-- `conversationHistory` (optional)
+The agent-returned reference contract must include enough locator data for reconciliation:
 
-`OpenClawSearchOutput.hits[]` must be extended with:
-
-- `evidenceId`
-- `documentId`
+- `reference_id`
+- `title`
+- `snippet`
+- `sourceUrl`
 - `path`
 - `headingPath`
-- `supportMetadata`
-- `repo`
-- `branch`
-- `commitSha`
-- `repoSourceUrl`
+- `repoSourceUrl` when available
 
-This allows the backend to validate that the answer is still bound to the active published snapshot.
+The backend then resolves each returned reference onto the published snapshot and maps it to canonical runtime evidence ids.
 
 ### 6.3 Single-agent answer model
 
@@ -185,14 +177,15 @@ Its responsibilities:
 1. accept the user question and recent conversation
 2. perform scoped retrieval on the OpenClaw side
 3. produce the final structured support answer
-4. return the exact references/citation ids it used
+4. return structured references plus claim-level `reference_id` bindings
 5. return structured diagnostics such as retrieval queries used and clarification reason when needed
 
 The backend must still validate:
 
-1. returned citation ids are present in the returned references
-2. returned references belong to the active runtime serving scope
-3. unsupported / uncited factual claims are downgraded before user delivery
+1. returned `reference_id`s are present in the returned references
+2. returned references reconcile to the active runtime serving scope
+3. reconciled references map to canonical runtime evidence ids
+4. unsupported / unreconciled factual claims are downgraded before user delivery
 
 ### 6.4 Backward-compatible rollout model
 
@@ -223,18 +216,18 @@ Gate:
 
 - no implementation starts until the contract gap list is explicit and testable
 
-### Phase 1: Retrieval And Citation Contract Hardening
+### Phase 1: Single-Agent Contract And Published-Snapshot Validation
 
 Tasks:
 
-1. extend `OpenClawSearchInput` / `OpenClawSearchOutput`
-2. extend WS adapter transport and parsing
-3. preserve backward compatibility for older gateway payloads
-4. add focused contract tests proving evidence identity survives transport
+1. add the new `runSupportMainAgent(...)` adapter contract
+2. define the single-agent JSON schema for answer draft, claims, references, and retrieval queries
+3. add backend reference reconciliation against the active published KB snapshot
+4. add focused tests proving unresolved references cannot leak into verified delivery
 
 Gate:
 
-- a retrieval hit must carry enough data for chunk-level grounding and publication-bound validation
+- one agent run can produce a draft answer, and every delivered factual claim must reconcile to published evidence
 
 ### Phase 2: Single-Agent Runtime Implementation
 
@@ -250,7 +243,19 @@ Gate:
 
 - the request path must no longer depend on planner/router/specialist drift
 
-### Phase 3: Live OpenClaw Alignment
+### Phase 3: Runtime Stability And Timeout Closure
+
+Tasks:
+
+1. re-check the async search-job timeout behavior under the simplified runtime
+2. ensure stage progress, terminal state, and front-end wait window remain coherent
+3. confirm the simplified runtime does not reintroduce infinite wait / request flood symptoms
+
+Gate:
+
+- the support request must enter a terminal state inside the expected interactive or async budget
+
+### Phase 4: Live OpenClaw Alignment
 
 Tasks:
 
@@ -266,7 +271,7 @@ Gate:
 
 - the live cloud agent behavior matches the new backend contract
 
-### Phase 4: Full Verification And Production Readiness Review
+### Phase 5: Full Verification And Production Readiness Review
 
 Tasks:
 
@@ -286,9 +291,10 @@ No KB publication model changes are required for this design.
 
 Expected application-side changes:
 
-1. OpenClaw transport types grow richer retrieval fields
+1. OpenClaw adapter gains a dedicated single-agent support contract
 2. support runtime diagnostics gain single-agent-specific fields
 3. feature-flag-driven runtime selection is added
+4. backend reference reconciliation maps agent-returned references onto published evidence ids
 
 This design must not weaken publication-based KB serving semantics.
 
@@ -318,48 +324,50 @@ Idempotency rules:
 
 Required verification layers:
 
-1. contract tests for retrieval request/response transport
-2. runtime tests proving single-agent mode bypasses retired multi-agent stages
-3. regression tests for business-critical queries:
+1. contract tests for single-agent request/response parsing
+2. reference-reconciliation tests against published-snapshot candidates
+3. runtime tests proving single-agent mode bypasses retired multi-agent stages
+4. regression tests for business-critical queries:
    - API scope question
    - ONESQL capability question
    - GitHub callback troubleshooting
    - deployment requirements question
-4. build verification
-5. preview-equivalent replay
-6. live OpenClaw trace review
+5. build verification
+6. preview-equivalent replay
+7. live OpenClaw trace review
 
 ## 11. Main Failure Risks
 
-### Risk 1: live OpenClaw agent lacks required retrieval tool behavior
+### Risk 1: live OpenClaw agent still cannot produce stable structured references
 
 Mitigation:
 
 - probe live capability first
 - keep flag-gated rollout
+- require backend reconciliation before delivery
 - do not remove compatibility path until live agent behavior is verified
 
-### Risk 2: retrieval still leaks across publication boundaries
+### Risk 2: backend reconciliation is too weak and accepts the wrong published chunk
 
 Mitigation:
 
-- require explicit scope fields in retrieval contract
-- validate references against the active runtime scope
+- match by published snapshot locator data
+- reject ambiguous matches
+- downgrade claims when reconciliation is not unique
 
-### Risk 3: single-agent output becomes harder to audit
-
-Mitigation:
-
-- require structured JSON output
-- require returned references plus exact citation ids
-- keep backend validation and unsupported-claim downgrade
-
-### Risk 4: rollout silently continues using old multi-agent path
+### Risk 3: runtime still falls back to old multi-agent path in preview
 
 Mitigation:
 
 - emit explicit diagnostics for `runtime_mode=single_agent`
-- verify topology and stage trace in preview before any production claim
+- inspect live cloud traces before any production claim
+
+### Risk 4: simplified runtime still times out or leaves async jobs hanging
+
+Mitigation:
+
+- verify job terminal-state timing explicitly
+- check preview request/polling behavior alongside OpenClaw traces
 
 ## 12. Production Standard
 
