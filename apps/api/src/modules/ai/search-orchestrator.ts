@@ -133,6 +133,8 @@ export class SearchOrchestrator {
   private toReference(
     hit: {
       documentId: string;
+      evidenceId?: string;
+      chunkId?: string;
       title: string;
       snippet: string;
       sourceUrl: string;
@@ -151,6 +153,7 @@ export class SearchOrchestrator {
   ): SearchReference {
     return {
       documentId: hit.documentId,
+      evidenceId: hit.evidenceId ?? hit.chunkId,
       title: hit.title,
       snippet: hit.snippet,
       sourceUrl: hit.sourceUrl,

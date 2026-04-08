@@ -3445,3 +3445,133 @@ If authorization returns page not found, verify Redirect URI, callback URL, and 
     await rm(rootDir, { recursive: true, force: true });
   }
 });
+
+test("runSupportSearchAgent rejects ambiguous bare document ids when multiple evidence ids share one document", async () => {
+  const adapter = createAdapter({
+    routeOverride: {
+      question_type: "why_behavior",
+      specialist_agent: "behavior-specialist"
+    }
+  });
+  const sharedDocumentId = "doc:deploy-capacity";
+  const rootEvidenceId = "chunk:deploy-capacity-root";
+  const detailEvidenceId = "chunk:deploy-capacity-detail";
+  const references: SearchReference[] = [
+    {
+      documentId: sharedDocumentId,
+      evidenceId: rootEvidenceId,
+      title: "Deployment capacity",
+      snippet: "General deployment overview.",
+      sourceUrl: "https://docs.ones.com/deploy/capacity",
+      path: "deploy-docs/docs/capacity.mdx",
+      headingPath: "ROOT",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.95,
+      retrievedAt: "2026-04-08T08:00:00.000Z"
+    },
+    {
+      documentId: sharedDocumentId,
+      evidenceId: detailEvidenceId,
+      title: "Deployment capacity",
+      snippet: "Capacity expansion is supported when the cluster has spare nodes.",
+      sourceUrl: "https://docs.ones.com/deploy/capacity#capacity-expansion",
+      path: "deploy-docs/docs/capacity.mdx",
+      headingPath: "Capacity expansion",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.94,
+      retrievedAt: "2026-04-08T08:00:00.000Z"
+    }
+  ];
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence() {
+      return {
+        query: "Does private deployment support capacity expansion?",
+        answer: "",
+        confidence: 0.94,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: ["private deployment capacity expansion"],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      return null;
+    }
+  };
+
+  adapter.selectSupportEvidence = async () => ({
+    primary_ids: [rootEvidenceId],
+    supplemental_ids: [detailEvidenceId],
+    rejected_ids: []
+  });
+  adapter.writeBehaviorSpecialistAnswer = async () => ({
+    question_type: "why_behavior",
+    render_variant: "behavior",
+    direct_answer: "Capacity expansion is supported in private deployment when spare nodes are available.",
+    claims: [
+      {
+        text: "Capacity expansion is supported in private deployment when spare nodes are available.",
+        kind: "verified_fact",
+        evidence_ids: [sharedDocumentId],
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["Check whether the target cluster has spare nodes."],
+    unknowns: [],
+    escalation_needed: false
+  });
+  adapter.judgeSupportAnswer = async () => ({
+    verdict: "verified",
+    summary: "The behavior is documented.",
+    unsupported_claims: [],
+    missing_info: [],
+    verified_citation_ids: [sharedDocumentId],
+    display_citation_ids: [sharedDocumentId],
+    verified_claims: ["Capacity expansion is supported in private deployment when spare nodes are available."],
+    claim_to_citation_map: [
+      {
+        text: "Capacity expansion is supported in private deployment when spare nodes are available.",
+        kind: "verified_fact",
+        verdict: "verified",
+        citation_ids: [sharedDocumentId]
+      }
+    ]
+  });
+  adapter.bindSupportCitations = async () => {
+    throw new Error("binder should not rescue ambiguous document ids in this regression test");
+  };
+
+  const result = await coreRunSupportSearchAgent({
+    query: "Does private deployment support capacity expansion?",
+    language: "en",
+    currentRound: 0,
+    conversationHistory: [],
+    adapter,
+    orchestrator: orchestrator as never,
+    runtime: {
+      intent: "retrieval",
+      sessionKey: "support-agent-ambiguous-document-id",
+      disableLocalDocs: true,
+      allowMultiPassRetrieval: false,
+      allowRefinement: false
+    },
+    idempotencyKey: "support-agent-ambiguous-document-id"
+  });
+
+  assert.deepEqual(result.verification.verified_citation_ids, []);
+  assert.equal(result.result.citations.length, 0);
+  assert.equal(
+    result.result.references.some((item) => resolveSearchReferenceEvidenceId(item) === detailEvidenceId),
+    true
+  );
+  assert.equal(result.result.support_answer?.mode === "grounded", false);
+});

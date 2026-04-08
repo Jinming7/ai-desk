@@ -352,3 +352,33 @@ test("search keeps explicit kb retrieval failures as kb_unavailable", async () =
   assert.equal(result.retrievalStatus, "kb_unavailable");
   assert.equal(result.unresolvedReasonCode, "KB_RETRIEVAL_UNAVAILABLE");
 });
+
+test("toReference preserves chunk evidence ids from KB retrieval hits", () => {
+  const orchestrator = new SearchOrchestrator(createAdapter({ count: 0 })) as never as {
+    toReference: (
+      hit: {
+        documentId: string;
+        chunkId?: string;
+        title: string;
+        snippet: string;
+        sourceUrl: string;
+        score: number;
+      },
+      retrievedAt: string
+    ) => { evidenceId?: string };
+  };
+
+  const reference = orchestrator.toReference(
+    {
+      documentId: "doc:execute-onesql",
+      chunkId: "chunk:execute-onesql-order-by",
+      title: "Execute ONESQL query",
+      snippet: "ORDER BY and GROUP BY are supported.",
+      sourceUrl: "https://docs.ones.com/openapi/onesql#query-syntax",
+      score: 0.94
+    },
+    "2026-04-08T08:00:00.000Z"
+  );
+
+  assert.equal(reference.evidenceId, "chunk:execute-onesql-order-by");
+});

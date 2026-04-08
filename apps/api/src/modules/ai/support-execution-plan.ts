@@ -51,6 +51,44 @@ function uniqueStrings(values: Array<string | null | undefined>, limit = 8): str
   return result;
 }
 
+function normalizeLookup(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function collectPlannerSemanticText(input: {
+  query: string;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  evidencePlan: SupportEvidencePlan;
+}): string {
+  return uniqueStrings(
+    [
+      input.query,
+      input.route.user_goal,
+      input.caseFrame.goal,
+      input.caseFrame.symptom,
+      input.caseFrame.object,
+      input.caseFrame.action_type,
+      input.caseFrame.product_area,
+      input.caseFrame.deployment_model,
+      ...(input.caseFrame.constraints ?? []),
+      ...(input.caseFrame.retrieval_queries ?? []),
+      ...(input.caseFrame.required_doc_kinds ?? []),
+      ...(input.caseFrame.query_plan?.concept_queries ?? []),
+      ...(input.caseFrame.query_plan?.object_queries ?? []),
+      ...(input.caseFrame.query_plan?.behavior_queries ?? []),
+      ...(input.evidencePlan.evidence_priority ?? []),
+      ...(input.evidencePlan.required_doc_kinds ?? []),
+      ...(input.evidencePlan.query_plan?.concept_queries ?? []),
+      ...(input.evidencePlan.query_plan?.object_queries ?? []),
+      ...(input.evidencePlan.query_plan?.behavior_queries ?? [])
+    ],
+    64
+  )
+    .join(" ")
+    .toLowerCase();
+}
+
 function normalizeStageStatus<T>(result: PlannerStageResult<T>): PlannerStageStatus {
   return result.status;
 }
@@ -58,17 +96,19 @@ function normalizeStageStatus<T>(result: PlannerStageResult<T>): PlannerStageSta
 function analyzePlanSignals(query: string) {
   const lowered = query.toLowerCase();
   const linuxDistributionContext =
-    /\blinux\b/.test(lowered) &&
+    /linux|发行版|操作系统/.test(lowered) &&
     (/\bdistribution\b/.test(lowered) ||
       /\bdistributions\b/.test(lowered) ||
       /\boperating system\b/.test(lowered) ||
-      /\bos\b/.test(lowered));
+      /\bos\b/.test(lowered) ||
+      /发行版|操作系统/.test(lowered));
   const environmentRequirementsContext =
     linuxDistributionContext ||
     /\bsystem requirements?\b/.test(lowered) ||
     /\bdeployment requirements?\b/.test(lowered) ||
     /\bsupported operating systems?\b/.test(lowered) ||
-    /\bserver os\b/.test(lowered);
+    /\bserver os\b/.test(lowered) ||
+    /系统要求|环境要求|兼容性|支持矩阵|操作系统要求/.test(lowered);
 
   return {
     linuxDistributionContext,
@@ -166,6 +206,143 @@ function synthesizeEvidencePlan(query: string, route: SupportQuestionRoute, case
   };
 }
 
+function canonicalizeProductArea(input: {
+  query: string;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  evidencePlan: SupportEvidencePlan;
+}): string {
+  const explicit = normalizeLookup(input.caseFrame.product_area);
+  if (explicit === "deployment" || explicit === "deployment_environment" || explicit.startsWith("deployment_")) {
+    return "deployment";
+  }
+  if (explicit === "openapi") return "openapi";
+  if (explicit === "integrations" || explicit === "integration") return "integrations";
+
+  const semanticText = collectPlannerSemanticText(input);
+  if (String(input.route.question_type ?? "").startsWith("api_")) {
+    return "openapi";
+  }
+  if (/(部署|安装|环境要求|系统要求|支持矩阵|兼容性|private deployment|self-hosted|self hosted|on-prem|on prem|operating system|supported operating systems|deployment requirements|system requirements)/.test(semanticText)) {
+    return "deployment";
+  }
+  if (/(集成|回调|重定向|integration|callback|redirect|webhook|oauth app)/.test(semanticText)) {
+    return "integrations";
+  }
+  if (/(openapi|api|接口|scope|oauth|token)/.test(semanticText)) {
+    return "openapi";
+  }
+  return input.caseFrame.product_area;
+}
+
+function canonicalizeRequiredDocKinds(values: string[], canonicalProductArea: string): string[] {
+  const canonical = uniqueStrings(
+    values.flatMap((value) => {
+      const normalized = normalizeLookup(value);
+      if (!normalized) return [];
+      const result: string[] = [];
+      if (normalized === "deployment_runbook" || /部署|安装|runbook/.test(normalized)) {
+        result.push("deployment_runbook");
+      }
+      if (
+        normalized === "product_guide" ||
+        /product.?guide|系统要求|环境要求|安装指南|部署文档|官方部署安装文档|guide/.test(normalized)
+      ) {
+        result.push("product_guide");
+      }
+      if (normalized === "rules" || /rules?|constraint|compatibility|support matrix|版本说明|限制|规则|支持矩阵|兼容性/.test(normalized)) {
+        result.push("rules");
+      }
+      if (normalized === "troubleshooting" || /故障|排查|troubleshooting/.test(normalized)) {
+        result.push("troubleshooting");
+      }
+      if (normalized === "openapi/api" || /openapi|api|接口/.test(normalized)) {
+        result.push("openapi/api");
+      }
+      if (normalized === "permissions" || /permission|scope|oauth|token|鉴权|授权|权限/.test(normalized)) {
+        result.push("permissions");
+      }
+      return result;
+    }),
+    6
+  );
+
+  if (canonical.length > 0) return canonical;
+  if (canonicalProductArea === "deployment") return ["deployment_runbook", "product_guide", "rules"];
+  if (canonicalProductArea === "openapi") return ["openapi/api"];
+  return [];
+}
+
+function canonicalizeObject(input: {
+  query: string;
+  caseFrame: SupportCaseFrame;
+  evidencePlan: SupportEvidencePlan;
+}): string {
+  const semanticText = uniqueStrings(
+    [
+      input.query,
+      input.caseFrame.object,
+      ...(input.caseFrame.retrieval_queries ?? []),
+      ...(input.caseFrame.query_plan?.object_queries ?? []),
+      ...(input.evidencePlan.query_plan?.object_queries ?? [])
+    ],
+    24
+  )
+    .join(" ")
+    .toLowerCase();
+
+  if (/linux/.test(semanticText) && (/distribution/.test(semanticText) || /发行版|操作系统/.test(semanticText))) {
+    return "linux distributions";
+  }
+
+  return input.caseFrame.object;
+}
+
+function canonicalizeActionType(actionType: string, route: SupportQuestionRoute): string {
+  const normalized = normalizeLookup(actionType);
+  if (normalized === "how_to" || normalized === "troubleshooting" || normalized === "api_lookup" || normalized === "capability_confirmation") {
+    return normalized;
+  }
+  if (/support[_ ]?matrix|compatibility|发行版|操作系统|system requirements?|environment requirements?/.test(normalized)) {
+    return "capability_confirmation";
+  }
+  if (/how|步骤|安装|配置|setup|configure/.test(normalized)) {
+    return "how_to";
+  }
+  if (/故障|排查|error|failed|troubleshoot/.test(normalized)) {
+    return "troubleshooting";
+  }
+  return inferActionType(route);
+}
+
+function normalizePlannerOutput(input: {
+  query: string;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  evidencePlan: SupportEvidencePlan;
+}): { caseFrame: SupportCaseFrame; evidencePlan: SupportEvidencePlan } {
+  const productArea = canonicalizeProductArea(input);
+  const requiredDocKinds = canonicalizeRequiredDocKinds(
+    [...(input.caseFrame.required_doc_kinds ?? []), ...(input.evidencePlan.required_doc_kinds ?? [])],
+    productArea
+  );
+  const caseFrame: SupportCaseFrame = {
+    ...input.caseFrame,
+    product_area: productArea,
+    object: canonicalizeObject(input),
+    action_type: canonicalizeActionType(input.caseFrame.action_type, input.route),
+    required_doc_kinds: requiredDocKinds.length > 0 ? requiredDocKinds : input.caseFrame.required_doc_kinds
+  };
+  const evidencePlan: SupportEvidencePlan = {
+    ...input.evidencePlan,
+    required_doc_kinds: requiredDocKinds.length > 0 ? requiredDocKinds : input.evidencePlan.required_doc_kinds
+  };
+  return {
+    caseFrame,
+    evidencePlan
+  };
+}
+
 function buildRetrievalPlan(query: string, caseFrame: SupportCaseFrame, evidencePlan: SupportEvidencePlan) {
   const baseQueries = uniqueStrings(
     [
@@ -207,12 +384,18 @@ export function resolveSupportExecutionPlan(input: {
     input.evidencePlanResult.status === "completed"
       ? input.evidencePlanResult.value
       : synthesizeEvidencePlan(input.query, route, synthesizedCaseFrame);
+  const normalizedPlannerOutput = normalizePlannerOutput({
+    query: input.query,
+    route,
+    caseFrame: synthesizedCaseFrame,
+    evidencePlan
+  });
 
   return {
     route,
-    caseFrame: synthesizedCaseFrame,
-    evidencePlan,
-    retrievalPlan: buildRetrievalPlan(input.query, synthesizedCaseFrame, evidencePlan),
+    caseFrame: normalizedPlannerOutput.caseFrame,
+    evidencePlan: normalizedPlannerOutput.evidencePlan,
+    retrievalPlan: buildRetrievalPlan(input.query, normalizedPlannerOutput.caseFrame, normalizedPlannerOutput.evidencePlan),
     degradedPolicy: {
       plannerSynthesized:
         input.casePlanResult.status !== "completed" || input.evidencePlanResult.status !== "completed"

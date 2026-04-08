@@ -244,6 +244,87 @@ function mapDirectCandidateToEvidence(candidate: HybridFusedCandidate): HybridGr
   };
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function extractSupportEvidence(metadata: unknown, options?: { allowRawRecord?: boolean }): Record<string, unknown> | undefined {
+  const record = asRecord(metadata);
+  if (!record) return undefined;
+  const nested = asRecord(record.supportEvidence);
+  if (nested) return nested;
+  const chunkSupportEvidence = asRecord(asRecord(record.chunk_metadata)?.supportEvidence) ?? asRecord(asRecord(record.chunkMetadata)?.supportEvidence);
+  if (chunkSupportEvidence) return chunkSupportEvidence;
+  const docSupportEvidence = asRecord(asRecord(record.doc_metadata)?.supportEvidence) ?? asRecord(asRecord(record.docMetadata)?.supportEvidence);
+  if (docSupportEvidence) return docSupportEvidence;
+  if (!options?.allowRawRecord) return undefined;
+  const looksLikeSupportEvidence = [
+    "product_area",
+    "evidence_kind",
+    "deployment_model",
+    "doc_kind",
+    "object_type",
+    "actions",
+    "objects",
+    "applies_to",
+    "limitations",
+    "permissions",
+    "prerequisites",
+    "version_scope"
+  ].some((key) => key in record);
+  return looksLikeSupportEvidence ? record : undefined;
+}
+
+function pickDefined(record: Record<string, unknown> | undefined, keys: string[]): Record<string, unknown> {
+  if (!record) return {};
+  return keys.reduce<Record<string, unknown>>((acc, key) => {
+    if (record[key] !== undefined) acc[key] = record[key];
+    return acc;
+  }, {});
+}
+
+function buildMemoryGroundedSupportMetadata(input: {
+  candidate?: HybridFusedCandidate;
+  memoryMetadata?: Record<string, unknown>;
+  docMetadata?: Record<string, unknown>;
+  groundedMetadata?: Record<string, unknown>;
+  citationFamily: string;
+  sourceFamily: string;
+}): Record<string, unknown> | undefined {
+  const candidateMetadata = asRecord(input.candidate?.supportMetadata);
+  const memoryLineage = {
+    ...pickDefined(input.memoryMetadata, ["memory_id", "memory_kind", "memory_source", "memory_relation_path", "memory_doc_kind"]),
+    ...pickDefined(candidateMetadata, ["memory_id", "memory_kind", "memory_source", "memory_relation_path", "memory_doc_kind"]),
+    memory_id: input.candidate?.candidateId ?? input.memoryMetadata?.memory_id,
+    memory_kind:
+      candidateMetadata?.memory_kind ??
+      input.candidate?.candidateFamily ??
+      input.memoryMetadata?.memory_kind,
+    memory_doc_kind:
+      candidateMetadata?.memory_doc_kind ??
+      input.candidate?.docKind ??
+      candidateMetadata?.doc_kind ??
+      input.memoryMetadata?.memory_doc_kind,
+    citation_family: input.citationFamily,
+    source_family: input.sourceFamily
+  };
+  const supportMetadata = {
+    ...(extractSupportEvidence(input.docMetadata) ?? {}),
+    ...(input.groundedMetadata ?? {}),
+    ...pickDefined(memoryLineage, [
+      "memory_id",
+      "memory_kind",
+      "memory_source",
+      "memory_relation_path",
+      "memory_doc_kind",
+      "citation_family",
+      "source_family"
+    ])
+  };
+  return Object.keys(supportMetadata).length ? supportMetadata : undefined;
+}
+
 export class DefaultHybridRetrievalProvider implements HybridRetrievalProvider {
   private readonly deps: DefaultHybridRetrievalProviderDeps;
 
@@ -446,7 +527,14 @@ export class DefaultHybridRetrievalProvider implements HybridRetrievalProvider {
           buildVersion: memoryCandidates.find((candidate) => candidate.candidateId === item.memoryId)?.buildVersion ?? "",
           knowledgeSpace: request.knowledgeSpace,
           sourceFamily: item.sourceFamily,
-          supportMetadata: item.memoryMetadata,
+          supportMetadata: buildMemoryGroundedSupportMetadata({
+            candidate: memoryCandidates.find((candidate) => candidate.candidateId === item.memoryId),
+            memoryMetadata: item.memoryMetadata,
+            docMetadata: item.docMetadata,
+            groundedMetadata: extractSupportEvidence(item.citationMetadata, { allowRawRecord: true }),
+            citationFamily: item.citationFamily,
+            sourceFamily: item.sourceFamily
+          }),
           docMetadata: item.docMetadata,
           sourceCandidateType: "memory" as const
         }))
@@ -482,7 +570,14 @@ export class DefaultHybridRetrievalProvider implements HybridRetrievalProvider {
             buildVersion: memoryCandidates.find((candidate) => candidate.candidateId === item.memoryId)?.buildVersion ?? "",
             knowledgeSpace: request.knowledgeSpace,
             sourceFamily: "doc_page",
-            supportMetadata: item.memoryMetadata,
+            supportMetadata: buildMemoryGroundedSupportMetadata({
+              candidate: memoryCandidates.find((candidate) => candidate.candidateId === item.memoryId),
+              memoryMetadata: item.memoryMetadata,
+              docMetadata: item.docMetadata,
+              groundedMetadata: extractSupportEvidence(item.chunkMetadata),
+              citationFamily: "doc_chunk",
+              sourceFamily: "doc_page"
+            }),
             chunkMetadata: item.chunkMetadata,
             docMetadata: item.docMetadata,
             sourceCandidateType: "memory" as const

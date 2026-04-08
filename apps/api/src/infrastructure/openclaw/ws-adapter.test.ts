@@ -200,3 +200,139 @@ test("waitAgentRun preserves explicit stage runtime timeout above default env ca
   });
   assert.equal(observedTimeoutMs, 45_000);
 });
+
+test("selectSupportEvidence exposes exact evidence ids to the selector prompt", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    selectSupportEvidence: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        caseFrame: Record<string, unknown>;
+        references: Array<Record<string, unknown>>;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{ primary_ids: string[]; supplemental_ids: string[]; rejected_ids: string[] }>;
+    runJsonPrompt: (prompt: string) => Promise<unknown>;
+  };
+  let capturedPrompt = "";
+
+  adapter.runJsonPrompt = async (prompt) => {
+    capturedPrompt = prompt;
+    return {
+      primary_ids: ["chunk:capacity"],
+      supplemental_ids: [],
+      rejected_ids: []
+    };
+  };
+
+  const selection = await adapter.selectSupportEvidence(
+    {
+      contextType: "search",
+      language: "en",
+      query: "Does private deployment support capacity scaling?",
+      caseFrame: {
+        goal: "capacity scaling",
+        symptom: "capacity question",
+        object: "private deployment",
+        action_type: "why",
+        deployment_model: "private_deployment",
+        product_area: "deploy",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: ["capacity scaling"]
+      },
+      references: [
+        {
+          documentId: "doc:deploy-capacity",
+          evidenceId: "chunk:capacity",
+          title: "Deployment capacity",
+          snippet: "Capacity scaling is supported for private deployment clusters.",
+          sourceUrl: "https://docs.ones.com/deploy/capacity",
+          path: "deploy-docs/docs/capacity.mdx",
+          headingPath: "Capacity",
+          score: 0.93,
+          retrievedAt: "2026-04-08T08:00:00.000Z",
+          supportMetadata: {
+            authority: "canonical_visible",
+            source_type: "github_kb"
+          }
+        }
+      ]
+    },
+    "ws-adapter:evidence-selector-prompt"
+  );
+
+  assert.match(capturedPrompt, /"evidenceId":"chunk:capacity"/);
+  assert.equal(capturedPrompt.includes('"documentId":"doc:deploy-capacity"'), true);
+  assert.deepEqual(selection.primary_ids, ["chunk:capacity"]);
+});
+
+test("selectSupportEvidence falls back rejected ids to evidence ids instead of document ids", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    selectSupportEvidence: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        caseFrame: Record<string, unknown>;
+        references: Array<Record<string, unknown>>;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{ primary_ids: string[]; supplemental_ids: string[]; rejected_ids: string[] }>;
+    runJsonPrompt: (prompt: string) => Promise<unknown>;
+  };
+
+  adapter.runJsonPrompt = async () => ({
+    primary_ids: [],
+    supplemental_ids: []
+  });
+
+  const selection = await adapter.selectSupportEvidence(
+    {
+      contextType: "search",
+      language: "en",
+      query: "Why does this behavior happen?",
+      caseFrame: {
+        goal: "behavior explanation",
+        symptom: "unexpected behavior",
+        object: "query execution",
+        action_type: "why",
+        deployment_model: "shared",
+        product_area: "onesql",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: ["behavior explanation"]
+      },
+      references: [
+        {
+          documentId: "doc:onesql",
+          evidenceId: "chunk:onesql-root",
+          title: "Execute ONESQL query",
+          snippet: "General overview.",
+          sourceUrl: "https://docs.ones.com/openapi/onesql",
+          path: "open-docs/docs/openapi/api/execute-onesql.api.mdx",
+          headingPath: "ROOT",
+          score: 0.8,
+          retrievedAt: "2026-04-08T08:00:00.000Z"
+        },
+        {
+          documentId: "doc:onesql",
+          evidenceId: "chunk:onesql-order-by",
+          title: "Execute ONESQL query",
+          snippet: "ORDER BY and GROUP BY are supported.",
+          sourceUrl: "https://docs.ones.com/openapi/onesql#query-syntax",
+          path: "open-docs/docs/openapi/api/execute-onesql.api.mdx",
+          headingPath: "Query syntax",
+          score: 0.79,
+          retrievedAt: "2026-04-08T08:00:00.000Z"
+        }
+      ]
+    },
+    "ws-adapter:evidence-selector-rejected-fallback"
+  );
+
+  assert.deepEqual(selection.rejected_ids, ["chunk:onesql-root", "chunk:onesql-order-by"]);
+});

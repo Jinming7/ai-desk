@@ -1,5 +1,5 @@
 import { canTransition } from "../../domain/state-machine.js";
-import type { OpenClawAdapter, OpenClawAnalyzeOutput, OpenClawDecisionAction } from "../../infrastructure/openclaw/types.js";
+import type { OpenClawAdapter, OpenClawAnalyzeOutput, OpenClawDecisionAction, OpenClawRuntimeContext } from "../../infrastructure/openclaw/types.js";
 import { env } from "../../config/env.js";
 import crypto from "node:crypto";
 import * as aiRepo from "./repository.js";
@@ -35,6 +35,16 @@ import * as onesSync from "../ones-sync/service.js";
 import * as githubKbService from "../github-kb/service.js";
 
 type SearchRuntimeDelivery = "interactive" | "async_job";
+type SupportSearchJobStageState = {
+  currentStage: string;
+  lastCompletedStage?: string;
+};
+type SupportSearchJobHeartbeat = (input: {
+  jobId: string;
+  leaseKey: string;
+  stageState?: Record<string, unknown>;
+  leaseMs?: number;
+}) => Promise<void>;
 
 function normalizeAction(action: string): OpenClawDecisionAction {
   if (action === "ask_info") return "ask_user";
@@ -1509,6 +1519,80 @@ export async function getSearchModeJob(jobId: string): Promise<SupportSearchJob 
   return getSupportSearchJob(jobId);
 }
 
+export async function runSupportSearchJobWithLease<T>(input: {
+  jobId: string;
+  leaseKey: string;
+  leaseMs: number;
+  timeoutMs: number;
+  initialStageState: SupportSearchJobStageState;
+  operation: (helpers: { reportStageProgress: (stageState: SupportSearchJobStageState) => Promise<void> }) => Promise<T>;
+  heartbeat?: SupportSearchJobHeartbeat;
+  keepAliveIntervalMs?: number;
+}): Promise<T> {
+  const heartbeat = input.heartbeat ?? heartbeatSupportSearchJob;
+  const keepAliveIntervalMs =
+    input.keepAliveIntervalMs ?? Math.max(1_000, Math.min(5_000, Math.floor(input.leaseMs / 3)));
+  let latestStageState = input.initialStageState;
+  let settled = false;
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  let keepAliveHandle: NodeJS.Timeout | undefined;
+  let rejectLeaseFailure: ((reason?: unknown) => void) | null = null;
+  const leaseFailure = new Promise<never>((_resolve, reject) => {
+    rejectLeaseFailure = reject;
+  });
+  let heartbeatChain = Promise.resolve();
+
+  const renewLease = async (stageState?: SupportSearchJobStageState): Promise<void> => {
+    if (settled) return;
+    latestStageState = stageState ?? latestStageState;
+    heartbeatChain = heartbeatChain
+      .catch(() => undefined)
+      .then(async () => {
+        if (settled) return;
+        await heartbeat({
+          jobId: input.jobId,
+          leaseKey: input.leaseKey,
+          leaseMs: input.leaseMs,
+          stageState: latestStageState
+        });
+      });
+
+    try {
+      await heartbeatChain;
+    } catch (error) {
+      if (!settled && rejectLeaseFailure) {
+        const reject = rejectLeaseFailure;
+        rejectLeaseFailure = null;
+        reject(error);
+      }
+      throw error;
+    }
+  };
+
+  await renewLease(input.initialStageState);
+  keepAliveHandle = setInterval(() => {
+    void renewLease().catch(() => undefined);
+  }, keepAliveIntervalMs);
+
+  try {
+    return await Promise.race([
+      input.operation({
+        reportStageProgress: renewLease
+      }),
+      new Promise<never>((_resolve, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new Error(`support search job timeout after ${input.timeoutMs}ms`));
+        }, input.timeoutMs);
+      }),
+      leaseFailure
+    ]);
+  } finally {
+    settled = true;
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    if (keepAliveHandle) clearInterval(keepAliveHandle);
+  }
+}
+
 export async function runDueSearchModeJobs(
   limit: number,
   adapter: OpenClawAdapter
@@ -1563,28 +1647,36 @@ async function runClaimedSearchModeJob(
   }
 
   try {
-    await heartbeatSupportSearchJob({
-      jobId: job.id,
-      leaseKey: job.leaseKey,
-      leaseMs: env.AI_SUPPORT_JOB_LEASE_MS,
-      stageState: {
-        currentStage: "run_search_mode",
-        lastCompletedStage: "job_claimed"
-      }
-    });
-
     const requestConversation = Array.isArray(job.request.conversation)
       ? (job.request.conversation as Array<{ role: "user" | "assistant"; content: string }>)
       : [];
     const requestAttachments = Array.isArray(job.request.attachments)
       ? job.request.attachments.map((item) => String(item))
       : [];
-    const result = await runSearchMode(String(job.request.query ?? job.query), adapter, {
+    const runtime = buildSearchRuntime({
+      intent: job.currentRound > 0 ? "clarify" : "retrieval",
       sessionId: job.sessionId,
-      conversation: requestConversation,
-      answerLanguage: job.answerLanguage,
-      attachments: requestAttachments,
-      runtimeDelivery: "async_job"
+      delivery: "async_job"
+    });
+    const result = await runSupportSearchJobWithLease({
+      jobId: job.id,
+      leaseKey: job.leaseKey,
+      leaseMs: env.AI_SUPPORT_JOB_LEASE_MS,
+      timeoutMs: Number(runtime.overallTimeoutMs ?? env.AI_SUPPORT_JOB_TIMEOUT_MS),
+      initialStageState: {
+        currentStage: "run_search_mode",
+        lastCompletedStage: "job_claimed"
+      },
+      operation: ({ reportStageProgress }) =>
+        runSearchMode(String(job.request.query ?? job.query), adapter, {
+          sessionId: job.sessionId,
+          conversation: requestConversation,
+          answerLanguage: job.answerLanguage,
+          attachments: requestAttachments,
+          runtimeDelivery: "async_job",
+          runtimeOverride: runtime,
+          onSupportStageProgress: reportStageProgress
+        })
     });
 
     await markSupportSearchJobSucceeded({
@@ -1642,17 +1734,21 @@ export async function runSearchMode(
     imageAttachments?: string[];
     attachments?: string[];
     runtimeDelivery?: SearchRuntimeDelivery;
+    runtimeOverride?: OpenClawRuntimeContext;
+    onSupportStageProgress?: (stageState: SupportSearchJobStageState) => Promise<void> | void;
   }
 ): Promise<SearchModeResult> {
   const sessionId = options?.sessionId ?? crypto.randomUUID();
   const previousDialog = await aiRepo.getDialogState(sessionId);
   const currentRound = previousDialog?.clarification_round ?? 0;
   const searchIntent: "clarify" | "retrieval" = currentRound > 0 ? "clarify" : "retrieval";
-  const runtime = buildSearchRuntime({
-    intent: searchIntent,
-    sessionId,
-    delivery: options?.runtimeDelivery ?? "interactive"
-  });
+  const runtime =
+    options?.runtimeOverride ??
+    buildSearchRuntime({
+      intent: searchIntent,
+      sessionId,
+      delivery: options?.runtimeDelivery ?? "interactive"
+    });
   const trimmedQuery = query.trim();
   const prevTranscript = previousDialog?.transcript;
   const resolvedQuery = trimmedQuery || (prevTranscript?.length ? prevTranscript[prevTranscript.length - 1].content : "") || "";
@@ -1814,6 +1910,7 @@ export async function runSearchMode(
       adapter,
       runtime,
       attachments,
+      onStageProgress: options?.onSupportStageProgress,
       idempotencyKey: `support-search:${sessionId}:${currentRound + 1}`
     });
 

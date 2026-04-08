@@ -1144,14 +1144,18 @@ function buildReferenceCitationAliases(reference: SearchReference, options?: { a
   const aliases = new Set<string>();
   const canonicalEvidenceId = resolveSearchReferenceEvidenceId(reference);
   const documentId = String(reference.documentId ?? "").trim();
+  const hasDistinctEvidenceId = Boolean(String(reference.evidenceId ?? "").trim()) && canonicalEvidenceId !== documentId;
   const sourceUrl = String(reference.sourceUrl ?? "").trim();
   const repoSourceUrl = String(reference.repoSourceUrl ?? "").trim();
   const canonicalPath = canonicalDocsPath(reference.path);
   const heading = resolveReferenceHeadingAlias(reference);
   const headingLower = heading.toLowerCase();
 
-  for (const value of [canonicalEvidenceId, documentId, sourceUrl, repoSourceUrl]) {
+  for (const value of [canonicalEvidenceId, sourceUrl, repoSourceUrl]) {
     if (value) aliases.add(value);
+  }
+  if (documentId && !hasDistinctEvidenceId) {
+    aliases.add(documentId);
   }
 
   if (canonicalPath) {
@@ -3358,6 +3362,11 @@ type SupportSearchOrchestrator = Pick<
   "collectEvidence" | "combineEvidenceCollections" | "refineEvidence" | "normalizeQuery"
 >;
 
+type SupportAgentStageProgress = {
+  currentStage: string;
+  lastCompletedStage?: string;
+};
+
 async function writeSpecialistDraft(input: {
   adapter: OpenClawAdapter;
   contextType: "search" | "triage";
@@ -3441,6 +3450,7 @@ export async function runSupportSearchAgent(input: {
   idempotencyKey: string;
   contextType?: "search" | "triage";
   orchestrator?: SupportSearchOrchestrator;
+  onStageProgress?: (progress: SupportAgentStageProgress) => Promise<void> | void;
   ticketContext?: {
     priority: string;
     customerMeta: Record<string, unknown>;
@@ -3459,6 +3469,16 @@ export async function runSupportSearchAgent(input: {
   const allowRefinement = input.runtime?.allowRefinement !== false;
   const contextType = input.contextType ?? "search";
   const runtimePolicy = resolveSupportRuntimePolicy(input.runtime);
+  let lastCompletedStage: string | undefined;
+  const reportStageProgress = async (currentStage: string): Promise<void> => {
+    if (!input.onStageProgress) return;
+    await input.onStageProgress({ currentStage, lastCompletedStage });
+  };
+  const markStageCompleted = (stage: string): void => {
+    lastCompletedStage = stage;
+  };
+
+  await reportStageProgress("planner");
   const unifiedPlannerRuntime = withStageRuntime(
     buildDeliveryAwareStageRuntime(
       input.runtime,
@@ -3678,6 +3698,7 @@ export async function runSupportSearchAgent(input: {
     }
   }
   const usedUnifiedPlanner = Boolean(unifiedPlanResult?.value);
+  markStageCompleted("planner");
   const mergedCaseFrame = mergeRouteAndEvidencePlan(executionPlan.caseFrame, executionPlan.route, executionPlan.evidencePlan);
   const stabilized = stabilizeSupportRouteAndCaseFrame({
     query: input.query,
@@ -3697,6 +3718,7 @@ export async function runSupportSearchAgent(input: {
     plan: executionPlan.evidencePlan
   });
   const baseQueries = buildInitialRetrievalQueries(input.query, caseFrame, executionPlan.retrievalPlan.baseQueries);
+  await reportStageProgress("retrieval_base");
   const baseEvidenceStartedAt = performance.now();
   const baseEvidenceResult = await orchestrator
     .collectEvidence({
@@ -3733,7 +3755,9 @@ export async function runSupportSearchAgent(input: {
       })
     }));
   const baseEvidence = baseEvidenceResult.value;
+  markStageCompleted("retrieval_base");
   const additionalQueries = combineRetrievalQueries(input.query, caseFrame, orchestrator, baseQueries);
+  await reportStageProgress("retrieval_extra");
   const additionalStartedAt = performance.now();
   const additionalEvidence =
     allowMultiPassRetrieval &&
@@ -3786,6 +3810,7 @@ export async function runSupportSearchAgent(input: {
           reference_count: evidenceCollection.references.length
         })
       : skippedStageTiming();
+  markStageCompleted("retrieval_extra");
 
   const selectionRuntime = withStageRuntime(
     buildDeliveryAwareStageRuntime(
@@ -3804,6 +3829,7 @@ export async function runSupportSearchAgent(input: {
     "support-evidence-selector",
     `${input.idempotencyKey}:evidence-selector`
   );
+  await reportStageProgress("evidence_selection");
   const evidenceSelectionStartedAt = performance.now();
   const evidenceSelection =
     evidenceCollection.references.length > 0 && hasEnoughBudget(input.runtime, 5000)
@@ -3828,6 +3854,7 @@ export async function runSupportSearchAgent(input: {
           value: fallbackEvidenceSelection(evidenceCollection.references, input.query, caseFrame),
           timing: stageTiming("skipped", elapsedMs(evidenceSelectionStartedAt), { reference_count: 0 })
         };
+  markStageCompleted("evidence_selection");
 
   const evidenceBundle = buildEvidenceBundle({
     references: evidenceCollection.references,
@@ -3866,6 +3893,7 @@ export async function runSupportSearchAgent(input: {
     route.specialist_agent,
     `${input.idempotencyKey}:${route.specialist_agent}`
   );
+  await reportStageProgress("writer");
   const specialistResult = !shouldSkipSpecialist && hasEnoughBudget(input.runtime, 6000)
     ? await writeSpecialistDraft({
         adapter: input.adapter,
@@ -3984,6 +4012,7 @@ export async function runSupportSearchAgent(input: {
       caseFrame
     }) ??
     rawDraftSupportAnswer;
+  markStageCompleted("writer");
   const draftClaimsWithEvidence = draftSupportAnswer.claims.filter(
     (claim: SpecialistDraftAnswer["claims"][number]) =>
       claim.evidence_ids.length > 0 && (claim.kind === "verified_fact" || claim.kind === "grounded_inference")
@@ -4043,6 +4072,7 @@ export async function runSupportSearchAgent(input: {
     hasEnoughBudget(input.runtime, 2500);
 
   const verifierStartedAt = performance.now();
+  await reportStageProgress("verification");
   const verificationResult = useFastAgentPath
     ? { value: writerBoundVerification, timing: stageTiming("skipped", elapsedMs(verifierStartedAt)) }
     : await (async () => {
@@ -4081,6 +4111,7 @@ export async function runSupportSearchAgent(input: {
               .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(verifierStartedAt)) }))
           : { value: null, timing: stageTiming("skipped", elapsedMs(verifierStartedAt)) };
       })();
+  markStageCompleted("verification");
   const verification =
     verificationResult.value ??
     fallbackVerification(
@@ -4131,6 +4162,7 @@ export async function runSupportSearchAgent(input: {
     "support-citation-binder",
     `${input.idempotencyKey}:support-citation-binder`
   );
+  await reportStageProgress("citation_binding");
   const citationBinderStartedAt = performance.now();
   const reboundVerification =
     useFastAgentPath || !draftSupportAnswer.claims.length || !evidenceBundle.primary.length || !hasEnoughBudget(input.runtime, 5000)
@@ -4161,6 +4193,7 @@ export async function runSupportSearchAgent(input: {
         evidenceBundle
       })
     : null;
+  markStageCompleted("citation_binding");
   const preselectedVerification = pickBestVerificationCandidate({
     query: input.query,
     caseFrame,
@@ -4187,6 +4220,7 @@ export async function runSupportSearchAgent(input: {
     useFastAgentPath ? "support-citation-selector" : "citation-curator",
     `${input.idempotencyKey}:${useFastAgentPath ? "support-citation-selector" : "citation-curator"}`
   );
+  await reportStageProgress("citation_selection");
   const citationSelectionStartedAt = performance.now();
   const selectedDisplayCitations =
     supportedVerificationClaims(preselectedVerification).length > 0 && hasEnoughBudget(input.runtime, 4500)
@@ -4223,6 +4257,7 @@ export async function runSupportSearchAgent(input: {
           reference_count: selectedDisplayCitations?.display_citation_ids.length ?? 0
         })
       : skippedStageTiming();
+  markStageCompleted("citation_selection");
 
   const finalVerification = sanitizeVerification({
     verification: selectedDisplayCitations
@@ -4268,6 +4303,7 @@ export async function runSupportSearchAgent(input: {
     `${input.idempotencyKey}:answer-composer`
   );
   const answerComposerStartedAt = performance.now();
+  await reportStageProgress("answer_composition");
   const shouldComposeCustomerAnswer =
     !useFastAgentPath &&
     hasEnoughBudget(input.runtime, 4500) &&
@@ -4299,6 +4335,7 @@ export async function runSupportSearchAgent(input: {
     shouldComposeCustomerAnswer
       ? stageTiming(composedSupportAnswer ? "completed" : "fallback", elapsedMs(answerComposerStartedAt))
       : skippedStageTiming();
+  markStageCompleted("answer_composition");
   const supportAnswer = buildSupportAnswerFromDraft({
     language: input.language,
     mode,

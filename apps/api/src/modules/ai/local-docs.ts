@@ -453,26 +453,29 @@ function inferEvidenceKind(filePath: string, title: string, content: string): st
 }
 
 function inferSupportMetadata(filePath: string, title: string, content: string): Record<string, unknown> {
+  const normalizedPath = filePath.toLowerCase();
   const normalizedContent = content.toLowerCase();
   const evidenceKind = inferEvidenceKind(filePath, title, content);
   const productArea =
-    /<methodendpoint|<paramsitem|<schemaitem|\b(get|post|put|patch|delete)\s+\/[a-z0-9_/{}/.-]+|openapi|oauth|scope|token|credential/.test(
-      normalizedContent
+    /\/openapi\/api\/|\.api\.|<methodendpoint|<paramsitem|<schemaitem|\b(get|post|put|patch|delete)\s+\/[a-z0-9_/{}/.-]+|openapi|oauth|scope|token|credential/.test(
+      `${normalizedPath} ${normalizedContent}`
     )
       ? "openapi"
-      : /github|gitlab|teams|slack|webhook|integration/.test(normalizedContent)
+      : /\/integrations\/|account-integration|github|gitlab|teams|slack|webhook|integration/.test(
+          `${normalizedPath} ${normalizedContent}`
+        )
       ? "integrations"
-      : /deploy|deployment|kubernetes|cluster|pod|ingress|database|storage|topology|architecture|self-hosted|on-prem|私有部署|本地部署/.test(
-          normalizedContent
+      : /deploy-docs\/|\/installation\/|\/configure\/|deploy|deployment|kubernetes|cluster|pod|ingress|database|storage|topology|architecture|self-hosted|on-prem|私有部署|本地部署/.test(
+          `${normalizedPath} ${normalizedContent}`
         )
       ? "deployment"
-      : /issue|project|field|comment|attachment|sprint|workflow|wiki|space|page/.test(normalizedContent)
+      : /issue|project|field|comment|attachment|sprint|workflow|wiki|space|page/.test(`${normalizedPath} ${normalizedContent}`)
       ? "project_management"
       : "general";
   const deploymentModel =
-    /private deployment|self-hosted|on-prem|私有部署|本地部署|闭网|离线/.test(normalizedContent)
+    /deploy-docs\/|private deployment|self-hosted|on-prem|私有部署|本地部署|闭网|离线/.test(`${normalizedPath} ${normalizedContent}`)
       ? "private_deployment"
-      : /public cloud|公有云|saas/.test(normalizedContent)
+      : /public cloud|公有云|saas/.test(`${normalizedPath} ${normalizedContent}`)
       ? "public_cloud"
       : "shared";
   const actions = uniqueStrings(

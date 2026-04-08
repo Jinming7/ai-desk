@@ -20,6 +20,12 @@ export interface HybridPublication {
   publishedBuildVersion: string;
 }
 
+export interface HybridRuntimeBudget {
+  mode: "full" | "tight" | "minimal";
+  remainingMs?: number;
+  deadlineAtMs?: number;
+}
+
 export interface HybridRetrievalRequest {
   query: string;
   rewrites: string[];
@@ -33,6 +39,7 @@ export interface HybridRetrievalRequest {
   branch?: string;
   knowledgeSpace: KbKnowledgeSpace;
   topK: number;
+  runtimeBudget?: HybridRuntimeBudget;
 }
 
 export interface HybridRecallCandidate {

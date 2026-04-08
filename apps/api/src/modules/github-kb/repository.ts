@@ -2056,6 +2056,7 @@ export async function searchKeywordCandidates(input: {
     )
     .join(" + ");
   const ordinalBoost = "CASE WHEN chunk.ordinal <= 3 THEN 0.9 WHEN chunk.ordinal <= 6 THEN 0.35 ELSE 0 END";
+  const lexicalPrefix = hasCjk ? "0 +" : `ts_rank_cd(chunk.search_vector, websearch_to_tsquery('english', $${queryParam ?? 0})) + `;
 
   const result = await pool.query<{
     chunk_id: string;
@@ -2097,7 +2098,7 @@ export async function searchKeywordCandidates(input: {
       ) AS snippet,`
       }
       (
-        ${hasCjk ? "0" : `ts_rank_cd(chunk.search_vector, websearch_to_tsquery('english', $${queryParam ?? 0})) + `}
+        ${lexicalPrefix}
         ${tokenScore}
         + ${ordinalBoost}
       )::text AS lexical_score,
@@ -2120,7 +2121,7 @@ export async function searchKeywordCandidates(input: {
          OR (${tokenOr})
        )
      ORDER BY (
-       ${hasCjk ? "0" : `ts_rank_cd(chunk.search_vector, websearch_to_tsquery('english', $${queryParam ?? 0})) + `}
+       ${lexicalPrefix}
        ${tokenScore}
        + ${ordinalBoost}
      ) DESC, chunk.ordinal ASC, chunk.updated_at DESC

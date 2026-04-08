@@ -38,6 +38,7 @@ import type {
   SupportVerificationResult,
   TriageSupportInsight
 } from "../../modules/ai/types.js";
+import { resolveSearchReferenceEvidenceId } from "../../modules/ai/types.js";
 import { resolveStageSpecificAgent } from "../../modules/ai/agent-router.js";
 import { assertRuntimeBudgetAvailable, capRuntimeTimeoutMs } from "../../modules/ai/runtime-budget.js";
 
@@ -879,6 +880,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportEvidenceSelection> {
     const candidates = input.references.slice(0, 8).map((reference) => ({
+      evidenceId: resolveSearchReferenceEvidenceId(reference),
       documentId: reference.documentId,
       title: reference.title,
       headingPath: reference.headingPath,
@@ -904,6 +906,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "- primary_ids should contain the strongest 1 to 3 evidence ids.",
       "- supplemental_ids may contain up to 2 additional evidence ids that add useful context.",
       "- Do not include the same id in multiple arrays.",
+      "- When you output ids, copy the exact evidenceId strings from candidate_evidence.evidenceId. Never output documentId as a substitute.",
       `context_type: ${input.contextType}`,
       `language: ${input.language}`,
       `user_query: ${input.query}`,
@@ -931,7 +934,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       supplemental_ids: dedupedSupplemental.slice(0, 2),
       rejected_ids: Array.isArray(parsed.rejected_ids)
         ? parsed.rejected_ids.map((item) => String(item)).filter((item) => !accepted.has(item))
-        : candidates.map((item) => item.documentId).filter((item) => !accepted.has(item))
+        : candidates.map((item) => item.evidenceId).filter((item) => !accepted.has(item))
     };
   }
 
