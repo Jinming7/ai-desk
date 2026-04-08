@@ -78,11 +78,17 @@ async function resolveRollbackCandidate(input: {
   return pickRollbackCandidate(builds);
 }
 
-function defaultRollbackFlagState(): RollbackFlagState {
+export function resolveRollbackFlagState(priorFlagState?: Partial<RollbackFlagState> | null): RollbackFlagState {
+  // Publication/runtime tightening may roll back, but hybrid retrieval stays on
+  // so operator payloads never suggest an unsupported legacy retrieval mode.
   return {
-    FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: false,
-    FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: false
+    FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: true,
+    FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: priorFlagState?.FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING ?? false
   };
+}
+
+export function resolveSafeRollbackFlagState(): RollbackFlagState {
+  return resolveRollbackFlagState();
 }
 
 async function buildScopeReleaseStatus(input: {
@@ -431,7 +437,7 @@ export async function buildKbRollbackRunbook(input: {
     branch: input.branch
   });
   const currentFlags = getSupportReleaseFlagSnapshot();
-  const targetFlags = input.priorFlagState ?? defaultRollbackFlagState();
+  const targetFlags = resolveRollbackFlagState(input.priorFlagState);
   const rollbackCandidate = await resolveRollbackCandidate({
     knowledgeSpace: input.knowledgeSpace,
     repoId: input.repoId,

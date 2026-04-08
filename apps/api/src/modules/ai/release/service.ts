@@ -1,5 +1,4 @@
 import { env } from "../../../config/env.js";
-import { parseBooleanEnvValue } from "../../../config/env-boolean.js";
 import { evaluateAcceptanceGates } from "../evals/gates.js";
 import type { AnswerEvaluationSummary, BuildValidationEvaluationSummary, EvaluationMode, RetrievalEvaluationSummary, RuntimeEvaluationSummary } from "../evals/types.js";
 
@@ -106,19 +105,10 @@ function safeRate(numerator: number, denominator: number): number {
   return denominator > 0 ? Number((numerator / denominator).toFixed(4)) : 0;
 }
 
-function isPreviewRuntime(): boolean {
-  return String(process.env.VERCEL_ENV ?? "").trim().toLowerCase() === "preview";
-}
-
 export function resolveSupportHybridRetrievalFlag(): boolean {
-  const raw = parseBooleanEnvValue(process.env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL);
-  if (typeof raw === "boolean") {
-    return raw;
-  }
-  if (isPreviewRuntime()) {
-    return true;
-  }
-  return env.FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL;
+  // Hybrid retrieval is now the only supported retrieval path. Keep the flag
+  // surface for release/rollback compatibility, but do not revive false mode.
+  return true;
 }
 
 export function getSupportReleaseFlagSnapshot(): SupportReleaseFlagSnapshot {

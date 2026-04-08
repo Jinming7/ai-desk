@@ -39,7 +39,7 @@ Confirm:
 
 - Part 02 publication-based serving is live and remains the only serving truth
 - Part 03 repository KB artifacts are available at least in isolated or controlled build contexts
-- Part 04 hybrid retrieval remains feature-flagged and not yet force-enabled for production
+- Part 04 hybrid retrieval is already the only supported retrieval path in runtime; rollout surfaces may retain a compatibility field, but they must not reintroduce a legacy false mode
 - Part 05 shared support runtime stage contracts exist
 - Part 06 evaluation framework exists and can produce structured blocking reports
 - the project still uses a single shared DB
@@ -144,12 +144,12 @@ Examples:
 
 This controls:
 
-- whether the support runtime uses the legacy retrieval path or the Part 04 hybrid retrieval stack
+- whether release, rollback, and diagnostics surfaces stay coherent with the fixed Part 04 hybrid retrieval runtime contract
 
 Examples:
 
-- `FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL=false`
-- then enable for limited shadow or controlled traffic
+- `FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL=true` in release status and rollback payloads
+- no operator flow may depend on switching back to a legacy retrieval path
 
 ### 4.3 Runtime rollout unit
 
@@ -282,13 +282,14 @@ Shadow mode must be:
 
 At this stage:
 
-- the new retrieval path or runtime path is enabled only behind explicit flags
+- stricter runtime behavior or later enhancements are enabled only behind explicit rollout controls
 - enablement must be reversible without migration or cleanup
+- hybrid retrieval remains the baseline retrieval path and is not a valid rollback toggle
 
 Recommended order:
 
 1. diagnostics-only instrumentation
-2. hybrid retrieval for controlled internal traffic or allowlisted path
+2. runtime tightening for controlled internal traffic or allowlisted path
 3. broader internal usage
 4. production traffic enablement only after stable metrics
 
@@ -349,25 +350,27 @@ Before promoting `support-prod`:
 
 ### 8.1 Required flag categories
 
-At minimum, rollout must be controlled through:
+At minimum, rollout must distinguish:
 
-- retrieval flag
+- retrieval compatibility state
 - runtime tightening flag
 - embedding or rerank enhancement flags when relevant
 
 Examples:
 
-- `FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL`
+- `FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL` retained for compatibility/reporting and expected to remain `true`
 - future rerank enablement flag
 - future stricter contract enforcement flag
 
 ### 8.2 Flag rules
 
-Flags must be:
+Live rollout controls must be:
 
 - independently switchable
 - diagnosable in logs and evaluation reports
 - reversible without redeploying data
+
+Compatibility fields retained for release/rollback contract stability may be fixed-value, but they must still be diagnosable in logs and evaluation reports.
 
 Flags must not:
 
@@ -595,7 +598,7 @@ These are operational scaffolding, not rollout approval by themselves.
 
 The following must wait before full execution:
 
-- production enablement of Part 04 hybrid retrieval
+- physical removal of the compatibility retrieval field from operator contracts
 - production enablement of stricter Part 05 runtime behavior
 - production promotion of newly built Part 07 KB snapshots
 

@@ -287,7 +287,7 @@ test("buildKbRollbackRunbook falls back to safe flag defaults when prior flag st
 
     assert.equal(result.rollbackPublicationTarget?.buildVersion, previousBuild.build_version);
     assert.deepEqual(result.recommendedRollbackFlagState, {
-      FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: false,
+      FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: true,
       FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: false
     });
     assert.equal(result.warnings.includes("prior_flag_state_not_recorded_using_safe_defaults"), true);

@@ -31,6 +31,7 @@ Canonical interpretation:
 
 - `kb_publications` is the serving source of truth
 - `kb_serving_versions` is compatibility metadata only and should be checked for drift against the active publication, not treated as a parallel serving truth
+- `FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL` is a compatibility/reporting field and should read `true`; operator procedures must not treat `false` as a supported retrieval mode
 
 ## 2. Promotion Dry Run
 
@@ -95,7 +96,7 @@ Body:
   "knowledgeSpace": "support-local",
   "actor": "internal_operator",
   "priorFlagState": {
-    "FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL": false,
+    "FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL": true,
     "FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING": false
   }
 }
@@ -103,8 +104,10 @@ Body:
 
 If `priorFlagState` is omitted, the helper falls back to the safe flag target:
 
-- `FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL=false`
+- `FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL=true`
 - `FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING=false`
+
+If an older recorded `priorFlagState` still contains `FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL=false`, the helper normalizes it back to `true` so rollback instructions never suggest the retired legacy retrieval path.
 
 The response includes:
 

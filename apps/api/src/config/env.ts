@@ -100,7 +100,7 @@ const envSchema = z.object({
   FEATURE_KB_MEMORY_QUERY_REWRITE: envBoolean(true),
   FEATURE_KB_MEMORY_RELATION_EXPANSION: envBoolean(true),
   FEATURE_KB_MEMORY_PROFILES: envBoolean(true),
-  FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: envBoolean(false),
+  FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: envBoolean(true),
   FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: envBoolean(false),
   AI_SUPPORT_INTERACTIVE_TIMEOUT_MS: z.coerce.number().int().min(5000).max(300000).default(22000),
   AI_SUPPORT_JOB_TIMEOUT_MS: z.coerce.number().int().min(10000).max(300000).default(240000),
