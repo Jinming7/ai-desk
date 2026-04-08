@@ -1,13 +1,12 @@
-import { config } from "dotenv";
 import path from "node:path";
 import { z } from "zod";
+import { loadDotenvFiles } from "./dotenv-loader.js";
 import { envBoolean } from "./env-boolean.js";
 
 const envFile = process.env.NODE_ENV === "test" ? ".env.test" : ".env";
 const SAFE_TEST_DATABASE_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "postgres"]);
 
-config({ path: path.resolve(process.cwd(), envFile) });
-config({ path: path.resolve(process.cwd(), "../../", envFile), override: false });
+loadDotenvFiles({ cwd: process.cwd(), envFile });
 
 function parseDatabaseHostname(url: string): string | null {
   const value = url.trim();
