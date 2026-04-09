@@ -72,6 +72,13 @@ function normalizeTimestamp(value: Date | string | null | undefined): string | n
   return Number.isNaN(date.getTime()) ? String(value) : date.toISOString();
 }
 
+function normalizeTimestampMs(value: Date | string | null | undefined): number | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  const timestamp = date.getTime();
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
 function mapJobRow(row: SupportSearchJobRow): SupportSearchJob {
   return {
     id: row.id,
@@ -104,6 +111,30 @@ function isUniqueViolation(error: unknown, constraint?: string): boolean {
   if (code !== "23505") return false;
   if (!constraint) return true;
   return "constraint" in error ? String((error as { constraint?: unknown }).constraint ?? "") === constraint : false;
+}
+
+function isJobClaimedStage(stageState: Record<string, unknown>): boolean {
+  return (
+    String(stageState.currentStage ?? "") === "run_search_mode" &&
+    String(stageState.lastCompletedStage ?? "") === "job_claimed"
+  );
+}
+
+function isRecoverableRunningSupportSearchJob(row: SupportSearchJobRow, staleAfterMs: number): boolean {
+  if (row.status !== "running" && row.status !== "partial_result_ready") return false;
+  const now = Date.now();
+  const leaseExpiresAtMs = normalizeTimestampMs(row.lease_expires_at);
+  if (leaseExpiresAtMs === null || leaseExpiresAtMs < now) {
+    return true;
+  }
+
+  const updatedAtMs = normalizeTimestampMs(row.updated_at);
+  if (updatedAtMs !== null && updatedAtMs < now - staleAfterMs) {
+    return true;
+  }
+
+  const startedAtMs = normalizeTimestampMs(row.started_at) ?? updatedAtMs;
+  return Boolean(startedAtMs && startedAtMs < now - staleAfterMs && isJobClaimedStage(row.stage_state_json ?? {}));
 }
 
 async function findActiveJobForSession(sessionId: string): Promise<SupportSearchJob | null> {
@@ -240,6 +271,61 @@ export async function getSupportSearchJob(jobId: string): Promise<SupportSearchJ
     [jobId]
   );
   return result.rows[0] ? mapJobRow(result.rows[0]) : null;
+}
+
+export async function claimSupportSearchJobForManualDrive(input: {
+  jobId: string;
+  workerId: string;
+  leaseMs: number;
+  staleAfterMs?: number;
+}): Promise<SupportSearchJob | null> {
+  const staleAfterMs = Number.isFinite(input.staleAfterMs) ? Math.max(1_000, Math.floor(input.staleAfterMs ?? 60_000)) : 60_000;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const currentResult = await client.query<SupportSearchJobRow>(
+      `SELECT *
+       FROM ai_support_search_jobs
+       WHERE id = $1
+       FOR UPDATE`,
+      [input.jobId]
+    );
+    const current = currentResult.rows[0];
+    if (!current) {
+      await client.query("COMMIT");
+      return null;
+    }
+
+    const claimableQueued = current.status === "queued" || current.status === "failed_retryable";
+    const claimableRunning = isRecoverableRunningSupportSearchJob(current, staleAfterMs);
+    if (!claimableQueued && !claimableRunning) {
+      await client.query("COMMIT");
+      return null;
+    }
+
+    const leaseKey = `${input.workerId}:${crypto.randomUUID()}`;
+    const updated = await client.query<SupportSearchJobRow>(
+      `UPDATE ai_support_search_jobs
+       SET status = 'running',
+           worker_id = $2,
+           lease_key = $3,
+           lease_expires_at = NOW() + ($4::int * INTERVAL '1 millisecond'),
+           started_at = COALESCE(started_at, NOW()),
+           next_run_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [input.jobId, input.workerId, leaseKey, input.leaseMs]
+    );
+
+    await client.query("COMMIT");
+    return updated.rows[0] ? mapJobRow(updated.rows[0]) : null;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function heartbeatSupportSearchJob(input: {

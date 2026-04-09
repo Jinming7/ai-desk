@@ -7,6 +7,7 @@ import { buildSearchRuntime, resolveExecutionRuntime } from "./agent-router.js";
 import { summarizeImageAttachments, summarizeTextAttachments } from "./multimodal.js";
 import { runSupportSearchAgent, runSupportTriageAgent } from "./support-agent.js";
 import {
+  claimSupportSearchJobForManualDrive,
   claimDueSupportSearchJobs,
   enqueueSupportSearchJob,
   getSupportSearchJob,
@@ -1742,29 +1743,14 @@ async function runClaimedSearchModeJob(
 }
 
 export async function driveSearchModeJob(jobId: string, adapter: OpenClawAdapter): Promise<SupportSearchJob | null> {
-  const current = await getSupportSearchJob(jobId);
-  if (!current) return null;
-  if (current.status === "completed" || current.status === "failed_terminal" || current.status === "cancelled") {
-    return current;
-  }
-  if (current.status === "running" || current.status === "partial_result_ready") {
-    const recovered = await requeueRecoverableSupportSearchJob({
-      jobId,
-      staleAfterMs: Math.max(5_000, env.AI_SUPPORT_JOB_LEASE_MS)
-    });
-    if (!recovered) {
-      return current;
-    }
-  }
-
-  const claimed = await claimDueSupportSearchJobs({
-    limit: 1,
+  const claimed = await claimSupportSearchJobForManualDrive({
+    jobId,
     leaseMs: env.AI_SUPPORT_JOB_LEASE_MS,
     workerId: "support-search-drive",
-    jobId
+    staleAfterMs: Math.max(5_000, env.AI_SUPPORT_JOB_LEASE_MS)
   });
-  if (claimed[0]) {
-    await runClaimedSearchModeJob(claimed[0], adapter);
+  if (claimed) {
+    await runClaimedSearchModeJob(claimed, adapter);
   }
 
   return getSupportSearchJob(jobId);

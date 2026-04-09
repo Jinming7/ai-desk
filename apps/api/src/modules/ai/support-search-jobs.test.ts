@@ -5,6 +5,7 @@ import { env, isSafeTestDatabaseUrl } from "../../config/env.js";
 import { pool } from "../../db/client.js";
 import {
   SUPPORT_SEARCH_JOB_LEASE_INVALID_MESSAGE,
+  claimSupportSearchJobForManualDrive,
   claimDueSupportSearchJobs,
   enqueueSupportSearchJob,
   getSupportSearchJob,
@@ -293,4 +294,46 @@ test("requeueRecoverableSupportSearchJob leaves an actively leased running job u
   const current = await getSupportSearchJob(queued.id);
   assert.equal(current?.status, "running");
   assert.equal(current?.leaseKey, claimed[0]?.leaseKey ?? null);
+});
+
+test("claimSupportSearchJobForManualDrive takes over a recoverable running job without reopening a queued window", async () => {
+  const queued = await enqueueSupportSearchJob(buildJobInput());
+  const claimed = await claimDueSupportSearchJobs({
+    limit: 1,
+    leaseMs: 60_000,
+    workerId: "test-worker"
+  });
+
+  assert.equal(claimed.length, 1);
+  await pool.query(
+    `UPDATE ai_support_search_jobs
+     SET lease_expires_at = NOW() + INTERVAL '2 minutes',
+         started_at = NOW() - INTERVAL '2 minutes',
+         updated_at = NOW(),
+         stage_state_json = $2::jsonb
+     WHERE id = $1`,
+    [
+      queued.id,
+      JSON.stringify({
+        currentStage: "run_search_mode",
+        lastCompletedStage: "job_claimed"
+      })
+    ]
+  );
+
+  const takenOver = await claimSupportSearchJobForManualDrive({
+    jobId: queued.id,
+    workerId: "support-search-drive",
+    leaseMs: 60_000,
+    staleAfterMs: 60_000
+  });
+
+  assert.equal(takenOver?.status, "running");
+  assert.equal(takenOver?.workerId, "support-search-drive");
+  assert.match(takenOver?.leaseKey ?? "", /^support-search-drive:/);
+
+  const current = await getSupportSearchJob(queued.id);
+  assert.equal(current?.status, "running");
+  assert.equal(current?.workerId, "support-search-drive");
+  assert.match(current?.leaseKey ?? "", /^support-search-drive:/);
 });
