@@ -100,8 +100,16 @@ function resolvePrimaryDeviceIdentityPath(env: NodeJS.ProcessEnv = process.env):
   return path.join(resolveOpenClawStateDir(env), "identity", "device.json");
 }
 
+function resolveFallbackOpenClawStateDir(): string {
+  return path.join(os.tmpdir(), "nexusflow-openclaw");
+}
+
 function resolveFallbackDeviceIdentityPath(): string {
-  return path.join(os.tmpdir(), "nexusflow-openclaw", "device.json");
+  return path.join(resolveFallbackOpenClawStateDir(), "device.json");
+}
+
+function resolveFallbackDeviceAuthPath(): string {
+  return path.join(resolveFallbackOpenClawStateDir(), DEVICE_AUTH_FILE);
 }
 
 function parseStoredIdentity(value: unknown): OpenClawDeviceIdentity | null {
@@ -130,6 +138,53 @@ function loadIdentityFromFile(filePath: string): OpenClawDeviceIdentity | null {
   } catch {
     return null;
   }
+}
+
+function uniquePaths(paths: string[]): string[] {
+  return [...new Set(paths.filter((candidate) => candidate.trim().length > 0))];
+}
+
+function ensureParentDirectory(filePath: string): boolean {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeTextFile(filePath: string, contents: string): boolean {
+  if (!ensureParentDirectory(filePath)) {
+    return false;
+  }
+  try {
+    fs.writeFileSync(filePath, contents, { mode: 0o600 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findWritableFilePath(preferredPath: string, fallbackPath: string): string | null {
+  for (const candidate of uniquePaths([preferredPath, fallbackPath])) {
+    if (ensureParentDirectory(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function readDeviceAuthStoreFromPaths(filePaths: string[]): { path: string; store: OpenClawDeviceAuthStore } | null {
+  for (const filePath of uniquePaths(filePaths)) {
+    const store = readDeviceAuthStore(filePath);
+    if (store) {
+      return {
+        path: filePath,
+        store
+      };
+    }
+  }
+  return null;
 }
 
 function parseEnvDeviceIdentity(identityJson: string): OpenClawDeviceIdentity {
@@ -161,26 +216,26 @@ export function loadOrCreateOpenClawDeviceIdentity(
     return existingIdentity;
   }
 
-  const fallbackIdentity = filePath === resolveFallbackDeviceIdentityPath() ? null : loadIdentityFromFile(resolveFallbackDeviceIdentityPath());
+  const fallbackPath = resolveFallbackDeviceIdentityPath();
+  const fallbackIdentity = filePath === fallbackPath ? null : loadIdentityFromFile(fallbackPath);
   if (fallbackIdentity) {
     return fallbackIdentity;
   }
 
   const identity = generateIdentity();
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(
-    filePath,
-    `${JSON.stringify(
-      {
-        version: 1,
-        ...identity,
-        createdAtMs: Date.now()
-      },
-      null,
-      2
-    )}\n`,
-    { mode: 0o600 }
-  );
+  const serializedIdentity = `${JSON.stringify(
+    {
+      version: 1,
+      ...identity,
+      createdAtMs: Date.now()
+    },
+    null,
+    2
+  )}\n`;
+  const persistenceTarget = findWritableFilePath(filePath, fallbackPath);
+  if (persistenceTarget) {
+    writeTextFile(persistenceTarget, serializedIdentity);
+  }
   return identity;
 }
 
@@ -221,7 +276,11 @@ export function loadOpenClawDeviceToken(params: {
     return explicitToken;
   }
 
-  const store = readDeviceAuthStore(resolveDeviceAuthPath(effectiveEnv));
+  const storeEntry = readDeviceAuthStoreFromPaths([
+    resolveDeviceAuthPath(effectiveEnv),
+    resolveFallbackDeviceAuthPath()
+  ]);
+  const store = storeEntry?.store;
   if (!store || store.deviceId !== params.deviceId) {
     return null;
   }
@@ -238,7 +297,9 @@ export function storeOpenClawDeviceToken(params: {
 }): void {
   const effectiveEnv = params.env ?? process.env;
   const filePath = resolveDeviceAuthPath(effectiveEnv);
-  const existing = readDeviceAuthStore(filePath);
+  const fallbackPath = resolveFallbackDeviceAuthPath();
+  const existingEntry = readDeviceAuthStoreFromPaths([filePath, fallbackPath]);
+  const existing = existingEntry?.store;
   const role = params.role.trim();
   const next: OpenClawDeviceAuthStore = {
     version: 1,
@@ -254,8 +315,11 @@ export function storeOpenClawDeviceToken(params: {
     scopes: Array.isArray(params.scopes) ? params.scopes.map((item) => item.trim()).filter(Boolean).sort() : [],
     updatedAtMs: Date.now()
   };
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(`${filePath}`, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  const serializedStore = `${JSON.stringify(next, null, 2)}\n`;
+  const persistenceTarget = existingEntry?.path ?? findWritableFilePath(filePath, fallbackPath);
+  if (persistenceTarget) {
+    writeTextFile(persistenceTarget, serializedStore);
+  }
 }
 
 export function clearOpenClawDeviceToken(params: {
@@ -265,7 +329,9 @@ export function clearOpenClawDeviceToken(params: {
 }): void {
   const effectiveEnv = params.env ?? process.env;
   const filePath = resolveDeviceAuthPath(effectiveEnv);
-  const existing = readDeviceAuthStore(filePath);
+  const fallbackPath = resolveFallbackDeviceAuthPath();
+  const existingEntry = readDeviceAuthStoreFromPaths([filePath, fallbackPath]);
+  const existing = existingEntry?.store;
   if (!existing || existing.deviceId !== params.deviceId) {
     return;
   }
@@ -279,8 +345,10 @@ export function clearOpenClawDeviceToken(params: {
     tokens: { ...existing.tokens }
   };
   delete next.tokens[role];
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(`${filePath}`, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  if (!existingEntry) {
+    return;
+  }
+  writeTextFile(existingEntry.path, `${JSON.stringify(next, null, 2)}\n`);
 }
 
 export function buildOpenClawDeviceAuthPayload(params: OpenClawDeviceAuthPayloadParams): string {

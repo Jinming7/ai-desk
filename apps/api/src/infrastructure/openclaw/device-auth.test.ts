@@ -8,7 +8,8 @@ import {
   buildOpenClawDeviceAuthPayload,
   buildSignedOpenClawDevice,
   loadOpenClawDeviceToken,
-  loadOrCreateOpenClawDeviceIdentity
+  loadOrCreateOpenClawDeviceIdentity,
+  storeOpenClawDeviceToken
 } from "./device-auth.js";
 
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
@@ -150,4 +151,71 @@ test("loadOpenClawDeviceToken falls back to the stored OpenClaw device-auth file
     }),
     "stored-operator-token"
   );
+});
+
+test("loadOrCreateOpenClawDeviceIdentity falls back to tmp storage when the primary path is not writable", () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-device-fallback-"));
+  const originalTmpdir = process.env.TMPDIR;
+  const originalIdentityJson = process.env.OPENCLAW_DEVICE_IDENTITY_JSON;
+  const fallbackPath = path.join(tempRoot, "nexusflow-openclaw", "device.json");
+
+  delete process.env.OPENCLAW_DEVICE_IDENTITY_JSON;
+  process.env.TMPDIR = tempRoot;
+
+  try {
+    const identity = loadOrCreateOpenClawDeviceIdentity("/dev/null/openclaw/device.json");
+    assert.equal(fs.existsSync(fallbackPath), true);
+    const stored = JSON.parse(fs.readFileSync(fallbackPath, "utf8")) as {
+      deviceId: string;
+      publicKeyPem: string;
+      privateKeyPem: string;
+    };
+    assert.equal(stored.deviceId, identity.deviceId);
+    assert.equal(stored.publicKeyPem, identity.publicKeyPem);
+    assert.equal(stored.privateKeyPem, identity.privateKeyPem);
+  } finally {
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+    if (originalIdentityJson === undefined) delete process.env.OPENCLAW_DEVICE_IDENTITY_JSON;
+    else process.env.OPENCLAW_DEVICE_IDENTITY_JSON = originalIdentityJson;
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("storeOpenClawDeviceToken falls back to tmp storage when the primary auth path is not writable", () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-device-token-fallback-"));
+  const originalTmpdir = process.env.TMPDIR;
+  const fallbackPath = path.join(tempRoot, "nexusflow-openclaw", "device-auth.json");
+
+  process.env.TMPDIR = tempRoot;
+
+  try {
+    storeOpenClawDeviceToken({
+      deviceId: "fallback-device",
+      role: "operator",
+      token: "fallback-token",
+      scopes: ["operator.admin"],
+      env: {
+        ...process.env,
+        OPENCLAW_DEVICE_AUTH_PATH: "/dev/null/openclaw/device-auth.json"
+      }
+    });
+
+    assert.equal(fs.existsSync(fallbackPath), true);
+    assert.equal(
+      loadOpenClawDeviceToken({
+        deviceId: "fallback-device",
+        role: "operator",
+        env: {
+          ...process.env,
+          OPENCLAW_DEVICE_AUTH_PATH: "/dev/null/openclaw/device-auth.json"
+        }
+      }),
+      "fallback-token"
+    );
+  } finally {
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
 });
