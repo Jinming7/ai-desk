@@ -4,9 +4,34 @@ import type { OpenClawAdapter } from "../../infrastructure/openclaw/types.js";
 import { driveSearchModeJob, getSearchModeJob } from "./service.js";
 
 type StreamEventName = "job_snapshot" | "job_completed" | "job_failed" | "job_timeout";
+const RUNNING_RECOVERY_DRIVE_INTERVAL_MS = 10_000;
 
 function isTerminalStatus(status: string): boolean {
   return status === "completed" || status === "failed_terminal" || status === "cancelled";
+}
+
+function isJobClaimedStage(job: { stageState?: Record<string, unknown> | null }): boolean {
+  return (
+    String(job.stageState?.currentStage ?? "") === "run_search_mode" &&
+    String(job.stageState?.lastCompletedStage ?? "") === "job_claimed"
+  );
+}
+
+export function shouldAttemptRunningSearchJobRecovery(input: {
+  job: {
+    status: string;
+    stageState?: Record<string, unknown> | null;
+  };
+  lastDriveAt: number;
+  now: number;
+  minimumIntervalMs?: number;
+}): boolean {
+  const minimumIntervalMs = input.minimumIntervalMs ?? RUNNING_RECOVERY_DRIVE_INTERVAL_MS;
+  return (
+    (input.job.status === "running" || input.job.status === "partial_result_ready") &&
+    isJobClaimedStage(input.job) &&
+    input.now - input.lastDriveAt >= minimumIntervalMs
+  );
 }
 
 function eventFingerprint(job: NonNullable<Awaited<ReturnType<typeof getSearchModeJob>>>): string {
@@ -66,9 +91,35 @@ export async function streamSearchModeJob(input: {
 
   emitSnapshot(current);
 
-  const shouldDrive = current.status === "queued" || current.status === "failed_retryable";
-  const drivePromise = shouldDrive ? driveSearchModeJob(input.jobId, input.adapter) : Promise.resolve(current);
-  void drivePromise.catch(() => undefined);
+  let lastDriveAt = 0;
+  const maybeDriveJob = async (job: typeof current) => {
+    if (!job) return job;
+    const shouldDriveQueued = job.status === "queued" || job.status === "failed_retryable";
+    const shouldRecoverRunning = shouldAttemptRunningSearchJobRecovery({
+      job,
+      lastDriveAt,
+      now: Date.now()
+    });
+    if (!shouldDriveQueued && !shouldRecoverRunning) {
+      return job;
+    }
+    lastDriveAt = Date.now();
+    try {
+      return (await driveSearchModeJob(input.jobId, input.adapter)) ?? job;
+    } catch {
+      return job;
+    }
+  };
+
+  current = await maybeDriveJob(current);
+  if (!current) {
+    writeEvent(input.res, "job_failed", {
+      error: "Search job not found"
+    });
+    input.res.end();
+    return;
+  }
+  emitSnapshot(current);
 
   const startedAt = Date.now();
   while (!closed) {
@@ -80,6 +131,15 @@ export async function streamSearchModeJob(input: {
       break;
     }
 
+    emitSnapshot(current);
+
+    current = await maybeDriveJob(current);
+    if (!current) {
+      writeEvent(input.res, "job_failed", {
+        error: "Search job not found"
+      });
+      break;
+    }
     emitSnapshot(current);
 
     if (isTerminalStatus(current.status)) {

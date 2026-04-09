@@ -19,6 +19,10 @@ import type {
   TicketStatus,
   UploadedAttachment
 } from "./types";
+import {
+  shouldProbeRunningSupportSearchRecovery,
+  type SupportSearchJobRecoveryStatus
+} from "./support-search-job-recovery";
 
 const API = (() => {
   const configured = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
@@ -54,14 +58,7 @@ function withInFlightDedup<T>(key: string, run: () => Promise<T>): Promise<T> {
   return promise;
 }
 
-type SupportSearchJobStatus =
-  | "queued"
-  | "running"
-  | "partial_result_ready"
-  | "completed"
-  | "failed_retryable"
-  | "failed_terminal"
-  | "cancelled";
+type SupportSearchJobStatus = SupportSearchJobRecoveryStatus;
 
 type SupportSearchJobView = {
   id: string;
@@ -70,6 +67,12 @@ type SupportSearchJobView = {
   result: SearchResult | null;
   errorMessage: string | null;
   updatedAt: string;
+  workerId?: string | null;
+  startedAt?: string | null;
+  stageState?: {
+    currentStage?: string;
+    lastCompletedStage?: string;
+  } | null;
 };
 
 function isTerminalSupportSearchJob(status: SupportSearchJobStatus): boolean {
@@ -217,6 +220,8 @@ async function waitForSearchKnowledgeJobViaPolling(jobId: string): Promise<Suppo
   const deadline = Date.now() + 250_000;
   let lastUpdatedAt = "";
   let unchangedPolls = 0;
+  let lastStageFingerprint = "";
+  let stagnantStagePolls = 0;
   let lastDriveAt = 0;
 
   let current = await driveSearchKnowledgeJob(jobId);
@@ -240,17 +245,37 @@ async function waitForSearchKnowledgeJobViaPolling(jobId: string): Promise<Suppo
       lastUpdatedAt = current.updatedAt;
     }
 
+    const stageFingerprint = JSON.stringify({
+      status: current.status,
+      currentStage: current.stageState?.currentStage ?? null,
+      lastCompletedStage: current.stageState?.lastCompletedStage ?? null
+    });
+    if (stageFingerprint === lastStageFingerprint) {
+      stagnantStagePolls += 1;
+    } else {
+      stagnantStagePolls = 0;
+      lastStageFingerprint = stageFingerprint;
+    }
+
     const shouldDriveQueuedJob = (current.status === "queued" || current.status === "failed_retryable") && unchangedPolls >= 3;
-    const shouldProbeRunningRecovery =
-      (current.status === "running" || current.status === "partial_result_ready") &&
-      unchangedPolls >= 20 &&
-      Date.now() - lastDriveAt >= 10_000;
+    const shouldProbeRunningRecovery = shouldProbeRunningSupportSearchRecovery({
+      job: current,
+      stagnantStagePolls,
+      lastDriveAt,
+      now: Date.now()
+    });
 
     if (shouldDriveQueuedJob || shouldProbeRunningRecovery) {
       current = await driveSearchKnowledgeJob(jobId);
       lastDriveAt = Date.now();
       unchangedPolls = 0;
+      stagnantStagePolls = 0;
       lastUpdatedAt = current.updatedAt;
+      lastStageFingerprint = JSON.stringify({
+        status: current.status,
+        currentStage: current.stageState?.currentStage ?? null,
+        lastCompletedStage: current.stageState?.lastCompletedStage ?? null
+      });
     }
   }
 
