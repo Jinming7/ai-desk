@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { OpenClawRuntimeContext } from "./types.js";
-import { WsOpenClawAdapter } from "./ws-adapter.js";
+import { summarizeOpenClawWsRuntimeConfigForLog, WsOpenClawAdapter } from "./ws-adapter.js";
 
 function createRuntimeAt(nowMs: number, input: {
   timeoutMs?: number;
@@ -14,6 +14,34 @@ function createRuntimeAt(nowMs: number, input: {
     requestStartedAtMs: nowMs - input.elapsedMs
   };
 }
+
+test("summarizeOpenClawWsRuntimeConfigForLog compacts multiline runtime env into a single-line preview", () => {
+  const originalWsUrl = process.env.OPENCLAW_WS_URL;
+  const originalVercelEnv = process.env.VERCEL_ENV;
+  const originalGitRef = process.env.VERCEL_GIT_COMMIT_REF;
+
+  process.env.OPENCLAW_WS_URL =
+    'vercel env add OPENCLAW_AGENT_ID_SUPPORT_MAIN preview "$branch" --value support-main --yes --force >/dev/null\necho synced:OPENCLAW_AGENT_ID_SUPPORT_MAIN';
+  process.env.VERCEL_ENV = "preview";
+  process.env.VERCEL_GIT_COMMIT_REF = "feature/support-single-agent-runtime-20260408";
+
+  try {
+    const summary = summarizeOpenClawWsRuntimeConfigForLog();
+    assert.equal(summary.processEnvPresent, true);
+    assert.equal(summary.processEnvPreview.includes("\n"), false);
+    assert.match(summary.processEnvPreview, /vercel env add OPENCLAW_AGENT_ID_SUPPORT_MAIN preview/);
+    assert.match(summary.processEnvPreview, /echo synced:OPENCLAW_AGENT_ID_SUPPORT_MAIN/);
+    assert.equal(summary.vercelEnv, "preview");
+    assert.equal(summary.gitRef, "feature/support-single-agent-runtime-20260408");
+  } finally {
+    if (originalWsUrl === undefined) delete process.env.OPENCLAW_WS_URL;
+    else process.env.OPENCLAW_WS_URL = originalWsUrl;
+    if (originalVercelEnv === undefined) delete process.env.VERCEL_ENV;
+    else process.env.VERCEL_ENV = originalVercelEnv;
+    if (originalGitRef === undefined) delete process.env.VERCEL_GIT_COMMIT_REF;
+    else process.env.VERCEL_GIT_COMMIT_REF = originalGitRef;
+  }
+});
 
 test("startChatRun caps chat.send transport timeout to the remaining overall runtime budget", async () => {
   const adapter = new WsOpenClawAdapter() as never as {

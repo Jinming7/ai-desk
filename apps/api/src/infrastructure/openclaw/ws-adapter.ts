@@ -445,6 +445,30 @@ function resolveMethodTimeoutMs(requestedTimeoutMs: number, runtime?: OpenClawRu
   });
 }
 
+function previewRuntimeValue(value: string | null | undefined): string {
+  const normalized = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return "<empty>";
+  return normalized.length > 180 ? `${normalized.slice(0, 180)}...` : normalized;
+}
+
+export function summarizeOpenClawWsRuntimeConfigForLog() {
+  const processEnvWsUrl = process.env.OPENCLAW_WS_URL;
+  return {
+    processEnvPresent: Boolean(processEnvWsUrl?.trim()),
+    processEnvPreview: previewRuntimeValue(processEnvWsUrl),
+    parsedEnvPreview: previewRuntimeValue(env.OPENCLAW_WS_URL),
+    parsedMatchesProcessEnv: previewRuntimeValue(processEnvWsUrl) === previewRuntimeValue(env.OPENCLAW_WS_URL),
+    cwd: process.cwd(),
+    nodeEnv: process.env.NODE_ENV ?? "",
+    vercelEnv: process.env.VERCEL_ENV ?? "",
+    gitRef: process.env.VERCEL_GIT_COMMIT_REF ?? ""
+  };
+}
+
+let hasLoggedOpenClawWsBootstrapFailure = false;
+
 export class WsOpenClawAdapter implements OpenClawAdapter {
   private consecutiveFailures = 0;
   private readonly requestedScopes = env.OPENCLAW_REQUEST_SCOPES.split(",").map((item) => item.trim()).filter(Boolean);
@@ -494,10 +518,21 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   }
 
   private createWebSocket(headers: Record<string, string>): WebSocket {
-    return new WebSocket(env.OPENCLAW_WS_URL, {
-      headers: Object.keys(headers).length ? headers : undefined,
-      rejectUnauthorized: !env.OPENCLAW_ALLOW_SELF_SIGNED
-    });
+    try {
+      return new WebSocket(env.OPENCLAW_WS_URL, {
+        headers: Object.keys(headers).length ? headers : undefined,
+        rejectUnauthorized: !env.OPENCLAW_ALLOW_SELF_SIGNED
+      });
+    } catch (error) {
+      if (!hasLoggedOpenClawWsBootstrapFailure) {
+        hasLoggedOpenClawWsBootstrapFailure = true;
+        console.error("[openclaw] websocket bootstrap failed", {
+          ...summarizeOpenClawWsRuntimeConfigForLog(),
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+      throw error;
+    }
   }
 
   private maybePersistIssuedDeviceToken(connectPayload: unknown): void {
