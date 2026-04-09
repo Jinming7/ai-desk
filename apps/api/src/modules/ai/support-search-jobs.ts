@@ -390,6 +390,11 @@ export async function requeueRecoverableSupportSearchJob(input: {
          lease_expires_at IS NULL
          OR lease_expires_at < NOW()
          OR updated_at < NOW() - ($2::int * INTERVAL '1 millisecond')
+         OR (
+           COALESCE(stage_state_json ->> 'currentStage', '') = 'run_search_mode'
+           AND COALESCE(stage_state_json ->> 'lastCompletedStage', '') = 'job_claimed'
+           AND COALESCE(started_at, updated_at) < NOW() - ($2::int * INTERVAL '1 millisecond')
+         )
        )`,
     [input.jobId, staleAfterMs]
   );

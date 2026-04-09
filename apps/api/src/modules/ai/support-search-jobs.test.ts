@@ -239,6 +239,42 @@ test("requeueRecoverableSupportSearchJob requeues a specific expired running job
   assert.equal(recovered?.leaseKey, null);
 });
 
+test("requeueRecoverableSupportSearchJob requeues a running job that never progressed beyond job_claimed", async () => {
+  const queued = await enqueueSupportSearchJob(buildJobInput());
+  const claimed = await claimDueSupportSearchJobs({
+    limit: 1,
+    leaseMs: 60_000,
+    workerId: "test-worker"
+  });
+
+  assert.equal(claimed.length, 1);
+  await pool.query(
+    `UPDATE ai_support_search_jobs
+     SET lease_expires_at = NOW() + INTERVAL '2 minutes',
+         started_at = NOW() - INTERVAL '2 minutes',
+         updated_at = NOW(),
+         stage_state_json = $2::jsonb
+     WHERE id = $1`,
+    [
+      queued.id,
+      JSON.stringify({
+        currentStage: "run_search_mode",
+        lastCompletedStage: "job_claimed"
+      })
+    ]
+  );
+
+  const requeued = await requeueRecoverableSupportSearchJob({
+    jobId: queued.id,
+    staleAfterMs: 60_000
+  });
+
+  assert.equal(requeued, true);
+  const recovered = await getSupportSearchJob(queued.id);
+  assert.equal(recovered?.status, "queued");
+  assert.equal(recovered?.leaseKey, null);
+});
+
 test("requeueRecoverableSupportSearchJob leaves an actively leased running job untouched", async () => {
   const queued = await enqueueSupportSearchJob(buildJobInput());
   const claimed = await claimDueSupportSearchJobs({

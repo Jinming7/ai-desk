@@ -273,3 +273,53 @@ test("support search drive endpoint can recover a stale running job and complete
   assert.equal(typeof driven.job.result?.answer, "string");
   assert.equal((driven.job.result?.answer ?? "").length > 0, true);
 });
+
+test("support search drive endpoint can recover a running job stuck at job_claimed even when the lease is still active", async () => {
+  const submitResponse = await fetch(`${baseUrl}/api/v1/ai/search/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query: "thisquerywillnotmatchkbx",
+      conversation: []
+    })
+  });
+
+  assert.equal(submitResponse.status, 202);
+  const submitted = (await submitResponse.json()) as {
+    job: { id: string; sessionId: string; status: string };
+  };
+
+  await pool.query(
+    `UPDATE ai_support_search_jobs
+     SET status = 'running',
+         lease_key = 'live-lease',
+         lease_expires_at = NOW() + INTERVAL '2 minutes',
+         worker_id = 'stuck-worker',
+         started_at = NOW() - INTERVAL '2 minutes',
+         updated_at = NOW(),
+         stage_state_json = $2::jsonb
+     WHERE id = $1`,
+    [
+      submitted.job.id,
+      JSON.stringify({
+        currentStage: "run_search_mode",
+        lastCompletedStage: "job_claimed"
+      })
+    ]
+  );
+
+  const driveResponse = await fetch(`${baseUrl}/api/v1/ai/search/jobs/${submitted.job.id}/drive`, {
+    method: "POST"
+  });
+  assert.equal(driveResponse.status, 202);
+
+  const driven = (await driveResponse.json()) as {
+    job: { id: string; sessionId: string; status: string; result: { session_id?: string; answer?: string } | null };
+  };
+
+  assert.equal(driven.job.id, submitted.job.id);
+  assert.equal(driven.job.status, "completed");
+  assert.equal(driven.job.result?.session_id, submitted.job.sessionId);
+  assert.equal(typeof driven.job.result?.answer, "string");
+  assert.equal((driven.job.result?.answer ?? "").length > 0, true);
+});
