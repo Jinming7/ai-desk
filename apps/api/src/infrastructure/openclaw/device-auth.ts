@@ -288,6 +288,24 @@ export function loadOpenClawDeviceToken(params: {
   return typeof entry?.token === "string" && entry.token.trim() ? entry.token.trim() : null;
 }
 
+export function hasOpenClawGatewayAuthConfigured(): boolean {
+  const gatewayToken = trimToNull(process.env.OPENCLAW_GATEWAY_TOKEN);
+  const basicPass = trimToNull(process.env.OPENCLAW_BASIC_PASS);
+  const deviceToken = trimToNull(process.env.OPENCLAW_DEVICE_TOKEN);
+
+  if (gatewayToken || basicPass || deviceToken) {
+    return true;
+  }
+
+  const identity = loadOrCreateOpenClawDeviceIdentity();
+  return Boolean(
+    loadOpenClawDeviceToken({
+      deviceId: identity.deviceId,
+      role: "operator"
+    })
+  );
+}
+
 export function storeOpenClawDeviceToken(params: {
   deviceId: string;
   role: string;

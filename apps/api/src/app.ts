@@ -60,6 +60,7 @@ import { getAiTopology } from "./modules/ai/agent-router.js";
 import { preloadLocalDocsIndex } from "./modules/ai/local-docs.js";
 import { getAiCapabilities } from "./modules/ai/multimodal.js";
 import { streamSearchModeJob } from "./modules/ai/support-search-stream.js";
+import { hasOpenClawGatewayAuthConfigured } from "./infrastructure/openclaw/device-auth.js";
 import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
 import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
 import { env } from "./config/env.js";
@@ -85,7 +86,7 @@ function currentAiTopology() {
 }
 
 function hasOpenClawGatewayAuth(): boolean {
-  return Boolean(env.OPENCLAW_GATEWAY_TOKEN || env.OPENCLAW_BASIC_PASS);
+  return hasOpenClawGatewayAuthConfigured();
 }
 
 export async function ensureAiRuntimeReady() {

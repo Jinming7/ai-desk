@@ -7,6 +7,7 @@ import { test } from "node:test";
 import {
   buildOpenClawDeviceAuthPayload,
   buildSignedOpenClawDevice,
+  hasOpenClawGatewayAuthConfigured,
   loadOpenClawDeviceToken,
   loadOrCreateOpenClawDeviceIdentity,
   storeOpenClawDeviceToken
@@ -113,6 +114,29 @@ test("loadOpenClawDeviceToken prefers OPENCLAW_DEVICE_TOKEN when provided", () =
   } finally {
     if (original === undefined) delete process.env.OPENCLAW_DEVICE_TOKEN;
     else process.env.OPENCLAW_DEVICE_TOKEN = original;
+  }
+});
+
+test("hasOpenClawGatewayAuthConfigured accepts OPENCLAW_DEVICE_TOKEN as valid auth", () => {
+  const originalDeviceToken = process.env.OPENCLAW_DEVICE_TOKEN;
+  const originalGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+  const originalBasicPass = process.env.OPENCLAW_BASIC_PASS;
+
+  delete process.env.OPENCLAW_GATEWAY_TOKEN;
+  delete process.env.OPENCLAW_BASIC_PASS;
+  process.env.OPENCLAW_DEVICE_TOKEN = "device-token-from-env";
+
+  try {
+    assert.equal(hasOpenClawGatewayAuthConfigured(), true);
+  } finally {
+    if (originalDeviceToken === undefined) delete process.env.OPENCLAW_DEVICE_TOKEN;
+    else process.env.OPENCLAW_DEVICE_TOKEN = originalDeviceToken;
+
+    if (originalGatewayToken === undefined) delete process.env.OPENCLAW_GATEWAY_TOKEN;
+    else process.env.OPENCLAW_GATEWAY_TOKEN = originalGatewayToken;
+
+    if (originalBasicPass === undefined) delete process.env.OPENCLAW_BASIC_PASS;
+    else process.env.OPENCLAW_BASIC_PASS = originalBasicPass;
   }
 });
 
