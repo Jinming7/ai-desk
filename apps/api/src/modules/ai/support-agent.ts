@@ -4546,12 +4546,12 @@ async function runSingleAgentSupportSearch(input: {
       idempotencyKey: `${input.idempotencyKey}:support-main:plan`
     }),
     stageTraceEntry({
-      stage: "retrieval_base",
+      stage: "retrieval",
       timing: baseEvidenceResult.timing,
       idempotencyKey: `${input.idempotencyKey}:support-main:validation`
     }),
     stageTraceEntry({
-      stage: "retrieval_extra",
+      stage: "retrieval_refine",
       timing: additionalTiming,
       idempotencyKey: `${input.idempotencyKey}:support-main:validation:extra`
     }),

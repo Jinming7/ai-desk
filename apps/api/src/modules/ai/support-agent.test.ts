@@ -4447,8 +4447,9 @@ test("runSupportSearchAgent single-agent stabilizes OAuth callback setup questio
         resolvedQueries.add(query);
       }
       for (const reference of collection.references) {
-        if (seenEvidenceIds.has(reference.evidenceId)) continue;
-        seenEvidenceIds.add(reference.evidenceId);
+        const evidenceId = reference.evidenceId ?? reference.documentId;
+        if (!evidenceId || seenEvidenceIds.has(evidenceId)) continue;
+        seenEvidenceIds.add(evidenceId);
         references.push(reference);
       }
     }
