@@ -342,6 +342,15 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   const architectureQuestion =
     (signals.privateDeploymentContext || /deployment documentation|部署文档/i.test(input.query)) &&
     (signals.deploymentArchitectureContext || signals.isolationContext || signals.infrastructureContext);
+  const shouldUseIntegrationProductArea =
+    (input.caseFrame.product_area === "general" ||
+      input.caseFrame.product_area === "openapi" ||
+      input.caseFrame.product_area === "integrations") &&
+    signals.integrationContext &&
+    (input.caseFrame.action_type === "troubleshooting" ||
+      signals.troubleshootingContext ||
+      signals.wantsProcedure ||
+      normalizedRoute.specialist_agent !== "api-specialist");
   const deploymentModel =
     input.caseFrame.deployment_model === "unknown" || input.caseFrame.deployment_model === "shared"
       ? signals.privateDeploymentContext || architectureQuestion || (signals.infrastructureContext && signals.mailDependencyContext)
@@ -355,9 +364,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
         (signals.accountRecoveryContext || signals.infrastructureContext || architectureQuestion))) &&
     (deploymentModel === "private_deployment" || signals.infrastructureContext || architectureQuestion)
       ? "deployment"
-      : (input.caseFrame.product_area === "general" || input.caseFrame.product_area === "openapi") &&
-        signals.integrationContext &&
-        (input.caseFrame.action_type === "troubleshooting" || signals.troubleshootingContext)
+      : shouldUseIntegrationProductArea
       ? "integrations"
       : input.caseFrame.product_area === "openapi" && normalizedRoute.specialist_agent !== "api-specialist" && !apiShaped
       ? "general"
@@ -367,11 +374,15 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     (signals.wantsProcedure &&
       deploymentModel === "private_deployment" &&
       normalizedRoute.question_type !== "capability_confirmation");
+  const shouldTreatIntegrationSetupAsHowTo =
+    shouldUseIntegrationProductArea &&
+    signals.wantsProcedure &&
+    !signals.troubleshootingContext;
   const shouldPreserveIntegrationTroubleshooting =
-    (productArea === "integrations" || input.caseFrame.product_area === "integrations" || signals.integrationContext) &&
-    (input.caseFrame.action_type === "troubleshooting" || signals.troubleshootingContext);
+    shouldUseIntegrationProductArea && (input.caseFrame.action_type === "troubleshooting" || signals.troubleshootingContext);
   const shouldForceApiRoute =
     signals.apiContext &&
+    !shouldTreatIntegrationSetupAsHowTo &&
     !shouldPreserveIntegrationTroubleshooting &&
     (input.caseFrame.product_area === "openapi" ||
       normalizedRoute.specialist_agent !== "api-specialist" ||
@@ -384,7 +395,11 @@ function stabilizeSupportRouteAndCaseFrame(input: {
       : input.caseFrame.object === "unspecified" && signals.integrationContext
       ? localizedSupportLabel(input.query, "集成授权回调", "integration authorization callback")
       : input.caseFrame.object;
-  const actionType = shouldTreatAsHowTo ? "how_to" : input.caseFrame.action_type;
+  const actionType = shouldTreatIntegrationSetupAsHowTo
+    ? localizedSupportLabel(input.query, "集成配置", "integration setup")
+    : shouldTreatAsHowTo
+    ? "how_to"
+    : input.caseFrame.action_type;
 
   let caseFrame: SupportCaseFrame = {
     ...input.caseFrame,
@@ -419,6 +434,8 @@ function stabilizeSupportRouteAndCaseFrame(input: {
           ],
           6
         )
+      : shouldTreatIntegrationSetupAsHowTo
+      ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "product_guide", "rules"], 6)
       : shouldPreserveIntegrationTroubleshooting
       ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "troubleshooting", "product_guide", "rules"], 6)
       : architectureQuestion
@@ -435,6 +452,15 @@ function stabilizeSupportRouteAndCaseFrame(input: {
           question_type: inferApiQuestionType(input.query),
           specialist_agent: "api-specialist",
           answer_contract: "Give the exact API answer first.",
+          routing_confidence: Math.max(input.route.routing_confidence, 0.84)
+        }
+      : shouldTreatIntegrationSetupAsHowTo
+      ? {
+          ...normalizedRoute,
+          question_type: "config_setup",
+          specialist_agent: "howto-specialist",
+          answer_contract:
+            "State exactly where to configure the integration callback first, then list the required values and the checks to run before retrying.",
           routing_confidence: Math.max(input.route.routing_confidence, 0.84)
         }
       : shouldPreserveIntegrationTroubleshooting
@@ -544,9 +570,16 @@ function mergeRouteAndEvidencePlan(caseFrame: SupportCaseFrame, route: SupportQu
 
 function normalizeStageBudget(input: { route: SupportQuestionRoute; plan: SupportEvidencePlan }) {
   const apiRoute = String(input.route.question_type ?? "").startsWith("api_");
+  const multiPassSensitiveRoute =
+    input.route.question_type === "config_setup" || input.route.question_type === "troubleshooting";
   const rawSpecialistBudget = input.route.specialist_budget ?? 1;
   const specialistBudget = Math.max(0, Math.min(1, Number.isFinite(rawSpecialistBudget) ? rawSpecialistBudget : 1));
-  const retrievalFloor = apiRoute && !(input.plan.stop_after_grounded_evidence && specialistBudget === 0) ? 2 : 1;
+  const retrievalFloor =
+    apiRoute && !(input.plan.stop_after_grounded_evidence && specialistBudget === 0)
+      ? 2
+      : multiPassSensitiveRoute
+      ? 2
+      : 1;
   const retrievalRounds = Math.max(retrievalFloor, Math.min(2, Number(input.plan.retrieval_rounds ?? 2) || 2));
   return {
     retrieval_rounds: retrievalRounds,
@@ -1295,6 +1328,9 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
   const requiredDocKinds = caseFrame.required_doc_kinds ?? [];
   const focusTerms = collectFocusTerms(query, caseFrame);
   const normalizedQuery = query.toLowerCase();
+  const integrationCallbackTroubleshootingQuery =
+    caseFrame.product_area === "integrations" &&
+    /callback|redirect(?:\s+uri|\s+url)?|webhook|baseurl|page not found|回调|重定向|排查|404/i.test(query);
   const wantsListVariant =
     /列表|枚举|可选|全部|有哪些/.test(query) || /\b(list|enum|options|all statuses?)\b/.test(normalizedQuery);
   const deploymentCapabilityQuestion =
@@ -1364,8 +1400,15 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
         if (profile.evidenceKind === "troubleshooting") topicScore += 14;
         else if (profile.evidenceKind === "procedure") topicScore += 10;
         else if (profile.evidenceKind === "constraint" || profile.evidenceKind === "capability") topicScore += 8;
-        if (/\b(github|gitlab|oauth|callback|redirect uri|redirect url|webhook|baseurl|page not found)\b|github|gitlab|回调|重定向|redirect uri|webhook|baseurl|page not found/.test(semanticText)) {
+        const callbackSignalMatched =
+          /\b(github|gitlab|oauth|callback|redirect uri|redirect url|webhook|baseurl|page not found)\b|github|gitlab|回调|重定向|redirect uri|webhook|baseurl|page not found/.test(
+            semanticText
+          );
+        if (callbackSignalMatched) {
           topicScore += 16;
+        }
+        if (integrationCallbackTroubleshootingQuery) {
+          topicScore += callbackSignalMatched ? 18 : -12;
         }
       }
       if (
@@ -3907,6 +3950,11 @@ function normalizeSupportMainCaseFrame(
 }
 
 function deriveSupportMainEvidencePlan(caseFrame: SupportCaseFrame, query: string, retrievalQueries: string[]): SupportEvidencePlan {
+  const multiPassQuestion =
+    caseFrame.question_type === "how_to_product" ||
+    caseFrame.question_type === "config_setup" ||
+    caseFrame.question_type === "troubleshooting" ||
+    caseFrame.question_type === "data_export_reporting";
   return {
     query_plan: caseFrame.query_plan ?? {
       concept_queries: uniqueStrings([...retrievalQueries, query], 4),
@@ -3915,9 +3963,9 @@ function deriveSupportMainEvidencePlan(caseFrame: SupportCaseFrame, query: strin
     },
     evidence_priority: caseFrame.evidence_priority ?? [],
     required_doc_kinds: caseFrame.required_doc_kinds ?? [],
-    retrieval_rounds: 1,
-    allow_refinement: false,
-    stop_after_grounded_evidence: true
+    retrieval_rounds: multiPassQuestion ? 2 : 1,
+    allow_refinement: multiPassQuestion,
+    stop_after_grounded_evidence: !multiPassQuestion
   };
 }
 
@@ -4005,10 +4053,22 @@ function normalizeSupportMainPlanOutput(
     caseFrame,
     evidencePlan
   });
-  return {
+  const stabilized = stabilizeSupportRouteAndCaseFrame({
+    query,
     route,
-    caseFrame: canonicalized.caseFrame,
-    evidencePlan: canonicalized.evidencePlan,
+    caseFrame: canonicalized.caseFrame
+  });
+  const stabilizedEvidencePlan = deriveSupportMainEvidencePlan(stabilized.caseFrame, query, retrievalQueries);
+  const stabilizedCanonicalized = canonicalizeSupportPlannerArtifacts({
+    query,
+    route: stabilized.route,
+    caseFrame: stabilized.caseFrame,
+    evidencePlan: stabilizedEvidencePlan
+  });
+  return {
+    route: stabilized.route,
+    caseFrame: stabilizedCanonicalized.caseFrame,
+    evidencePlan: stabilizedCanonicalized.evidencePlan,
     retrievalQueries
   };
 }
@@ -4227,16 +4287,22 @@ async function runSingleAgentSupportSearch(input: {
   markStageCompleted("support_main_plan");
 
   const normalizedPlan = normalizeSupportMainPlanOutput(rawSupportMainPlan, input.query);
-  const validationQueries = uniqueStrings(
-    [...normalizedPlan.retrievalQueries, ...normalizedPlan.caseFrame.retrieval_queries, input.query],
-    8
-  );
+  const allowMultiPassRetrieval = input.runtime?.allowMultiPassRetrieval !== false;
+  const allowRefinement = input.runtime?.allowRefinement !== false;
+  const singleAgentBudget = normalizeStageBudget({
+    route: {
+      ...normalizedPlan.route,
+      specialist_budget: 0
+    },
+    plan: normalizedPlan.evidencePlan
+  });
+  const baseQueries = buildInitialRetrievalQueries(input.query, normalizedPlan.caseFrame, normalizedPlan.retrievalQueries);
 
-  await reportStageProgress("retrieval_validation");
-  const validationStartedAt = performance.now();
-  const validationEvidenceResult = await input.orchestrator
+  await reportStageProgress("retrieval_base");
+  const baseEvidenceStartedAt = performance.now();
+  const baseEvidenceResult = await input.orchestrator
     .collectEvidence({
-      queries: validationQueries,
+      queries: baseQueries,
       idempotencyKey: `${input.idempotencyKey}:support-main:validation`,
       runtime: input.runtime,
       answerLanguage: input.language,
@@ -4247,8 +4313,8 @@ async function runSingleAgentSupportSearch(input: {
     })
     .then((value) => ({
       value,
-      timing: stageTiming("completed", elapsedMs(validationStartedAt), {
-        query_count: validationQueries.length,
+      timing: stageTiming("completed", elapsedMs(baseEvidenceStartedAt), {
+        query_count: baseQueries.length,
         reference_count: value.references.length
       })
     }))
@@ -4260,18 +4326,76 @@ async function runSingleAgentSupportSearch(input: {
         references: [],
         retrievalStatus: "kb_unavailable" as const,
         unresolvedReasonCode: "KB_RETRIEVAL_UNAVAILABLE" as const,
-        resolvedQueries: validationQueries,
+        resolvedQueries: baseQueries,
         fallbackUsed: true
       },
-      timing: stageTiming("fallback", elapsedMs(validationStartedAt), {
-        query_count: validationQueries.length,
+      timing: stageTiming("fallback", elapsedMs(baseEvidenceStartedAt), {
+        query_count: baseQueries.length,
         reference_count: 0
       })
     }));
-  markStageCompleted("retrieval_validation");
+  markStageCompleted("retrieval_base");
+
+  await reportStageProgress("retrieval_extra");
+  const additionalStartedAt = performance.now();
+  const additionalQueries = combineRetrievalQueries(input.query, normalizedPlan.caseFrame, input.orchestrator, baseQueries);
+  const additionalEvidence =
+    allowMultiPassRetrieval &&
+    singleAgentBudget.retrieval_rounds > 1 &&
+    additionalQueries.length > 0 &&
+    hasEnoughBudget(input.runtime, 9000)
+      ? await input.orchestrator
+          .collectEvidence({
+            queries: additionalQueries,
+            idempotencyKey: `${input.idempotencyKey}:support-main:validation:extra`,
+            runtime: input.runtime,
+            answerLanguage: input.language,
+            attachments: input.attachments,
+            caseFrame: normalizedPlan.caseFrame,
+            repoId: input.repoId,
+            branch: input.branch
+          })
+          .catch(() => null)
+      : null;
+  const preRefinedEvidence = additionalEvidence
+    ? input.orchestrator.combineEvidenceCollections([baseEvidenceResult.value, additionalEvidence])
+    : baseEvidenceResult.value;
+  const refinementEvidence =
+    allowRefinement &&
+    singleAgentBudget.retrieval_rounds > 1 &&
+    singleAgentBudget.allow_refinement &&
+    preRefinedEvidence.references.length > 0 &&
+    hasEnoughBudget(input.runtime, 7000)
+      ? await input.orchestrator
+          .refineEvidence({
+            baseQuery: input.query,
+            references: preRefinedEvidence.references,
+            idempotencyKey: `${input.idempotencyKey}:support-main:validation`,
+            runtime: input.runtime,
+            answerLanguage: input.language,
+            attachments: input.attachments,
+            caseFrame: normalizedPlan.caseFrame,
+            repoId: input.repoId,
+            branch: input.branch
+          })
+          .catch(() => null)
+      : null;
+  const evidenceCollection =
+    refinementEvidence && refinementEvidence.references.length > 0
+      ? input.orchestrator.combineEvidenceCollections([preRefinedEvidence, refinementEvidence])
+      : preRefinedEvidence;
+  const secondRoundQueryCount = (additionalEvidence ? additionalQueries.length : 0) + (refinementEvidence?.resolvedQueries.length ?? 0);
+  const additionalTiming =
+    secondRoundQueryCount > 0
+      ? stageTiming("completed", elapsedMs(additionalStartedAt), {
+          query_count: secondRoundQueryCount,
+          reference_count: evidenceCollection.references.length
+        })
+      : skippedStageTiming();
+  markStageCompleted("retrieval_extra");
 
   const draftEvidence = buildSupportMainProvidedEvidence({
-    references: validationEvidenceResult.value.references,
+    references: evidenceCollection.references,
     limit: 8
   });
   const supportMainDraftRuntime = withStageRuntime(
@@ -4341,9 +4465,9 @@ async function runSingleAgentSupportSearch(input: {
   );
   const evidenceBundle = buildEvidenceBundle({
     references: draftEvidence.visibleReferences,
-    confidence: validationEvidenceResult.value.confidence,
-    fallbackUsed: validationEvidenceResult.value.fallbackUsed,
-    resolvedQueries: validationEvidenceResult.value.resolvedQueries,
+    confidence: evidenceCollection.confidence,
+    fallbackUsed: evidenceCollection.fallbackUsed,
+    resolvedQueries: evidenceCollection.resolvedQueries,
     caseFrame: normalizedPlan.caseFrame,
     query: input.query,
     selection: {
@@ -4390,7 +4514,7 @@ async function runSingleAgentSupportSearch(input: {
     verification
   });
   const unresolvedReasonCode =
-    validationEvidenceResult.value.retrievalStatus === "kb_unavailable"
+    evidenceCollection.retrievalStatus === "kb_unavailable"
       ? "KB_RETRIEVAL_UNAVAILABLE"
       : verification.verified_citation_ids.length > 0
       ? null
@@ -4409,8 +4533,8 @@ async function runSingleAgentSupportSearch(input: {
   const stageTimings: SupportAgentStageTimings = {
     total_ms: elapsedMs(runStartedAt),
     planner: supportMainPlanTiming,
-    retrieval_base: validationEvidenceResult.timing,
-    retrieval_extra: skippedStageTiming(),
+    retrieval_base: baseEvidenceResult.timing,
+    retrieval_extra: additionalTiming,
     writer: supportMainDraftTiming,
     verifier: skippedStageTiming()
   };
@@ -4422,9 +4546,14 @@ async function runSingleAgentSupportSearch(input: {
       idempotencyKey: `${input.idempotencyKey}:support-main:plan`
     }),
     stageTraceEntry({
-      stage: "retrieval",
-      timing: validationEvidenceResult.timing,
+      stage: "retrieval_base",
+      timing: baseEvidenceResult.timing,
       idempotencyKey: `${input.idempotencyKey}:support-main:validation`
+    }),
+    stageTraceEntry({
+      stage: "retrieval_extra",
+      timing: additionalTiming,
+      idempotencyKey: `${input.idempotencyKey}:support-main:validation:extra`
     }),
     stageTraceEntry({
       stage: "support_main_draft",
@@ -4447,10 +4576,10 @@ async function runSingleAgentSupportSearch(input: {
       support_answer: supportAnswer,
       verification,
       structured_answer: structuredAnswer,
-      confidence: validationEvidenceResult.value.confidence,
+      confidence: evidenceCollection.confidence,
       suggested_next_step: mode === "grounded" ? "self_serve" : "submit_ticket",
       retrieval_status:
-        validationEvidenceResult.value.retrievalStatus === "kb_unavailable"
+        evidenceCollection.retrievalStatus === "kb_unavailable"
           ? "kb_unavailable"
           : draftEvidence.visibleReferences.length
           ? "grounded"
@@ -4465,14 +4594,12 @@ async function runSingleAgentSupportSearch(input: {
       internal_diagnostics: {
         route: normalizedPlan.route,
         evidence_plan: normalizedPlan.evidencePlan,
-        stage_budget: {
-          retrieval_rounds: 1,
-          allow_refinement: false,
-          stop_after_grounded_evidence: true,
-          specialist_budget: 0
-        },
-        retrieval_queries_used: validationQueries,
-        retrieval_queries_refined: [],
+        stage_budget: singleAgentBudget,
+        retrieval_queries_used: baseQueries,
+        retrieval_queries_refined: uniqueStrings(
+          [...(additionalEvidence ? additionalQueries : []), ...(refinementEvidence?.resolvedQueries ?? [])],
+          8
+        ),
         claim_graph: buildClaimGraph(verification),
         specialist_skipped: true,
         specialists_used: ["support-main"],

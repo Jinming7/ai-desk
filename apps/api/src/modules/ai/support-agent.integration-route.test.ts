@@ -349,7 +349,14 @@ title: "GitHub 和公共 GitLab"
     assert.equal(result.caseFrame.question_type, "troubleshooting");
     assert.equal(result.caseFrame.specialist_agent, "troubleshooting-specialist");
     assert.equal(String(result.result.references[0]?.supportMetadata?.product_area ?? ""), "integrations");
-    assert.match(result.result.references[0]?.snippet ?? "", /Redirect URI|回调|page not found/i);
+    assert.equal(
+      result.result.references.some(
+        (item) =>
+          item.path === "docs/ones-devops/code-integration/github-and-public-gitlab.mdx" &&
+          /Webhook|Redirect URI|回调|page not found/i.test(`${item.title}\n${item.snippet}`)
+      ),
+      true
+    );
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

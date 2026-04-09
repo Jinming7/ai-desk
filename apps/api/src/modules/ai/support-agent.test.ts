@@ -4296,6 +4296,271 @@ test("runSupportSearchAgent single-agent falls back capability questions away fr
   }
 });
 
+test("runSupportSearchAgent single-agent stabilizes OAuth callback setup questions and widens retrieval beyond the first generic pass", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    draftSupportMainAgent?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        route: SupportQuestionRoute;
+        caseFrame: SupportCaseFrame;
+        providedEvidence: Array<{
+          reference_id: string;
+          evidence_id: string;
+          sourceUrl: string;
+        }>;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+  };
+  const observedQueryBatches: string[][] = [];
+  let observedRoute: SupportQuestionRoute | undefined;
+  let observedCaseFrame: SupportCaseFrame | undefined;
+  let observedProvidedEvidence: Array<{ reference_id: string; evidence_id: string; sourceUrl: string }> = [];
+
+  adapter.planSupportMainAgent = async () => ({
+    route: {
+      question_type: "troubleshooting",
+      user_goal: "配置 OAuth 应用的回调地址",
+      answer_contract: "先给排查方向。",
+      specialist_agent: "troubleshooting-specialist",
+      routing_confidence: 0.88
+    },
+    caseFrame: {
+      goal: "告诉用户去哪里配置 OAuth 应用的回调地址",
+      symptom: "用户需要配置授权回调地址而不是排查报错",
+      object: "unspecified",
+      action_type: "troubleshooting",
+      deployment_model: "shared",
+      product_area: "openapi",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["OAuth 应用 配置", "集成设置"],
+      required_doc_kinds: ["product_guide"]
+    },
+    retrievalQueries: ["OAuth 应用 配置", "集成设置"]
+  });
+  adapter.draftSupportMainAgent = async (input) => {
+    observedRoute = input.route;
+    observedCaseFrame = input.caseFrame;
+    observedProvidedEvidence = input.providedEvidence;
+    const callbackEvidence = input.providedEvidence.find((item) => /callback|redirect/i.test(item.sourceUrl));
+    return {
+      draftAnswer: {
+        question_type: input.route.question_type,
+        render_variant: "how_to",
+        direct_answer: callbackEvidence
+          ? "在 OAuth 应用配置页面填写回调地址（redirect URI），保存后再重新发起授权。"
+          : "当前只找到了泛化集成说明，没有定位到回调地址配置位置。",
+        claims: callbackEvidence
+          ? [
+              {
+                text: "OAuth 应用的回调地址需要在应用配置页中填写 redirect URI / callback URL。",
+                kind: "verified_fact",
+                reference_ids: [callbackEvidence.reference_id],
+                authority: "canonical"
+              }
+            ]
+          : [],
+        next_actions: ["打开 OAuth 应用配置页并填写回调地址。"],
+        unknowns: callbackEvidence ? [] : ["缺少回调地址配置文档。"],
+        escalation_needed: false
+      }
+    };
+  };
+
+  const genericReference: SearchReference = {
+    documentId: "doc:oauth-overview",
+    evidenceId: "chunk:oauth-overview",
+    title: "OAuth 集成概览",
+    snippet: "OAuth 应用支持基础授权流程。",
+    sourceUrl: "https://docs.ones.com/oauth/overview",
+    path: "open-docs/docs/oauth/overview.mdx",
+    headingPath: "OAuth 集成",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    supportMetadata: {
+      product_area: "integrations",
+      evidence_kind: "capability"
+    },
+    score: 0.62,
+    retrievedAt: "2026-04-09T03:00:00.000Z"
+  };
+  const callbackReference: SearchReference = {
+    documentId: "doc:oauth-callback",
+    evidenceId: "chunk:oauth-callback",
+    title: "配置 OAuth 回调地址",
+    snippet: "在 OAuth 应用配置页中填写 Redirect URI / Callback URL。",
+    sourceUrl: "https://docs.ones.com/oauth/app/callback-url",
+    path: "open-docs/docs/oauth/app/callback-url.mdx",
+    headingPath: "回调地址",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    supportMetadata: {
+      product_area: "integrations",
+      evidence_kind: "procedure",
+      doc_kind: "product_guide",
+      actions: ["configure callback url", "set redirect uri"]
+    },
+    score: 0.96,
+    retrievedAt: "2026-04-09T03:01:00.000Z"
+  };
+  const mergeEvidenceCollections = (
+    collections: Array<{
+      query: string;
+      confidence: number;
+      references: SearchReference[];
+      resolvedQueries: string[];
+      fallbackUsed: boolean;
+    }>
+  ) => {
+    const references: SearchReference[] = [];
+    const seenEvidenceIds = new Set<string>();
+    const resolvedQueries = new Set<string>();
+    let confidence = 0;
+    let fallbackUsed = false;
+
+    for (const collection of collections) {
+      confidence = Math.max(confidence, collection.confidence);
+      fallbackUsed ||= collection.fallbackUsed;
+      for (const query of collection.resolvedQueries) {
+        resolvedQueries.add(query);
+      }
+      for (const reference of collection.references) {
+        if (seenEvidenceIds.has(reference.evidenceId)) continue;
+        seenEvidenceIds.add(reference.evidenceId);
+        references.push(reference);
+      }
+    }
+
+    return {
+      query: collections[0]?.query ?? "",
+      answer: "",
+      confidence,
+      references,
+      retrievalStatus: references.length ? ("grounded" as const) : ("no_results" as const),
+      unresolvedReasonCode: references.length ? null : ("NO_MATCHING_KB" as const),
+      resolvedQueries: [...resolvedQueries],
+      fallbackUsed
+    };
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { queries: string[] }) {
+      observedQueryBatches.push([...(input.queries ?? [])]);
+      const joinedQueries = (input.queries ?? []).join(" ");
+      if (/回调|callback|redirect/i.test(joinedQueries)) {
+        return {
+          query: input.queries[0] ?? "",
+          answer: "",
+          confidence: 0.96,
+          references: [callbackReference],
+          retrievalStatus: "grounded" as const,
+          unresolvedReasonCode: null,
+          resolvedQueries: input.queries ?? [],
+          fallbackUsed: false
+        };
+      }
+
+      return {
+        query: input.queries[0] ?? "",
+        answer: "",
+        confidence: 0.62,
+        references: [genericReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: "LOW_CONFIDENCE" as const,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections(items: Array<{
+      query: string;
+      confidence: number;
+      references: SearchReference[];
+      resolvedQueries: string[];
+      fallbackUsed: boolean;
+    }>) {
+      return mergeEvidenceCollections(items);
+    },
+    async refineEvidence(input: { baseQuery: string; references: SearchReference[] }) {
+      const titles = input.references.map((item) => item.title).join(" ");
+      if (/回调|callback|redirect/i.test(titles)) {
+        return {
+          query: input.baseQuery,
+          answer: "",
+          confidence: 0.96,
+          references: [callbackReference],
+          retrievalStatus: "grounded" as const,
+          unresolvedReasonCode: null,
+          resolvedQueries: ["OAuth 应用 回调地址 redirect uri callback url"],
+          fallbackUsed: false
+        };
+      }
+      return {
+        query: input.baseQuery,
+        answer: "",
+        confidence: 0.55,
+        references: [],
+        retrievalStatus: "no_results" as const,
+        unresolvedReasonCode: "NO_MATCHING_KB" as const,
+        resolvedQueries: [],
+        fallbackUsed: false
+      };
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "如何配置 OAuth 应用的回调地址？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-single-agent-oauth-callback-setup"
+    });
+
+    assert.equal(observedRoute?.question_type, "config_setup");
+    assert.equal(observedRoute?.specialist_agent, "howto-specialist");
+    assert.match(observedCaseFrame?.object ?? "", /回调/);
+    assert.equal(observedQueryBatches.length >= 2, true);
+    assert.equal(observedProvidedEvidence.some((item) => /callback|redirect/i.test(item.sourceUrl)), true);
+    assert.deepEqual(result.verification.verified_citation_ids, ["chunk:oauth-callback"]);
+    assert.match(result.result.answer, /回调地址|redirect uri/i);
+    assert.equal(
+      (result.result.internal_diagnostics as { stage_budget?: { retrieval_rounds?: number } } | undefined)?.stage_budget
+        ?.retrieval_rounds,
+      2
+    );
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
 test("runSupportSearchAgent single-agent keeps broad partial capability answers instead of collapsing to one narrow claim", async () => {
   const mutableEnv = env as {
     FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
