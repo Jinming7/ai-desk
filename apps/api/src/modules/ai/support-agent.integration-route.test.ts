@@ -30,6 +30,7 @@ import type {
 import { runSupportSearchAgent } from "./support-agent.js";
 import type {
   DraftSupportAnswer,
+  SearchReference,
   SpecialistDraftAnswer,
   SupportCaseFrame,
   SupportEvidencePlan,
@@ -335,6 +336,48 @@ title: "GitHub 和公共 GitLab"
 `
   );
 
+  const validationReference: SearchReference = {
+    documentId: "doc:github-public-gitlab",
+    evidenceId: "chunk:integration-callback",
+    title: "GitHub 和公共 GitLab",
+    snippet: "如果授权完成后无法返回 ONES，或者回调页面显示 page not found，请检查 Redirect URI、Webhook 回调地址，以及 baseURL 配置是否一致。",
+    sourceUrl: "https://docs.ones.com/integrations/github-public-gitlab",
+    path: "docs/ones-devops/code-integration/github-and-public-gitlab.mdx",
+    headingPath: "链接仓库",
+    authority: "canonical_visible",
+    sourceType: "local_docs",
+    score: 0.98,
+    retrievedAt: "2026-04-09T05:30:00.000Z",
+    supportMetadata: {
+      product_area: "integrations",
+      evidence_kind: "integration_guidance"
+    }
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.98,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("integration route test should not refine evidence");
+    }
+  };
+
   try {
     const result = await runSupportSearchAgent({
       query: "GitHub 集成授权后回调页面显示 page not found，怎么排查？",
@@ -342,6 +385,7 @@ title: "GitHub 和公共 GitLab"
       currentRound: 0,
       conversationHistory: [],
       adapter: createFocusedAdapter(),
+      orchestrator: orchestrator as never,
       idempotencyKey: "support-agent-focused-integration-callback-troubleshooting"
     });
 

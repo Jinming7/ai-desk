@@ -1233,6 +1233,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         "Rules:",
         "- Use ONLY provided_evidence. Do not retrieve.",
         "- Answer the likely primary API conclusion first.",
+        "- If the question implies changing or reading an issue/project/comment/field object and the evidence contains a matching method/path, treat that operation as the primary answer.",
+        "- If the evidence already contains a plausible exact operation doc, do not fall back to a generic handoff or clarification.",
+        "- If the question mentions assignee, owner, status, field, UUID, or request payload, surface the exact documented operation and the relevant request/response fact when evidence supports it.",
         "- Convert supported endpoint, field, parameter, scope, and auth facts into narrow claims with evidence_ids.",
         "- Do not mention internal routing or reasoning."
       ],
@@ -1285,6 +1288,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         "- Use ONLY provided_evidence. Do not retrieve.",
         "- Answer from published product documentation, behavior notes, capability descriptions, and how-to guidance.",
         "- Prefer a direct product conclusion before extra context.",
+        "- Do not turn endpoint, request-field, scope, or auth lookup questions into generic product navigation or generic behavior language.",
+        "- If the route indicates how-to, keep the answer procedural. If the route indicates behavior, keep the answer explanatory. If the route indicates troubleshooting, keep the answer diagnostic.",
+        "- When the provided evidence does not support a docs-domain answer, keep unknowns narrow instead of inventing broad unsupported guidance.",
         "- Keep the wording concise and support-engineer style."
       ],
       input,
@@ -1374,6 +1380,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         "Rules:",
         "- Answer the user's API question directly first.",
         "- If the evidence contains a likely exact operation doc, answer with that operation first instead of asking for clarification.",
+        "- Do not downgrade a nearby documented operation into a generic handoff when the method/path and object match the user's likely goal.",
+        "- For issue assignee, owner, field, status, or similar update requests, prefer the documented update operation and cite the relevant request field when it is present in evidence.",
         "- For endpoint lookup, field lookup, and scope questions, provide the exact endpoint details when evidence supports them.",
         "- If there is a nearby ambiguity, such as current status versus status list, keep the most likely primary answer in direct_answer and put the nearby variant in related_variant or important_note.",
         "- For field lookup questions, prefer the operation whose response schema returns the current object details when the user asks for a current value.",
@@ -1403,6 +1411,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         "Rules:",
         "- Provide a practical customer-facing answer first.",
         "- Prefer concrete actions, settings, paths, or operations over abstract summaries.",
+        "- Stay within procedural product or deployment guidance. Do not answer endpoint, scope, or request-schema lookup as generic how-to guidance.",
+        "- If the provided evidence does not support a procedural answer, keep the missing detail narrow instead of broad handoff language.",
         "- Keep wording polite and professional."
       ],
       input,
@@ -1425,6 +1435,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         "Rules:",
         "- Answer the user's why/behavior question directly.",
         "- If the retrieved docs support a narrow conclusion, state that narrow conclusion directly instead of escalating immediately.",
+        "- Do not treat endpoint, request-body, request-field, or OAuth scope lookup as a behavior explanation task.",
+        "- When evidence is procedural or API-shaped rather than behavioral, keep unknowns narrow and avoid generic unsupported conclusions.",
         "- When the question is about supported syntax or documented capability, prefer syntax/reference docs over UI guidance, and keep the claim narrow.",
         "- It is acceptable to use grounded_inference for the most likely explanation, but never present an inference as documented fact.",
         "- Keep the tone polite, measured, and useful."
@@ -1449,6 +1461,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         "Rules:",
         "- Start with the most useful diagnosis or support conclusion you can defend.",
         "- Focus on practical checks and follow-up details.",
+        "- Do not convert a documented endpoint or request-field lookup into an error-diagnosis answer.",
+        "- If the evidence supports an operational fix directly, say that first. If it does not, keep the missing checks narrow and actionable.",
         "- Keep the tone polite and concise."
       ],
       input,

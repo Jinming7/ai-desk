@@ -4796,3 +4796,222 @@ test("runSupportSearchAgent supervisor-domain runtime supports deployment answer
     mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
   }
 });
+
+test("runSupportSearchAgent supervisor-domain runtime recovers implicit assignee-update API questions onto openapi evidence", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "open-docs/docs/openapi/api/04-update-a-issue.api.mdx",
+    `---
+id: 04-update-a-issue
+title: "Update a issue"
+---
+
+# Update a issue
+
+<MethodEndpoint
+  method={"put"}
+  path={"/project/issues/{issueID}"}
+>
+</MethodEndpoint>
+
+Use this operation to update an issue.
+
+<SchemaItem
+  collapsible={false}
+  name={"assignee"}
+  required={false}
+  schemaName={"string"}
+  schema={{"type":"string","description":"The assignee user UUID."}}
+>
+</SchemaItem>
+`
+  );
+
+  await writeFixture(
+    rootDir,
+    "docs/ones-project/issues/assign-issues.mdx",
+    `---
+title: "Assign issues"
+---
+
+# Assign issues
+
+Use the UI to reassign issues from the issue detail page.
+`
+  );
+
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeOpenApiDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    writeDocsDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("answer composer must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "docs",
+    route: {
+      question_type: "how_to_product",
+      user_goal: input.query,
+      answer_contract: "Give the direct product steps first.",
+      specialist_agent: "howto-specialist",
+      routing_confidence: 0.74,
+      primary_domain: "docs"
+    },
+    caseFrame: {
+      goal: input.query,
+      symptom: "Need the right update path for issue assignee changes.",
+      object: "issue assignee update",
+      action_type: "how_to",
+      deployment_model: "shared",
+      product_area: "general",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["how to update assignee of an issue"],
+      question_type: "how_to_product",
+      specialist_agent: "howto-specialist",
+      answer_contract: "Give the direct product steps first.",
+      routing_confidence: 0.74,
+      primary_domain: "docs",
+      required_doc_kinds: ["product_guide"]
+    },
+    retrievalQueries: ["how to update assignee of an issue"]
+  });
+  adapter.writeOpenApiDomainAnswer = async () => ({
+    question_type: "api_endpoint_lookup",
+    render_variant: "api",
+    direct_answer: "",
+    claims: [],
+    next_actions: [],
+    unknowns: ["the exact endpoint"],
+    escalation_needed: false
+  });
+  adapter.writeDocsDomainAnswer = async () => ({
+    question_type: "how_to_product",
+    render_variant: "how_to",
+    direct_answer: "Please follow the product guide to assign issues.",
+    claims: [],
+    next_actions: [],
+    unknowns: ["whether this should be done by API or UI"],
+    escalation_needed: false
+  });
+
+  const validationReference: SearchReference = {
+    documentId: "doc:update-issue",
+    evidenceId: "chunk:update-issue-assignee",
+    title: "Update a issue",
+    snippet: "PUT /project/issues/{issueID}. The assignee field updates the assignee user UUID.",
+    sourceUrl: "https://docs.ones.com/openapi/update-issue",
+    path: "open-docs/docs/openapi/api/04-update-a-issue.api.mdx",
+    headingPath: "ROOT",
+    authority: "canonical_visible",
+    sourceType: "local_docs",
+    score: 0.98,
+    retrievedAt: "2026-04-09T05:10:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.98,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence for this regression");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "how to update assignee of an issue",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-implicit-api-assignee"
+    });
+
+    assert.equal((result.result.internal_diagnostics as { runtime_mode?: string } | undefined)?.runtime_mode, "supervisor_domain");
+    assert.equal(result.caseFrame.specialist_agent, "api-specialist");
+    assert.equal(String(result.caseFrame.question_type ?? ""), "api_endpoint_lookup");
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { primary_domain?: string } } | undefined)?.route?.primary_domain),
+      "openapi"
+    );
+    assert.equal(result.result.support_answer?.render_variant, "api");
+    assert.notEqual(result.result.support_answer?.mode, "handoff");
+    assert.match(result.result.answer, /PUT \/project\/issues\/\{issueID\}/);
+    assert.match(result.result.answer, /assignee/i);
+    assert.ok(result.result.references.some((reference) => /04-update-a-issue\.api\.mdx/.test(reference.path ?? "")));
+    assert.ok(result.result.citations.length >= 1);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});

@@ -268,17 +268,20 @@ function normalizeSupportQuestionRoute(route: SupportQuestionRoute): SupportQues
 }
 
 function inferSupportDomainFromRouteAndCaseFrame(route: SupportQuestionRoute, caseFrame: SupportCaseFrame): SupportDomain {
+  if (route.question_type.startsWith("api_")) {
+    return "openapi";
+  }
+  if (caseFrame.product_area === "openapi") {
+    return "openapi";
+  }
+  if (caseFrame.deployment_model === "private_deployment" || caseFrame.product_area === "deployment") {
+    return "deployment";
+  }
   if (route.primary_domain === "openapi" || route.primary_domain === "deployment" || route.primary_domain === "docs") {
     return route.primary_domain;
   }
   if (caseFrame.primary_domain === "openapi" || caseFrame.primary_domain === "deployment" || caseFrame.primary_domain === "docs") {
     return caseFrame.primary_domain;
-  }
-  if (route.question_type.startsWith("api_")) {
-    return "openapi";
-  }
-  if (caseFrame.deployment_model === "private_deployment" || caseFrame.product_area === "deployment") {
-    return "deployment";
   }
   return "docs";
 }
@@ -326,8 +329,29 @@ function localizedSupportLabel(query: string, zh: string, en: string): string {
   return hasCjkText(query) ? zh : en;
 }
 
+function isImplicitApiOperationQuery(query: string): boolean {
+  const lowered = query.toLowerCase();
+  const hasOperation =
+    /(create|add|new|update|modify|change|set|delete|remove|get|fetch|read|list|query|search|execute|trigger)/i.test(query) ||
+    /创建|新增|新建|更新|修改|变更|设置|删除|移除|获取|查询|列表|执行|触发/.test(query);
+  const hasApiResource =
+    /\b(issue|issues|comment|comments|project|projects|field|fields|status|statuses|workflow|wiki|space|page)\b/i.test(query) ||
+    /工作项|评论|项目|字段|属性|状态|工作流|页面|知识库/.test(query);
+  const hasApiSurfaceCue =
+    /\b(assignee|owner|uuid|identifier|payload|request body|response field|response schema|field values?|issueid|teamid|issuetypeid|query param|path param|request param)\b/i.test(
+      lowered
+    ) ||
+    /请求体|响应字段|响应结构|字段值|uuid|标识符|路径参数|查询参数|请求参数/.test(query);
+
+  return hasOperation && hasApiResource && hasApiSurfaceCue;
+}
+
 function isApiShapedQuery(query: string): boolean {
-  return /\b(api|openapi|endpoint|path|method|scope|oauth|token)\b/i.test(query) || /接口|开放平台|鉴权|授权/.test(query);
+  return (
+    /\b(api|openapi|endpoint|path|method|scope|oauth|token)\b/i.test(query) ||
+    /接口|开放平台|鉴权|授权/.test(query) ||
+    isImplicitApiOperationQuery(query)
+  );
 }
 
 function inferApiQuestionType(query: string): SupportQuestionRoute["question_type"] {
@@ -3620,6 +3644,12 @@ function recoverEvidenceAnchoredApiDraft(input: {
     .slice(0, 3);
 
   const directAnswerLead = coherentClaims[0]?.text ?? "";
+  const focusText = focusTerms.join(" ").toLowerCase();
+  const focusFieldCandidate = rankedCandidates.find(
+    (candidate) =>
+      candidate.fieldName &&
+      (tokenMatchesFocus(candidate.fieldName.toLowerCase(), focusText) || tokenMatchesFocus(candidate.text.toLowerCase(), focusText))
+  );
   const draftOperationPath = (() => {
     const raw = String(input.draft.api_path ?? "").trim();
     if (!raw) return undefined;
@@ -3655,6 +3685,12 @@ function recoverEvidenceAnchoredApiDraft(input: {
     3
   );
   const leadingPermissionScope = selectedPermissionCandidates[0]?.scopeValue;
+  const fieldLead =
+    input.route.question_type === "api_scope_auth"
+      ? ""
+      : focusFieldCandidate?.text && !directAnswerLead.includes(focusFieldCandidate.text)
+      ? focusFieldCandidate.text
+      : "";
   const directAnswer =
     input.route.question_type === "api_scope_auth" && leadingPermissionScope
       ? input.language === "zh"
@@ -3662,10 +3698,10 @@ function recoverEvidenceAnchoredApiDraft(input: {
         : `The documentation states that the required OAuth scope is \`${leadingPermissionScope}\`.`
       : input.language === "zh"
       ? operationLabel
-        ? `${directAnswerLead}${directAnswerLead.includes(operationLabel) ? "" : ` 对应接口是 ${operationLabel}。`}`.trim()
+        ? `${directAnswerLead}${directAnswerLead.includes(operationLabel) ? "" : ` 对应接口是 ${operationLabel}。`}${fieldLead ? ` ${fieldLead}` : ""}`.trim()
         : directAnswerLead
       : operationLabel
-      ? `${directAnswerLead}${directAnswerLead.includes(operationLabel) ? "" : ` The endpoint is ${operationLabel}.`}`.trim()
+      ? `${directAnswerLead}${directAnswerLead.includes(operationLabel) ? "" : ` The endpoint is ${operationLabel}.`}${fieldLead ? ` ${fieldLead}` : ""}`.trim()
       : directAnswerLead;
 
   const nextActions =
@@ -4441,7 +4477,7 @@ async function runSupervisorDomainSupportSearch(input: {
     : { value: null, timing: stageTiming("skipped", elapsedMs(specialistStartedAt)) };
   markStageCompleted("writer");
 
-  const draftSupportAnswer =
+  const rawDraftSupportAnswer =
     specialistResult.value ??
     fallbackSpecialistDraftAnswer({
       language: input.language,
@@ -4450,6 +4486,39 @@ async function runSupervisorDomainSupportSearch(input: {
       evidenceBundle,
       missingInfo: caseFrame.missing_critical_info
     });
+  const draftSupportAnswer =
+    recoverEvidenceAnchoredApiDraft({
+      language: input.language,
+      query: input.query,
+      draft: rawDraftSupportAnswer,
+      evidenceBundle,
+      route,
+      caseFrame
+    }) ??
+    recoverEvidenceAnchoredHowToDraft({
+      language: input.language,
+      query: input.query,
+      draft: rawDraftSupportAnswer,
+      evidenceBundle,
+      route
+    }) ??
+    recoverEvidenceAnchoredBehaviorCapabilityDraft({
+      language: input.language,
+      query: input.query,
+      draft: rawDraftSupportAnswer,
+      evidenceBundle,
+      route,
+      caseFrame
+    }) ??
+    recoverEvidenceAnchoredDeploymentBehaviorDraft({
+      language: input.language,
+      query: input.query,
+      draft: rawDraftSupportAnswer,
+      evidenceBundle,
+      route,
+      caseFrame
+    }) ??
+    rawDraftSupportAnswer;
 
   const localVerificationStartedAt = performance.now();
   const writerBoundVerification = sanitizeVerification({
