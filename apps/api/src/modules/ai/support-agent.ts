@@ -6,6 +6,7 @@ import type {
   OpenClawAdapter,
   OpenClawAnalyzeOutput,
   OpenClawRuntimeContext,
+  OpenClawSupportDispatchOutput,
   OpenClawSupportMainDraftOutput,
   OpenClawSupportMainPlanOutput,
   OpenClawSupportMainProvidedEvidence
@@ -21,6 +22,7 @@ import type {
   SupportAgentStageTraceEntry,
   SupportAgentStageTimings,
   SupportCaseFrame,
+  SupportDomain,
   SupportEvidenceBundle,
   SupportEvidencePlan,
   SupportEvidenceSelection,
@@ -265,6 +267,22 @@ function normalizeSupportQuestionRoute(route: SupportQuestionRoute): SupportQues
       };
 }
 
+function inferSupportDomainFromRouteAndCaseFrame(route: SupportQuestionRoute, caseFrame: SupportCaseFrame): SupportDomain {
+  if (route.primary_domain === "openapi" || route.primary_domain === "deployment" || route.primary_domain === "docs") {
+    return route.primary_domain;
+  }
+  if (caseFrame.primary_domain === "openapi" || caseFrame.primary_domain === "deployment" || caseFrame.primary_domain === "docs") {
+    return caseFrame.primary_domain;
+  }
+  if (route.question_type.startsWith("api_")) {
+    return "openapi";
+  }
+  if (caseFrame.deployment_model === "private_deployment" || caseFrame.product_area === "deployment") {
+    return "deployment";
+  }
+  return "docs";
+}
+
 function hasCjkText(input: string): boolean {
   return /[\u3400-\u9FBF]/.test(input);
 }
@@ -506,6 +524,45 @@ function fallbackQuestionRoute(query: string): SupportQuestionRoute {
     specialist_agent,
     routing_confidence: 0.7,
     specialist_budget: 1
+  };
+}
+
+function fallbackSupportDispatch(query: string): OpenClawSupportDispatchOutput {
+  const route = fallbackQuestionRoute(query);
+  const draftCaseFrame: SupportCaseFrame = {
+    goal: query.trim() || "support question",
+    symptom: query.trim() || "needs support guidance",
+    object: route.question_type.startsWith("api_") ? "api" : "unspecified",
+    action_type:
+      route.specialist_agent === "api-specialist"
+        ? "lookup"
+        : route.specialist_agent === "howto-specialist"
+        ? "how_to"
+        : route.specialist_agent === "behavior-specialist"
+        ? "capability_confirmation"
+        : "troubleshooting",
+    deployment_model: "unknown",
+    product_area: route.question_type.startsWith("api_") ? "openapi" : "general",
+    constraints: [],
+    missing_critical_info: [],
+    retrieval_queries: [query].filter(Boolean),
+    question_type: route.question_type,
+    specialist_agent: route.specialist_agent,
+    answer_contract: route.answer_contract,
+    routing_confidence: route.routing_confidence
+  };
+  const primaryDomain = inferSupportDomainFromRouteAndCaseFrame(route, draftCaseFrame);
+  return {
+    primaryDomain,
+    route: {
+      ...route,
+      primary_domain: primaryDomain
+    },
+    caseFrame: {
+      ...draftCaseFrame,
+      primary_domain: primaryDomain
+    },
+    retrievalQueries: [query].filter(Boolean)
   };
 }
 
@@ -4088,10 +4145,14 @@ function convertSupportMainDraftToSpecialistDraft(input: {
   };
 }
 
-function buildSupportMainVerification(input: {
+function buildEvidenceBoundDraftVerification(input: {
   language: "zh" | "en";
   draftAnswer: SpecialistDraftAnswer;
   missingInfo: string[];
+  summary?: {
+    zh: string;
+    en: string;
+  };
 }): SupportVerificationResult {
   const supportedClaims = input.draftAnswer.claims
     .filter(
@@ -4125,8 +4186,8 @@ function buildSupportMainVerification(input: {
         : "partial",
     summary:
       input.language === "zh"
-        ? "support-main 输出已按已发布知识证据完成绑定。"
-        : "The support-main output was reconciled against published knowledge evidence.",
+        ? input.summary?.zh ?? "回答草稿已按已发布知识证据完成绑定。"
+        : input.summary?.en ?? "The draft answer was reconciled against published knowledge evidence.",
     unsupported_claims: unsupportedClaims,
     missing_info: input.missingInfo,
     verified_citation_ids: verifiedCitationIds,
@@ -4134,6 +4195,20 @@ function buildSupportMainVerification(input: {
     verified_claims: supportedClaims.map((claim) => claim.text),
     claim_to_citation_map: supportedClaims
   };
+}
+
+function buildSupportMainVerification(input: {
+  language: "zh" | "en";
+  draftAnswer: SpecialistDraftAnswer;
+  missingInfo: string[];
+}): SupportVerificationResult {
+  return buildEvidenceBoundDraftVerification({
+    ...input,
+    summary: {
+      zh: "support-main 输出已按已发布知识证据完成绑定。",
+      en: "The support-main output was reconciled against published knowledge evidence."
+    }
+  });
 }
 
 function buildSupportMainOrchestrationTrace() {
@@ -4150,6 +4225,385 @@ function buildSupportMainOrchestrationTrace() {
       model: resolved.model ?? null
     }
   ];
+}
+
+async function runSupervisorDomainSupportSearch(input: {
+  query: string;
+  language: "zh" | "en";
+  currentRound: number;
+  conversationHistory: Array<{ role: "user" | "assistant"; content: string }>;
+  adapter: OpenClawAdapter;
+  runtime?: OpenClawRuntimeContext;
+  attachments?: string[];
+  repoId?: string;
+  branch?: string;
+  idempotencyKey: string;
+  contextType: "search" | "triage";
+  orchestrator: SupportSearchOrchestrator;
+  runtimePolicy: ReturnType<typeof resolveSupportRuntimePolicy>;
+  onStageProgress?: (progress: SupportAgentStageProgress) => Promise<void> | void;
+  ticketContext?: {
+    priority: string;
+    customerMeta: Record<string, unknown>;
+    history: Array<{ author: string; body: string; at: string }>;
+  };
+}): Promise<{
+  result: SearchModeResult;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  verification: SupportVerificationResult;
+  stageTimings: SupportAgentStageTimings;
+}> {
+  const runStartedAt = performance.now();
+  let lastCompletedStage: string | undefined;
+  const reportStageProgress = async (currentStage: string): Promise<void> => {
+    if (!input.onStageProgress) return;
+    await input.onStageProgress({ currentStage, lastCompletedStage });
+  };
+  const markStageCompleted = (stage: string): void => {
+    lastCompletedStage = stage;
+  };
+
+  const dispatchRuntime = withStageRuntime(
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 14_000,
+        minimumTimeoutMs: 5_000,
+        stageTimeoutMs: 12_000
+      },
+      {
+        reserveMs: 24_000,
+        minimumTimeoutMs: 10_000,
+        stageTimeoutMs: 20_000
+      }
+    ),
+    "planner",
+    `${input.idempotencyKey}:support-dispatch`
+  );
+
+  await reportStageProgress("planner");
+  const dispatchStartedAt = performance.now();
+  const dispatchResult = await input.adapter.planSupportDispatch!(
+    {
+      contextType: input.contextType,
+      language: input.language,
+      query: input.query,
+      conversationHistory: input.conversationHistory,
+      ticketContext: input.ticketContext
+    },
+    `${input.idempotencyKey}:support-dispatch`,
+    dispatchRuntime
+  )
+    .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(dispatchStartedAt)) }))
+    .catch(() => ({ value: fallbackSupportDispatch(input.query), timing: stageTiming("fallback", elapsedMs(dispatchStartedAt)) }));
+  markStageCompleted("planner");
+
+  const dispatch = dispatchResult.value;
+  const stabilized = stabilizeSupportRouteAndCaseFrame({
+    query: input.query,
+    route: dispatch.route,
+    caseFrame: {
+      ...dispatch.caseFrame,
+      retrieval_queries: uniqueStrings(
+        [...dispatch.retrievalQueries, ...dispatch.caseFrame.retrieval_queries, input.query],
+        8
+      )
+    }
+  });
+  const primaryDomain = inferSupportDomainFromRouteAndCaseFrame(stabilized.route, stabilized.caseFrame);
+  const route: SupportQuestionRoute = {
+    ...stabilized.route,
+    primary_domain: primaryDomain
+  };
+  const caseFrame: SupportCaseFrame = {
+    ...stabilized.caseFrame,
+    primary_domain: primaryDomain,
+    retrieval_queries: uniqueStrings(
+      [...dispatch.retrievalQueries, ...stabilized.caseFrame.retrieval_queries, input.query],
+      8
+    )
+  };
+  const stageBudget = {
+    retrieval_rounds: 1,
+    allow_refinement: false,
+    stop_after_grounded_evidence: false,
+    specialist_budget: 1
+  };
+  const evidencePlan: SupportEvidencePlan = {
+    query_plan: caseFrame.query_plan ?? {
+      concept_queries: caseFrame.retrieval_queries.slice(0, 3),
+      object_queries: [caseFrame.object].filter(Boolean),
+      behavior_queries: [caseFrame.action_type].filter(Boolean)
+    },
+    evidence_priority: caseFrame.required_doc_kinds ?? [],
+    required_doc_kinds: caseFrame.required_doc_kinds ?? [],
+    retrieval_rounds: 1,
+    allow_refinement: false,
+    stop_after_grounded_evidence: false
+  };
+
+  await reportStageProgress("retrieval_base");
+  const retrievalStartedAt = performance.now();
+  const retrievalQueries = uniqueStrings([...dispatch.retrievalQueries, ...caseFrame.retrieval_queries, input.query], 8);
+  const evidenceResult = await input.orchestrator
+    .collectEvidence({
+      queries: retrievalQueries,
+      idempotencyKey: `${input.idempotencyKey}:support-domain:evidence`,
+      runtime: input.runtime,
+      answerLanguage: input.language,
+      attachments: input.attachments,
+      caseFrame,
+      repoId: input.repoId,
+      branch: input.branch
+    })
+    .then((value) => ({
+      value,
+      timing: stageTiming("completed", elapsedMs(retrievalStartedAt), {
+        query_count: retrievalQueries.length,
+        reference_count: value.references.length
+      })
+    }))
+    .catch(() => ({
+      value: {
+        query: input.query,
+        answer: "",
+        confidence: 0,
+        references: [],
+        retrievalStatus: "kb_unavailable" as const,
+        unresolvedReasonCode: "KB_RETRIEVAL_UNAVAILABLE" as const,
+        resolvedQueries: retrievalQueries,
+        fallbackUsed: true
+      },
+      timing: stageTiming("fallback", elapsedMs(retrievalStartedAt), {
+        query_count: retrievalQueries.length,
+        reference_count: 0
+      })
+    }));
+  markStageCompleted("retrieval_base");
+
+  await reportStageProgress("evidence_selection");
+  const evidenceSelectionStartedAt = performance.now();
+  const evidenceSelection = {
+    value: fallbackEvidenceSelection(evidenceResult.value.references, input.query, caseFrame),
+    timing: stageTiming("completed", elapsedMs(evidenceSelectionStartedAt), {
+      reference_count: evidenceResult.value.references.length
+    })
+  };
+  markStageCompleted("evidence_selection");
+
+  const evidenceBundle = buildEvidenceBundle({
+    references: evidenceResult.value.references,
+    confidence: evidenceResult.value.confidence,
+    fallbackUsed: evidenceResult.value.fallbackUsed,
+    resolvedQueries: evidenceResult.value.resolvedQueries,
+    caseFrame,
+    query: input.query,
+    selection: evidenceSelection.value
+  });
+
+  const specialistRuntime = withStageRuntime(
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 10_000,
+        minimumTimeoutMs: 5_000,
+        stageTimeoutMs: 18_000
+      },
+      {
+        reserveMs: 18_000,
+        minimumTimeoutMs: 10_000,
+        stageTimeoutMs: 28_000
+      }
+    ),
+    route.specialist_agent,
+    `${input.idempotencyKey}:domain-specialist`
+  );
+
+  await reportStageProgress("writer");
+  const specialistStartedAt = performance.now();
+  const specialistResult = hasEnoughBudget(input.runtime, 6_000)
+    ? await writeDomainSpecialistDraft({
+        adapter: input.adapter,
+        primaryDomain,
+        contextType: input.contextType,
+        route,
+        language: input.language,
+        query: input.query,
+        caseFrame,
+        evidenceBundle,
+        conversationHistory: input.conversationHistory,
+        runtime: specialistRuntime,
+        idempotencyKey: `${input.idempotencyKey}:domain-specialist`
+      })
+        .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(specialistStartedAt)) }))
+        .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(specialistStartedAt)) }))
+    : { value: null, timing: stageTiming("skipped", elapsedMs(specialistStartedAt)) };
+  markStageCompleted("writer");
+
+  const draftSupportAnswer =
+    specialistResult.value ??
+    fallbackSpecialistDraftAnswer({
+      language: input.language,
+      route,
+      query: input.query,
+      evidenceBundle,
+      missingInfo: caseFrame.missing_critical_info
+    });
+
+  const localVerificationStartedAt = performance.now();
+  const writerBoundVerification = sanitizeVerification({
+    verification: buildEvidenceBoundDraftVerification({
+      language: input.language,
+      draftAnswer: draftSupportAnswer,
+      missingInfo: sanitizeMissingCriticalInfo([...caseFrame.missing_critical_info, ...draftSupportAnswer.unknowns], 3),
+      summary: {
+        zh: "域专家回答已按已发布知识证据完成绑定。",
+        en: "The domain specialist answer was reconciled against published knowledge evidence."
+      }
+    }),
+    evidenceBundle,
+    query: input.query,
+    caseFrame
+  });
+  const localVerificationTiming = stageTiming("completed", elapsedMs(localVerificationStartedAt));
+
+  const missingInfo = sanitizeMissingCriticalInfo(
+    [...writerBoundVerification.missing_info, ...caseFrame.missing_critical_info, ...draftSupportAnswer.unknowns],
+    3
+  );
+  const mode = resolveSupportMode({
+    verification: writerBoundVerification,
+    references: [...evidenceBundle.primary, ...evidenceBundle.supplemental],
+    currentRound: input.currentRound + 1,
+    missingInfo
+  });
+  const supportAnswer = buildSupportAnswerFromDraft({
+    language: input.language,
+    mode,
+    route,
+    draft: draftSupportAnswer,
+    verification: writerBoundVerification,
+    missingInfo,
+    composed: null
+  });
+  const structuredAnswer = buildStructuredAnswer(supportAnswer, writerBoundVerification);
+  const citations = buildCitations({
+    references: [...evidenceBundle.primary, ...evidenceBundle.supplemental],
+    verification: writerBoundVerification
+  });
+  const unresolvedReasonCode =
+    evidenceResult.value.retrievalStatus === "kb_unavailable"
+      ? "KB_RETRIEVAL_UNAVAILABLE"
+      : writerBoundVerification.verified_citation_ids.length > 0
+      ? null
+      : evidenceBundle.primary.length > 0 || evidenceBundle.supplemental.length > 0
+      ? "LOW_CONFIDENCE"
+      : "NO_MATCHING_KB";
+  const clarificationRound = mode === "clarification" ? input.currentRound + 1 : 0;
+  const state: SearchDialogState =
+    mode === "clarification"
+      ? input.currentRound > 0
+        ? "CLARIFICATION_IN_PROGRESS"
+        : "CLARIFICATION_REQUIRED"
+      : mode === "handoff"
+      ? "TICKET_HANDOFF_RECOMMENDED"
+      : "GROUNDABLE_ANSWER_READY";
+  const stageTimings: SupportAgentStageTimings = {
+    total_ms: elapsedMs(runStartedAt),
+    planner: dispatchResult.timing,
+    retrieval_base: evidenceResult.timing,
+    retrieval_extra: skippedStageTiming(),
+    writer: specialistResult.timing,
+    verifier: localVerificationTiming
+  };
+  const stageTrace: SupportAgentStageTraceEntry[] = [
+    stageTraceEntry({
+      stage: "domain_dispatch",
+      timing: dispatchResult.timing,
+      runtimeStage: "planner",
+      idempotencyKey: `${input.idempotencyKey}:support-dispatch`
+    }),
+    stageTraceEntry({
+      stage: "retrieval",
+      timing: evidenceResult.timing,
+      idempotencyKey: `${input.idempotencyKey}:support-domain:evidence`
+    }),
+    stageTraceEntry({
+      stage: "evidence_selection",
+      timing: evidenceSelection.timing,
+      idempotencyKey: `${input.idempotencyKey}:support-domain:evidence-selection`
+    }),
+    stageTraceEntry({
+      stage: "domain_specialist",
+      timing: specialistResult.timing,
+      runtimeStage: route.specialist_agent,
+      idempotencyKey: `${input.idempotencyKey}:domain-specialist`
+    }),
+    stageTraceEntry({
+      stage: "verification",
+      timing: localVerificationTiming,
+      idempotencyKey: `${input.idempotencyKey}:support-domain:local-verification`
+    })
+  ];
+
+  return {
+    caseFrame,
+    evidenceBundle,
+    verification: writerBoundVerification,
+    stageTimings,
+    result: {
+      session_id: "",
+      answer: supportAnswer.direct_answer,
+      answer_language: input.language,
+      case_frame: caseFrame,
+      support_answer: supportAnswer,
+      verification: writerBoundVerification,
+      structured_answer: structuredAnswer,
+      confidence: evidenceResult.value.confidence,
+      suggested_next_step: mode === "grounded" ? "self_serve" : "submit_ticket",
+      retrieval_status:
+        evidenceResult.value.retrievalStatus === "kb_unavailable"
+          ? "kb_unavailable"
+          : evidenceResult.value.references.length
+          ? "grounded"
+          : "no_results",
+      unresolved_reason_code: unresolvedReasonCode,
+      references: [...evidenceBundle.primary, ...evidenceBundle.supplemental],
+      citations,
+      state,
+      clarification_round: clarificationRound,
+      show_create_ticket_now: mode === "handoff",
+      follow_up_question: mode === "clarification" ? missingInfo[0] ?? null : null,
+      internal_diagnostics: {
+        route,
+        evidence_plan: evidencePlan,
+        stage_budget: stageBudget,
+        retrieval_queries_used: retrievalQueries,
+        retrieval_queries_refined: [],
+        claim_graph: buildClaimGraph(writerBoundVerification),
+        specialist_skipped: false,
+        specialists_used: [route.specialist_agent],
+        domains_used: [primaryDomain],
+        evidence_sources: uniqueStrings(
+          evidenceBundle.primary.concat(evidenceBundle.supplemental).map((item) => item.sourceType ?? "unknown"),
+          6
+        ),
+        runtime_policy: input.runtimePolicy,
+        runtime_mode: "supervisor_domain",
+        fast_path_used: false,
+        confirmed_facts: uniqueStrings(draftSupportAnswer.confirmed_facts ?? [], 4),
+        stage_trace: stageTrace,
+        orchestration_trace: buildOrchestrationTrace({
+          route,
+          specialistSkipped: false,
+          usedUnifiedPlanner: true,
+          verificationSkipped: true,
+          answerComposerUsed: false
+        })
+      }
+    }
+  };
 }
 
 async function runSingleAgentSupportSearch(input: {
@@ -4524,6 +4978,45 @@ async function writeSpecialistDraft(input: {
   }
 }
 
+async function writeDomainSpecialistDraft(input: {
+  adapter: OpenClawAdapter;
+  primaryDomain: SupportDomain;
+  contextType: "search" | "triage";
+  route: SupportQuestionRoute;
+  language: "zh" | "en";
+  query: string;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  conversationHistory: Array<{ role: "user" | "assistant"; content: string }>;
+  runtime?: OpenClawRuntimeContext;
+  idempotencyKey: string;
+}): Promise<SpecialistDraftAnswer | null> {
+  const specialistInput = {
+    contextType: input.contextType,
+    language: input.language,
+    query: input.query,
+    route: input.route,
+    caseFrame: input.caseFrame,
+    evidenceBundle: input.evidenceBundle,
+    conversationHistory: input.conversationHistory
+  };
+
+  switch (input.primaryDomain) {
+    case "openapi":
+      return input.adapter.writeOpenApiDomainAnswer
+        ? input.adapter.writeOpenApiDomainAnswer(specialistInput, input.idempotencyKey, input.runtime)
+        : null;
+    case "deployment":
+      return input.adapter.writeDeploymentDomainAnswer
+        ? input.adapter.writeDeploymentDomainAnswer(specialistInput, input.idempotencyKey, input.runtime)
+        : null;
+    default:
+      return input.adapter.writeDocsDomainAnswer
+        ? input.adapter.writeDocsDomainAnswer(specialistInput, input.idempotencyKey, input.runtime)
+        : null;
+  }
+}
+
 function fallbackTriageInsight(language: "zh" | "en", caseFrame: SupportCaseFrame, mode: "ask_user" | "escalate"): TriageSupportInsight {
   if (language === "zh") {
     return {
@@ -4593,6 +5086,14 @@ export async function runSupportSearchAgent(input: {
   const allowRefinement = input.runtime?.allowRefinement !== false;
   const contextType = input.contextType ?? "search";
   const runtimePolicy = resolveSupportRuntimePolicy(input.runtime);
+  if (isSupportMainRuntimeEnabled() && input.adapter.planSupportDispatch) {
+    return runSupervisorDomainSupportSearch({
+      ...input,
+      contextType,
+      orchestrator,
+      runtimePolicy
+    });
+  }
   if (isSupportMainRuntimeEnabled() && input.adapter.planSupportMainAgent && input.adapter.draftSupportMainAgent) {
     return runSingleAgentSupportSearch({
       ...input,

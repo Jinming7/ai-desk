@@ -27,6 +27,7 @@ import type {
   DraftSupportAnswer,
   SpecialistDraftAnswer,
   SupportCaseFrame,
+  SupportDomain,
   SupportEvidencePlan,
   SupportEvidenceSelection,
   SupportQuestionRoute,
@@ -212,6 +213,55 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
         specialist_agent: route.specialist_agent,
         answer_contract: route.answer_contract,
         routing_confidence: route.routing_confidence
+      },
+      retrievalQueries: [input.query]
+    };
+  }
+
+  async planSupportDispatch(
+    input: OpenClawSupportPlannerInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ) {
+    const route = await this.routeSupportQuestion(
+      {
+        contextType: input.contextType,
+        language: input.language,
+        query: input.query,
+        conversationHistory: input.conversationHistory
+      },
+      `${input.query}:support-dispatch:route`
+    );
+    const caseFrame = await this.planSupportCase(
+      {
+        contextType: input.contextType,
+        language: input.language,
+        query: input.query,
+        conversationHistory: input.conversationHistory,
+        ticketContext: input.ticketContext
+      },
+      `${input.query}:support-dispatch:case`
+    );
+    const primaryDomain: SupportDomain =
+      route.question_type.startsWith("api_")
+        ? "openapi"
+        : caseFrame.deployment_model === "private_deployment" || caseFrame.product_area === "deployment"
+        ? "deployment"
+        : "docs";
+
+    return {
+      primaryDomain,
+      route: {
+        ...route,
+        primary_domain: primaryDomain
+      },
+      caseFrame: {
+        ...caseFrame,
+        question_type: route.question_type,
+        specialist_agent: route.specialist_agent,
+        answer_contract: route.answer_contract,
+        routing_confidence: route.routing_confidence,
+        primary_domain: primaryDomain
       },
       retrievalQueries: [input.query]
     };
@@ -437,6 +487,14 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
+  async writeOpenApiDomainAnswer(
+    input: OpenClawSupportSpecialistInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    return this.writeApiSpecialistAnswer(input, _idempotencyKey, _runtime);
+  }
+
   async writeHowToSpecialistAnswer(
     input: OpenClawSupportSpecialistInput,
     _idempotencyKey: string,
@@ -459,6 +517,16 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
+  async writeDeploymentDomainAnswer(
+    input: OpenClawSupportSpecialistInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    return input.route.specialist_agent === "troubleshooting-specialist"
+      ? this.writeTroubleshootingSpecialistAnswer(input, _idempotencyKey, _runtime)
+      : this.writeHowToSpecialistAnswer(input, _idempotencyKey, _runtime);
+  }
+
   async writeBehaviorSpecialistAnswer(
     input: OpenClawSupportSpecialistInput,
     _idempotencyKey: string,
@@ -479,6 +547,18 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       confirmed_facts: primary ? [primary.snippet] : [],
       what_to_check_next: ["Verify the exact input, object, or configuration involved."]
     };
+  }
+
+  async writeDocsDomainAnswer(
+    input: OpenClawSupportSpecialistInput,
+    _idempotencyKey: string,
+    _runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    return input.route.specialist_agent === "howto-specialist"
+      ? this.writeHowToSpecialistAnswer(input, _idempotencyKey, _runtime)
+      : input.route.specialist_agent === "troubleshooting-specialist"
+      ? this.writeTroubleshootingSpecialistAnswer(input, _idempotencyKey, _runtime)
+      : this.writeBehaviorSpecialistAnswer(input, _idempotencyKey, _runtime);
   }
 
   async writeTroubleshootingSpecialistAnswer(

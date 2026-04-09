@@ -4,6 +4,7 @@ import type { RuntimeCaseScore, RuntimeEvaluationSummary, RuntimeObservation, Ru
 const STAGE_ORDER: SupportAgentRuntimeStage[] = [
   "support_main",
   "support_main_plan",
+  "domain_dispatch",
   "route",
   "evidence_plan",
   "case_plan",
@@ -11,6 +12,7 @@ const STAGE_ORDER: SupportAgentRuntimeStage[] = [
   "retrieval_refine",
   "evidence_selection",
   "support_main_draft",
+  "domain_specialist",
   "specialist",
   "generic_writer",
   "verification",

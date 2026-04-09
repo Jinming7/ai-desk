@@ -46,6 +46,7 @@ export const runtimeScenarioCaseSchema = z.object({
       z.enum([
         "support_main",
         "support_main_plan",
+        "domain_dispatch",
         "route",
         "evidence_plan",
         "case_plan",
@@ -53,6 +54,7 @@ export const runtimeScenarioCaseSchema = z.object({
         "retrieval_refine",
         "evidence_selection",
         "support_main_draft",
+        "domain_specialist",
         "specialist",
         "generic_writer",
         "verification",
@@ -67,6 +69,7 @@ export const runtimeScenarioCaseSchema = z.object({
       z.enum([
         "support_main",
         "support_main_plan",
+        "domain_dispatch",
         "route",
         "evidence_plan",
         "case_plan",
@@ -74,6 +77,7 @@ export const runtimeScenarioCaseSchema = z.object({
         "retrieval_refine",
         "evidence_selection",
         "support_main_draft",
+        "domain_specialist",
         "specialist",
         "generic_writer",
         "verification",
@@ -88,6 +92,7 @@ export const runtimeScenarioCaseSchema = z.object({
       z.enum([
         "support_main",
         "support_main_plan",
+        "domain_dispatch",
         "route",
         "evidence_plan",
         "case_plan",
@@ -95,6 +100,7 @@ export const runtimeScenarioCaseSchema = z.object({
         "retrieval_refine",
         "evidence_selection",
         "support_main_draft",
+        "domain_specialist",
         "specialist",
         "generic_writer",
         "verification",

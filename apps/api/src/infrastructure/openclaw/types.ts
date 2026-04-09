@@ -1,6 +1,7 @@
 import type {
   DraftSupportAnswer,
   SupportClaimKind,
+  SupportDomain,
   SearchReference,
   SpecialistDraftAnswer,
   SupportAnswer,
@@ -320,6 +321,13 @@ export interface OpenClawSupportMainPlanOutput {
   retrievalQueries: string[];
 }
 
+export interface OpenClawSupportDispatchOutput {
+  primaryDomain: SupportDomain;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  retrievalQueries: string[];
+}
+
 export interface OpenClawSupportMainDraftOutput {
   draftAnswer: OpenClawSupportMainDraftAnswer;
 }
@@ -364,6 +372,11 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawSupportExecutionPlannerOutput>;
+  planSupportDispatch?(
+    input: OpenClawSupportPlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportDispatchOutput>;
   planSupportMainAgent?(
     input: OpenClawSupportMainPlanInput,
     idempotencyKey: string,
@@ -399,12 +412,27 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SpecialistDraftAnswer>;
+  writeOpenApiDomainAnswer?(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
   writeHowToSpecialistAnswer(
     input: OpenClawSupportSpecialistInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SpecialistDraftAnswer>;
+  writeDeploymentDomainAnswer?(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
   writeBehaviorSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeDocsDomainAnswer?(
     input: OpenClawSupportSpecialistInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext

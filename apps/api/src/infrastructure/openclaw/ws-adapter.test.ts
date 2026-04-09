@@ -440,6 +440,75 @@ test("planSupportMainAgent parses route, case frame, and retrieval queries witho
   assert.deepEqual(result.retrievalQueries, ["issue comment api scope"]);
 });
 
+test("planSupportDispatch parses primary domain, route, case frame, and retrieval queries for the supervisor runtime", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    planSupportDispatch: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{
+      primaryDomain: string;
+      route: {
+        question_type: string;
+      };
+      caseFrame: {
+        product_area: string;
+      };
+      retrievalQueries: string[];
+    }>;
+    runJsonPrompt: (prompt: string) => Promise<unknown>;
+  };
+  let capturedPrompt = "";
+
+  adapter.runJsonPrompt = async (prompt) => {
+    capturedPrompt = prompt;
+    return {
+      primary_domain: "deployment",
+      route: {
+        question_type: "config_setup",
+        user_goal: "Reset the administrator password in a private deployment.",
+        answer_contract: "Give the direct recovery steps first.",
+        specialist_agent: "howto-specialist",
+        routing_confidence: 0.93
+      },
+      case_frame: {
+        goal: "Reset the administrator password in a private deployment.",
+        symptom: "Administrator password reset is blocked.",
+        object: "administrator password reset",
+        action_type: "recovery",
+        deployment_model: "private_deployment",
+        product_area: "deployment",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: ["private deployment administrator password reset"],
+        required_doc_kinds: ["deployment_runbook", "product_guide"]
+      },
+      retrieval_queries: ["private deployment administrator password reset"]
+    };
+  };
+
+  const result = await adapter.planSupportDispatch(
+    {
+      contextType: "search",
+      language: "en",
+      query: "How do I reset the administrator password in a private deployment?"
+    },
+    "ws-adapter:domain-dispatch"
+  );
+
+  assert.match(capturedPrompt, /primary_domain/);
+  assert.match(capturedPrompt, /retrieval_queries/);
+  assert.match(capturedPrompt, /Do not draft the customer answer/i);
+  assert.equal(result.primaryDomain, "deployment");
+  assert.equal(result.route.question_type, "config_setup");
+  assert.equal(result.caseFrame.product_area, "deployment");
+  assert.deepEqual(result.retrievalQueries, ["private deployment administrator password reset"]);
+});
+
 test("draftSupportMainAgent parses claim reference ids from provided evidence without triggering retrieval", async () => {
   const adapter = new WsOpenClawAdapter() as never as {
     draftSupportMainAgent: (
@@ -536,6 +605,108 @@ test("draftSupportMainAgent parses claim reference ids from provided evidence wi
   assert.match(capturedPrompt, /evidence_id/);
   assert.match(capturedPrompt, /Do not retrieve/i);
   assert.deepEqual(result.draftAnswer.claims[0]?.reference_ids, ["ref-issue-comment-scope"]);
+});
+
+test("writeDeploymentDomainAnswer parses evidence ids from provided evidence without triggering retrieval", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    writeDeploymentDomainAnswer: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        route: Record<string, unknown>;
+        caseFrame: Record<string, unknown>;
+        evidenceBundle: {
+          primary: Array<Record<string, unknown>>;
+          supplemental: Array<Record<string, unknown>>;
+        };
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{
+      render_variant: string;
+      claims: Array<{ text: string; evidence_ids: string[] }>;
+    }>;
+    runJsonPrompt: (prompt: string) => Promise<unknown>;
+  };
+  let capturedPrompt = "";
+
+  adapter.runJsonPrompt = async (prompt) => {
+    capturedPrompt = prompt;
+    return {
+      question_type: "config_setup",
+      render_variant: "how_to",
+      direct_answer: "Reset the administrator password from the documented private-deployment recovery path.",
+      claims: [
+        {
+          text: "The deployment recovery guide documents the administrator password reset path.",
+          kind: "verified_fact",
+          evidence_ids: ["chunk:deployment-reset"],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["Follow the documented recovery steps."],
+      unknowns: [],
+      escalation_needed: false,
+      steps: ["Open the private deployment recovery flow."],
+      prerequisites: ["Administrator host access"],
+      limits_or_notes: ["Do not rely on email reset when SMTP is unavailable."]
+    };
+  };
+
+  const result = await adapter.writeDeploymentDomainAnswer(
+    {
+      contextType: "search",
+      language: "en",
+      query: "How do I reset the administrator password in a private deployment?",
+      route: {
+        question_type: "config_setup",
+        user_goal: "Reset the administrator password in a private deployment.",
+        answer_contract: "Give the direct recovery steps first.",
+        specialist_agent: "howto-specialist",
+        routing_confidence: 0.93,
+        primary_domain: "deployment"
+      },
+      caseFrame: {
+        goal: "Reset the administrator password in a private deployment.",
+        symptom: "Administrator password reset is blocked.",
+        object: "administrator password reset",
+        action_type: "recovery",
+        deployment_model: "private_deployment",
+        product_area: "deployment",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: ["private deployment administrator password reset"],
+        question_type: "config_setup",
+        specialist_agent: "howto-specialist",
+        primary_domain: "deployment"
+      },
+      evidenceBundle: {
+        primary: [
+          {
+            documentId: "doc:deployment-reset",
+            evidenceId: "chunk:deployment-reset",
+            title: "Deployment recovery",
+            snippet: "Use the deployment recovery path to reset the administrator password.",
+            sourceUrl: "https://docs.ones.com/private-deployment/recovery",
+            path: "docs/private-deployment/recovery.mdx",
+            headingPath: "Administrator recovery",
+            authority: "canonical_visible",
+            sourceType: "github_kb",
+            score: 0.99,
+            retrievedAt: "2026-04-09T02:00:00.000Z"
+          }
+        ],
+        supplemental: []
+      }
+    },
+    "ws-adapter:deployment-domain"
+  );
+
+  assert.match(capturedPrompt, /provided_evidence/);
+  assert.match(capturedPrompt, /Do not retrieve/i);
+  assert.equal(result.render_variant, "how_to");
+  assert.deepEqual(result.claims[0]?.evidence_ids, ["chunk:deployment-reset"]);
 });
 
 test("buildConnectParams includes a nonce-signed device payload for the live gateway", () => {

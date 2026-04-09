@@ -47,6 +47,8 @@ export type SupportQuestionType =
   | "capability_confirmation"
   | "data_export_reporting";
 
+export type SupportDomain = "openapi" | "deployment" | "docs";
+
 export type SupportSpecialistAgent =
   | "api-specialist"
   | "howto-specialist"
@@ -62,6 +64,7 @@ export interface SupportQuestionRoute {
   specialist_agent: SupportSpecialistAgent;
   routing_confidence: number;
   specialist_budget?: number;
+  primary_domain?: SupportDomain;
 }
 
 export interface SupportEvidencePlan {
@@ -90,6 +93,7 @@ export interface SupportCaseFrame {
   routing_confidence?: number;
   evidence_priority?: string[];
   required_doc_kinds?: string[];
+  primary_domain?: SupportDomain;
 }
 
 export type SupportClaimKind = "verified_fact" | "grounded_inference" | "operational_advice" | "unknown";
@@ -224,6 +228,8 @@ export type SupportAgentRuntimeStage =
   | "support_main"
   | "support_main_plan"
   | "support_main_draft"
+  | "domain_dispatch"
+  | "domain_specialist"
   | "route"
   | "evidence_plan"
   | "case_plan"
@@ -336,6 +342,7 @@ export interface SearchModeResult {
     }>;
     specialist_skipped: boolean;
     specialists_used?: string[];
+    domains_used?: SupportDomain[];
     evidence_sources?: string[];
     runtime_policy?: {
       deliveryMode: "interactive" | "async_job";
@@ -343,7 +350,7 @@ export interface SearchModeResult {
       fastPathAllowed: boolean;
       profile: "latency_optimized" | "quality_optimized" | "tightened";
     };
-    runtime_mode?: "legacy_multi_agent" | "single_agent";
+    runtime_mode?: "legacy_multi_agent" | "single_agent" | "supervisor_domain";
     fast_path_used?: boolean;
     confirmed_facts?: string[];
     search_agents_used?: Array<{

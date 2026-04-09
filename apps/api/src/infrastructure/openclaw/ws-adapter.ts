@@ -23,6 +23,7 @@ import type {
   OpenClawSupportMainDraftOutput,
   OpenClawSupportMainPlanInput,
   OpenClawSupportMainPlanOutput,
+  OpenClawSupportDispatchOutput,
   OpenClawSupportExecutionPlannerInput,
   OpenClawSupportExecutionPlannerOutput,
   OpenClawSupportEvidencePlannerInput,
@@ -42,6 +43,7 @@ import type {
   SpecialistDraftAnswer,
   SupportAnswer,
   SupportCaseFrame,
+  SupportDomain,
   SupportEvidencePlan,
   SupportEvidenceBundle,
   SupportEvidenceSelection,
@@ -162,6 +164,28 @@ function compactEvidenceBundle(
   };
 }
 
+function buildProvidedEvidenceFromBundle(
+  bundle: SupportEvidenceBundle,
+  options?: { primaryLimit?: number; supplementalLimit?: number; snippetMax?: number }
+) {
+  const primaryLimit = options?.primaryLimit ?? 3;
+  const supplementalLimit = options?.supplementalLimit ?? 2;
+  const snippetMax = options?.snippetMax ?? 260;
+
+  return [...bundle.primary.slice(0, primaryLimit), ...bundle.supplemental.slice(0, supplementalLimit)].map((reference) => ({
+    evidence_id: resolveSearchReferenceEvidenceId(reference),
+    title: reference.title,
+    snippet: reference.snippet.slice(0, snippetMax),
+    sourceUrl: reference.sourceUrl,
+    path: reference.path,
+    headingPath: reference.headingPath,
+    repoSourceUrl: reference.repoSourceUrl,
+    authority: reference.authority,
+    sourceType: reference.sourceType,
+    metadata: compactSupportMetadata(reference.supportMetadata)
+  }));
+}
+
 function extractQueryFocusTerms(input: { query: string; caseFrame?: SupportCaseFrame }) {
   const candidates = [
     input.query,
@@ -236,6 +260,33 @@ function normalizeQuestionType(value: unknown): SupportQuestionRoute["question_t
     default:
       return "troubleshooting";
   }
+}
+
+function inferSupportDomain(input: {
+  explicit?: unknown;
+  questionType?: SupportQuestionRoute["question_type"];
+  productArea?: string;
+  deploymentModel?: string;
+}): SupportDomain {
+  if (input.explicit === "openapi" || input.explicit === "deployment" || input.explicit === "docs") {
+    return input.explicit;
+  }
+  if (String(input.questionType ?? "").startsWith("api_")) {
+    return "openapi";
+  }
+
+  const productArea = String(input.productArea ?? "").toLowerCase();
+  const deploymentModel = String(input.deploymentModel ?? "").toLowerCase();
+  if (
+    productArea.includes("deploy") ||
+    productArea.includes("ops") ||
+    productArea.includes("运维") ||
+    deploymentModel === "private_deployment"
+  ) {
+    return "deployment";
+  }
+
+  return "docs";
 }
 
 function specialistFromQuestionType(questionType: SupportQuestionRoute["question_type"]): SupportQuestionRoute["specialist_agent"] {
@@ -325,7 +376,11 @@ function normalizeSupportRouteOutput(parsed: Record<string, unknown>, fallbackQu
     specialist_budget:
       typeof parsed.specialist_budget === "number" && Number.isFinite(parsed.specialist_budget)
         ? Math.max(0, Math.round(parsed.specialist_budget))
-        : undefined
+        : undefined,
+    primary_domain: inferSupportDomain({
+      explicit: parsed.primary_domain,
+      questionType: question_type
+    })
   };
 }
 
@@ -374,7 +429,13 @@ function normalizeSupportCaseFrameOutput(parsed: Partial<SupportCaseFrame>, fall
         : undefined,
     required_doc_kinds: Array.isArray(parsed.required_doc_kinds)
       ? parsed.required_doc_kinds.map((item) => String(item)).filter(Boolean)
-      : undefined
+      : undefined,
+    primary_domain: inferSupportDomain({
+      explicit: parsed.primary_domain,
+      questionType: normalizeQuestionType(parsed.question_type),
+      productArea: typeof parsed.product_area === "string" ? parsed.product_area : undefined,
+      deploymentModel: typeof parsed.deployment_model === "string" ? parsed.deployment_model : undefined
+    })
   };
 }
 
@@ -897,6 +958,83 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
+  async planSupportDispatch(
+    input: OpenClawSupportPlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportDispatchOutput> {
+    const prompt = [
+      "You are the supervisor dispatcher for the ONES customer-facing support runtime.",
+      "Return ONLY valid JSON with keys:",
+      "primary_domain(openapi|deployment|docs),",
+      "route({question_type,user_goal,answer_contract,specialist_agent,routing_confidence,specialist_budget,primary_domain}),",
+      "case_frame({goal,symptom,object,action_type,deployment_model,product_area,constraints(string[]),missing_critical_info(string[]),retrieval_queries(string[]),query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),required_doc_kinds(string[]),primary_domain}),",
+      "retrieval_queries(string[])",
+      "Rules:",
+      "- Do not draft the customer answer.",
+      "- Do not retrieve. Produce retrieval_queries only for backend published-KB retrieval.",
+      "- primary_domain must be one of: openapi, deployment, docs.",
+      "- openapi: OpenAPI, OAuth, token, scope, endpoint, method, schema, request/response fields.",
+      "- deployment: private deployment, self-hosted, server-side recovery, OS or host operations, admin recovery, SMTP blocked reset, architecture and capacity questions tied to deployment.",
+      "- docs: product behavior, capability, workflow, configuration, reporting, general how-to questions answered from published docs.",
+      "- Keep route, case_frame, primary_domain, and retrieval_queries mutually consistent.",
+      "- Retrieval must stay single-pass. Make retrieval_queries specific and object-aware.",
+      "- Only ask for missing_critical_info when the answer truly cannot proceed without it.",
+      `context_type: ${input.contextType}`,
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      ...(input.conversationHistory?.length
+        ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
+        : []),
+      ...(input.ticketContext
+        ? [
+            `ticket_priority: ${input.ticketContext.priority}`,
+            `customer_meta: ${JSON.stringify(input.ticketContext.customerMeta)}`,
+            `ticket_history: ${JSON.stringify(input.ticketContext.history.slice(-6))}`
+          ]
+        : [])
+    ].join("\n");
+
+    const parsed = (await this.runJsonPrompt(
+      prompt,
+      `${idempotencyKey}:support-dispatch`,
+      runtime,
+      undefined,
+      "planner"
+    )) as Record<string, unknown>;
+    const route = normalizeSupportRouteOutput(((parsed.route as Record<string, unknown> | undefined) ?? {}), input.query);
+    const rawCaseFrame = normalizeSupportCaseFrameOutput(
+      (((parsed.case_frame as Partial<SupportCaseFrame> | undefined) ?? {}) as Partial<SupportCaseFrame>),
+      input.query
+    );
+    const primaryDomain = inferSupportDomain({
+      explicit: parsed.primary_domain,
+      questionType: route.question_type,
+      productArea: rawCaseFrame.product_area,
+      deploymentModel: rawCaseFrame.deployment_model
+    });
+    const retrievalQueries = Array.isArray(parsed.retrieval_queries)
+      ? parsed.retrieval_queries.map((item) => String(item)).filter(Boolean)
+      : rawCaseFrame.retrieval_queries;
+
+    return {
+      primaryDomain,
+      route: {
+        ...route,
+        primary_domain: primaryDomain
+      },
+      caseFrame: {
+        ...rawCaseFrame,
+        question_type: route.question_type,
+        specialist_agent: route.specialist_agent,
+        answer_contract: route.answer_contract,
+        routing_confidence: route.routing_confidence,
+        primary_domain: primaryDomain
+      },
+      retrievalQueries
+    };
+  }
+
   async planSupportMainAgent(
     input: OpenClawSupportMainPlanInput,
     idempotencyKey: string,
@@ -1079,6 +1217,80 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         when_to_handoff: typeof draft.when_to_handoff === "string" ? draft.when_to_handoff : undefined
       }
     };
+  }
+
+  async writeOpenApiDomainAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    return this.runDomainSpecialistPrompt(
+      "api-specialist",
+      [
+        "You are the OpenAPI domain specialist for ONES customer-facing support.",
+        "Return ONLY valid JSON with keys:",
+        "question_type, render_variant, direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean), api_method, api_path, required_params(string[]), auth_scope(string[]), response_field_hint, important_note, related_variant",
+        "Rules:",
+        "- Use ONLY provided_evidence. Do not retrieve.",
+        "- Answer the likely primary API conclusion first.",
+        "- Convert supported endpoint, field, parameter, scope, and auth facts into narrow claims with evidence_ids.",
+        "- Do not mention internal routing or reasoning."
+      ],
+      input,
+      idempotencyKey,
+      runtime
+    );
+  }
+
+  async writeDeploymentDomainAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    return this.runDomainSpecialistPrompt(
+      input.route.specialist_agent === "troubleshooting-specialist" ? "troubleshooting-specialist" : "howto-specialist",
+      [
+        "You are the deployment domain specialist for ONES customer-facing support.",
+        "Return ONLY valid JSON with keys:",
+        "question_type, render_variant, direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean), steps(string[]), prerequisites(string[]), limits_or_notes(string[]), most_likely_causes(string[]), recommended_checks(string[]), required_followup_info(string[]), when_to_handoff",
+        "Rules:",
+        "- Use ONLY provided_evidence. Do not retrieve.",
+        "- Focus on private deployment, recovery, host-side operations, architecture, and deployment constraints.",
+        "- When the question is procedural, prefer direct steps and prerequisites.",
+        "- When the question is diagnostic, prefer the most likely causes and immediate checks.",
+        "- Keep unknowns narrow and operational."
+      ],
+      input,
+      idempotencyKey,
+      runtime
+    );
+  }
+
+  async writeDocsDomainAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    return this.runDomainSpecialistPrompt(
+      input.route.specialist_agent === "howto-specialist"
+        ? "howto-specialist"
+        : input.route.specialist_agent === "troubleshooting-specialist"
+        ? "troubleshooting-specialist"
+        : "behavior-specialist",
+      [
+        "You are the product-docs domain specialist for ONES customer-facing support.",
+        "Return ONLY valid JSON with keys:",
+        "question_type, render_variant, direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean), steps(string[]), prerequisites(string[]), limits_or_notes(string[]), most_likely_explanation, confirmed_facts(string[]), what_to_check_next(string[])",
+        "Rules:",
+        "- Use ONLY provided_evidence. Do not retrieve.",
+        "- Answer from published product documentation, behavior notes, capability descriptions, and how-to guidance.",
+        "- Prefer a direct product conclusion before extra context.",
+        "- Keep the wording concise and support-engineer style."
+      ],
+      input,
+      idempotencyKey,
+      runtime
+    );
   }
 
   async routeSupportQuestion(
@@ -1946,6 +2158,85 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         parsed.render_variant === "handoff"
           ? parsed.render_variant
           : renderVariantFromQuestionType(input.route.question_type),
+      direct_answer: typeof parsed.direct_answer === "string" ? parsed.direct_answer : "",
+      claims: Array.isArray(parsed.claims)
+        ? parsed.claims
+            .map((item) => item as Record<string, unknown>)
+            .map((item) => ({
+              text: typeof item.text === "string" ? item.text : "",
+              kind: (item.kind === "grounded_inference"
+                ? "grounded_inference"
+                : item.kind === "operational_advice"
+                ? "operational_advice"
+                : item.kind === "unknown"
+                ? "unknown"
+                : "verified_fact") as SpecialistDraftAnswer["claims"][number]["kind"],
+              evidence_ids: Array.isArray(item.evidence_ids) ? item.evidence_ids.map((value) => String(value)).filter(Boolean) : [],
+              authority: (item.authority === "assistive" ? "assistive" : "canonical") as SpecialistDraftAnswer["claims"][number]["authority"]
+            }))
+            .filter((item) => item.text)
+        : [],
+      next_actions: Array.isArray(parsed.next_actions) ? parsed.next_actions.map((item) => String(item)).filter(Boolean) : [],
+      unknowns: Array.isArray(parsed.unknowns) ? parsed.unknowns.map((item) => String(item)).filter(Boolean) : [],
+      escalation_needed: Boolean(parsed.escalation_needed),
+      api_method: typeof parsed.api_method === "string" ? parsed.api_method : undefined,
+      api_path: typeof parsed.api_path === "string" ? parsed.api_path : undefined,
+      required_params: Array.isArray(parsed.required_params) ? parsed.required_params.map((item) => String(item)).filter(Boolean) : undefined,
+      auth_scope: Array.isArray(parsed.auth_scope) ? parsed.auth_scope.map((item) => String(item)).filter(Boolean) : undefined,
+      response_field_hint: typeof parsed.response_field_hint === "string" ? parsed.response_field_hint : undefined,
+      important_note: typeof parsed.important_note === "string" ? parsed.important_note : undefined,
+      related_variant: typeof parsed.related_variant === "string" ? parsed.related_variant : undefined,
+      steps: Array.isArray(parsed.steps) ? parsed.steps.map((item) => String(item)).filter(Boolean) : undefined,
+      prerequisites: Array.isArray(parsed.prerequisites) ? parsed.prerequisites.map((item) => String(item)).filter(Boolean) : undefined,
+      limits_or_notes: Array.isArray(parsed.limits_or_notes) ? parsed.limits_or_notes.map((item) => String(item)).filter(Boolean) : undefined,
+      most_likely_explanation:
+        typeof parsed.most_likely_explanation === "string" ? parsed.most_likely_explanation : undefined,
+      confirmed_facts: Array.isArray(parsed.confirmed_facts) ? parsed.confirmed_facts.map((item) => String(item)).filter(Boolean) : undefined,
+      what_to_check_next: Array.isArray(parsed.what_to_check_next)
+        ? parsed.what_to_check_next.map((item) => String(item)).filter(Boolean)
+        : undefined,
+      most_likely_causes: Array.isArray(parsed.most_likely_causes)
+        ? parsed.most_likely_causes.map((item) => String(item)).filter(Boolean)
+        : undefined,
+      recommended_checks: Array.isArray(parsed.recommended_checks)
+        ? parsed.recommended_checks.map((item) => String(item)).filter(Boolean)
+        : undefined,
+      required_followup_info: Array.isArray(parsed.required_followup_info)
+        ? parsed.required_followup_info.map((item) => String(item)).filter(Boolean)
+        : undefined,
+      when_to_handoff: typeof parsed.when_to_handoff === "string" ? parsed.when_to_handoff : undefined
+    };
+  }
+
+  private async runDomainSpecialistPrompt(
+    stage: "api-specialist" | "howto-specialist" | "behavior-specialist" | "troubleshooting-specialist",
+    promptLines: string[],
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer> {
+    const providedEvidence = buildProvidedEvidenceFromBundle(input.evidenceBundle, {
+      primaryLimit: 3,
+      supplementalLimit: 2,
+      snippetMax: input.route.question_type.startsWith("api_") ? 900 : 260
+    });
+    const prompt = [
+      ...promptLines,
+      "- When you output claims[].evidence_ids, copy the exact evidence_id strings from provided_evidence. Never invent ids or rewrite them.",
+      `language: ${input.language}`,
+      `user_query: ${input.query}`,
+      `route: ${JSON.stringify(input.route)}`,
+      `query_focus_terms: ${JSON.stringify(extractQueryFocusTerms({ query: input.query, caseFrame: input.caseFrame }))}`,
+      `case_frame: ${JSON.stringify(input.caseFrame)}`,
+      `provided_evidence: ${JSON.stringify(providedEvidence)}`,
+      ...(input.conversationHistory?.length
+        ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
+        : [])
+    ].join("\n");
+    const parsed = (await this.runJsonPrompt(prompt, `${idempotencyKey}:${stage}`, runtime, undefined, stage)) as Record<string, unknown>;
+    return {
+      question_type: normalizeQuestionType(parsed.question_type ?? input.route.question_type),
+      render_variant: normalizeSupportRenderVariant(parsed.render_variant, input.route.question_type),
       direct_answer: typeof parsed.direct_answer === "string" ? parsed.direct_answer : "",
       claims: Array.isArray(parsed.claims)
         ? parsed.claims

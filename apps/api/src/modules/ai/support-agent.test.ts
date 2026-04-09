@@ -4452,3 +4452,347 @@ test("runSupportSearchAgent single-agent keeps broad partial capability answers 
     mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
   }
 });
+
+test("runSupportSearchAgent prefers the supervisor-domain runtime over support-main and keeps verification local", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeOpenApiDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("answer composer must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "openapi",
+    route: {
+      question_type: "api_scope_auth",
+      user_goal: input.query,
+      answer_contract: "Return the exact scope first.",
+      specialist_agent: "api-specialist",
+      routing_confidence: 0.96,
+      primary_domain: "openapi"
+    },
+    caseFrame: {
+      goal: "Find the required scope for the issue comment API.",
+      symptom: "Scope lookup",
+      object: "issue comment API",
+      action_type: "lookup",
+      deployment_model: "shared",
+      product_area: "openapi",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["issue comment api scope"],
+      question_type: "api_scope_auth",
+      specialist_agent: "api-specialist",
+      answer_contract: "Return the exact scope first.",
+      routing_confidence: 0.96,
+      primary_domain: "openapi",
+      required_doc_kinds: ["openapi/api", "permissions"]
+    },
+    retrievalQueries: ["issue comment api scope"]
+  });
+  adapter.writeOpenApiDomainAnswer = async (input) => ({
+    question_type: "api_scope_auth",
+    render_variant: "api",
+    direct_answer: "The issue comment API requires write:project.",
+    claims: [
+      {
+        text: "The issue comment API requires write:project.",
+        kind: "verified_fact",
+        evidence_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)).slice(0, 1),
+        authority: "canonical"
+      },
+      {
+        text: "The issue comment API also requires admin:workspace.",
+        kind: "verified_fact",
+        evidence_ids: [],
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["Use write:project in the access token."],
+    unknowns: [],
+    escalation_needed: false,
+    auth_scope: ["write:project"]
+  });
+
+  const validationReference: SearchReference = {
+    documentId: "doc:add-issue-comment",
+    evidenceId: "chunk:comment-scope",
+    title: "Add issue comment",
+    snippet: "Scope: write:project",
+    sourceUrl: "https://docs.ones.com/openapi/add-issue-comment",
+    path: "open-docs/docs/openapi/api/add-issue-comment.api.mdx",
+    headingPath: "Permissions",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.97,
+    retrievedAt: "2026-04-09T04:00:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.97,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "What scope is required for the issue comment API?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-openapi"
+    });
+
+    assert.equal((result.result.internal_diagnostics as { runtime_mode?: string } | undefined)?.runtime_mode, "supervisor_domain");
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { primary_domain?: string } } | undefined)?.route?.primary_domain),
+      "openapi"
+    );
+    assert.deepEqual(result.verification.verified_citation_ids, ["chunk:comment-scope"]);
+    assert.deepEqual(result.result.citations.map((item) => item.id), ["chunk:comment-scope"]);
+    assert.equal(result.stageTimings.retrieval_extra.status, "skipped");
+    assert.deepEqual(
+      (result.result.internal_diagnostics as { stage_budget?: Record<string, unknown> } | undefined)?.stage_budget,
+      {
+        retrieval_rounds: 1,
+        allow_refinement: false,
+        stop_after_grounded_evidence: false,
+        specialist_budget: 1
+      }
+    );
+    assert.equal(
+      result.result.internal_diagnostics?.orchestration_trace?.some((item) => item.stage === "support_main_plan"),
+      false
+    );
+    assert.match(result.result.answer, /write:project/);
+    assert.doesNotMatch(result.result.answer, /admin:workspace/);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
+test("runSupportSearchAgent supervisor-domain runtime supports deployment answers with one retrieval pass", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("answer composer must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "deployment",
+    route: {
+      question_type: "config_setup",
+      user_goal: input.query,
+      answer_contract: "Give the direct recovery steps first.",
+      specialist_agent: "howto-specialist",
+      routing_confidence: 0.94,
+      primary_domain: "deployment"
+    },
+    caseFrame: {
+      goal: "Reset the administrator password in a private deployment.",
+      symptom: "Administrator password reset is blocked.",
+      object: "administrator password reset",
+      action_type: "recovery",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["private deployment administrator password reset"],
+      question_type: "config_setup",
+      specialist_agent: "howto-specialist",
+      answer_contract: "Give the direct recovery steps first.",
+      routing_confidence: 0.94,
+      primary_domain: "deployment",
+      required_doc_kinds: ["deployment_runbook", "product_guide"]
+    },
+    retrievalQueries: ["private deployment administrator password reset"]
+  });
+  adapter.writeDeploymentDomainAnswer = async (input) => ({
+    question_type: "config_setup",
+    render_variant: "how_to",
+    direct_answer: "Use the documented private-deployment recovery path to reset the administrator password.",
+    claims: [
+      {
+        text: "The deployment recovery guide documents the administrator password reset path.",
+        kind: "verified_fact",
+        evidence_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)).slice(0, 1),
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["Use the private-deployment recovery path."],
+    unknowns: [],
+    escalation_needed: false,
+    steps: ["Open the deployment recovery flow.", "Reset the administrator password from the host-side recovery path."],
+    prerequisites: ["Administrator host access"],
+    limits_or_notes: ["Do not rely on email reset when SMTP is unavailable."]
+  });
+
+  const validationReference: SearchReference = {
+    documentId: "doc:deployment-reset",
+    evidenceId: "chunk:deployment-reset",
+    title: "Deployment recovery",
+    snippet: "Use the deployment recovery path to reset the administrator password.",
+    sourceUrl: "https://docs.ones.com/private-deployment/recovery",
+    path: "docs/private-deployment/recovery.mdx",
+    headingPath: "Administrator recovery",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.98,
+    retrievedAt: "2026-04-09T04:20:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.98,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "私有化部署下如何重置管理员密码？",
+      language: "zh",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment"
+    });
+
+    assert.equal((result.result.internal_diagnostics as { runtime_mode?: string } | undefined)?.runtime_mode, "supervisor_domain");
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { primary_domain?: string } } | undefined)?.route?.primary_domain),
+      "deployment"
+    );
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.equal(result.stageTimings.retrieval_extra.status, "skipped");
+    assert.match(result.result.answer, /重置管理员密码|recovery path/);
+    assert.deepEqual(result.result.citations.map((item) => item.id), ["chunk:deployment-reset"]);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
