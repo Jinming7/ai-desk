@@ -5195,3 +5195,188 @@ test("runSupportSearchAgent supervisor-domain runtime keeps docs troubleshooting
     mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
   }
 });
+
+test("runSupportSearchAgent supervisor-domain runtime keeps deployment architecture answers on the behavior contract", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("answer composer must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "deployment",
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: input.query,
+      answer_contract: "State the documented architecture first.",
+      specialist_agent: "behavior-specialist",
+      routing_confidence: 0.95,
+      primary_domain: "deployment"
+    },
+    caseFrame: {
+      goal: "Understand whether self-hosted deployment supports isolated service chains.",
+      symptom: "Need a documented architecture conclusion.",
+      object: "self-hosted deployment topology",
+      action_type: "capability_confirmation",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["self-hosted deployment architecture isolation"],
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract: "State the documented architecture first.",
+      routing_confidence: 0.95,
+      primary_domain: "deployment",
+      required_doc_kinds: ["deployment_runbook", "product_guide"]
+    },
+    retrievalQueries: ["self-hosted deployment architecture isolation"]
+  });
+  adapter.writeDeploymentDomainAnswer = async (input) => ({
+    question_type: "capability_confirmation",
+    render_variant: "behavior",
+    direct_answer:
+      "The current deployment docs support this conclusion first: ONES self-hosted deployment is documented as a unified topology by default.",
+    claims: [
+      {
+        text: "The deployment architecture guide describes ONES self-hosted deployment as a unified topology by default.",
+        kind: "verified_fact",
+        evidence_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)).slice(0, 1),
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["Plan capacity assuming a unified topology first."],
+    unknowns: [],
+    escalation_needed: false,
+    most_likely_explanation:
+      "The current deployment docs describe a unified topology rather than separately deployable backend chains for requirements and issues.",
+    confirmed_facts: ["ONES self-hosted deployment is documented as a unified topology by default."],
+    what_to_check_next: ["Check whether database or storage externalization is documented for the target environment."]
+  });
+
+  const validationReference: SearchReference = {
+    documentId: "doc:deployment-architecture",
+    evidenceId: "chunk:deployment-architecture",
+    title: "Deployment architecture",
+    snippet:
+      "ONES self-hosted deployment uses a unified topology by default. Some infrastructure components can be externalized depending on the deployment plan.",
+    sourceUrl: "https://docs.ones.com/private-deployment/architecture",
+    path: "docs/private-deployment/architecture.mdx",
+    headingPath: "Topology",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.99,
+    retrievedAt: "2026-04-10T06:00:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.99,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "Can requirements and issues use isolated backend services in self-hosted deployment?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment-behavior"
+    });
+
+    assert.equal((result.result.internal_diagnostics as { runtime_mode?: string } | undefined)?.runtime_mode, "supervisor_domain");
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { primary_domain?: string } } | undefined)?.route?.primary_domain),
+      "deployment"
+    );
+    assert.equal(result.caseFrame.specialist_agent, "behavior-specialist");
+    assert.equal(result.result.support_answer?.render_variant, "behavior");
+    assert.match(result.result.answer, /unified topology/i);
+    assert.deepEqual(result.result.citations.map((item) => item.id), ["chunk:deployment-architecture"]);
+    assert.equal(result.stageTimings.retrieval_extra.status, "skipped");
+    assert.ok(
+      result.result.support_answer?.sections.some(
+        (section) =>
+          section.kind === "bullet_list" &&
+          section.title === "Confirmed facts" &&
+          section.items.includes(
+            "The deployment architecture guide describes ONES self-hosted deployment as a unified topology by default."
+          )
+      )
+    );
+    assert.ok(
+      result.result.support_answer?.sections.some(
+        (section) =>
+          section.kind === "bullet_list" &&
+          section.title === "What to watch" &&
+          section.items.includes("Check whether database or storage externalization is documented for the target environment.")
+      )
+    );
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});

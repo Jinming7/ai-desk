@@ -1251,16 +1251,22 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     runtime?: OpenClawRuntimeContext
   ): Promise<SpecialistDraftAnswer> {
     return this.runDomainSpecialistPrompt(
-      input.route.specialist_agent === "troubleshooting-specialist" ? "troubleshooting-specialist" : "howto-specialist",
+      input.route.specialist_agent === "troubleshooting-specialist"
+        ? "troubleshooting-specialist"
+        : input.route.specialist_agent === "behavior-specialist"
+        ? "behavior-specialist"
+        : "howto-specialist",
       [
         "You are the deployment domain specialist for ONES customer-facing support.",
         "Return ONLY valid JSON with keys:",
-        "question_type, render_variant, direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean), steps(string[]), prerequisites(string[]), limits_or_notes(string[]), most_likely_causes(string[]), recommended_checks(string[]), required_followup_info(string[]), when_to_handoff",
+        "question_type, render_variant, direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean), steps(string[]), prerequisites(string[]), limits_or_notes(string[]), most_likely_explanation, confirmed_facts(string[]), what_to_check_next(string[]), most_likely_causes(string[]), recommended_checks(string[]), required_followup_info(string[]), when_to_handoff",
         "Rules:",
         "- Use ONLY provided_evidence. Do not retrieve.",
         "- Focus on private deployment, recovery, host-side operations, architecture, and deployment constraints.",
         "- When the question is procedural, prefer direct steps and prerequisites.",
+        "- When the question is about deployment capability, architecture, isolation, or expected behavior, answer the documented architecture conclusion first and fill most_likely_explanation, confirmed_facts, and what_to_check_next.",
         "- When the question is diagnostic, prefer the most likely causes and immediate checks.",
+        "- For deployment behavior questions, keep claims narrow and grounded in the deployment docs that explicitly describe topology, supported isolation, or component externalization.",
         "- Keep unknowns narrow and operational."
       ],
       input,

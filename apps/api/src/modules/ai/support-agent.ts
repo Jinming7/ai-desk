@@ -2281,6 +2281,25 @@ function buildFallbackSectionsFromDraft(draft: SpecialistDraftAnswer, language: 
   }
 }
 
+function mergePreferredSupportSections(
+  preferredSections: SupportAnswer["sections"],
+  specialistSections: SupportAnswer["sections"]
+): SupportAnswer["sections"] {
+  if (!specialistSections.length) return preferredSections;
+  const mergedSections = [...specialistSections];
+  for (const preferredSection of preferredSections) {
+    const existingIndex = mergedSections.findIndex(
+      (section) => section.kind === preferredSection.kind && section.title === preferredSection.title
+    );
+    if (existingIndex >= 0) {
+      mergedSections[existingIndex] = preferredSection;
+      continue;
+    }
+    mergedSections.push(preferredSection);
+  }
+  return mergedSections;
+}
+
 function buildSupportAnswerFromDraft(input: {
   language: "zh" | "en";
   mode: SupportAnswer["mode"];
@@ -2362,6 +2381,10 @@ function buildSupportAnswerFromDraft(input: {
     stillNeedToConfirm,
     mode: input.mode
   });
+  const preferredSections =
+    supportedClaimSections.length && shouldPreferSupportedClaimDirectAnswer
+      ? mergePreferredSupportSections(supportedClaimSections, fallbackSections)
+      : [];
   const minimalStructuredSections =
     input.mode === "clarification" && stillNeedToConfirm.length
       ? [
@@ -2391,8 +2414,8 @@ function buildSupportAnswerFromDraft(input: {
   const sections =
     input.composed?.sections?.length
       ? input.composed.sections
-      : supportedClaimSections.length && shouldPreferSupportedClaimDirectAnswer
-      ? supportedClaimSections
+      : preferredSections.length
+      ? preferredSections
       : fallbackSections.length
       ? fallbackSections
       : supportedClaimSections.length

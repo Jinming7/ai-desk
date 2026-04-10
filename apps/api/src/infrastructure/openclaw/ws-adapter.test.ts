@@ -709,6 +709,124 @@ test("writeDeploymentDomainAnswer parses evidence ids from provided evidence wit
   assert.deepEqual(result.claims[0]?.evidence_ids, ["chunk:deployment-reset"]);
 });
 
+test("writeDeploymentDomainAnswer routes deployment capability questions through the behavior specialist contract", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    writeDeploymentDomainAnswer: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        route: Record<string, unknown>;
+        caseFrame: Record<string, unknown>;
+        evidenceBundle: {
+          primary: Array<Record<string, unknown>>;
+          supplemental: Array<Record<string, unknown>>;
+        };
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{
+      render_variant: string;
+      claims: Array<{ text: string; evidence_ids: string[] }>;
+      most_likely_explanation?: string;
+      confirmed_facts?: string[];
+      what_to_check_next?: string[];
+    }>;
+    runJsonPrompt: (prompt: string, idempotencyKey: string) => Promise<unknown>;
+  };
+  let capturedPrompt = "";
+  let capturedIdempotencyKey = "";
+
+  adapter.runJsonPrompt = async (prompt, callIdempotencyKey) => {
+    capturedPrompt = prompt;
+    capturedIdempotencyKey = callIdempotencyKey;
+    return {
+      question_type: "capability_confirmation",
+      render_variant: "behavior",
+      direct_answer: "The deployment docs describe a unified topology by default.",
+      claims: [
+        {
+          text: "The deployment guide describes the self-hosted topology as unified by default.",
+          kind: "verified_fact",
+          evidence_ids: ["chunk:deployment-topology"],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["Plan capacity on the assumption of a unified deployment topology first."],
+      unknowns: [],
+      escalation_needed: false,
+      most_likely_explanation: "The current deployment docs describe a unified topology rather than independent service chains.",
+      confirmed_facts: ["The deployment guide describes the self-hosted topology as unified by default."],
+      what_to_check_next: ["Check whether storage or database externalization is documented for the target environment."]
+    };
+  };
+
+  const result = await adapter.writeDeploymentDomainAnswer(
+    {
+      contextType: "search",
+      language: "en",
+      query: "Can requirements and issues use isolated backend services in self-hosted deployment?",
+      route: {
+        question_type: "capability_confirmation",
+        user_goal: "Understand the supported self-hosted deployment topology.",
+        answer_contract: "State the documented architecture first.",
+        specialist_agent: "behavior-specialist",
+        routing_confidence: 0.93,
+        primary_domain: "deployment"
+      },
+      caseFrame: {
+        goal: "Understand the supported self-hosted deployment topology.",
+        symptom: "Need to know whether requirements and issues can be isolated.",
+        object: "self-hosted deployment topology",
+        action_type: "capability_confirmation",
+        deployment_model: "private_deployment",
+        product_area: "deployment",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: ["self-hosted deployment architecture isolation"],
+        question_type: "capability_confirmation",
+        specialist_agent: "behavior-specialist",
+        primary_domain: "deployment"
+      },
+      evidenceBundle: {
+        primary: [
+          {
+            documentId: "doc:deployment-topology",
+            evidenceId: "chunk:deployment-topology",
+            title: "Deployment architecture",
+            snippet: "ONES self-hosted deployment uses a unified topology by default.",
+            sourceUrl: "https://docs.ones.com/private-deployment/architecture",
+            path: "docs/private-deployment/architecture.mdx",
+            headingPath: "Topology",
+            authority: "canonical_visible",
+            sourceType: "github_kb",
+            score: 0.99,
+            retrievedAt: "2026-04-10T02:20:00.000Z"
+          }
+        ],
+        supplemental: []
+      }
+    },
+    "ws-adapter:deployment-domain-behavior"
+  );
+
+  assert.match(capturedPrompt, /most_likely_explanation/);
+  assert.match(capturedPrompt, /confirmed_facts/);
+  assert.match(capturedPrompt, /what_to_check_next/);
+  assert.match(capturedPrompt, /deployment capability, architecture, isolation, or expected behavior/i);
+  assert.match(capturedIdempotencyKey, /behavior-specialist$/);
+  assert.equal(result.render_variant, "behavior");
+  assert.deepEqual(result.claims[0]?.evidence_ids, ["chunk:deployment-topology"]);
+  assert.equal(
+    result.most_likely_explanation,
+    "The current deployment docs describe a unified topology rather than independent service chains."
+  );
+  assert.deepEqual(result.confirmed_facts, ["The deployment guide describes the self-hosted topology as unified by default."]);
+  assert.deepEqual(result.what_to_check_next, [
+    "Check whether storage or database externalization is documented for the target environment."
+  ]);
+});
+
 test("writeDocsDomainAnswer supports troubleshooting fields from provided evidence without triggering retrieval", async () => {
   const adapter = new WsOpenClawAdapter() as never as {
     writeDocsDomainAnswer: (
