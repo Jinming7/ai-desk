@@ -5015,3 +5015,183 @@ Use the UI to reassign issues from the issue detail page.
     await rm(rootDir, { recursive: true, force: true });
   }
 });
+
+test("runSupportSearchAgent supervisor-domain runtime keeps docs troubleshooting answers diagnostic without local judge stages", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDocsDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("answer composer must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "docs",
+    route: {
+      question_type: "troubleshooting",
+      user_goal: input.query,
+      answer_contract: "Start with the most likely documented cause and the checks to run now.",
+      specialist_agent: "troubleshooting-specialist",
+      routing_confidence: 0.92,
+      primary_domain: "docs"
+    },
+    caseFrame: {
+      goal: "Diagnose the failing GitHub callback flow.",
+      symptom: "GitHub callback fails after OAuth setup.",
+      object: "GitHub callback",
+      action_type: "troubleshooting",
+      deployment_model: "shared",
+      product_area: "integrations",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["github callback troubleshooting"],
+      question_type: "troubleshooting",
+      specialist_agent: "troubleshooting-specialist",
+      answer_contract: "Start with the most likely documented cause and the checks to run now.",
+      routing_confidence: 0.92,
+      primary_domain: "docs",
+      required_doc_kinds: ["troubleshooting", "product_guide"]
+    },
+    retrievalQueries: ["github callback troubleshooting"]
+  });
+  adapter.writeDocsDomainAnswer = async (input) => ({
+    question_type: "troubleshooting",
+    render_variant: "troubleshooting",
+    direct_answer: "The most likely documented cause is a callback URL mismatch.",
+    claims: [
+      {
+        text: "The callback troubleshooting guide says callback URL mismatch causes the integration to fail.",
+        kind: "verified_fact",
+        evidence_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)).slice(0, 1),
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["Compare the redirect URI in ONES with the callback URL registered in the provider."],
+    unknowns: [],
+    escalation_needed: false,
+    most_likely_causes: ["Callback URL mismatch between ONES and the provider registration."],
+    recommended_checks: ["Compare the redirect URI in ONES with the provider-side callback URL."],
+    required_followup_info: ["The exact redirect URI configured in ONES and in the provider console."],
+    when_to_handoff: "Escalate only if both callback URLs match and the issue still reproduces."
+  });
+
+  const validationReference: SearchReference = {
+    documentId: "doc:github-callback-troubleshooting",
+    evidenceId: "chunk:callback-mismatch",
+    title: "GitHub callback troubleshooting",
+    snippet: "Callback URL mismatch causes the integration to fail. Compare the configured redirect URI with the provider callback URL.",
+    sourceUrl: "https://docs.ones.com/integrations/github/callback-troubleshooting",
+    path: "docs/integrations/github/callback-troubleshooting.mdx",
+    headingPath: "Most common cause",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.98,
+    retrievedAt: "2026-04-10T05:30:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.98,
+        references: [validationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "GitHub callback keeps failing after OAuth setup",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-docs-troubleshooting"
+    });
+
+    assert.equal((result.result.internal_diagnostics as { runtime_mode?: string } | undefined)?.runtime_mode, "supervisor_domain");
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { primary_domain?: string } } | undefined)?.route?.primary_domain),
+      "docs"
+    );
+    assert.equal(result.result.support_answer?.render_variant, "troubleshooting");
+    assert.match(result.result.answer, /callback URL mismatch/i);
+    assert.deepEqual(result.result.citations.map((item) => item.id), ["chunk:callback-mismatch"]);
+    assert.equal(result.stageTimings.retrieval_extra.status, "skipped");
+    assert.ok(
+      result.result.support_answer?.sections.some(
+        (section) =>
+          section.kind === "bullet_list" &&
+          section.title === "Checks to run now" &&
+          section.items.includes("Compare the redirect URI in ONES with the provider-side callback URL.")
+      )
+    );
+    assert.ok(
+      result.result.support_answer?.sections.some(
+        (section) =>
+          section.kind === "bullet_list" &&
+          section.title === "Still needed" &&
+          section.items.includes("The exact redirect URI configured in ONES and in the provider console.")
+      )
+    );
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});

@@ -709,6 +709,119 @@ test("writeDeploymentDomainAnswer parses evidence ids from provided evidence wit
   assert.deepEqual(result.claims[0]?.evidence_ids, ["chunk:deployment-reset"]);
 });
 
+test("writeDocsDomainAnswer supports troubleshooting fields from provided evidence without triggering retrieval", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    writeDocsDomainAnswer: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        route: Record<string, unknown>;
+        caseFrame: Record<string, unknown>;
+        evidenceBundle: {
+          primary: Array<Record<string, unknown>>;
+          supplemental: Array<Record<string, unknown>>;
+        };
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{
+      render_variant: string;
+      claims: Array<{ text: string; evidence_ids: string[] }>;
+      most_likely_causes?: string[];
+      recommended_checks?: string[];
+      required_followup_info?: string[];
+      when_to_handoff?: string;
+    }>;
+    runJsonPrompt: (prompt: string) => Promise<unknown>;
+  };
+  let capturedPrompt = "";
+
+  adapter.runJsonPrompt = async (prompt) => {
+    capturedPrompt = prompt;
+    return {
+      question_type: "troubleshooting",
+      render_variant: "troubleshooting",
+      direct_answer: "The most likely documented cause is a callback URL mismatch.",
+      claims: [
+        {
+          text: "The callback troubleshooting guide states that callback URL mismatch causes the integration to fail.",
+          kind: "verified_fact",
+          evidence_ids: ["chunk:callback-mismatch"],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["Compare the redirect URI in ONES with the callback URL registered in the provider."],
+      unknowns: [],
+      escalation_needed: false,
+      most_likely_causes: ["Callback URL mismatch between ONES and the provider registration."],
+      recommended_checks: ["Compare the redirect URI in ONES with the provider-side callback URL."],
+      required_followup_info: ["The exact redirect URI configured in ONES and in the provider console."],
+      when_to_handoff: "Escalate only if both callback URLs match and the issue still reproduces."
+    };
+  };
+
+  const result = await adapter.writeDocsDomainAnswer(
+    {
+      contextType: "search",
+      language: "en",
+      query: "GitHub callback keeps failing after OAuth setup",
+      route: {
+        question_type: "troubleshooting",
+        user_goal: "Diagnose the failing callback flow.",
+        answer_contract: "Start with the most likely documented cause and the checks to run now.",
+        specialist_agent: "troubleshooting-specialist",
+        routing_confidence: 0.91,
+        primary_domain: "docs"
+      },
+      caseFrame: {
+        goal: "Diagnose the failing callback flow.",
+        symptom: "GitHub callback returns an error after setup.",
+        object: "GitHub callback",
+        action_type: "troubleshooting",
+        deployment_model: "shared",
+        product_area: "integrations",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: ["github callback troubleshooting"],
+        question_type: "troubleshooting",
+        specialist_agent: "troubleshooting-specialist",
+        primary_domain: "docs"
+      },
+      evidenceBundle: {
+        primary: [
+          {
+            documentId: "doc:callback-troubleshooting",
+            evidenceId: "chunk:callback-mismatch",
+            title: "GitHub callback troubleshooting",
+            snippet: "Callback URL mismatch causes the integration to fail.",
+            sourceUrl: "https://docs.ones.com/integrations/github/callback-troubleshooting",
+            path: "docs/integrations/github/callback-troubleshooting.mdx",
+            headingPath: "Most common cause",
+            authority: "canonical_visible",
+            sourceType: "github_kb",
+            score: 0.99,
+            retrievedAt: "2026-04-10T02:00:00.000Z"
+          }
+        ],
+        supplemental: []
+      }
+    },
+    "ws-adapter:docs-domain-troubleshooting"
+  );
+
+  assert.match(capturedPrompt, /provided_evidence/);
+  assert.match(capturedPrompt, /Do not retrieve/i);
+  assert.match(capturedPrompt, /most_likely_causes/);
+  assert.match(capturedPrompt, /recommended_checks/);
+  assert.match(capturedPrompt, /required_followup_info/);
+  assert.equal(result.render_variant, "troubleshooting");
+  assert.deepEqual(result.claims[0]?.evidence_ids, ["chunk:callback-mismatch"]);
+  assert.deepEqual(result.most_likely_causes, ["Callback URL mismatch between ONES and the provider registration."]);
+  assert.deepEqual(result.recommended_checks, ["Compare the redirect URI in ONES with the provider-side callback URL."]);
+  assert.deepEqual(result.required_followup_info, ["The exact redirect URI configured in ONES and in the provider console."]);
+});
+
 test("buildConnectParams includes a nonce-signed device payload for the live gateway", () => {
   const adapter = new WsOpenClawAdapter() as never as {
     buildConnectParams: (input: {
