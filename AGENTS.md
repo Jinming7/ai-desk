@@ -102,11 +102,16 @@
 ## General Development Discipline (Mandatory)
 - This applies to all development tasks in this workspace, not only KB/sync or one specific subsystem.
 - Do not code by trial-and-error. Do not use the codebase or shared environments as a place to discover the design through repeated failed attempts.
+- For customer-facing or operator-facing flows, `business usability` is the primary acceptance gate. `Code compiles`, `a stage returns richer fields`, `a prompt looks better`, or `a component test passes` do not count as success if the end-to-end workflow is still unavailable, degraded, regressed, or timing out.
+- When the user names or implies a known-good commit/checkpoint for a customer-facing flow, freeze that commit as the baseline first. Before editing, inspect the exact diff from that baseline to the current branch in the affected files/modules and identify the first regression commit or the smallest regression diff set. Do not start a new redesign until that regression source is named concretely.
 - Before writing or changing code, first analyze the task clearly enough to understand:
   `current flow`, `target behavior`, `constraints`, `data model impact`, `state transitions`, `idempotency/retry behavior when relevant`, `integration boundaries`, `verification plan`, and `main failure risks`.
 - If those points are still unclear, stop and analyze further before editing.
+- Before editing a customer-facing workflow, freeze one explicit business acceptance target first: a representative user question, operator action, or end-to-end scenario plus the exact expected usable outcome. If that target is not yet passing, do not expand scope into extra architecture, optimization, or intelligence work.
 - Implement only after the change plan is coherent. Prefer deliberate, minimal, well-scoped changes over speculative patches.
 - For any non-trivial task, decide how correctness will be verified before coding. That can include focused tests, static inspection targets, runtime probes, DB checks, or API/status validation depending on the task.
+- In multi-stage systems, verification must include the final customer-visible or operator-visible output boundary. Intermediate planner, router, specialist, verifier, or adapter outputs are evidence only; they are not the acceptance result.
+- When a usable baseline already exists, preserve it first. Only one complexity axis may change at a time: `retrieval`, `routing`, `prompt/stage contract`, `orchestration topology`, or `fallback/recovery behavior`. If the business gate regresses, stop and return to the last validated checkpoint before further changes.
 - Do not rely on “write first, debug later” as a normal workflow. Preventing avoidable bugs up front is the expected baseline.
 
 ## AI Support Agent Principles (Mandatory)
@@ -114,11 +119,16 @@
 - Hard prohibition: do not patch answer quality, retrieval quality, or routing quality by stacking query regexes, keyword branches, string-match conditionals, or one-off rewrites over user input / draft answer text unless the user explicitly asks for a deterministic rule.
 - For AI support/search quality issues, the default fix order is: `knowledge metadata -> evidence policy -> retrieval/rerank strategy -> agent prompt/stage contract -> orchestration topology`. Do not jump straight to `if/else` patches over specific questions.
 - If a change would make one narrow query pass by adding literal phrase checks, route-name special cases, or answer-text rewrite guards, treat that as a design smell and stop to redesign the shared pipeline instead.
+- Hard prohibition: do not introduce extra agents, extra stages, broader orchestration, or “smarter” routing while the current customer-facing support path is still failing its explicit business acceptance target.
+- A support-flow improvement is real only when the final customer-facing answer on the intended runtime path remains usable, timely, and non-regressed. Better intermediate drafts, richer specialist JSON, or cleaner internal traces do not qualify on their own.
+- When a support question is known to have worked in a specific checkpoint, freeze that question as a mandatory regression case before changing routing, retrieval, prompt/stage contract, fallback, or orchestration. The regression case must validate the final answer on the real intended runtime path, not only internal route/stage diagnostics.
+- If a support-flow change regresses a previously passing business question, stop further optimization immediately. Restore the last validated baseline behavior first, then continue with only one complexity axis changed at a time.
 - Use `BangWork/docs-com` as the primary knowledge source for support answers whenever grounded documentation is available. Legacy/local fallback logic is only for infrastructure failure, retrieval unavailability, or explicit disaster-recovery paths.
 - Preserve multi-turn, role-aware conversation history end to end. Do not flatten assistant turns into `user` text or downgrade conversation payloads back to `string[]`.
 - Customer-facing answers must prioritize `direct answer`, `what to do now`, `minimum missing info`, and grounded citations. Avoid exposing internal reasoning labels such as `assessment`, `reasoning_summary`, or other chain-of-thought style fields in the portal UI.
 - Customer-facing answer structure must follow `/Users/jeremypeng/Downloads/Workspace/TicketManagement/docs/agents/support-answer-composer.md`. Treat that file as the repository source of truth for support answer formatting across API, how-to, behavior, troubleshooting, clarification, and handoff cases.
 - When changing the AI support flow, prefer tightening the shared support-agent contract over adding new legacy paths beside it.
+- Mandatory execution order for support-flow work: `freeze business baseline -> add/confirm final-answer regression check -> change one layer only -> re-verify the same business baseline`. Do not continue to the next layer until the current baseline remains green.
 
 ## AI Support Agent Rebuild Constraints (Mandatory)
 - The target system is an `AI-driven support engineer agent`, not a search box, not a rule tree, and not a path/regex router. Retrieval is only a subsystem inside the shared support-agent pipeline.
