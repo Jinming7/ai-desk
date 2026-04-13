@@ -16,6 +16,7 @@ import type {
   OpenClawSearchAnswerOutput,
   OpenClawSearchInput,
   OpenClawSearchOutput,
+  OpenClawSupportAnswerComposerInput,
   OpenClawSupportEvidencePlannerInput,
   OpenClawSupportEvidenceSelectorInput,
   OpenClawSupportPlannerInput,
@@ -35,6 +36,7 @@ import {
   type DraftSupportAnswer,
   type SearchReference,
   type SpecialistDraftAnswer,
+  type SupportAnswer,
   type SupportCaseFrame,
   type SupportEvidencePlan,
   type SupportQuestionRoute,
@@ -5623,6 +5625,258 @@ test("runSupportSearchAgent supervisor-domain fallback planner keeps HAR trouble
   } finally {
     mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
     mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
+test("runSupportSearchAgent supervisor-domain runtime recovers a grounded HAR how-to answer when docs specialist and answer composer both fall back", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+    LOCAL_DOCS_COM_PATH?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  const originalLocalDocsPath = mutableEnv.LOCAL_DOCS_COM_PATH;
+  const originalFetch = globalThis.fetch;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+  mutableEnv.LOCAL_DOCS_COM_PATH = "";
+
+  let observedFetchCount = 0;
+  globalThis.fetch = (async (input: string | URL | { url?: string | URL }) => {
+    const requestUrl =
+      input instanceof URL
+        ? input.toString()
+        : typeof input === "string"
+        ? input
+        : input?.url instanceof URL
+        ? input.url.toString()
+        : String(input?.url ?? "");
+
+    if (requestUrl === "https://docs.ones.com/operations-toolkit/capture-a-har-file-for-troubleshooting") {
+      observedFetchCount += 1;
+      return new Response(
+        `<!doctype html>
+        <html lang="en">
+          <body>
+            <main>
+              <article>
+                <h1>Capture a HAR file for troubleshooting</h1>
+                <p>Follow the documented browser procedure to capture a HAR file before sending it to support.</p>
+                <h2>Steps</h2>
+                <ol>
+                  <li>Open your browser DevTools.</li>
+                  <li>Switch to the Network tab and keep recording enabled.</li>
+                  <li>Reproduce the issue in the browser.</li>
+                  <li>Use Save all as HAR with content to export the HAR file.</li>
+                </ol>
+                <h2>Notes</h2>
+                <ul>
+                  <li>Review the HAR file for sensitive data before sharing it with support.</li>
+                </ul>
+              </article>
+            </main>
+          </body>
+        </html>`,
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
+
+    throw new Error(`unexpected fetch in HAR recovery test: ${requestUrl}`);
+  }) as typeof globalThis.fetch;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDocsDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    composeCustomerAnswer?: (
+      input: OpenClawSupportAnswerComposerInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<Omit<SupportAnswer, "mode">>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async () => {
+    throw new Error("simulate planner fallback");
+  };
+  adapter.writeDocsDomainAnswer = async () => {
+    throw new Error("simulate docs specialist timeout/fallback");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("simulate answer composer timeout/fallback");
+  };
+
+  const references: SearchReference[] = [
+    {
+      documentId: "doc:oauth-openapi-troubleshooting-1",
+      evidenceId: "chunk:oauth-openapi-troubleshooting-1",
+      title: "Troubleshooting",
+      snippet: "OpenAPI 403: check app.oauth.scope and token settings.",
+      sourceUrl: "https://docs.ones.com/developer/guide/getting-started/app-oauth",
+      path: "open-docs/docs/guide/getting-started/access-openapi.mdx",
+      headingPath: "Access Open API > Troubleshooting",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.6148196721311475,
+      retrievedAt: "2026-04-13T08:21:12.485Z",
+      supportMetadata: {
+        product_area: "openapi",
+        deployment_model: "shared",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    },
+    {
+      documentId: "doc:oauth-openapi-troubleshooting-2",
+      evidenceId: "chunk:oauth-openapi-troubleshooting-2",
+      title: "Troubleshooting",
+      snippet: "OpenAPI 403: ensure token scope is configured correctly.",
+      sourceUrl: "https://docs.ones.com/developer/guide/getting-started/app-websdk",
+      path: "open-docs/docs/guide/getting-started/use-websdk.mdx",
+      headingPath: "Use Web SDK > Troubleshooting",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.4067741935483871,
+      retrievedAt: "2026-04-13T08:21:12.485Z",
+      supportMetadata: {
+        product_area: "openapi",
+        deployment_model: "shared",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    },
+    {
+      documentId: "doc:extensions-troubleshooting",
+      evidenceId: "chunk:extensions-troubleshooting",
+      title: "Troubleshooting",
+      snippet: "Common extension troubleshooting issues.",
+      sourceUrl: "https://docs.ones.com/developer/guide/getting-started/app-extensions",
+      path: "open-docs/docs/guide/getting-started/use-extensions.mdx",
+      headingPath: "Use Extensions > Troubleshooting",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.40285714285714286,
+      retrievedAt: "2026-04-13T08:21:12.485Z",
+      supportMetadata: {
+        product_area: "general",
+        deployment_model: "shared",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    },
+    {
+      documentId: "doc:har-capture-live",
+      evidenceId: "chunk:har-capture-live",
+      title: "捕获故障排除的 HAR 文件",
+      snippet:
+        "当使用 ONES.com 系统遇到问题时，技术支持团队可能会要求您获取浏览器生成的 HAR（HTTP Archive）文件，以帮助识别问题的根本原因。以下是捕获 HAR 文件的分步说明。",
+      sourceUrl: "https://docs.ones.com/operations-toolkit/capture-a-har-file-for-troubleshooting",
+      path: "docs/operations-toolkit/capture-a-har-file-for-troubleshooting.mdx",
+      headingPath: "捕获故障排除的 HAR 文件",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.6098783712321523,
+      retrievedAt: "2026-04-13T08:21:12.485Z",
+      supportMetadata: {
+        product_area: "general",
+        deployment_model: "shared",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    }
+  ];
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.68,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "how to get a har file for troubule shooting?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-har-fallback-recovers-grounded-howto",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(observedFetchCount, 1);
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { specialist_agent?: string } } | undefined)?.route?.specialist_agent),
+      "howto-specialist"
+    );
+    assert.equal(result.result.support_answer?.mode, "grounded");
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.equal(result.result.citations.some((item) => item.id === "chunk:har-capture-live"), true);
+    assert.match(result.result.answer, /network tab|export the har file|save all as har/i);
+    assert.notEqual(result.result.state, "TICKET_HANDOFF_RECOMMENDED");
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+    mutableEnv.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    globalThis.fetch = originalFetch;
   }
 });
 

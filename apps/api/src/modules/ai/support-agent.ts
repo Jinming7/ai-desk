@@ -33,6 +33,7 @@ import type {
 import { canonicalizeSupportPlannerArtifacts, resolveSupportExecutionPlan } from "./support-execution-plan.js";
 import { resolveSupportRuntimePolicy } from "./support-runtime-policy.js";
 import { filterSupportEvidenceByPolicy, getSupportEvidenceProfile, matchesSupportEvidencePolicy } from "./support-evidence-policy.js";
+import { fetchWithNodeCompat } from "../../utils/fetch-compat.js";
 import { resolveSearchReferenceEvidenceId, type SearchReference } from "./types.js";
 import { SearchOrchestrator } from "./search-orchestrator.js";
 import { isSupportMainRuntimeEnabled, resolveStageSpecificAgent } from "./agent-router.js";
@@ -2687,19 +2688,112 @@ function looksLikeProcedureNote(text: string): boolean {
   return /^(note|warning|important|prerequisite|requirement|risk|validate|validation)\b/i.test(text);
 }
 
-function loadProcedureSourceLines(reference: SearchReference): string[] {
-  const resolvedPath = resolveLocalDocsMirrorPath(reference);
-  const source = (() => {
-    if (!resolvedPath) return String(reference.snippet ?? "");
-    try {
-      return fs.readFileSync(resolvedPath, "utf8");
-    } catch {
-      return String(reference.snippet ?? "");
+const PUBLISHED_DOCS_EXPANSION_CACHE_TTL_MS = 10 * 60 * 1000;
+const publishedDocsExpansionCache = new Map<string, { expiresAt: number; source: string }>();
+
+function trimPublishedDocsExpansionCache(now = Date.now()): void {
+  for (const [key, value] of publishedDocsExpansionCache.entries()) {
+    if (value.expiresAt <= now) {
+      publishedDocsExpansionCache.delete(key);
     }
-  })();
+  }
+  while (publishedDocsExpansionCache.size > 32) {
+    const oldestKey = publishedDocsExpansionCache.keys().next().value;
+    if (!oldestKey) break;
+    publishedDocsExpansionCache.delete(oldestKey);
+  }
+}
+
+function decodeHtmlEntities(source: string): string {
+  return source
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#([0-9]+);/g, (_, value: string) => String.fromCodePoint(parseInt(value, 10)));
+}
+
+function extractPublishedDocsArticleText(source: string): string {
+  const scoped =
+    source.match(/<article\b[^>]*>([\s\S]*?)<\/article>/i)?.[1] ??
+    source.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1] ??
+    source;
+  const normalized = scoped
+    .replace(/<script[\s\S]*?<\/script>/gi, "\n")
+    .replace(/<style[\s\S]*?<\/style>/gi, "\n")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, "\n")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, "\n")
+    .replace(/<h([1-6])\b[^>]*>/gi, (_, level: string) => `\n${"#".repeat(Number(level))} `)
+    .replace(/<\/h[1-6]>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "\n- ")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<blockquote\b[^>]*>/gi, "\n> ")
+    .replace(/<\/blockquote>/gi, "\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<(?:p|div|section|article|main|ol|ul|table|thead|tbody|tr|td|th|pre|code)\b[^>]*>/gi, "\n")
+    .replace(/<\/(?:p|div|section|article|main|ol|ul|table|thead|tbody|tr|td|th|pre|code)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+  return decodeHtmlEntities(normalized)
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .filter((line) => !/^(skip to main content|on this page)$/i.test(line))
+    .join("\n");
+}
+
+async function loadPublishedDocsExpansionSource(reference: SearchReference): Promise<string | null> {
+  const sourceUrl = String(reference.sourceUrl ?? "").trim();
+  if (!sourceUrl.startsWith("https://docs.ones.com/")) return null;
+  if (reference.authority !== "canonical_visible") return null;
+  if (resolveLocalDocsMirrorPath(reference)) return null;
+
+  const now = Date.now();
+  trimPublishedDocsExpansionCache(now);
+  const cached = publishedDocsExpansionCache.get(sourceUrl);
+  if (cached && cached.expiresAt > now) {
+    return cached.source;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2500);
+  if (typeof (timeout as { unref?: () => void }).unref === "function") {
+    (timeout as { unref: () => void }).unref();
+  }
+
+  try {
+    const response = await fetchWithNodeCompat(sourceUrl, {
+      headers: {
+        accept: "text/html,application/xhtml+xml"
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) return null;
+
+    const raw = await response.text();
+    const extracted = /<[^>]+>/.test(raw) ? extractPublishedDocsArticleText(raw) : raw.trim();
+    const normalized = extracted.trim();
+    if (!normalized) return null;
+
+    publishedDocsExpansionCache.set(sourceUrl, {
+      expiresAt: now + PUBLISHED_DOCS_EXPANSION_CACHE_TTL_MS,
+      source: normalized.slice(0, 40_000)
+    });
+    trimPublishedDocsExpansionCache(now);
+    return normalized.slice(0, 40_000);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function scopeProcedureSourceLines(reference: SearchReference, source: string, allowHeadingScoping: boolean): string[] {
   const lines = source.replace(/^---\s*\n[\s\S]*?\n---\s*(?:\n|$)/, "").split(/\r?\n/);
   const headingLabel = shortHeadingLabel(reference.headingPath);
-  if (!resolvedPath || !headingLabel || headingLabel.toUpperCase() === "ROOT") return lines.slice(0, 260);
+  if (!allowHeadingScoping || !headingLabel || headingLabel.toUpperCase() === "ROOT") return lines.slice(0, 260);
 
   const normalizedHeading = stripProcedureMarkup(headingLabel).toLowerCase();
   let anchorIndex = -1;
@@ -2727,8 +2821,34 @@ function loadProcedureSourceLines(reference: SearchReference): string[] {
   return scoped;
 }
 
-function extractProcedureBlocks(reference: SearchReference): { steps: string[]; notes: string[] } {
-  const scopedLines = loadProcedureSourceLines(reference);
+function loadProcedureSourceLines(reference: SearchReference): string[] {
+  const resolvedPath = resolveLocalDocsMirrorPath(reference);
+  const source = (() => {
+    if (!resolvedPath) return String(reference.snippet ?? "");
+    try {
+      return fs.readFileSync(resolvedPath, "utf8");
+    } catch {
+      return String(reference.snippet ?? "");
+    }
+  })();
+  return scopeProcedureSourceLines(reference, source, Boolean(resolvedPath));
+}
+
+async function loadProcedureSourceLinesAsync(reference: SearchReference): Promise<string[]> {
+  const resolvedPath = resolveLocalDocsMirrorPath(reference);
+  if (resolvedPath) {
+    try {
+      return scopeProcedureSourceLines(reference, fs.readFileSync(resolvedPath, "utf8"), true);
+    } catch {
+      return scopeProcedureSourceLines(reference, String(reference.snippet ?? ""), false);
+    }
+  }
+
+  const expandedSource = await loadPublishedDocsExpansionSource(reference);
+  return scopeProcedureSourceLines(reference, expandedSource ?? String(reference.snippet ?? ""), Boolean(expandedSource));
+}
+
+function extractProcedureBlocksFromLines(reference: SearchReference, scopedLines: string[]): { steps: string[]; notes: string[] } {
   const steps: string[] = [];
   const notes: string[] = [];
   let sectionContext: "steps" | "notes" | null = null;
@@ -2814,13 +2934,69 @@ function extractProcedureBlocks(reference: SearchReference): { steps: string[]; 
   return { steps, notes };
 }
 
-function scoreProcedureReference(reference: SearchReference, blocks: { steps: string[]; notes: string[] }): number {
+function extractProcedureBlocks(reference: SearchReference): { steps: string[]; notes: string[] } {
+  return extractProcedureBlocksFromLines(reference, loadProcedureSourceLines(reference));
+}
+
+async function extractProcedureBlocksAsync(reference: SearchReference): Promise<{ steps: string[]; notes: string[] }> {
+  return extractProcedureBlocksFromLines(reference, await loadProcedureSourceLinesAsync(reference));
+}
+
+function scoreProcedureReference(input: {
+  reference: SearchReference;
+  blocks: { steps: string[]; notes: string[] };
+  query: string;
+  caseFrame: SupportCaseFrame;
+}): number {
+  const { reference, blocks } = input;
+  const profile = getReferenceSupportProfile(reference);
+  const focusTerms = collectFocusTerms(input.query, input.caseFrame);
+  const haystack = [
+    getReferenceSemanticText(reference),
+    reference.sourceUrl,
+    reference.path
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
   let score = Math.round(reference.score * 10);
   score += blocks.steps.length * 8;
   score += blocks.notes.length * 3;
   if (shortHeadingLabel(reference.headingPath)) score += 2;
   if (reference.sourceType === "local_docs") score += 2;
+  if (profile.evidenceKind === "procedure") score += 6;
+  else if (profile.evidenceKind === "troubleshooting") score += 4;
+  if (!isApiShapedQuery(input.query) && profile.productArea === "openapi") score -= 18;
+  for (const term of focusTerms) {
+    const normalized = term.toLowerCase();
+    if (!normalized) continue;
+    if (haystack.includes(normalized)) score += normalized.length >= 4 ? 6 : 3;
+  }
   return score;
+}
+
+function collectProcedureSemanticTerms(input: string): string[] {
+  const normalized = String(input ?? "").toLowerCase();
+  const ascii = [...normalized.matchAll(/[a-z0-9]{3,}/g)].map((match) => match[0]);
+  const cjk = [...normalized.matchAll(/[\u4e00-\u9fff]{2,}/g)].map((match) => match[0]);
+  return uniqueStrings([...ascii, ...cjk], 32);
+}
+
+function shouldPreserveRecoveredProcedureDraft(value: string, actionItems: string[]): boolean {
+  const normalizedValue = String(value ?? "").trim();
+  if (!normalizedValue) return false;
+  if (!actionItems.length) return true;
+
+  const actionTerms = new Set(actionItems.flatMap((item) => collectProcedureSemanticTerms(item)));
+  if (!actionTerms.size) return true;
+
+  let overlapCount = 0;
+  for (const term of collectProcedureSemanticTerms(normalizedValue)) {
+    if (!actionTerms.has(term)) continue;
+    overlapCount += 1;
+    if (overlapCount >= 2) return true;
+  }
+  return false;
 }
 
 type BehaviorEvidenceCandidate = {
@@ -2987,29 +3163,65 @@ function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
   };
 }
 
-function recoverEvidenceAnchoredHowToDraft(input: {
+async function recoverEvidenceAnchoredHowToDraft(input: {
   language: "zh" | "en";
   query: string;
   draft: SpecialistDraftAnswer;
   evidenceBundle: SupportEvidenceBundle;
   route: SupportQuestionRoute;
-}): SpecialistDraftAnswer | null {
+  caseFrame: SupportCaseFrame;
+}): Promise<SpecialistDraftAnswer | null> {
   if (input.route.specialist_agent !== "howto-specialist") return null;
   if (hasGroundedDraftClaimsInEvidence(input.draft, input.evidenceBundle)) return null;
 
   const ranked = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].filter(
     (reference) => reference.authority === "canonical_visible"
   );
-  const analyzed = ranked
+  const initialAnalyzed = ranked
     .map((reference) => {
       const blocks = extractProcedureBlocks(reference);
       return {
         reference,
         blocks,
-        score: scoreProcedureReference(reference, blocks)
+        score: scoreProcedureReference({
+          reference,
+          blocks,
+          query: input.query,
+          caseFrame: input.caseFrame
+        })
       };
     })
     .sort((left, right) => right.score - left.score);
+  const expansionCandidate =
+    initialAnalyzed.find(
+      (item) =>
+        item.blocks.steps.length === 0 &&
+        item.reference.authority === "canonical_visible" &&
+        String(item.reference.sourceUrl ?? "").startsWith("https://docs.ones.com/") &&
+        !resolveLocalDocsMirrorPath(item.reference)
+    ) ?? null;
+  const analyzed = expansionCandidate
+    ? (
+        await Promise.all(
+          initialAnalyzed.map(async (item) => {
+            if (resolveSearchReferenceEvidenceId(item.reference) !== resolveSearchReferenceEvidenceId(expansionCandidate.reference)) {
+              return item;
+            }
+            const blocks = await extractProcedureBlocksAsync(item.reference);
+            return {
+              reference: item.reference,
+              blocks,
+              score: scoreProcedureReference({
+                reference: item.reference,
+                blocks,
+                query: input.query,
+                caseFrame: input.caseFrame
+              })
+            };
+          })
+        )
+      ).sort((left, right) => right.score - left.score)
+    : initialAnalyzed;
   const actionCandidate = analyzed.find((item) => item.blocks.steps.length > 0) ?? analyzed[0];
   if (!actionCandidate) return null;
   const noteCandidate =
@@ -3044,10 +3256,14 @@ function recoverEvidenceAnchoredHowToDraft(input: {
   ]
     .filter(Boolean)
     .join(" ");
+  const directAnswerEvidence = [...howToSteps, ...supportNotes];
   const preferredDraftDirectAnswer = (() => {
     const value = String(input.draft.direct_answer ?? "").trim();
     if (!value) return "";
     if (/documented api details first|exact api answer first|critical detail before/i.test(value.toLowerCase())) {
+      return "";
+    }
+    if (!shouldPreserveRecoveredProcedureDraft(value, directAnswerEvidence)) {
       return "";
     }
     return value;
@@ -4647,17 +4863,44 @@ async function runSupervisorDomainSupportSearch(input: {
       evidenceBundle,
       missingInfo: caseFrame.missing_critical_info
     });
+  const recoveredApiDraft = recoverEvidenceAnchoredApiDraft({
+    language: input.language,
+    query: input.query,
+    draft: rawDraftSupportAnswer,
+    evidenceBundle,
+    route,
+    caseFrame
+  });
+  const recoveredHowToDraft =
+    recoveredApiDraft ??
+    (await recoverEvidenceAnchoredHowToDraft({
+      language: input.language,
+      query: input.query,
+      draft: rawDraftSupportAnswer,
+      evidenceBundle,
+      route,
+      caseFrame
+    }));
   const draftSupportAnswer =
-    route.specialist_agent === "api-specialist"
-      ? recoverEvidenceAnchoredApiDraft({
-          language: input.language,
-          query: input.query,
-          draft: rawDraftSupportAnswer,
-          evidenceBundle,
-          route,
-          caseFrame
-        }) ?? rawDraftSupportAnswer
-      : rawDraftSupportAnswer;
+    recoveredApiDraft ??
+    recoveredHowToDraft ??
+    recoverEvidenceAnchoredBehaviorCapabilityDraft({
+      language: input.language,
+      query: input.query,
+      draft: rawDraftSupportAnswer,
+      evidenceBundle,
+      route,
+      caseFrame
+    }) ??
+    recoverEvidenceAnchoredDeploymentBehaviorDraft({
+      language: input.language,
+      query: input.query,
+      draft: rawDraftSupportAnswer,
+      evidenceBundle,
+      route,
+      caseFrame
+    }) ??
+    rawDraftSupportAnswer;
 
   const localVerificationStartedAt = performance.now();
   const writerBoundVerification = sanitizeVerification({
@@ -5778,22 +6021,27 @@ export async function runSupportSearchAgent(input: {
       evidenceBundle,
       missingInfo: caseFrame.missing_critical_info
     });
-  const draftSupportAnswer =
-    recoverEvidenceAnchoredApiDraft({
+  const recoveredApiDraft = recoverEvidenceAnchoredApiDraft({
+    language: input.language,
+    query: input.query,
+    draft: rawDraftSupportAnswer,
+    evidenceBundle,
+    route,
+    caseFrame
+  });
+  const recoveredHowToDraft =
+    recoveredApiDraft ??
+    (await recoverEvidenceAnchoredHowToDraft({
       language: input.language,
       query: input.query,
       draft: rawDraftSupportAnswer,
       evidenceBundle,
       route,
       caseFrame
-    }) ??
-    recoverEvidenceAnchoredHowToDraft({
-      language: input.language,
-      query: input.query,
-      draft: rawDraftSupportAnswer,
-      evidenceBundle,
-      route
-    }) ??
+    }));
+  const draftSupportAnswer =
+    recoveredApiDraft ??
+    recoveredHowToDraft ??
     recoverEvidenceAnchoredBehaviorCapabilityDraft({
       language: input.language,
       query: input.query,
