@@ -5196,6 +5196,202 @@ test("runSupportSearchAgent supervisor-domain runtime keeps docs troubleshooting
   }
 });
 
+test("runSupportSearchAgent supervisor-domain runtime canonicalizes freeform docs troubleshooting taxonomy before evidence filtering", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDocsDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("answer composer must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async () => ({
+    primaryDomain: "docs",
+    route: {
+      question_type: "troubleshooting",
+      user_goal: "learn how to capture a HAR file for troubleshooting",
+      answer_contract:
+        "Provide concise step-by-step instructions for generating a HAR file in a browser for support troubleshooting, including where to open DevTools, how to record/export the HAR, and basic privacy caution before sharing.",
+      specialist_agent: "troubleshooting-specialist",
+      routing_confidence: 0.98,
+      primary_domain: "docs"
+    },
+    caseFrame: {
+      goal: "Get instructions for capturing a HAR file to support troubleshooting.",
+      symptom: "User asks how to obtain a HAR file and likely needs it for diagnosis.",
+      object: "HAR file (HTTP Archive) captured from browser network activity",
+      action_type: "collect_diagnostic_artifact",
+      deployment_model: "unknown",
+      product_area: "troubleshooting/support diagnostics",
+      constraints: [
+        "Must not answer directly here; only frame for retrieval.",
+        "Need published-doc guidance, ideally browser-based and support-oriented."
+      ],
+      missing_critical_info: [],
+      retrieval_queries: [
+        "HAR file capture troubleshooting how to export browser network log for support",
+        "collect HAR file Chrome DevTools export HTTP Archive troubleshooting"
+      ],
+      question_type: "troubleshooting",
+      specialist_agent: "troubleshooting-specialist",
+      answer_contract:
+        "Provide concise step-by-step instructions for generating a HAR file in a browser for support troubleshooting, including where to open DevTools, how to record/export the HAR, and basic privacy caution before sharing.",
+      routing_confidence: 0.98,
+      primary_domain: "docs",
+      required_doc_kinds: ["troubleshooting guide", "support diagnostic artifact guide", "browser/network debugging instructions"]
+    },
+    retrievalQueries: [
+      "HAR file capture troubleshooting how to export browser network log for support",
+      "collect HAR file Chrome DevTools export HTTP Archive troubleshooting",
+      "how to get a har file for troubule shooting?"
+    ]
+  });
+  adapter.writeDocsDomainAnswer = async (input) => ({
+    question_type: "troubleshooting",
+    render_variant: "troubleshooting",
+    direct_answer:
+      input.evidenceBundle.primary.length > 0
+        ? "Open your browser DevTools, reproduce the issue in the Network tab, then export the HAR before sharing it with support."
+        : "I’m sorry, but there is still not enough verified evidence for a reliable final answer.",
+    claims:
+      input.evidenceBundle.primary.length > 0
+        ? [
+            {
+              text: "The HAR capture guide says to record the issue in the browser Network tab and export the HAR file before sending it to support.",
+              kind: "verified_fact",
+              evidence_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)).slice(0, 1),
+              authority: "canonical"
+            }
+          ]
+        : [],
+    next_actions: ["Share the exported HAR with support after checking whether sensitive data should be redacted."],
+    unknowns: input.evidenceBundle.primary.length > 0 ? [] : ["No published HAR capture guidance found."],
+    escalation_needed: input.evidenceBundle.primary.length === 0,
+    most_likely_causes: [],
+    recommended_checks: ["Open DevTools, use the Network tab, reproduce the issue, then export the HAR file."],
+    required_followup_info: [],
+    when_to_handoff: "Escalate only if the HAR export still cannot be generated after following the documented browser steps."
+  });
+
+  const validationReference: SearchReference = {
+    documentId: "doc:har-capture",
+    evidenceId: "chunk:har-capture",
+    title: "Capture a HAR file for troubleshooting",
+    snippet:
+      "Open DevTools, switch to the Network tab, reproduce the issue, then use Save all as HAR with content before sharing it with support.",
+    sourceUrl: "https://docs.ones.com/support/har-capture",
+    path: "docs/support/har-capture.mdx",
+    headingPath: "Capture steps",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.97,
+    retrievedAt: "2026-04-13T03:10:00.000Z",
+    supportMetadata: {
+      product_area: "general",
+      deployment_model: "shared",
+      evidence_kind: "procedure",
+      doc_kind: "product_guide"
+    }
+  };
+
+  let observedCaseFrame: SupportCaseFrame | undefined;
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { caseFrame?: SupportCaseFrame; query?: string; queries?: string[] }) {
+      observedCaseFrame = input.caseFrame;
+      const normalizedDocKinds = [...(input.caseFrame?.required_doc_kinds ?? [])].sort();
+      const canonicalized =
+        input.caseFrame?.product_area === "general" &&
+        JSON.stringify(normalizedDocKinds) === JSON.stringify(["product_guide", "troubleshooting"]);
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: canonicalized ? 0.97 : 0,
+        references: canonicalized ? [validationReference] : [],
+        retrievalStatus: canonicalized ? ("grounded" as const) : ("no_results" as const),
+        unresolvedReasonCode: canonicalized ? null : ("NO_MATCHING_KB" as const),
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "how to get a har file for troubule shooting?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-docs-har-taxonomy",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(observedCaseFrame?.product_area, "general");
+    assert.deepEqual([...(observedCaseFrame?.required_doc_kinds ?? [])].sort(), ["product_guide", "troubleshooting"]);
+    assert.equal(result.result.retrieval_status, "grounded");
+    assert.deepEqual(result.result.citations.map((item) => item.id), ["chunk:har-capture"]);
+    assert.match(result.result.answer, /network tab/i);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
 test("runSupportSearchAgent supervisor-domain runtime keeps deployment architecture answers on the behavior contract", async () => {
   const mutableEnv = env as {
     FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;

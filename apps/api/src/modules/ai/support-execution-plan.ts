@@ -232,7 +232,7 @@ function canonicalizeProductArea(input: {
   if (/(openapi|api|接口|scope|oauth|token)/.test(semanticText)) {
     return "openapi";
   }
-  return input.caseFrame.product_area;
+  return explicit && explicit !== "general" && explicit !== "unknown" ? "general" : input.caseFrame.product_area;
 }
 
 function canonicalizeRequiredDocKinds(values: string[], canonicalProductArea: string): string[] {

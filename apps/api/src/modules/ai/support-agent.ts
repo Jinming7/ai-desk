@@ -4370,18 +4370,16 @@ async function runSupervisorDomainSupportSearch(input: {
       )
     }
   });
-  const primaryDomain = inferSupportDomainFromRouteAndCaseFrame(stabilized.route, stabilized.caseFrame);
-  const route: SupportQuestionRoute = {
-    ...stabilized.route,
-    primary_domain: primaryDomain
-  };
-  const caseFrame: SupportCaseFrame = {
+  const initialCaseFrame: SupportCaseFrame = {
     ...stabilized.caseFrame,
-    primary_domain: primaryDomain,
     retrieval_queries: uniqueStrings(
       [...dispatch.retrievalQueries, ...stabilized.caseFrame.retrieval_queries, input.query],
       8
     )
+  };
+  const initialRoute: SupportQuestionRoute = {
+    ...stabilized.route,
+    primary_domain: inferSupportDomainFromRouteAndCaseFrame(stabilized.route, initialCaseFrame)
   };
   const stageBudget = {
     retrieval_rounds: 1,
@@ -4389,17 +4387,41 @@ async function runSupervisorDomainSupportSearch(input: {
     stop_after_grounded_evidence: false,
     specialist_budget: 1
   };
-  const evidencePlan: SupportEvidencePlan = {
-    query_plan: caseFrame.query_plan ?? {
-      concept_queries: caseFrame.retrieval_queries.slice(0, 3),
-      object_queries: [caseFrame.object].filter(Boolean),
-      behavior_queries: [caseFrame.action_type].filter(Boolean)
+  const initialEvidencePlan: SupportEvidencePlan = {
+    query_plan: initialCaseFrame.query_plan ?? {
+      concept_queries: initialCaseFrame.retrieval_queries.slice(0, 3),
+      object_queries: [initialCaseFrame.object].filter(Boolean),
+      behavior_queries: [initialCaseFrame.action_type].filter(Boolean)
     },
-    evidence_priority: caseFrame.required_doc_kinds ?? [],
-    required_doc_kinds: caseFrame.required_doc_kinds ?? [],
+    evidence_priority: initialCaseFrame.required_doc_kinds ?? [],
+    required_doc_kinds: initialCaseFrame.required_doc_kinds ?? [],
     retrieval_rounds: 1,
     allow_refinement: false,
     stop_after_grounded_evidence: false
+  };
+  const canonicalized = canonicalizeSupportPlannerArtifacts({
+    query: input.query,
+    route: initialRoute,
+    caseFrame: initialCaseFrame,
+    evidencePlan: initialEvidencePlan
+  });
+  const primaryDomain = inferSupportDomainFromRouteAndCaseFrame(initialRoute, canonicalized.caseFrame);
+  const route: SupportQuestionRoute = {
+    ...initialRoute,
+    primary_domain: primaryDomain
+  };
+  const caseFrame: SupportCaseFrame = {
+    ...canonicalized.caseFrame,
+    primary_domain: primaryDomain,
+    retrieval_queries: uniqueStrings(
+      [...dispatch.retrievalQueries, ...canonicalized.caseFrame.retrieval_queries, input.query],
+      8
+    )
+  };
+  const evidencePlan: SupportEvidencePlan = {
+    ...canonicalized.evidencePlan,
+    evidence_priority: canonicalized.evidencePlan.required_doc_kinds ?? [],
+    required_doc_kinds: canonicalized.evidencePlan.required_doc_kinds ?? []
   };
 
   await reportStageProgress("retrieval_base");
