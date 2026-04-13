@@ -56,7 +56,7 @@ import * as supportUxService from "./modules/support-ux/service.js";
 import * as githubKbService from "./modules/github-kb/service.js";
 import * as kbCleanupService from "./modules/github-kb/cleanup/service.js";
 import * as kbReleaseService from "./modules/github-kb/release/service.js";
-import { getAiTopology } from "./modules/ai/agent-router.js";
+import { getAiRuntimeReadinessProfile, getAiTopology } from "./modules/ai/agent-router.js";
 import { preloadLocalDocsIndex } from "./modules/ai/local-docs.js";
 import { getAiCapabilities } from "./modules/ai/multimodal.js";
 import { streamSearchModeJob } from "./modules/ai/support-search-stream.js";
@@ -85,6 +85,14 @@ function currentAiTopology() {
   return getAiTopology();
 }
 
+function currentAiRuntimeReadiness() {
+  return getAiRuntimeReadinessProfile({
+    supervisorDomainAvailable: Boolean(aiAdapter.planSupportDispatch),
+    supportMainAvailable: Boolean(aiAdapter.planSupportMainAgent) && Boolean(aiAdapter.draftSupportMainAgent),
+    customerAnswerComposerAvailable: true
+  });
+}
+
 function hasOpenClawGatewayAuth(): boolean {
   return hasOpenClawGatewayAuthConfigured();
 }
@@ -95,11 +103,12 @@ export async function ensureAiRuntimeReady() {
     throw new Error("OpenClaw gateway auth is not configured");
   }
   const topology = currentAiTopology();
+  const readiness = currentAiRuntimeReadiness();
   if (!topology.multiAgentReady) {
     throw new Error(`AI topology conflicts: ${topology.conflicts.map((item) => item.detail).join("; ")}`);
   }
   const health = await aiAdapter.healthCheck({
-    agentIds: topology.configuredAgents
+    agentIds: readiness.requiredAgents
   });
   if (!health.ok || (health.unreachableAgents?.length ?? 0) > 0) {
     const detail =
@@ -189,8 +198,9 @@ app.get(
   "/api/v1/health",
   asyncHandler(async (_req, res) => {
     const topology = currentAiTopology();
+    const readiness = currentAiRuntimeReadiness();
     const health = await aiAdapter.healthCheck({
-      agentIds: topology.configuredAgents
+      agentIds: readiness.requiredAgents
     });
     res.json({
       ok: topology.multiAgentReady && health.ok,
@@ -200,6 +210,8 @@ app.get(
       topologyHash: topology.topologyHash,
       aiTopology: topology,
       configuredAgents: topology.configuredAgents,
+      healthCheckedAgents: readiness.requiredAgents,
+      optionalAgents: readiness.optionalAgents,
       reachableAgents: health.reachableAgents ?? [],
       unreachableAgents: health.unreachableAgents ?? [],
       conflicts: topology.conflicts
@@ -215,8 +227,9 @@ app.get(
   "/api/v1/integrations/openclaw/health",
   asyncHandler(async (_req, res) => {
     const topology = currentAiTopology();
+    const readiness = currentAiRuntimeReadiness();
     const health = await aiAdapter.healthCheck({
-      agentIds: topology.configuredAgents
+      agentIds: readiness.requiredAgents
     });
     const ok = topology.multiAgentReady && health.ok;
     res.status(ok ? 200 : 503).json({
@@ -224,6 +237,8 @@ app.get(
       multiAgentReady: ok,
       topologyHash: topology.topologyHash,
       configuredAgents: topology.configuredAgents,
+      healthCheckedAgents: readiness.requiredAgents,
+      optionalAgents: readiness.optionalAgents,
       conflicts: topology.conflicts
     });
   })

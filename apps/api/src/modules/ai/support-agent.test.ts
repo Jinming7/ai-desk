@@ -41,7 +41,7 @@ import {
   type SupportVerificationResult,
   type TriageSupportInsight
 } from "./types.js";
-import { getAiTopology, resolveStageSpecificAgent } from "./agent-router.js";
+import { getAiRuntimeReadinessProfile, getAiTopology, resolveStageSpecificAgent } from "./agent-router.js";
 
 const DEFAULT_TEST_LOCAL_DOCS_PATH = env.LOCAL_DOCS_COM_PATH;
 
@@ -2939,6 +2939,30 @@ test("AI topology only exposes support-main when single-agent runtime is enabled
   }
 });
 
+test("AI runtime readiness for supervisor-domain checks only active planner and specialist agents", () => {
+  const topology = getAiTopology();
+  const executionAgentId = topology.searchStages.find((stage) => stage.stage === "execution")?.agentId ?? "";
+  const readiness = getAiRuntimeReadinessProfile({
+    supervisorDomainAvailable: true,
+    supportMainAvailable: true,
+    customerAnswerComposerAvailable: true
+  });
+
+  assert.equal(readiness.requiredAgents.includes("search-retrieval"), true);
+  assert.equal(readiness.requiredAgents.includes("search-clarify"), true);
+  assert.equal(readiness.requiredAgents.includes(executionAgentId), true);
+  assert.equal(readiness.requiredAgents.includes("support-planner"), true);
+  assert.equal(readiness.requiredAgents.includes("support-api-specialist"), true);
+  assert.equal(readiness.requiredAgents.includes("support-howto-specialist"), true);
+  assert.equal(readiness.requiredAgents.includes("support-behavior-specialist"), true);
+  assert.equal(readiness.requiredAgents.includes("support-troubleshooting-specialist"), true);
+  assert.equal(readiness.requiredAgents.includes("support-router"), false);
+  assert.equal(readiness.requiredAgents.includes("support-evidence-planner"), false);
+  assert.equal(readiness.requiredAgents.includes("support-evidence-judge"), false);
+  assert.equal(readiness.requiredAgents.includes("support-answer-composer"), false);
+  assert.equal(readiness.requiredAgents.includes("support-main"), false);
+});
+
 test("retired support-citation-binder still resolves to the stage-level fallback when explicitly addressed", () => {
   const binding = resolveStageSpecificAgent("support-citation-binder");
 
@@ -5386,6 +5410,360 @@ test("runSupportSearchAgent supervisor-domain runtime canonicalizes freeform doc
     assert.equal(result.result.retrieval_status, "grounded");
     assert.deepEqual(result.result.citations.map((item) => item.id), ["chunk:har-capture"]);
     assert.match(result.result.answer, /network tab/i);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
+test("runSupportSearchAgent supervisor-domain runtime preserves coherent deployment dispatch without forcing an API route from lexical overlap", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "deployment",
+    route: {
+      question_type: "how_to_product",
+      user_goal: input.query,
+      answer_contract: "Give the private deployment recovery steps first.",
+      specialist_agent: "howto-specialist",
+      routing_confidence: 0.94,
+      primary_domain: "deployment"
+    },
+    caseFrame: {
+      goal: "Recover administrator access in private deployment.",
+      symptom: "The administrator password needs to be reset when SMTP-based token delivery is unavailable.",
+      object: "administrator password reset",
+      action_type: "how_to",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["private deployment administrator password reset"],
+      question_type: "how_to_product",
+      specialist_agent: "howto-specialist",
+      answer_contract: "Give the private deployment recovery steps first.",
+      routing_confidence: 0.94,
+      primary_domain: "deployment",
+      required_doc_kinds: ["deployment_runbook", "troubleshooting"]
+    },
+    retrievalQueries: ["private deployment administrator password reset"]
+  });
+  adapter.writeDeploymentDomainAnswer = async (input) => ({
+    question_type: "how_to_product",
+    render_variant: "how_to",
+    direct_answer: "Use the private deployment password-reset procedure directly. Do not treat this as an OAuth API call.",
+    claims: [
+      {
+        text: "The private deployment password-reset guide documents a direct administrator recovery procedure.",
+        kind: "verified_fact",
+        evidence_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)).slice(0, 1),
+        authority: "canonical"
+      }
+    ],
+    next_actions: [
+      "Run the documented private deployment password-reset procedure.",
+      "Verify administrator access after the reset completes."
+    ],
+    unknowns: [],
+    escalation_needed: false,
+    steps: [
+      "Run the documented private deployment password-reset procedure.",
+      "Verify administrator access after the reset completes."
+    ],
+    prerequisites: ["You need operator access to the private deployment environment."],
+    limits_or_notes: ["Use the deployment recovery flow when SMTP delivery is unavailable."]
+  });
+
+  const deploymentReference: SearchReference = {
+    documentId: "doc:private-deployment-admin-reset",
+    evidenceId: "chunk:private-deployment-admin-reset",
+    title: "Reset administrator password in private deployment",
+    snippet:
+      "When SMTP-based delivery is unavailable, use the private deployment recovery procedure to reset the administrator password directly in the deployment environment.",
+    sourceUrl: "https://docs.ones.com/private-deployment/reset-administrator-password",
+    path: "docs/private-deployment/reset-administrator-password.mdx",
+    headingPath: "Recovery procedure",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.97,
+    retrievedAt: "2026-04-13T09:10:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.97,
+        references: [deploymentReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "How do I reset the administrator password when OAuth token delivery is unavailable in private deployment?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment-admin-reset"
+    });
+
+    assert.equal((result.result.internal_diagnostics as { runtime_mode?: string } | undefined)?.runtime_mode, "supervisor_domain");
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { primary_domain?: string; specialist_agent?: string } } | undefined)?.route
+        ?.primary_domain),
+      "deployment"
+    );
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { primary_domain?: string; specialist_agent?: string } } | undefined)?.route
+        ?.specialist_agent),
+      "howto-specialist"
+    );
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.match(result.result.answer, /private deployment password-reset procedure/i);
+    assert.equal(result.result.references[0]?.path, "docs/private-deployment/reset-administrator-password.mdx");
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
+test("runSupportSearchAgent supervisor-domain runtime uses the customer answer composer for grounded answers when budget is available", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  let composed = false;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDocsDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "docs",
+    route: {
+      question_type: "how_to_product",
+      user_goal: input.query,
+      answer_contract: "Give the direct troubleshooting artifact collection steps first.",
+      specialist_agent: "howto-specialist",
+      routing_confidence: 0.93,
+      primary_domain: "docs"
+    },
+    caseFrame: {
+      goal: "Explain how to collect a HAR file.",
+      symptom: "The customer needs a HAR file for troubleshooting.",
+      object: "HAR file collection",
+      action_type: "how_to",
+      deployment_model: "shared",
+      product_area: "general",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["HAR file troubleshooting collection"],
+      question_type: "how_to_product",
+      specialist_agent: "howto-specialist",
+      answer_contract: "Give the direct troubleshooting artifact collection steps first.",
+      routing_confidence: 0.93,
+      primary_domain: "docs",
+      required_doc_kinds: ["product_guide", "troubleshooting"]
+    },
+    retrievalQueries: ["HAR file troubleshooting collection"]
+  });
+  adapter.writeDocsDomainAnswer = async (input) => ({
+    question_type: "how_to_product",
+    render_variant: "how_to",
+    direct_answer: "You can collect a HAR file directly from the browser network panel.",
+    claims: [
+      {
+        text: "The troubleshooting guide documents how to collect a HAR file from the browser network panel.",
+        kind: "verified_fact",
+        evidence_ids: input.evidenceBundle.primary.map((item) => resolveSearchReferenceEvidenceId(item)).slice(0, 1),
+        authority: "canonical"
+      }
+    ],
+    next_actions: ["Open DevTools and keep the Network tab recording.", "Export the HAR file after reproducing the issue."],
+    unknowns: [],
+    escalation_needed: false,
+    steps: ["Open DevTools and keep the Network tab recording.", "Export the HAR file after reproducing the issue."]
+  });
+  adapter.composeCustomerAnswer = async (input) => {
+    composed = true;
+    return {
+      question_type: input.route.question_type,
+      render_variant: "how_to",
+      direct_answer: "Collect the HAR file from the browser network panel while reproducing the issue.",
+      sections: [
+        {
+          kind: "bullet_list",
+          title: "Steps",
+          items: ["Open DevTools and start recording in Network.", "Reproduce the issue and export the HAR file."]
+        }
+      ],
+      why: ["The troubleshooting guide explicitly documents HAR collection from the browser network panel."],
+      what_to_do_now: ["Open DevTools and start recording in Network.", "Reproduce the issue and export the HAR file."],
+      still_need_to_confirm: []
+    };
+  };
+
+  const harReference: SearchReference = {
+    documentId: "doc:har-file-troubleshooting",
+    evidenceId: "chunk:har-file-troubleshooting",
+    title: "Collect a HAR file for troubleshooting",
+    snippet: "Open the browser network panel, reproduce the problem, and export the HAR file for support analysis.",
+    sourceUrl: "https://docs.ones.com/support/collect-har-file",
+    path: "docs/support/collect-har-file.mdx",
+    headingPath: "Browser network capture",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.99,
+    retrievedAt: "2026-04-13T09:30:00.000Z"
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.99,
+        references: [harReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "How do I collect a HAR file for troubleshooting?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-answer-composer",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(composed, true);
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.match(result.result.answer, /Collect the HAR file from the browser network panel/i);
+    assert.ok(
+      result.result.support_answer?.sections.some(
+        (section) => section.kind === "bullet_list" && section.title === "Steps"
+      )
+    );
   } finally {
     mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
     mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;

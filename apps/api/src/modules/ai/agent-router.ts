@@ -67,6 +67,11 @@ export type AiTopologySnapshot = {
   topologyHash: string;
 };
 
+export type AiRuntimeReadinessProfile = {
+  requiredAgents: string[];
+  optionalAgents: string[];
+};
+
 const DEFAULT_SEARCH_AGENT_IDS = {
   retrieval: "search-retrieval",
   clarify: "search-clarify",
@@ -470,5 +475,71 @@ export function getAiTopology(): AiTopologySnapshot {
     conflicts,
     multiAgentReady: conflicts.length === 0,
     topologyHash: buildTopologyHash(searchStages, supportStages)
+  };
+}
+
+function uniqueAgentIds(bindings: Array<{ agentId: string }>): string[] {
+  return [...new Set(bindings.map((binding) => binding.agentId.trim()).filter(Boolean))];
+}
+
+export function getAiRuntimeReadinessProfile(input?: {
+  supervisorDomainAvailable?: boolean;
+  supportMainAvailable?: boolean;
+  customerAnswerComposerAvailable?: boolean;
+}): AiRuntimeReadinessProfile {
+  const searchStages = [
+    resolveSearchStageBinding("retrieval"),
+    resolveSearchStageBinding("clarify"),
+    resolveSearchStageBinding("execution")
+  ];
+  const supervisorBindings = [
+    resolveStageBinding("planner"),
+    resolveStageBinding("api-specialist"),
+    resolveStageBinding("howto-specialist"),
+    resolveStageBinding("behavior-specialist"),
+    resolveStageBinding("troubleshooting-specialist")
+  ];
+  const supportMainBindings = [resolveStageBinding("support-main")];
+  const legacyBindings = [
+    resolveStageBinding("router"),
+    resolveStageBinding("evidence-planner"),
+    resolveStageBinding("planner"),
+    resolveStageBinding("api-specialist"),
+    resolveStageBinding("howto-specialist"),
+    resolveStageBinding("behavior-specialist"),
+    resolveStageBinding("troubleshooting-specialist"),
+    resolveStageBinding("evidence-judge")
+  ];
+
+  const requiredSupportBindings = input?.supervisorDomainAvailable
+    ? supervisorBindings
+    : input?.supportMainAvailable
+    ? supportMainBindings
+    : legacyBindings;
+
+  const optionalSupportBindings = input?.supervisorDomainAvailable
+    ? [
+        ...(input.supportMainAvailable ? supportMainBindings : []),
+        resolveStageBinding("router"),
+        resolveStageBinding("evidence-planner"),
+        resolveStageBinding("evidence-judge"),
+        ...(input.customerAnswerComposerAvailable ? [resolveStageBinding("answer-composer")] : [])
+      ]
+    : input?.supportMainAvailable
+    ? [
+        resolveStageBinding("planner"),
+        resolveStageBinding("api-specialist"),
+        resolveStageBinding("howto-specialist"),
+        resolveStageBinding("behavior-specialist"),
+        resolveStageBinding("troubleshooting-specialist"),
+        ...(input.customerAnswerComposerAvailable ? [resolveStageBinding("answer-composer")] : [])
+      ]
+    : input?.customerAnswerComposerAvailable
+    ? [resolveStageBinding("answer-composer")]
+    : [];
+
+  return {
+    requiredAgents: uniqueAgentIds([...searchStages, ...requiredSupportBindings]),
+    optionalAgents: uniqueAgentIds(optionalSupportBindings)
   };
 }

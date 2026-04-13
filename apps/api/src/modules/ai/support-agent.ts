@@ -286,6 +286,60 @@ function inferSupportDomainFromRouteAndCaseFrame(route: SupportQuestionRoute, ca
   return "docs";
 }
 
+function reconcileSupervisorRouteWithEvidence(input: {
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  references: SearchReference[];
+}): { route: SupportQuestionRoute; caseFrame: SupportCaseFrame } {
+  if (input.route.specialist_agent === "api-specialist") {
+    return input;
+  }
+
+  const visibleReferences = input.references
+    .filter((reference) => reference.authority !== "disabled_for_user")
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 3);
+
+  const apiEvidenceCount = visibleReferences.filter((reference) => {
+    const profile = getSupportEvidenceProfile(reference);
+    return (
+      profile.productArea === "openapi" ||
+      profile.docKind === "openapi/api" ||
+      profile.evidenceKind === "api_operation"
+    );
+  }).length;
+
+  if (apiEvidenceCount === 0) {
+    return input;
+  }
+
+  const route: SupportQuestionRoute = {
+    ...input.route,
+    question_type:
+      input.route.question_type === "api_scope_auth" || input.route.question_type === "api_field_lookup"
+        ? input.route.question_type
+        : "api_endpoint_lookup",
+    specialist_agent: "api-specialist",
+    answer_contract: "Give the exact API answer first.",
+    primary_domain: "openapi"
+  };
+
+  const caseFrame: SupportCaseFrame = {
+    ...input.caseFrame,
+    question_type: route.question_type,
+    specialist_agent: route.specialist_agent,
+    answer_contract: route.answer_contract,
+    product_area: "openapi",
+    primary_domain: "openapi",
+    required_doc_kinds: uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "openapi/api"], 6)
+  };
+
+  return {
+    route,
+    caseFrame
+  };
+}
+
 function hasCjkText(input: string): boolean {
   return /[\u3400-\u9FBF]/.test(input);
 }
@@ -4359,27 +4413,23 @@ async function runSupervisorDomainSupportSearch(input: {
   markStageCompleted("planner");
 
   const dispatch = dispatchResult.value;
-  const stabilized = stabilizeSupportRouteAndCaseFrame({
-    query: input.query,
-    route: dispatch.route,
-    caseFrame: {
-      ...dispatch.caseFrame,
-      retrieval_queries: uniqueStrings(
-        [...dispatch.retrievalQueries, ...dispatch.caseFrame.retrieval_queries, input.query],
-        8
-      )
-    }
-  });
+  const normalizedRoute = normalizeSupportQuestionRoute(dispatch.route);
   const initialCaseFrame: SupportCaseFrame = {
-    ...stabilized.caseFrame,
+    ...dispatch.caseFrame,
+    question_type: normalizedRoute.question_type,
+    specialist_agent: normalizedRoute.specialist_agent,
+    answer_contract: normalizedRoute.answer_contract,
+    routing_confidence: normalizedRoute.routing_confidence,
     retrieval_queries: uniqueStrings(
-      [...dispatch.retrievalQueries, ...stabilized.caseFrame.retrieval_queries, input.query],
+      [...dispatch.retrievalQueries, ...dispatch.caseFrame.retrieval_queries, input.query],
       8
     )
   };
   const initialRoute: SupportQuestionRoute = {
-    ...stabilized.route,
-    primary_domain: inferSupportDomainFromRouteAndCaseFrame(stabilized.route, initialCaseFrame)
+    ...normalizedRoute,
+    primary_domain:
+      dispatch.primaryDomain ??
+      inferSupportDomainFromRouteAndCaseFrame(normalizedRoute, initialCaseFrame)
   };
   const stageBudget = {
     retrieval_rounds: 1,
@@ -4405,12 +4455,12 @@ async function runSupervisorDomainSupportSearch(input: {
     caseFrame: initialCaseFrame,
     evidencePlan: initialEvidencePlan
   });
-  const primaryDomain = inferSupportDomainFromRouteAndCaseFrame(initialRoute, canonicalized.caseFrame);
-  const route: SupportQuestionRoute = {
+  let primaryDomain = inferSupportDomainFromRouteAndCaseFrame(initialRoute, canonicalized.caseFrame);
+  let route: SupportQuestionRoute = {
     ...initialRoute,
     primary_domain: primaryDomain
   };
-  const caseFrame: SupportCaseFrame = {
+  let caseFrame: SupportCaseFrame = {
     ...canonicalized.caseFrame,
     primary_domain: primaryDomain,
     retrieval_queries: uniqueStrings(
@@ -4482,6 +4532,14 @@ async function runSupervisorDomainSupportSearch(input: {
     query: input.query,
     selection: evidenceSelection.value
   });
+  const evidenceAligned = reconcileSupervisorRouteWithEvidence({
+    route,
+    caseFrame,
+    references: [...evidenceBundle.primary, ...evidenceBundle.supplemental]
+  });
+  route = evidenceAligned.route;
+  caseFrame = evidenceAligned.caseFrame;
+  primaryDomain = route.primary_domain ?? inferSupportDomainFromRouteAndCaseFrame(route, caseFrame);
 
   const specialistRuntime = withStageRuntime(
     buildDeliveryAwareStageRuntime(
@@ -4532,38 +4590,16 @@ async function runSupervisorDomainSupportSearch(input: {
       missingInfo: caseFrame.missing_critical_info
     });
   const draftSupportAnswer =
-    recoverEvidenceAnchoredApiDraft({
-      language: input.language,
-      query: input.query,
-      draft: rawDraftSupportAnswer,
-      evidenceBundle,
-      route,
-      caseFrame
-    }) ??
-    recoverEvidenceAnchoredHowToDraft({
-      language: input.language,
-      query: input.query,
-      draft: rawDraftSupportAnswer,
-      evidenceBundle,
-      route
-    }) ??
-    recoverEvidenceAnchoredBehaviorCapabilityDraft({
-      language: input.language,
-      query: input.query,
-      draft: rawDraftSupportAnswer,
-      evidenceBundle,
-      route,
-      caseFrame
-    }) ??
-    recoverEvidenceAnchoredDeploymentBehaviorDraft({
-      language: input.language,
-      query: input.query,
-      draft: rawDraftSupportAnswer,
-      evidenceBundle,
-      route,
-      caseFrame
-    }) ??
-    rawDraftSupportAnswer;
+    route.specialist_agent === "api-specialist"
+      ? recoverEvidenceAnchoredApiDraft({
+          language: input.language,
+          query: input.query,
+          draft: rawDraftSupportAnswer,
+          evidenceBundle,
+          route,
+          caseFrame
+        }) ?? rawDraftSupportAnswer
+      : rawDraftSupportAnswer;
 
   const localVerificationStartedAt = performance.now();
   const writerBoundVerification = sanitizeVerification({
@@ -4592,6 +4628,51 @@ async function runSupervisorDomainSupportSearch(input: {
     currentRound: input.currentRound + 1,
     missingInfo
   });
+  const supportedClaims = supportedVerificationClaims(writerBoundVerification);
+  const answerComposerRuntime = withStageRuntime(
+    buildDeliveryAwareStageRuntime(
+      input.runtime,
+      {
+        reserveMs: 1_500,
+        minimumTimeoutMs: 4_000,
+        stageTimeoutMs: 14_000
+      },
+      {
+        reserveMs: 3_000,
+        minimumTimeoutMs: 10_000,
+        stageTimeoutMs: 26_000
+      }
+    ),
+    "answer-composer",
+    `${input.idempotencyKey}:answer-composer`
+  );
+  const answerComposerStartedAt = performance.now();
+  await reportStageProgress("answer_composition");
+  const shouldComposeCustomerAnswer =
+    input.runtime?.deliveryMode === "async_job" && hasEnoughBudget(input.runtime, 4500);
+  const composedSupportAnswer =
+    shouldComposeCustomerAnswer && input.adapter.composeCustomerAnswer
+      ? await input.adapter
+          .composeCustomerAnswer(
+            {
+              contextType: input.contextType,
+              language: input.language,
+              query: input.query,
+              mode,
+              route,
+              caseFrame,
+              draftSupportAnswer,
+              supportedClaims,
+              nextActions: filterUnsupported(draftSupportAnswer.next_actions, writerBoundVerification.unsupported_claims),
+              unknowns: uniqueStrings([...draftSupportAnswer.unknowns, ...missingInfo], 4)
+            },
+            `${input.idempotencyKey}:answer-composer`,
+            answerComposerRuntime
+          )
+          .then((value) => ({ value, timing: stageTiming("completed", elapsedMs(answerComposerStartedAt)) }))
+          .catch(() => ({ value: null, timing: stageTiming("fallback", elapsedMs(answerComposerStartedAt)) }))
+      : { value: null, timing: skippedStageTiming() };
+  markStageCompleted("answer_composition");
   const supportAnswer = buildSupportAnswerFromDraft({
     language: input.language,
     mode,
@@ -4599,7 +4680,7 @@ async function runSupervisorDomainSupportSearch(input: {
     draft: draftSupportAnswer,
     verification: writerBoundVerification,
     missingInfo,
-    composed: null
+    composed: composedSupportAnswer.value
   });
   const structuredAnswer = buildStructuredAnswer(supportAnswer, writerBoundVerification);
   const citations = buildCitations({
@@ -4658,6 +4739,12 @@ async function runSupervisorDomainSupportSearch(input: {
       stage: "verification",
       timing: localVerificationTiming,
       idempotencyKey: `${input.idempotencyKey}:support-domain:local-verification`
+    }),
+    stageTraceEntry({
+      stage: "answer_composition",
+      timing: composedSupportAnswer.timing,
+      runtimeStage: shouldComposeCustomerAnswer ? "answer-composer" : undefined,
+      idempotencyKey: `${input.idempotencyKey}:answer-composer`
     })
   ];
 
@@ -4713,7 +4800,7 @@ async function runSupervisorDomainSupportSearch(input: {
           specialistSkipped: false,
           usedUnifiedPlanner: true,
           verificationSkipped: true,
-          answerComposerUsed: false
+          answerComposerUsed: shouldComposeCustomerAnswer && Boolean(composedSupportAnswer.value)
         })
       }
     }
