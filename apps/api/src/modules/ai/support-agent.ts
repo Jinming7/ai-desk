@@ -287,27 +287,84 @@ function inferSupportDomainFromRouteAndCaseFrame(route: SupportQuestionRoute, ca
 }
 
 function reconcileSupervisorRouteWithEvidence(input: {
+  query: string;
   route: SupportQuestionRoute;
   caseFrame: SupportCaseFrame;
   references: SearchReference[];
 }): { route: SupportQuestionRoute; caseFrame: SupportCaseFrame } {
-  if (input.route.specialist_agent === "api-specialist") {
-    return input;
-  }
-
   const visibleReferences = input.references
     .filter((reference) => reference.authority !== "disabled_for_user")
     .sort((left, right) => right.score - left.score)
-    .slice(0, 3);
+    .slice(0, 6);
+  const querySignals = analyzeSupportQuerySignals(input.query);
+  const apiShapedQuery = isApiShapedQuery(input.query);
 
-  const apiEvidenceCount = visibleReferences.filter((reference) => {
+  const apiReferences = visibleReferences.filter((reference) => {
     const profile = getSupportEvidenceProfile(reference);
     return (
       profile.productArea === "openapi" ||
       profile.docKind === "openapi/api" ||
       profile.evidenceKind === "api_operation"
     );
-  }).length;
+  });
+  const docsActionableReferences = visibleReferences.filter((reference) => {
+    const profile = getSupportEvidenceProfile(reference);
+    return (
+      profile.productArea !== "openapi" &&
+      (profile.evidenceKind === "procedure" ||
+        profile.evidenceKind === "troubleshooting" ||
+        profile.docKind === "product_guide" ||
+        profile.docKind === "troubleshooting")
+    );
+  });
+  const apiEvidenceCount = apiReferences.length;
+  const bestApiScore = apiReferences[0]?.score ?? 0;
+  const bestDocsActionableScore = docsActionableReferences[0]?.score ?? 0;
+  const shouldPreferDocsActionableRoute =
+    !apiShapedQuery &&
+    bestDocsActionableScore > 0 &&
+    bestDocsActionableScore >= bestApiScore * 0.9 &&
+    (querySignals.wantsProcedure ||
+      querySignals.troubleshootingContext ||
+      input.caseFrame.action_type === "how_to" ||
+      input.caseFrame.action_type === "troubleshooting");
+
+  if (shouldPreferDocsActionableRoute) {
+    const question_type: SupportQuestionRoute["question_type"] = querySignals.wantsProcedure
+      ? "how_to_product"
+      : "troubleshooting";
+    const specialist_agent = canonicalSpecialistAgentForQuestionType(question_type);
+    const answer_contract =
+      specialist_agent === "howto-specialist"
+        ? "Give direct steps first."
+        : "Give the most likely cause and checks first.";
+    return {
+      route: {
+        ...input.route,
+        question_type,
+        specialist_agent,
+        answer_contract,
+        primary_domain: "docs"
+      },
+      caseFrame: {
+        ...input.caseFrame,
+        action_type: specialist_agent === "howto-specialist" ? "how_to" : "troubleshooting",
+        product_area: input.caseFrame.product_area === "openapi" ? "general" : input.caseFrame.product_area,
+        question_type,
+        specialist_agent,
+        answer_contract,
+        primary_domain: "docs",
+        required_doc_kinds: uniqueStrings(
+          [...(input.caseFrame.required_doc_kinds ?? []), "product_guide", "troubleshooting"],
+          6
+        )
+      }
+    };
+  }
+
+  if (input.route.specialist_agent === "api-specialist") {
+    return input;
+  }
 
   if (apiEvidenceCount === 0) {
     return input;
@@ -582,7 +639,7 @@ function fallbackQuestionRoute(query: string): SupportQuestionRoute {
       ? "api_field_lookup"
       : /为什么|why|预期|行为/.test(query)
       ? "why_behavior"
-      : /如何|怎么|步骤|setup|configure|config|导出|export/.test(query)
+      : /如何|怎么|步骤|setup|configure|config|导出|export|\b(how|how to|steps?|procedure|workflow)\b/i.test(query)
       ? "how_to_product"
       : /\b(not work|failed|failure|error|报错|异常|失败)\b/i.test(query)
       ? "troubleshooting"
@@ -4533,6 +4590,7 @@ async function runSupervisorDomainSupportSearch(input: {
     selection: evidenceSelection.value
   });
   const evidenceAligned = reconcileSupervisorRouteWithEvidence({
+    query: input.query,
     route,
     caseFrame,
     references: [...evidenceBundle.primary, ...evidenceBundle.supplemental]
