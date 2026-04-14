@@ -7062,6 +7062,313 @@ test("runSupportSearchAgent supervisor-domain runtime preserves coherent deploym
   }
 });
 
+test("runSupportSearchAgent supervisor-domain runtime prioritizes deployment sizing matrix evidence over generic deployment capability snippets", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+    LOCAL_DOCS_COM_PATH?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  const originalLocalDocsPath = mutableEnv.LOCAL_DOCS_COM_PATH;
+  const originalFetch = globalThis.fetch;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+  mutableEnv.LOCAL_DOCS_COM_PATH = "";
+  const deploymentSizingPrioritySourceUrl = "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements?test=sizing-priority";
+
+  globalThis.fetch = (async (input: string | URL | { url?: string | URL }) => {
+    const requestUrl =
+      input instanceof URL
+        ? input.toString()
+        : typeof input === "string"
+        ? input
+        : input?.url instanceof URL
+        ? input.url.toString()
+        : String(input?.url ?? "");
+
+    if (requestUrl === deploymentSizingPrioritySourceUrl) {
+      return new Response(
+        `<!doctype html>
+        <html lang="zh-Hans">
+          <body>
+            <main>
+              <article>
+                <h1>ONES 私有部署环境要求</h1>
+                <h2>服务器配置要求</h2>
+                <h3>1.2 ONES K3s集群版配置说明</h3>
+                <h4>1.2.1 准备4台服务器</h4>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>集群规模</th>
+                      <th>角色</th>
+                      <th>CPU</th>
+                      <th>内存</th>
+                      <th>系统盘</th>
+                      <th>数据盘</th>
+                      <th>索引盘</th>
+                      <th>网络带宽</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>500人以内</td>
+                      <td>3台工作节点</td>
+                      <td>>=16C</td>
+                      <td>>=32G</td>
+                      <td>>=200G</td>
+                      <td>>=300G</td>
+                      <td>>=100G</td>
+                      <td>>=50Mbps</td>
+                    </tr>
+                    <tr>
+                      <td>500～2999</td>
+                      <td>3台工作节点</td>
+                      <td>>=24C</td>
+                      <td>>=48G</td>
+                      <td>>=200G</td>
+                      <td>>=500G</td>
+                      <td>>=200G</td>
+                      <td>>=100Mbps</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </article>
+            </main>
+          </body>
+        </html>`,
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
+
+    throw new Error(`unexpected fetch in deployment sizing evidence-priority test: ${requestUrl}`);
+  }) as typeof globalThis.fetch;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    composeCustomerAnswer?: (
+      input: OpenClawSupportAnswerComposerInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<Omit<SupportAnswer, "mode">>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "deployment",
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: input.query,
+      answer_contract: "State the documented per-node resource requirements first.",
+      specialist_agent: "behavior-specialist",
+      routing_confidence: 0.88,
+      primary_domain: "deployment"
+    },
+    caseFrame: {
+      goal: input.query,
+      symptom: input.query,
+      object: "per-node CPU, memory, and disk requirements",
+      action_type: "capability_confirmation",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: [
+        input.query,
+        "deployment sizing requirements",
+        "per node cpu memory disk requirements"
+      ],
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract: "State the documented per-node resource requirements first.",
+      routing_confidence: 0.88,
+      primary_domain: "deployment",
+      query_plan: {
+        concept_queries: ["deployment sizing requirements", "resource requirements per node"],
+        object_queries: ["per-node CPU, memory, and disk requirements"],
+        behavior_queries: ["capability confirmation", "capacity planning"]
+      },
+      required_doc_kinds: ["deployment_runbook", "product_guide", "rules"]
+    },
+    retrievalQueries: [
+      input.query,
+      "deployment sizing requirements",
+      "per node cpu memory disk requirements"
+    ]
+  });
+  adapter.writeDeploymentDomainAnswer = async () => {
+    throw new Error("simulate deployment specialist timeout/fallback");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("simulate answer composer timeout/fallback");
+  };
+
+  const references: SearchReference[] = [
+    {
+      documentId: "9cf655c7-cbf3-4a3e-93a0-46c6b3c0e671",
+      evidenceId: "ab5069720c603535e780ab247f2b798c4d5c3490eb9d0d93e0d534ba3ff466e2",
+      title: "Docker迁移K3S方案",
+      snippet:
+        "迁移准备 信息收集 当前Docker单机实例信息。若当前Docker实例服务器无法满足K3S部署实例，建议基于当前用户日活使用规模，参考ONES规格推荐，升级服务器配置。",
+      sourceUrl: "https://docs.ones.com/zh-Hans/deploy/data/docker-to-k3s",
+      path: "deploy-docs/data/docker-to-k3s.cn.md",
+      headingPath: "Docker迁移K3S方案 > 四、迁移实施预演",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.4581557377049181,
+      retrievedAt: "2026-04-14T09:41:15.302Z"
+    },
+    {
+      documentId: "11cb3938-c6d0-5557-9da7-0207b394ffa9",
+      evidenceId: "11cb3938-c6d0-5557-9da7-0207b394ffa9",
+      title: "操作系统要求",
+      snippet:
+        "只支持Linux 4.*以上内核的操作系统，最佳实践为Ubuntu 22.04 server，支持64位 Ubuntu 18/20/24、64位Redhat 8.0及以上等操作系统。",
+      sourceUrl: deploymentSizingPrioritySourceUrl,
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      headingPath: "ONES 私有部署环境要求 > 操作系统要求",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.4343373493975906,
+      retrievedAt: "2026-04-14T09:41:15.302Z",
+      supportMetadata: {
+        product_area: "general",
+        evidence_kind: "capability",
+        deployment_model: "shared"
+      }
+    },
+    {
+      documentId: "9e9b5320-3d0b-488b-a7fb-c4f8e9b237e4",
+      evidenceId: "eda702d68413bb6d1a4376dd6b71e557cfa46dc602c4ca5cb850fa2bee10b11e",
+      title: "ONES 私有部署环境要求",
+      snippet:
+        "|集群规模|角色|CPU|内存|系统盘|数据盘|索引盘|网络带宽| |500人以内|3台工作节点|>=16C|>=32G|>=200G|>=300G|>=100G|>=50Mbps| |500～2999|3台工作节点|>=24C|>=48G|>=200G|>=500G|>=200G|>=100Mbps|",
+      sourceUrl: deploymentSizingPrioritySourceUrl,
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      headingPath: "ONES 私有部署环境要求 > 服务器配置要求 > 1.2 ONES K3s集群版配置说明 > 1.2.1 准备4台服务器",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.6390865314460819,
+      retrievedAt: "2026-04-14T09:41:15.302Z",
+      supportMetadata: {
+        product_area: "general",
+        evidence_kind: "capability",
+        deployment_model: "shared"
+      }
+    },
+    {
+      documentId: "f298beca-0463-4ac6-8173-f927ee2f4445",
+      evidenceId: "8e428fa7117c44da154dd2785f4119ba403dc84a233ba6230d2b7ad285ef7fcf",
+      title: "Form Custom Control",
+      snippet: "<b>Private</b> <b>Deployment</b> SAAS",
+      sourceUrl: "https://docs.ones.com/developer/abilities/extensions/form-control",
+      path: "open-docs/docs/abilities/extensions/form-control.mdx",
+      headingPath: "Form Custom Control > Requirements > Applicable Environments",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.4702541806020066,
+      retrievedAt: "2026-04-14T09:41:15.302Z",
+      supportMetadata: {
+        product_area: "deployment",
+        evidence_kind: "capability",
+        deployment_model: "private_deployment"
+      }
+    }
+  ];
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 1,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "What are the per-node CPU, memory, and disk requirements for private deployment?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment-sizing-prioritizes-resource-matrix"
+    });
+
+    assert.equal(result.result.support_answer?.mode, "grounded");
+    assert.equal(result.result.support_answer?.render_variant, "behavior");
+    assert.equal(
+      result.result.citations.some((item) => item.id === "eda702d68413bb6d1a4376dd6b71e557cfa46dc602c4ca5cb850fa2bee10b11e"),
+      true
+    );
+    assert.equal(
+      result.result.citations.some((item) => item.id === "8e428fa7117c44da154dd2785f4119ba403dc84a233ba6230d2b7ad285ef7fcf"),
+      false
+    );
+    assert.match(result.result.answer, /16c|32g|500人以内|500～2999/i);
+    assert.doesNotMatch(result.result.answer, /unified|colocated|applicable environments/i);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+    mutableEnv.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("runSupportSearchAgent supervisor-domain fallback keeps private deployment password reset on deployment how-to despite oauth api noise", async () => {
   const mutableEnv = env as {
     FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;

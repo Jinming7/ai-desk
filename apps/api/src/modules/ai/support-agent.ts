@@ -635,13 +635,14 @@ function stabilizeSupportRouteAndCaseFrame(input: {
           routing_confidence: Math.max(initialRoute.routing_confidence, nonApiFallbackRoute.routing_confidence)
         }
       : initialRoute;
-  const architectureQuestion =
-    (signals.privateDeploymentContext || /deployment documentation|部署文档/i.test(input.query)) &&
-    (signals.deploymentArchitectureContext || signals.isolationContext || signals.infrastructureContext);
   const deploymentSizingQuestion =
     signals.deploymentSizingContext &&
     !signals.apiContext &&
     !signals.troubleshootingContext;
+  const architectureQuestion =
+    !deploymentSizingQuestion &&
+    (signals.privateDeploymentContext || /deployment documentation|部署文档/i.test(input.query)) &&
+    (signals.deploymentArchitectureContext || signals.isolationContext || signals.infrastructureContext);
   const deploymentModel =
     input.caseFrame.deployment_model === "unknown" || input.caseFrame.deployment_model === "shared"
       ? signals.privateDeploymentContext ||
@@ -1451,6 +1452,8 @@ function getReferenceSupportProfile(reference: SearchReference): {
   title: string;
   heading: string;
   snippet: string;
+  docKind: string;
+  objectType: string;
   evidenceKind: string;
   productArea: string;
   deploymentModel: string;
@@ -1463,6 +1466,8 @@ function getReferenceSupportProfile(reference: SearchReference): {
     title: profile.title,
     heading: profile.heading,
     snippet: profile.snippet,
+    docKind: profile.docKind,
+    objectType: profile.objectType,
     evidenceKind: profile.evidenceKind,
     productArea: profile.productArea,
     deploymentModel: profile.deploymentModel,
@@ -1478,12 +1483,48 @@ function getReferenceSemanticText(reference: SearchReference): string {
     profile.title,
     profile.heading,
     profile.snippet,
+    profile.docKind,
+    profile.objectType,
     ...profile.permissions,
     ...profile.prerequisites,
     ...profile.actions
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+function isDeploymentSizingQuestion(query: string, caseFrame: SupportCaseFrame): boolean {
+  const signals = analyzeSupportQuerySignals(query);
+  return (
+    signals.deploymentSizingContext &&
+    !signals.apiContext &&
+    !signals.troubleshootingContext &&
+    String(caseFrame.product_area ?? "").toLowerCase() === "deployment"
+  );
+}
+
+function getReferenceRetrievalUnitFamily(reference: SearchReference): string {
+  const metadata = mergeSupportReferenceMetadata(reference) ?? {};
+  return String(metadata.retrieval_unit_family ?? metadata.source_family ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function looksLikeDeploymentSizingEvidenceText(text: string): boolean {
+  return analyzeSupportQuerySignals(text).deploymentSizingContext;
+}
+
+function referenceLooksLikeDeploymentSizingEvidence(reference: SearchReference): boolean {
+  const profile = getReferenceSupportProfile(reference);
+  if (profile.objectType === "deployment_node_sizing") return true;
+  if (getReferenceRetrievalUnitFamily(reference) === "constraint_table_row_unit") return true;
+  return looksLikeDeploymentSizingEvidenceText(getReferenceSemanticText(reference));
+}
+
+function fragmentLooksLikeDeploymentSizingEvidence(fragment: string): boolean {
+  const normalized = normalizeBehaviorEvidenceFragment(fragment);
+  if (!normalized) return false;
+  return looksLikeDeploymentSizingEvidenceText(normalized);
 }
 
 function referenceHasPermissionSignal(reference: SearchReference): boolean {
@@ -1756,6 +1797,7 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
   const requiredDocKinds = caseFrame.required_doc_kinds ?? [];
   const focusTerms = collectFocusTerms(query, caseFrame);
   const normalizedQuery = query.toLowerCase();
+  const deploymentSizingQuestion = isDeploymentSizingQuestion(query, caseFrame);
   const wantsListVariant =
     /列表|枚举|可选|全部|有哪些/.test(query) || /\b(list|enum|options|all statuses?)\b/.test(normalizedQuery);
   const deploymentCapabilityQuestion =
@@ -1767,6 +1809,8 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
       const heading = profile.heading;
       const snippet = profile.snippet;
       const semanticText = getReferenceSemanticText(reference);
+      const deploymentSizingEvidence = referenceLooksLikeDeploymentSizingEvidence(reference);
+      const retrievalUnitFamily = getReferenceRetrievalUnitFamily(reference);
       let topicScore = 0;
       for (const term of focusTerms) {
         if (title.includes(term)) topicScore += 8;
@@ -1790,6 +1834,20 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
         else if (profile.evidenceKind === "constraint" || profile.evidenceKind === "capability") topicScore += 8;
         if (/\b(unified|shared|external|externalized|database|storage|topology|architecture|isolation|separate|separable)\b|统一|共享|外置|数据库|存储|拓扑|架构|隔离|独立/.test(semanticText)) {
           topicScore += 14;
+        }
+      }
+      if (deploymentSizingQuestion) {
+        if (deploymentSizingEvidence) topicScore += 34;
+        if (profile.objectType === "deployment_node_sizing") topicScore += 18;
+        if (retrievalUnitFamily === "constraint_table_row_unit") topicScore += 16;
+        if (/\|/.test(String(reference.snippet ?? ""))) topicScore += 10;
+        if (
+          !deploymentSizingEvidence &&
+          /\b(applicable environments?|operating system requirements?|support matrix|compatibility)\b|适用环境|操作系统要求|支持矩阵|兼容性/.test(
+            semanticText
+          )
+        ) {
+          topicScore -= 16;
         }
       }
       if (deploymentCapabilityQuestion) {
@@ -3461,6 +3519,58 @@ function formatBehaviorTableRowFragment(heading: string, headerCells: string[] |
   return appendBehaviorHeadingContext(heading, pairs.join("; "));
 }
 
+function inferBehaviorInlineTableHeaderLength(cells: string[]): number {
+  const maxHeaderLength = Math.min(12, Math.floor(cells.length / 2));
+  const firstValueLikeIndex = cells.findIndex(
+    (cell, index) => index > 0 && /(?:\d|>=|<=|mbps|gb|g\b|c\b|台|人|users?|seats?)/i.test(cell)
+  );
+  if (
+    firstValueLikeIndex >= 2 &&
+    firstValueLikeIndex <= maxHeaderLength &&
+    looksLikeBehaviorTableHeaderRow(cells.slice(0, firstValueLikeIndex))
+  ) {
+    return firstValueLikeIndex;
+  }
+
+  for (let size = maxHeaderLength; size >= 2; size -= 1) {
+    const headerCells = cells.slice(0, size);
+    const firstRow = cells.slice(size, size * 2);
+    if (firstRow.length < size || !looksLikeBehaviorTableHeaderRow(headerCells) || looksLikeBehaviorTableHeaderRow(firstRow)) {
+      continue;
+    }
+    const rowFragment = formatBehaviorTableRowFragment("", headerCells, firstRow);
+    if (looksLikeBehaviorEvidenceFragment(rowFragment) || looksLikeDeploymentSizingEvidenceText(rowFragment)) {
+      return size;
+    }
+  }
+
+  return 0;
+}
+
+function extractBehaviorEvidenceFragmentsFromInlineTable(reference: SearchReference, snippet: string): string[] {
+  const cells = parseBehaviorTableCells(snippet);
+  if (!cells || cells.length < 4) return [];
+
+  const headerLength = inferBehaviorInlineTableHeaderLength(cells);
+  if (headerLength < 2) return [];
+
+  const headerCells = cells.slice(0, headerLength);
+  const rowCells = cells.slice(headerLength);
+  const heading = shortHeadingLabel(reference.headingPath) || reference.title;
+  const fragments: string[] = [];
+
+  for (let index = 0; index + headerLength <= rowCells.length; index += headerLength) {
+    const row = rowCells.slice(index, index + headerLength);
+    const rowFragment = formatBehaviorTableRowFragment(heading, headerCells, row);
+    if (looksLikeBehaviorEvidenceFragment(rowFragment) || looksLikeDeploymentSizingEvidenceText(rowFragment)) {
+      fragments.push(rowFragment);
+    }
+    if (fragments.length >= 4) break;
+  }
+
+  return uniqueStrings(fragments, 4);
+}
+
 function extractBehaviorEvidenceFragmentsFromLines(reference: SearchReference, scopedLines: string[]): string[] {
   const fragments: string[] = [];
   let currentHeading = shortHeadingLabel(reference.headingPath) || reference.title;
@@ -3533,13 +3643,15 @@ async function collectBehaviorEvidenceFragmentsAsync(reference: SearchReference)
 
 function collectBehaviorEvidenceFragments(reference: SearchReference): string[] {
   const normalizedSnippet = normalizeBehaviorEvidenceFragment(reference.snippet);
-  const fragments = uniqueStrings(
+  const inlineTableFragments = extractBehaviorEvidenceFragmentsFromInlineTable(reference, normalizedSnippet);
+  const sentenceFragments = uniqueStrings(
     normalizedSnippet
       .split(/。|；|(?:\.\s+)|\n/)
       .map((item) => normalizeBehaviorEvidenceFragment(item))
       .filter(looksLikeBehaviorEvidenceFragment),
     8
   );
+  const fragments = uniqueStrings([...inlineTableFragments, ...sentenceFragments], 8);
   if (fragments.length > 0) return fragments;
   return looksLikeBehaviorEvidenceFragment(normalizedSnippet) ? [normalizedSnippet] : [];
 }
@@ -3554,6 +3666,8 @@ function scoreBehaviorEvidenceFragment(input: {
   const focusTerms = collectFocusTerms(input.query, input.caseFrame);
   const haystack = `${input.reference.title} ${input.reference.headingPath ?? ""} ${input.fragment}`.toLowerCase();
   const profile = getReferenceSupportProfile(input.reference);
+  const deploymentSizingQuestion = isDeploymentSizingQuestion(input.query, input.caseFrame);
+  const deploymentSizingFragment = fragmentLooksLikeDeploymentSizingEvidence(input.fragment);
   let score = input.primaryBoost + Math.round(input.reference.score * 10);
   if (profile.evidenceKind === "capability" || profile.evidenceKind === "constraint") score += 14;
   else if (profile.evidenceKind === "procedure" || profile.evidenceKind === "troubleshooting") score += 6;
@@ -3563,6 +3677,18 @@ function scoreBehaviorEvidenceFragment(input: {
   if (/(supports?|supported|available|only|requires?|required|recommended|must|cannot|not support|unsupported)/i.test(input.fragment)) score += 10;
   if (/(支持|可用|仅|只在|要求|推荐|必须|不能|不支持|兼容|环境要求|系统要求)/.test(input.fragment)) score += 10;
   if (isRecommendationLikeFragment(input.fragment)) score += 4;
+  if (deploymentSizingQuestion) {
+    if (referenceLooksLikeDeploymentSizingEvidence(input.reference)) score += 18;
+    if (deploymentSizingFragment) score += 26;
+    if (
+      !deploymentSizingFragment &&
+      /\b(applicable environments?|operating system requirements?|support matrix|compatibility)\b|适用环境|操作系统要求|支持矩阵|兼容性/i.test(
+        input.fragment
+      )
+    ) {
+      score -= 14;
+    }
+  }
   for (const term of focusTerms) {
     const normalized = term.toLowerCase();
     if (!normalized) continue;
@@ -3587,11 +3713,23 @@ function buildBehaviorRecommendation(language: "zh" | "en", fragment: string): s
 
 function isDeploymentArchitectureQuestion(query: string, caseFrame: SupportCaseFrame): boolean {
   if (caseFrame.product_area !== "deployment") return false;
+  if (isDeploymentSizingQuestion(query, caseFrame)) return false;
   const signals = analyzeSupportQuerySignals(query);
   return (
     (signals.privateDeploymentContext || /deployment documentation|部署文档/i.test(query)) &&
     (signals.deploymentArchitectureContext || signals.isolationContext || signals.infrastructureContext)
   );
+}
+
+function shouldExpandBehaviorEvidenceAsync(
+  reference: SearchReference,
+  index: number,
+  query: string,
+  caseFrame: SupportCaseFrame
+): boolean {
+  if (index < 2) return true;
+  if (!isDeploymentSizingQuestion(query, caseFrame)) return false;
+  return index < 4 || referenceLooksLikeDeploymentSizingEvidence(reference);
 }
 
 async function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
@@ -3614,7 +3752,9 @@ async function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
   const analyzed = await Promise.all(
     ranked.map(async (reference, index) => {
       const primaryBoost = index < input.evidenceBundle.primary.length ? 24 : 10;
-      const fragments = index < 2 ? await collectBehaviorEvidenceFragmentsAsync(reference) : collectBehaviorEvidenceFragments(reference);
+      const fragments = shouldExpandBehaviorEvidenceAsync(reference, index, input.query, input.caseFrame)
+        ? await collectBehaviorEvidenceFragmentsAsync(reference)
+        : collectBehaviorEvidenceFragments(reference);
       return fragments.map((fragment) => ({
         fragment,
         evidenceId: resolveSearchReferenceEvidenceId(reference),
