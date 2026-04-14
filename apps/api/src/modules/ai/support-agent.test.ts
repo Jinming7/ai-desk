@@ -7242,6 +7242,9 @@ test("runSupportSearchAgent supervisor-domain fallback keeps private deployment 
       ((result.result.internal_diagnostics as { route?: { specialist_agent?: string } } | undefined)?.route?.specialist_agent),
       "howto-specialist"
     );
+    assert.equal(result.result.case_frame?.object, "administrator password reset");
+    assert.equal(result.result.case_frame?.required_doc_kinds?.includes("openapi/api"), false);
+    assert.equal(result.result.case_frame?.query_plan?.object_queries?.includes("api"), false);
     assert.equal(result.result.support_answer?.render_variant, "how_to");
     assert.equal(result.result.citations.some((item) => item.id === "chunk:private-deployment-admin-reset-low-score"), true);
     assert.match(result.result.answer, /reset the administrator password|recovery procedure/i);

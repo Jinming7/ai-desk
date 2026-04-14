@@ -80,7 +80,6 @@ function shouldStripGenericApiRetrievalNoise(caseFrame: Pick<
   return (
     caseFrame.product_area === "deployment" &&
     caseFrame.deployment_model === "private_deployment" &&
-    caseFrame.specialist_agent !== "api-specialist" &&
     (caseFrame.action_type === "how_to" ||
       caseFrame.action_type === "troubleshooting" ||
       caseFrame.question_type === "how_to_product" ||
@@ -703,7 +702,6 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   };
   const shouldStripApiRetrievalNoise =
     shouldPreserveDeploymentRoute &&
-    normalizedRoute.specialist_agent !== "api-specialist" &&
     shouldStripGenericApiRetrievalNoise(provisionalCaseFrame);
   const shouldForceApiRoute =
     signals.apiContext &&
