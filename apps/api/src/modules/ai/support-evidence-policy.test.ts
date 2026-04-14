@@ -4,6 +4,7 @@ import type { SupportCaseFrame } from "./types.js";
 import {
   buildSupportEvidencePolicy,
   filterSupportEvidenceByPolicy,
+  getSupportEvidenceProfile,
   matchesSupportEvidencePolicy
 } from "./support-evidence-policy.js";
 
@@ -178,4 +179,23 @@ test("matchesSupportEvidencePolicy falls back to deploy-docs path semantics when
     ),
     true
   );
+});
+
+test("getSupportEvidenceProfile reclassifies deployment migration rehearsal content as procedure evidence", () => {
+  const profile = getSupportEvidenceProfile({
+    path: "deploy-docs/data/docker-to-k3s.cn.md",
+    title: "Docker迁移K3S方案",
+    headingPath: "Docker迁移K3S方案 > 四、迁移实施预演",
+    snippet: "迁移前先做好备份、目标服务器检查、实施预演与回滚预案，确认切换窗口和演练步骤。",
+    supportMetadata: {
+      product_area: "deployment",
+      deployment_model: "private_deployment",
+      evidence_kind: "capability"
+    }
+  });
+
+  assert.equal(profile.productArea, "deployment");
+  assert.equal(profile.deploymentModel, "private_deployment");
+  assert.equal(profile.evidenceKind, "procedure");
+  assert.equal(profile.docKind, "deployment_runbook");
 });

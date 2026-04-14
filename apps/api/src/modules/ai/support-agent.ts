@@ -276,7 +276,6 @@ type SupportQuerySignals = {
   integrationContext: boolean;
   privateDeploymentContext: boolean;
   infrastructureContext: boolean;
-  deploymentSizingContext: boolean;
   deploymentArchitectureContext: boolean;
   isolationContext: boolean;
   accountRecoveryContext: boolean;
@@ -365,40 +364,44 @@ function reconcileSupervisorRouteWithEvidence(input: {
         profile.docKind === "troubleshooting")
     );
   });
-  const deploymentSizingReferences = visibleReferences.filter((reference) => {
+  const deploymentCapabilityReferences = visibleReferences.filter((reference) => {
     const profile = getSupportEvidenceProfile(reference);
-    const semanticText = getReferenceSemanticText(reference).toLowerCase();
     return (
       profile.productArea === "deployment" &&
-      (profile.evidenceKind === "constraint" || profile.evidenceKind === "capability") &&
-      /\b(cpu|memory|ram|disk|storage|node|users?|capacity|sizing|requirements?)\b|cpu|内存|磁盘|存储|节点|用户/.test(
-        semanticText
-      )
+      (referenceHasStructuredConstraintEvidence(reference) || profile.evidenceKind === "capability")
     );
   });
+  const deploymentConstraintReferences = deploymentCapabilityReferences.filter((reference) =>
+    referenceHasStructuredConstraintEvidence(reference)
+  );
   const apiEvidenceCount = apiReferences.length;
   const bestApiScore = apiReferences[0]?.score ?? 0;
   const bestDocsActionableScore = docsActionableReferences[0]?.score ?? 0;
-  const bestDeploymentSizingScore = deploymentSizingReferences[0]?.score ?? 0;
+  const bestDeploymentCapabilityScore = deploymentCapabilityReferences[0]?.score ?? 0;
+  const bestDeploymentConstraintScore = deploymentConstraintReferences[0]?.score ?? 0;
   const shouldPreferDocsActionableRoute =
     !apiShapedQuery &&
     bestDocsActionableScore > 0 &&
     bestDocsActionableScore >= bestApiScore * 0.9 &&
+    bestDocsActionableScore > bestDeploymentCapabilityScore * 0.95 &&
     (querySignals.wantsProcedure ||
       querySignals.troubleshootingContext ||
       input.caseFrame.action_type === "how_to" ||
       input.caseFrame.action_type === "troubleshooting");
-  const shouldPreferDeploymentSizingRoute =
-    querySignals.deploymentSizingContext &&
+  const shouldPreferDeploymentCapabilityRoute =
     !apiShapedQuery &&
-    !querySignals.troubleshootingContext &&
-    bestDeploymentSizingScore > 0 &&
+    bestDeploymentConstraintScore > 0 &&
+    (input.caseFrame.product_area === "deployment" ||
+      input.caseFrame.deployment_model === "private_deployment" ||
+      deploymentCapabilityReferences.length >= 2) &&
     (input.route.specialist_agent === "troubleshooting-specialist" ||
       input.caseFrame.action_type === "troubleshooting" ||
-      bestDeploymentSizingScore >= bestDocsActionableScore * 0.95);
+      bestDeploymentConstraintScore >= bestDocsActionableScore * 0.95) &&
+    !querySignals.wantsProcedure &&
+    !querySignals.troubleshootingContext;
 
-  if (shouldPreferDeploymentSizingRoute) {
-    const answer_contract = "State the documented per-node resource requirements first.";
+  if (shouldPreferDeploymentCapabilityRoute) {
+    const answer_contract = "State the documented requirement or supported scope first.";
     return {
       route: {
         ...input.route,
@@ -410,10 +413,6 @@ function reconcileSupervisorRouteWithEvidence(input: {
       },
       caseFrame: {
         ...input.caseFrame,
-        object:
-          input.caseFrame.object === "unspecified"
-            ? localizedSupportLabel(input.query, "每节点 CPU、内存和磁盘要求", "per-node CPU, memory, and disk requirements")
-            : input.caseFrame.object,
         action_type: "capability_confirmation",
         deployment_model: "private_deployment",
         product_area: "deployment",
@@ -424,29 +423,7 @@ function reconcileSupervisorRouteWithEvidence(input: {
         required_doc_kinds: uniqueStrings(
           [...(input.caseFrame.required_doc_kinds ?? []), "deployment_runbook", "product_guide", "rules"],
           6
-        ),
-        retrieval_queries: uniqueStrings(
-          [
-            ...input.caseFrame.retrieval_queries,
-            "deployment sizing requirements",
-            "per node cpu memory disk requirements"
-          ],
-          8
-        ),
-        query_plan: {
-          concept_queries: uniqueStrings(
-            [...(input.caseFrame.query_plan?.concept_queries ?? []), "deployment sizing requirements", "resource requirements per node"],
-            4
-          ),
-          object_queries: uniqueStrings(
-            [...(input.caseFrame.query_plan?.object_queries ?? []), "per-node CPU, memory, and disk requirements"],
-            4
-          ),
-          behavior_queries: uniqueStrings(
-            [...(input.caseFrame.query_plan?.behavior_queries ?? []), "capability confirmation", "capacity planning"],
-            4
-          )
-        }
+        )
       }
     };
   }
@@ -526,21 +503,6 @@ function hasCjkText(input: string): boolean {
 function analyzeSupportQuerySignals(query: string): SupportQuerySignals {
   const normalized = query.trim();
   const lowered = normalized.toLowerCase();
-  const resourceDimensionCount = [
-    /\bcpu\b|\bprocessor\b|\bcore\b|\bcores\b|处理器|核数|核/,
-    /\bmemory\b|\bram\b|内存/,
-    /\bdisk\b|\bstorage\b|磁盘|存储/,
-    /\bnode\b|每节点|单节点|节点/,
-    /\busers?\b|\bseats?\b|用户数|用户规模|用户量/
-  ].reduce((count, pattern) => count + (pattern.test(lowered) || pattern.test(normalized) ? 1 : 0), 0);
-  const sizingIntentCount = [
-    /\brequirements?\b|\brequired\b|要求|需求/,
-    /\bresource\b|\bresources\b|资源/,
-    /\bcapacity\b|\bcapacity planning\b|容量|容量规划/,
-    /\bsizing\b|\bsize\b|\bspecs?\b|规格|配额/,
-    /\bper[- ]?node\b|每节点|单节点|节点/
-  ].reduce((count, pattern) => count + (pattern.test(lowered) || pattern.test(normalized) ? 1 : 0), 0);
-  const deploymentSizingContext = resourceDimensionCount >= 2 && sizingIntentCount >= 1;
   const httpStatusMention =
     /\b(401|403|404|500)\b/.test(lowered) &&
     (/\b(http|https|status|error|errors|response|request|returned|returns|code|endpoint|api)\b/.test(lowered) ||
@@ -559,7 +521,6 @@ function analyzeSupportQuerySignals(query: string): SupportQuerySignals {
     infrastructureContext:
       /服务器|os层|操作系统|pod|集群|k8s|k3s|容器|运维|内存|磁盘|存储|节点/.test(normalized) ||
       /\b(server|backend service|backend services|database|databases|service topology|query path|query paths|architecture|topology|os[- ]?level|operating system|pod|cluster|k8s|k3s|container|ops|operation toolkit|memory|disk|storage|node)\b/i.test(lowered),
-    deploymentSizingContext,
     deploymentArchitectureContext:
       /部署架构|架构拓扑|服务拓扑|数据库拓扑|查询路径|隔离部署|模块隔离/.test(normalized) ||
       /\b(architecture|topology|service boundaries|service topology|database topology|shared backend|backend services|query path|query paths|monolith|unified system)\b/i.test(lowered),
@@ -635,19 +596,13 @@ function stabilizeSupportRouteAndCaseFrame(input: {
           routing_confidence: Math.max(initialRoute.routing_confidence, nonApiFallbackRoute.routing_confidence)
         }
       : initialRoute;
-  const deploymentSizingQuestion =
-    signals.deploymentSizingContext &&
-    !signals.apiContext &&
-    !signals.troubleshootingContext;
   const architectureQuestion =
-    !deploymentSizingQuestion &&
     (signals.privateDeploymentContext || /deployment documentation|部署文档/i.test(input.query)) &&
-    (signals.deploymentArchitectureContext || signals.isolationContext || signals.infrastructureContext);
+    (signals.deploymentArchitectureContext || signals.isolationContext);
   const deploymentModel =
     input.caseFrame.deployment_model === "unknown" || input.caseFrame.deployment_model === "shared"
       ? signals.privateDeploymentContext ||
         architectureQuestion ||
-        deploymentSizingQuestion ||
         (signals.infrastructureContext && signals.mailDependencyContext)
         ? "private_deployment"
         : input.caseFrame.deployment_model
@@ -657,9 +612,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
       (input.caseFrame.product_area === "openapi" &&
         !apiShaped &&
         (signals.accountRecoveryContext || signals.infrastructureContext || architectureQuestion))) &&
-    (deploymentModel === "private_deployment" || signals.infrastructureContext || architectureQuestion || deploymentSizingQuestion)
-      ? "deployment"
-      : (input.caseFrame.product_area === "general" || input.caseFrame.product_area === "openapi") && deploymentSizingQuestion
+    (deploymentModel === "private_deployment" || signals.infrastructureContext || architectureQuestion)
       ? "deployment"
       : (input.caseFrame.product_area === "general" || input.caseFrame.product_area === "openapi") &&
         signals.integrationContext &&
@@ -683,7 +636,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     (deploymentModel === "private_deployment" ||
       preliminaryProductArea === "deployment" ||
       input.caseFrame.product_area === "deployment") &&
-    (signals.accountRecoveryContext || shouldTreatAsHowTo || architectureQuestion || deploymentSizingQuestion);
+    (signals.accountRecoveryContext || shouldTreatAsHowTo || architectureQuestion);
   const productArea =
     shouldPreserveDeploymentRoute && !shouldPreserveIntegrationTroubleshooting ? "deployment" : preliminaryProductArea;
   const provisionalCaseFrame: Pick<
@@ -694,12 +647,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     deployment_model: deploymentModel,
     specialist_agent: normalizedRoute.specialist_agent,
     question_type: normalizedRoute.question_type,
-    action_type:
-      shouldTreatAsHowTo
-        ? "how_to"
-        : deploymentSizingQuestion
-        ? "capability_confirmation"
-        : input.caseFrame.action_type
+    action_type: shouldTreatAsHowTo ? "how_to" : input.caseFrame.action_type
   };
   const shouldStripApiRetrievalNoise =
     shouldPreserveDeploymentRoute &&
@@ -728,18 +676,12 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   const object =
     objectNeedsDeploymentRecoveryReplacement && signals.accountRecoveryContext
       ? localizedSupportLabel(input.query, "管理员密码重置", "administrator password reset")
-      : objectNeedsDeploymentRecoveryReplacement && deploymentSizingQuestion
-      ? localizedSupportLabel(input.query, "每节点 CPU、内存和磁盘要求", "per-node CPU, memory, and disk requirements")
       : objectNeedsDeploymentRecoveryReplacement && architectureQuestion
       ? localizedSupportLabel(input.query, "私有部署架构与隔离能力", "self-hosted deployment architecture and isolation")
       : objectNeedsDeploymentRecoveryReplacement && signals.integrationContext
       ? localizedSupportLabel(input.query, "集成授权回调", "integration authorization callback")
       : input.caseFrame.object;
-  const actionType = shouldTreatAsHowTo
-    ? "how_to"
-    : deploymentSizingQuestion
-    ? "capability_confirmation"
-    : input.caseFrame.action_type;
+  const actionType = shouldTreatAsHowTo ? "how_to" : input.caseFrame.action_type;
 
   let caseFrame: SupportCaseFrame = {
     ...input.caseFrame,
@@ -778,8 +720,6 @@ function stabilizeSupportRouteAndCaseFrame(input: {
       ? uniqueStrings([...baseRequiredDocKinds, "troubleshooting", "product_guide", "rules"], 6)
       : architectureQuestion
       ? ["deployment_runbook", "product_guide", "rules", "troubleshooting"]
-      : deploymentSizingQuestion
-      ? uniqueStrings([...baseRequiredDocKinds, "deployment_runbook", "product_guide", "rules"], 6)
       : shouldTreatAsHowTo
       ? uniqueStrings([...baseRequiredDocKinds, "deployment_runbook", "troubleshooting"], 6)
       : baseRequiredDocKinds
@@ -801,14 +741,6 @@ function stabilizeSupportRouteAndCaseFrame(input: {
           specialist_agent: "troubleshooting-specialist",
           answer_contract: "Give the most likely integration configuration cause first, then the direct checks to run now.",
           routing_confidence: Math.max(input.route.routing_confidence, 0.84)
-        }
-      : deploymentSizingQuestion && normalizedRoute.specialist_agent !== "api-specialist"
-      ? {
-          ...normalizedRoute,
-          question_type: "capability_confirmation",
-          specialist_agent: "behavior-specialist",
-          answer_contract: "State the documented per-node resource requirements first.",
-          routing_confidence: Math.max(input.route.routing_confidence, 0.86)
         }
       : shouldTreatAsHowTo &&
         (normalizedRoute.specialist_agent === "behavior-specialist" ||
@@ -856,7 +788,6 @@ function stabilizeSupportRouteAndCaseFrame(input: {
 
 function fallbackQuestionRoute(query: string): SupportQuestionRoute {
   const lowered = query.toLowerCase();
-  const signals = analyzeSupportQuerySignals(query);
   const question_type: SupportQuestionRoute["question_type"] =
     /\b(scope|oauth|token)\b/i.test(query)
       ? "api_scope_auth"
@@ -868,8 +799,6 @@ function fallbackQuestionRoute(query: string): SupportQuestionRoute {
       ? "why_behavior"
       : /如何|怎么|步骤|setup|configure|config|导出|export|\b(how|how to|steps?|procedure|workflow)\b/i.test(query)
       ? "how_to_product"
-      : signals.deploymentSizingContext && !signals.troubleshootingContext
-      ? "capability_confirmation"
       : /\b(not work|failed|failure|error|报错|异常|失败)\b/i.test(query)
       ? "troubleshooting"
       : "capability_confirmation";
@@ -892,30 +821,12 @@ function fallbackQuestionRoute(query: string): SupportQuestionRoute {
 }
 
 function fallbackSupportDispatch(query: string): OpenClawSupportDispatchOutput {
-  const signals = analyzeSupportQuerySignals(query);
   const fallbackRoute = fallbackQuestionRoute(query);
-  const deploymentSizingQuestion =
-    signals.deploymentSizingContext &&
-    !signals.apiContext &&
-    !signals.troubleshootingContext;
-  const route: SupportQuestionRoute =
-    deploymentSizingQuestion && fallbackRoute.specialist_agent !== "api-specialist"
-      ? {
-          ...fallbackRoute,
-          question_type: "capability_confirmation",
-          specialist_agent: "behavior-specialist",
-          answer_contract: "State the documented per-node resource requirements first.",
-          routing_confidence: Math.max(fallbackRoute.routing_confidence, 0.84)
-        }
-      : fallbackRoute;
+  const route: SupportQuestionRoute = fallbackRoute;
   const draftCaseFrame: SupportCaseFrame = {
     goal: query.trim() || "support question",
     symptom: query.trim() || "needs support guidance",
-    object: route.question_type.startsWith("api_")
-      ? "api"
-      : deploymentSizingQuestion
-      ? "per-node CPU, memory, and disk requirements"
-      : "unspecified",
+    object: route.question_type.startsWith("api_") ? "api" : "unspecified",
     action_type:
       route.specialist_agent === "api-specialist"
         ? "lookup"
@@ -924,35 +835,21 @@ function fallbackSupportDispatch(query: string): OpenClawSupportDispatchOutput {
         : route.specialist_agent === "behavior-specialist"
         ? "capability_confirmation"
         : "troubleshooting",
-    deployment_model: deploymentSizingQuestion ? "private_deployment" : "unknown",
+    deployment_model: "unknown",
     product_area:
-      route.question_type.startsWith("api_")
-        ? "openapi"
-        : deploymentSizingQuestion
-        ? "deployment"
-        : "general",
+      route.question_type.startsWith("api_") ? "openapi" : "general",
     constraints: [],
     missing_critical_info: [],
     retrieval_queries: uniqueStrings(
-      [
-        query,
-        deploymentSizingQuestion ? "deployment sizing requirements" : undefined,
-        deploymentSizingQuestion ? "per node cpu memory disk requirements" : undefined
-      ],
+      [query],
       4
     ),
     question_type: route.question_type,
     specialist_agent: route.specialist_agent,
     answer_contract: route.answer_contract,
     routing_confidence: route.routing_confidence,
-    query_plan: deploymentSizingQuestion
-      ? {
-          concept_queries: ["deployment sizing requirements", "resource requirements per node"],
-          object_queries: ["per-node CPU, memory, and disk requirements"],
-          behavior_queries: ["capability confirmation", "capacity planning"]
-        }
-      : undefined,
-    required_doc_kinds: deploymentSizingQuestion ? ["deployment_runbook", "product_guide", "rules"] : undefined
+    query_plan: undefined,
+    required_doc_kinds: undefined
   };
   const primaryDomain = inferSupportDomainFromRouteAndCaseFrame(route, draftCaseFrame);
   return {
@@ -965,9 +862,7 @@ function fallbackSupportDispatch(query: string): OpenClawSupportDispatchOutput {
       ...draftCaseFrame,
       primary_domain: primaryDomain
     },
-    retrievalQueries: deploymentSizingQuestion
-      ? uniqueStrings([query, "deployment sizing requirements", "per node cpu memory disk requirements"], 4)
-      : [query].filter(Boolean)
+    retrievalQueries: [query].filter(Boolean)
   };
 }
 
@@ -1493,14 +1388,10 @@ function getReferenceSemanticText(reference: SearchReference): string {
     .join(" ");
 }
 
-function isDeploymentSizingQuestion(query: string, caseFrame: SupportCaseFrame): boolean {
-  const signals = analyzeSupportQuerySignals(query);
-  return (
-    signals.deploymentSizingContext &&
-    !signals.apiContext &&
-    !signals.troubleshootingContext &&
-    String(caseFrame.product_area ?? "").toLowerCase() === "deployment"
-  );
+function isConstraintFirstCapabilityCase(caseFrame: SupportCaseFrame): boolean {
+  const questionType = String(caseFrame.question_type ?? "").toLowerCase();
+  if (questionType.startsWith("api_")) return false;
+  return questionType === "capability_confirmation";
 }
 
 function getReferenceRetrievalUnitFamily(reference: SearchReference): string {
@@ -1510,58 +1401,52 @@ function getReferenceRetrievalUnitFamily(reference: SearchReference): string {
     .toLowerCase();
 }
 
-function looksLikeDeploymentSizingEvidenceText(text: string): boolean {
-  return analyzeSupportQuerySignals(text).deploymentSizingContext;
-}
-
-function looksLikeDeploymentMigrationPlanningText(text: string): boolean {
-  return /\b(migration|migrate|cutover|rollback|backup|current instance|target server|rehearsal|preflight|dry run)\b|迁移|回滚|备份|当前.*实例|目标服务器|实施预演|信息收集/.test(
+function looksLikeOperationalPlanText(text: string): boolean {
+  return /\b(migration|migrate|cutover|rollback|backup|rehearsal|preflight|dry run|rollout plan|runbook rehearsal)\b|迁移|切换|回滚|备份|实施预演|预演|演练|信息收集/.test(
     text
   );
 }
 
-function looksLikeDirectDeploymentSizingEvidenceText(text: string): boolean {
-  if (!looksLikeDeploymentSizingEvidenceText(text)) return false;
-  if (looksLikeDeploymentMigrationPlanningText(text)) return false;
-  return /\b(requirements?|resource requirements?|configuration requirements?|server requirements?|capacity|sizing|specs?|per[- ]?node)\b|要求|配置要求|环境要求|规格|准备\d+台服务器|单机版配置说明|集群版配置说明/.test(
+function looksLikeStructuredConstraintText(text: string): boolean {
+  return /\b(requirements?|required|supported|support matrix|compatibility|resource|resources|capacity|limits?|quota|cpu|memory|ram|disk|storage|operating system)\b|要求|支持矩阵|兼容性|资源|容量|限制|配额|cpu|内存|磁盘|存储|操作系统/.test(
     text
   );
 }
 
-function referenceLooksLikeDeploymentSizingEvidence(reference: SearchReference): boolean {
+function referenceHasStructuredConstraintEvidence(reference: SearchReference): boolean {
   const profile = getReferenceSupportProfile(reference);
-  if (profile.objectType === "deployment_node_sizing") return true;
-  if (getReferenceRetrievalUnitFamily(reference) === "constraint_table_row_unit") return true;
-  return looksLikeDeploymentSizingEvidenceText(getReferenceSemanticText(reference));
+  const retrievalUnitFamily = getReferenceRetrievalUnitFamily(reference);
+  return (
+    profile.evidenceKind === "constraint" ||
+    profile.docKind === "rules" ||
+    retrievalUnitFamily === "constraint_table_row_unit" ||
+    retrievalUnitFamily === "schema_constraint_unit" ||
+    profile.objectType === "deployment_node_sizing"
+  );
 }
 
-function referenceLooksLikeDirectDeploymentSizingEvidence(reference: SearchReference): boolean {
-  const profile = getReferenceSupportProfile(reference);
-  if (profile.objectType === "deployment_node_sizing") return true;
-  if (getReferenceRetrievalUnitFamily(reference) === "constraint_table_row_unit") return true;
-  return looksLikeDirectDeploymentSizingEvidenceText(getReferenceSemanticText(reference));
+function referenceLooksLikeOperationalPlan(reference: SearchReference): boolean {
+  return looksLikeOperationalPlanText(getReferenceSemanticText(reference));
 }
 
-function referenceLooksLikeDeploymentMigrationPlanning(reference: SearchReference): boolean {
-  return looksLikeDeploymentMigrationPlanningText(getReferenceSemanticText(reference));
-}
-
-function fragmentLooksLikeDeploymentSizingEvidence(fragment: string): boolean {
+function fragmentLooksLikeOperationalPlan(fragment: string): boolean {
   const normalized = normalizeBehaviorEvidenceFragment(fragment);
   if (!normalized) return false;
-  return looksLikeDeploymentSizingEvidenceText(normalized);
+  return looksLikeOperationalPlanText(normalized);
 }
 
-function fragmentLooksLikeDirectDeploymentSizingEvidence(fragment: string): boolean {
-  const normalized = normalizeBehaviorEvidenceFragment(fragment);
-  if (!normalized) return false;
-  return looksLikeDirectDeploymentSizingEvidenceText(normalized);
-}
-
-function fragmentLooksLikeDeploymentMigrationPlanning(fragment: string): boolean {
-  const normalized = normalizeBehaviorEvidenceFragment(fragment);
-  if (!normalized) return false;
-  return looksLikeDeploymentMigrationPlanningText(normalized);
+function scoreObjectTypeFocusFit(objectType: string, focusTerms: string[]): number {
+  const normalizedObjectType = String(objectType ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, " ");
+  if (!normalizedObjectType || normalizedObjectType === "unspecified") return 0;
+  const focusText = focusTerms.join(" ").toLowerCase();
+  let score = 0;
+  for (const token of normalizedObjectType.split(/[^a-z0-9\u4e00-\u9fff]+/).filter(Boolean)) {
+    score += tokenMatchesFocus(token, focusText) || focusText.includes(token) ? 8 : -2;
+  }
+  return score;
 }
 
 function referenceHasPermissionSignal(reference: SearchReference): boolean {
@@ -1834,9 +1719,9 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
   const requiredDocKinds = caseFrame.required_doc_kinds ?? [];
   const focusTerms = collectFocusTerms(query, caseFrame);
   const normalizedQuery = query.toLowerCase();
-  const deploymentSizingQuestion = isDeploymentSizingQuestion(query, caseFrame);
   const wantsListVariant =
     /列表|枚举|可选|全部|有哪些/.test(query) || /\b(list|enum|options|all statuses?)\b/.test(normalizedQuery);
+  const constraintFirstCapabilityCase = isConstraintFirstCapabilityCase(caseFrame);
   const deploymentCapabilityQuestion =
     caseFrame.product_area === "deployment" && caseFrame.question_type === "capability_confirmation";
   return [...references].sort((a, b) => {
@@ -1846,16 +1731,16 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
       const heading = profile.heading;
       const snippet = profile.snippet;
       const semanticText = getReferenceSemanticText(reference);
-      const deploymentSizingEvidence = referenceLooksLikeDeploymentSizingEvidence(reference);
-      const directDeploymentSizingEvidence = referenceLooksLikeDirectDeploymentSizingEvidence(reference);
-      const deploymentMigrationPlanning = referenceLooksLikeDeploymentMigrationPlanning(reference);
       const retrievalUnitFamily = getReferenceRetrievalUnitFamily(reference);
+      const structuredConstraintEvidence = referenceHasStructuredConstraintEvidence(reference);
+      const operationalPlanReference = referenceLooksLikeOperationalPlan(reference);
       let topicScore = 0;
       for (const term of focusTerms) {
         if (title.includes(term)) topicScore += 8;
         else if (heading.includes(term)) topicScore += 5;
         else if (snippet.includes(term)) topicScore += 1;
       }
+      topicScore += scoreObjectTypeFocusFit(profile.objectType, focusTerms);
       if (reference.sourceType === "local_docs" || reference.sourceType === "github_kb") {
         topicScore += 2;
       }
@@ -1875,21 +1760,14 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
           topicScore += 14;
         }
       }
-      if (deploymentSizingQuestion) {
-        if (deploymentSizingEvidence) topicScore += 12;
-        if (directDeploymentSizingEvidence) topicScore += 34;
-        if (profile.objectType === "deployment_node_sizing") topicScore += 18;
-        if (retrievalUnitFamily === "constraint_table_row_unit") topicScore += 16;
-        if (/\|/.test(String(reference.snippet ?? ""))) topicScore += 10;
-        if (deploymentMigrationPlanning && !directDeploymentSizingEvidence) topicScore -= 22;
-        if (
-          !deploymentSizingEvidence &&
-          /\b(applicable environments?|operating system requirements?|support matrix|compatibility)\b|适用环境|操作系统要求|支持矩阵|兼容性/.test(
-            semanticText
-          )
-        ) {
-          topicScore -= 16;
-        }
+      if (constraintFirstCapabilityCase) {
+        if (structuredConstraintEvidence) topicScore += 26;
+        else if (profile.evidenceKind === "capability") topicScore += 10;
+        else if (profile.evidenceKind === "procedure") topicScore -= 8;
+        if (retrievalUnitFamily === "constraint_table_row_unit") topicScore += 18;
+        else if (retrievalUnitFamily === "schema_constraint_unit") topicScore += 12;
+        if (/\|/.test(String(reference.snippet ?? ""))) topicScore += 8;
+        if (operationalPlanReference && !structuredConstraintEvidence) topicScore -= 20;
       }
       if (deploymentCapabilityQuestion) {
         const rootHeading = String(reference.headingPath ?? "").trim().toUpperCase() === "ROOT";
@@ -3580,7 +3458,7 @@ function inferBehaviorInlineTableHeaderLength(cells: string[]): number {
       continue;
     }
     const rowFragment = formatBehaviorTableRowFragment("", headerCells, firstRow);
-    if (looksLikeBehaviorEvidenceFragment(rowFragment) || looksLikeDeploymentSizingEvidenceText(rowFragment)) {
+    if (looksLikeBehaviorEvidenceFragment(rowFragment) || looksLikeStructuredConstraintText(rowFragment)) {
       return size;
     }
   }
@@ -3603,7 +3481,7 @@ function extractBehaviorEvidenceFragmentsFromInlineTable(reference: SearchRefere
   for (let index = 0; index + headerLength <= rowCells.length; index += headerLength) {
     const row = rowCells.slice(index, index + headerLength);
     const rowFragment = formatBehaviorTableRowFragment(heading, headerCells, row);
-    if (looksLikeBehaviorEvidenceFragment(rowFragment) || looksLikeDeploymentSizingEvidenceText(rowFragment)) {
+    if (looksLikeBehaviorEvidenceFragment(rowFragment) || looksLikeStructuredConstraintText(rowFragment)) {
       fragments.push(rowFragment);
     }
     if (fragments.length >= 4) break;
@@ -3707,10 +3585,9 @@ function scoreBehaviorEvidenceFragment(input: {
   const focusTerms = collectFocusTerms(input.query, input.caseFrame);
   const haystack = `${input.reference.title} ${input.reference.headingPath ?? ""} ${input.fragment}`.toLowerCase();
   const profile = getReferenceSupportProfile(input.reference);
-  const deploymentSizingQuestion = isDeploymentSizingQuestion(input.query, input.caseFrame);
-  const deploymentSizingFragment = fragmentLooksLikeDeploymentSizingEvidence(input.fragment);
-  const directDeploymentSizingFragment = fragmentLooksLikeDirectDeploymentSizingEvidence(input.fragment);
-  const deploymentMigrationPlanningFragment = fragmentLooksLikeDeploymentMigrationPlanning(input.fragment);
+  const constraintFirstCapabilityCase = isConstraintFirstCapabilityCase(input.caseFrame);
+  const structuredConstraintReference = referenceHasStructuredConstraintEvidence(input.reference);
+  const operationalPlanFragment = fragmentLooksLikeOperationalPlan(input.fragment);
   let score = input.primaryBoost + Math.round(input.reference.score * 10);
   if (profile.evidenceKind === "capability" || profile.evidenceKind === "constraint") score += 14;
   else if (profile.evidenceKind === "procedure" || profile.evidenceKind === "troubleshooting") score += 6;
@@ -3720,23 +3597,11 @@ function scoreBehaviorEvidenceFragment(input: {
   if (/(supports?|supported|available|only|requires?|required|recommended|must|cannot|not support|unsupported)/i.test(input.fragment)) score += 10;
   if (/(支持|可用|仅|只在|要求|推荐|必须|不能|不支持|兼容|环境要求|系统要求)/.test(input.fragment)) score += 10;
   if (isRecommendationLikeFragment(input.fragment)) score += 4;
-  if (deploymentSizingQuestion) {
-    if (referenceLooksLikeDeploymentSizingEvidence(input.reference)) score += 8;
-    if (referenceLooksLikeDirectDeploymentSizingEvidence(input.reference)) score += 16;
-    if (deploymentSizingFragment) score += 10;
-    if (directDeploymentSizingFragment) score += 22;
-    if (deploymentMigrationPlanningFragment && !directDeploymentSizingFragment) score -= 22;
-    if (referenceLooksLikeDeploymentMigrationPlanning(input.reference) && !referenceLooksLikeDirectDeploymentSizingEvidence(input.reference)) {
-      score -= 18;
-    }
-    if (
-      !deploymentSizingFragment &&
-      /\b(applicable environments?|operating system requirements?|support matrix|compatibility)\b|适用环境|操作系统要求|支持矩阵|兼容性/i.test(
-        input.fragment
-      )
-    ) {
-      score -= 14;
-    }
+  if (constraintFirstCapabilityCase) {
+    if (structuredConstraintReference) score += 20;
+    if (isStructuredBehaviorEvidenceFragment(input.fragment)) score += 10;
+    if (referenceLooksLikeOperationalPlan(input.reference) && !structuredConstraintReference) score -= 18;
+    if (operationalPlanFragment && !isStructuredBehaviorEvidenceFragment(input.fragment)) score -= 18;
   }
   for (const term of focusTerms) {
     const normalized = term.toLowerCase();
@@ -3762,11 +3627,10 @@ function buildBehaviorRecommendation(language: "zh" | "en", fragment: string): s
 
 function isDeploymentArchitectureQuestion(query: string, caseFrame: SupportCaseFrame): boolean {
   if (caseFrame.product_area !== "deployment") return false;
-  if (isDeploymentSizingQuestion(query, caseFrame)) return false;
   const signals = analyzeSupportQuerySignals(query);
   return (
     (signals.privateDeploymentContext || /deployment documentation|部署文档/i.test(query)) &&
-    (signals.deploymentArchitectureContext || signals.isolationContext || signals.infrastructureContext)
+    (signals.deploymentArchitectureContext || signals.isolationContext)
   );
 }
 
@@ -3776,15 +3640,16 @@ function shouldExpandBehaviorEvidenceAsync(
   query: string,
   caseFrame: SupportCaseFrame
 ): boolean {
-  const deploymentSizingQuestion = isDeploymentSizingQuestion(query, caseFrame);
+  const constraintFirstCapabilityCase = isConstraintFirstCapabilityCase(caseFrame);
   if (index < 2) {
-    if (deploymentSizingQuestion && referenceLooksLikeDeploymentMigrationPlanning(reference)) {
-      return referenceLooksLikeDirectDeploymentSizingEvidence(reference);
+    if (constraintFirstCapabilityCase && referenceLooksLikeOperationalPlan(reference)) {
+      return referenceHasStructuredConstraintEvidence(reference);
     }
     return true;
   }
-  if (!deploymentSizingQuestion) return false;
-  return index < 4 ? !referenceLooksLikeDeploymentMigrationPlanning(reference) : referenceLooksLikeDirectDeploymentSizingEvidence(reference);
+  if (!constraintFirstCapabilityCase) return false;
+  if (referenceHasStructuredConstraintEvidence(reference)) return true;
+  return index < 4 && !referenceLooksLikeOperationalPlan(reference);
 }
 
 async function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
@@ -3841,12 +3706,13 @@ async function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
     .slice(0, maxSelectedFacts);
   if (!selectedFacts.length) return null;
 
-  const selectedNote =
-    candidates.find(
-      (candidate) =>
-        candidate.note &&
-        !selectedFacts.some((fact) => fact.fragment === candidate.fragment || fact.evidenceId === candidate.evidenceId)
-    ) ?? null;
+  const selectedNote = isConstraintFirstCapabilityCase(input.caseFrame)
+    ? null
+    : (candidates.find(
+        (candidate) =>
+          candidate.note &&
+          !selectedFacts.some((fact) => fact.fragment === candidate.fragment || fact.evidenceId === candidate.evidenceId)
+      ) ?? null);
 
   return {
     ...input.draft,

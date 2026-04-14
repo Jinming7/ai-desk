@@ -173,6 +173,13 @@ function inferEvidenceKindFallback(input: {
     return "constraint";
   }
   if (
+    /\b(migration|migrate|cutover|rollback|backup|rehearsal|preflight|dry run|rollout plan|runbook rehearsal)\b|迁移|切换|回滚|备份|实施预演|预演|演练|信息收集/.test(
+      semanticText
+    )
+  ) {
+    return "procedure";
+  }
+  if (
     input.currentEvidenceKind === "" &&
     /guide|quick start|setup|configure|install|deployment flow|部署说明|安装步骤|配置步骤|操作步骤/.test(semanticText)
   ) {
