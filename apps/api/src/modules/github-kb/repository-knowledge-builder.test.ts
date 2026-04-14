@@ -240,3 +240,68 @@ test("document retrieval units always keep grounded citation mappings", () => {
   assert.equal(memoryEntries.length, 1);
   assert.deepEqual(memoryEntries[0].citations?.map((item) => item.citation_id), [citations[0].id]);
 });
+
+test("document retrieval units emit row-level memory for deployment sizing tables", () => {
+  const sections = [
+    {
+      headingPath: "Deployment requirements > Per-node resource requirements",
+      title: "Per-node resource requirements",
+      content: `| User tier | CPU per node | Memory per node | Disk per node |
+| --- | --- | --- | --- |
+| <=500 users | >=16 CPU | >=32 GB | >=200 GB system disk, >=300 GB data disk, >=100 GB index disk |
+| 500-2999 users | >=32 CPU | >=64 GB | >=500 GB system disk, >=500 GB data disk, >=200 GB index disk |`,
+      order: 1
+    }
+  ];
+  const citations = buildDocChunkCitations(
+    {
+      ...baseContext,
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      title: "ONES private deployment requirements",
+      content: sections[0].content
+    },
+    [
+      {
+        id: "chunk-sizing",
+        headingPath: sections[0].headingPath,
+        content: sections[0].content,
+        metadata: { sectionTitle: sections[0].title, sectionOrder: 1 }
+      }
+    ]
+  );
+  const retrievalUnits = buildDocumentRetrievalUnits({
+    sections,
+    docKind: "deployment_runbook",
+    productArea: "deployment",
+    deploymentModel: "private_deployment",
+    citationByHeading: new Map([[sections[0].headingPath, citations[0].id]]),
+    title: "ONES private deployment requirements"
+  });
+
+  const rowUnits = retrievalUnits.filter((unit) => unit.metadata.retrieval_unit_family === "constraint_table_row_unit");
+  assert.equal(rowUnits.length, 2);
+  assert.equal(
+    rowUnits.some(
+      (unit) =>
+        /<=500 users/i.test(unit.canonicalClaim) &&
+        /cpu/i.test(unit.canonicalClaim) &&
+        /memory/i.test(unit.canonicalClaim) &&
+        /disk/i.test(unit.canonicalClaim)
+    ),
+    true
+  );
+  assert.equal(
+    rowUnits.some(
+      (unit) =>
+        /500-2999 users/i.test(unit.canonicalClaim) &&
+        /32 cpu/i.test(unit.canonicalClaim) &&
+        /64 gb/i.test(unit.canonicalClaim)
+    ),
+    true
+  );
+  assert.equal(rowUnits.every((unit) => unit.objectType === "deployment_node_sizing"), true);
+  assert.equal(
+    rowUnits.every((unit) => unit.citationIds.length === 1 && unit.citationIds[0] === citations[0].id),
+    true
+  );
+});
