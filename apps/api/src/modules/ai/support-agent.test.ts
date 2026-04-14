@@ -7461,6 +7461,215 @@ test("runSupportSearchAgent supervisor-domain runtime realigns deployment recove
   }
 });
 
+test("runSupportSearchAgent supervisor-domain runtime strips generic api retrieval noise from deployment recovery plans before retrieval", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  const originalFetch = globalThis.fetch;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  globalThis.fetch = (async (input) => {
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (requestUrl === "https://docs.ones.com/private-deployment/reset-administrator-password") {
+      return new Response(
+        `<!doctype html>
+          <html>
+            <body>
+              <main>
+                <article>
+                  <h1>Reset administrator password in private deployment</h1>
+                  <h2>Procedure</h2>
+                  <ol>
+                    <li>Log in to the deployment host with operator access.</li>
+                    <li>Run the documented password reset script in the ONES pod.</li>
+                    <li>Confirm the administrator can sign in again.</li>
+                  </ol>
+                </article>
+              </main>
+            </body>
+          </html>`,
+        {
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
+    throw new Error(`unexpected fetch in deployment retrieval sanitization test: ${requestUrl}`);
+  }) as typeof fetch;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    routeSupportQuestion?: (...args: unknown[]) => Promise<unknown>;
+    planSupportEvidence?: (...args: unknown[]) => Promise<unknown>;
+    planSupportCase?: (...args: unknown[]) => Promise<unknown>;
+    judgeSupportAnswer?: (...args: unknown[]) => Promise<unknown>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    composeCustomerAnswer?: (
+      input: OpenClawSupportAnswerComposerInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<Omit<SupportAnswer, "mode">>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "deployment" as const,
+    route: {
+      question_type: "how_to_product",
+      user_goal: input.query,
+      answer_contract: "Provide the direct recovery steps and prerequisites first.",
+      specialist_agent: "howto-specialist",
+      routing_confidence: 0.82,
+      primary_domain: "deployment"
+    },
+    caseFrame: {
+      goal: input.query,
+      symptom: input.query,
+      object: "api",
+      action_type: "how_to",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: [input.query, "api", "private deployment", "deployment"],
+      question_type: "how_to_product",
+      specialist_agent: "howto-specialist",
+      answer_contract: "Provide the direct recovery steps and prerequisites first.",
+      routing_confidence: 0.82,
+      primary_domain: "deployment",
+      query_plan: {
+        concept_queries: ["deployment", "private deployment"],
+        object_queries: ["api"],
+        behavior_queries: ["how_to"]
+      },
+      required_doc_kinds: ["openapi/api", "deployment_runbook", "troubleshooting"]
+    },
+    retrievalQueries: [input.query, "api", "private deployment", "deployment"]
+  });
+  adapter.writeDeploymentDomainAnswer = async () => {
+    throw new Error("simulate deployment specialist fallback");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("simulate answer composer fallback");
+  };
+
+  type ObservedDeploymentRecoveryCaseFrame = {
+    object?: string;
+    required_doc_kinds?: string[];
+    query_plan?: {
+      object_queries?: string[];
+    };
+  };
+
+  let capturedQueries: string[] = [];
+  let capturedCaseFrame: ObservedDeploymentRecoveryCaseFrame | null = null;
+
+  const references: SearchReference[] = [
+    {
+      documentId: "doc:private-deployment-admin-reset-sanitized-plan",
+      evidenceId: "chunk:private-deployment-admin-reset-sanitized-plan",
+      title: "Reset administrator password in private deployment",
+      snippet: "Use the documented recovery path to reset the administrator password directly in the deployment environment.",
+      sourceUrl: "https://docs.ones.com/private-deployment/reset-administrator-password",
+      path: "deploy-docs/configure/ops/admin-password.cn.md",
+      headingPath: "Recovery procedure",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.12,
+      retrievedAt: "2026-04-14T06:10:00.000Z",
+      supportMetadata: {
+        product_area: "deployment",
+        deployment_model: "private_deployment",
+        evidence_kind: "procedure",
+        doc_kind: "deployment_runbook"
+      }
+    }
+  ];
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: {
+      query?: string;
+      queries?: string[];
+      caseFrame?: ObservedDeploymentRecoveryCaseFrame;
+    }) {
+      capturedQueries = input.queries ?? [];
+      capturedCaseFrame = input.caseFrame ?? null;
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.84,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "How do I reset the administrator password when OAuth token delivery is unavailable in private deployment?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment-sanitize-api-noise-before-retrieval"
+    });
+
+    assert.equal(capturedQueries.some((item) => item.trim().toLowerCase() === "api"), false);
+    assert.notEqual(capturedCaseFrame, null);
+    const observedCaseFrame: ObservedDeploymentRecoveryCaseFrame = capturedCaseFrame ?? {};
+    assert.equal(observedCaseFrame.object, "administrator password reset");
+    assert.equal(observedCaseFrame.required_doc_kinds?.includes("openapi/api"), false);
+    assert.equal(observedCaseFrame.query_plan?.object_queries?.includes("api"), false);
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.equal(result.result.citations.some((item) => item.id === "chunk:private-deployment-admin-reset-sanitized-plan"), true);
+    assert.match(result.result.answer, /password reset script|reset the administrator password|administrator can sign in again/i);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("runSupportSearchAgent supervisor-domain runtime expands object-specific deployment how-to docs before generic no-step runbooks", async () => {
   const mutableEnv = env as {
     FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;

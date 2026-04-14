@@ -60,6 +60,44 @@ function sanitizeSupportRetrievalSeeds(input: Array<string | undefined | null>, 
   return uniqueStrings(input, limit).filter((item) => !isPlaceholderSupportRetrievalSeed(item));
 }
 
+function isGenericApiPlaceholderSeed(value: string): boolean {
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, " ");
+  return normalized === "api" || normalized === "openapi" || normalized === "open api";
+}
+
+function stripGenericApiPlaceholderSeeds(input: Array<string | undefined | null>, limit = 6): string[] {
+  return sanitizeSupportRetrievalSeeds(input, limit).filter((item) => !isGenericApiPlaceholderSeed(item));
+}
+
+function stripApiSpecificDocKinds(input: Array<string | undefined | null>, limit = 6): string[] {
+  return uniqueStrings(input, limit).filter((item) => item !== "openapi/api" && item !== "permissions");
+}
+
+function shouldStripGenericApiRetrievalNoise(caseFrame: Pick<
+  SupportCaseFrame,
+  "product_area" | "deployment_model" | "specialist_agent" | "question_type" | "action_type"
+>): boolean {
+  return (
+    caseFrame.product_area === "deployment" &&
+    caseFrame.deployment_model === "private_deployment" &&
+    caseFrame.specialist_agent !== "api-specialist" &&
+    (caseFrame.action_type === "how_to" ||
+      caseFrame.action_type === "troubleshooting" ||
+      caseFrame.question_type === "how_to_product" ||
+      caseFrame.question_type === "config_setup")
+  );
+}
+
+function sanitizeRetrievalSeedsForCaseFrame(
+  input: Array<string | undefined | null>,
+  caseFrame: Pick<SupportCaseFrame, "product_area" | "deployment_model" | "specialist_agent" | "question_type" | "action_type">,
+  limit = 6
+): string[] {
+  return shouldStripGenericApiRetrievalNoise(caseFrame)
+    ? stripGenericApiPlaceholderSeeds(input, limit)
+    : sanitizeSupportRetrievalSeeds(input, limit);
+}
+
 function localizedSectionTitle(language: "zh" | "en", zh: string, en: string): string {
   return language === "zh" ? zh : en;
 }
@@ -648,6 +686,26 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     (signals.accountRecoveryContext || shouldTreatAsHowTo || architectureQuestion || deploymentSizingQuestion);
   const productArea =
     shouldPreserveDeploymentRoute && !shouldPreserveIntegrationTroubleshooting ? "deployment" : preliminaryProductArea;
+  const provisionalCaseFrame: Pick<
+    SupportCaseFrame,
+    "product_area" | "deployment_model" | "specialist_agent" | "question_type" | "action_type"
+  > = {
+    product_area: productArea,
+    deployment_model: deploymentModel,
+    specialist_agent: normalizedRoute.specialist_agent,
+    question_type: normalizedRoute.question_type,
+    action_type:
+      shouldTreatAsHowTo
+        ? "how_to"
+        : deploymentSizingQuestion
+        ? "capability_confirmation"
+        : input.caseFrame.action_type
+  };
+  const shouldStripApiRetrievalNoise =
+    shouldPreserveDeploymentRoute &&
+    normalizedRoute.specialist_agent !== "api-specialist" &&
+    input.caseFrame.product_area !== "openapi" &&
+    shouldStripGenericApiRetrievalNoise(provisionalCaseFrame);
   const shouldForceApiRoute =
     signals.apiContext &&
     !shouldPreserveIntegrationTroubleshooting &&
@@ -655,14 +713,28 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     (input.caseFrame.product_area === "openapi" ||
       normalizedRoute.specialist_agent !== "api-specialist" ||
       !String(normalizedRoute.question_type ?? "").startsWith("api_"));
+  const baseRetrievalQueries = shouldStripApiRetrievalNoise
+    ? stripGenericApiPlaceholderSeeds(input.caseFrame.retrieval_queries, 8)
+    : sanitizeSupportRetrievalSeeds(input.caseFrame.retrieval_queries, 8);
+  const baseConceptQueries = shouldStripApiRetrievalNoise
+    ? stripGenericApiPlaceholderSeeds(input.caseFrame.query_plan?.concept_queries ?? [], 4)
+    : sanitizeSupportRetrievalSeeds(input.caseFrame.query_plan?.concept_queries ?? [], 4);
+  const baseObjectQueries = shouldStripApiRetrievalNoise
+    ? stripGenericApiPlaceholderSeeds(input.caseFrame.query_plan?.object_queries ?? [], 4)
+    : sanitizeSupportRetrievalSeeds(input.caseFrame.query_plan?.object_queries ?? [], 4);
+  const baseRequiredDocKinds = shouldStripApiRetrievalNoise
+    ? stripApiSpecificDocKinds(input.caseFrame.required_doc_kinds ?? [], 6)
+    : uniqueStrings(input.caseFrame.required_doc_kinds ?? [], 6);
+  const objectNeedsDeploymentRecoveryReplacement =
+    input.caseFrame.object === "unspecified" || (shouldStripApiRetrievalNoise && isGenericApiPlaceholderSeed(input.caseFrame.object));
   const object =
-    input.caseFrame.object === "unspecified" && signals.accountRecoveryContext
+    objectNeedsDeploymentRecoveryReplacement && signals.accountRecoveryContext
       ? localizedSupportLabel(input.query, "管理员密码重置", "administrator password reset")
-      : input.caseFrame.object === "unspecified" && deploymentSizingQuestion
+      : objectNeedsDeploymentRecoveryReplacement && deploymentSizingQuestion
       ? localizedSupportLabel(input.query, "每节点 CPU、内存和磁盘要求", "per-node CPU, memory, and disk requirements")
-      : input.caseFrame.object === "unspecified" && architectureQuestion
+      : objectNeedsDeploymentRecoveryReplacement && architectureQuestion
       ? localizedSupportLabel(input.query, "私有部署架构与隔离能力", "self-hosted deployment architecture and isolation")
-      : input.caseFrame.object === "unspecified" && signals.integrationContext
+      : objectNeedsDeploymentRecoveryReplacement && signals.integrationContext
       ? localizedSupportLabel(input.query, "集成授权回调", "integration authorization callback")
       : input.caseFrame.object;
   const actionType = shouldTreatAsHowTo
@@ -678,7 +750,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     object,
     action_type: actionType,
     retrieval_queries: sanitizeSupportRetrievalSeeds(
-      [...input.caseFrame.retrieval_queries, object, deploymentModel, productArea].map((item) =>
+      [...baseRetrievalQueries, object, deploymentModel, productArea].map((item) =>
         String(item ?? "").replace(/[_/]+/g, " ")
       ),
       6
@@ -686,33 +758,33 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     query_plan: {
       concept_queries: sanitizeSupportRetrievalSeeds(
         [
-          ...(input.caseFrame.query_plan?.concept_queries ?? []),
+          ...baseConceptQueries,
           productArea.replace(/[_/]+/g, " "),
           deploymentModel.replace(/[_/]+/g, " ")
         ],
         4
       ),
-      object_queries: sanitizeSupportRetrievalSeeds([...(input.caseFrame.query_plan?.object_queries ?? []), object], 4),
+      object_queries: sanitizeSupportRetrievalSeeds([...baseObjectQueries, object], 4),
       behavior_queries: uniqueStrings([...(input.caseFrame.query_plan?.behavior_queries ?? []), actionType], 4)
     },
     required_doc_kinds: shouldForceApiRoute
       ? uniqueStrings(
           [
-            ...(input.caseFrame.required_doc_kinds ?? []),
+            ...baseRequiredDocKinds,
             "openapi/api",
             /\b(scope|oauth|token)\b/i.test(input.query) || /权限|鉴权|授权/.test(input.query) ? "permissions" : undefined
           ],
           6
         )
       : shouldPreserveIntegrationTroubleshooting
-      ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "troubleshooting", "product_guide", "rules"], 6)
+      ? uniqueStrings([...baseRequiredDocKinds, "troubleshooting", "product_guide", "rules"], 6)
       : architectureQuestion
       ? ["deployment_runbook", "product_guide", "rules", "troubleshooting"]
       : deploymentSizingQuestion
-      ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "deployment_runbook", "product_guide", "rules"], 6)
+      ? uniqueStrings([...baseRequiredDocKinds, "deployment_runbook", "product_guide", "rules"], 6)
       : shouldTreatAsHowTo
-      ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "deployment_runbook", "troubleshooting"], 6)
-      : input.caseFrame.required_doc_kinds
+      ? uniqueStrings([...baseRequiredDocKinds, "deployment_runbook", "troubleshooting"], 6)
+      : baseRequiredDocKinds
   };
 
   const route: SupportQuestionRoute =
@@ -4602,7 +4674,7 @@ function buildInitialRetrievalQueries(query: string, caseFrame: SupportCaseFrame
   const compactFocus = buildCompactFocusQuery(query, caseFrame);
   return uniqueStrings(
     [
-      ...seedQueries,
+      ...sanitizeRetrievalSeedsForCaseFrame(seedQueries, caseFrame, 6),
       structuredCaseFrameQuery,
       query,
       compactFocus,
@@ -5191,8 +5263,15 @@ async function runSupervisorDomainSupportSearch(input: {
   let caseFrame: SupportCaseFrame = {
     ...stabilized.caseFrame,
     primary_domain: primaryDomain,
-    retrieval_queries: sanitizeSupportRetrievalSeeds(
+    retrieval_queries: sanitizeRetrievalSeedsForCaseFrame(
       [...dispatch.retrievalQueries, ...stabilized.caseFrame.retrieval_queries, input.query],
+      {
+        product_area: stabilized.caseFrame.product_area,
+        deployment_model: stabilized.caseFrame.deployment_model,
+        specialist_agent: stabilized.caseFrame.specialist_agent,
+        question_type: stabilized.caseFrame.question_type,
+        action_type: stabilized.caseFrame.action_type
+      },
       8
     )
   };
@@ -5204,8 +5283,15 @@ async function runSupervisorDomainSupportSearch(input: {
 
   await reportStageProgress("retrieval_base");
   const retrievalStartedAt = performance.now();
-  const retrievalQueries = sanitizeSupportRetrievalSeeds(
+  const retrievalQueries = sanitizeRetrievalSeedsForCaseFrame(
     [...dispatch.retrievalQueries, ...caseFrame.retrieval_queries, input.query],
+    {
+      product_area: caseFrame.product_area,
+      deployment_model: caseFrame.deployment_model,
+      specialist_agent: caseFrame.specialist_agent,
+      question_type: caseFrame.question_type,
+      action_type: caseFrame.action_type
+    },
     8
   );
   const evidenceResult = await input.orchestrator
