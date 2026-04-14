@@ -5880,6 +5880,270 @@ test("runSupportSearchAgent supervisor-domain runtime recovers a grounded HAR ho
   }
 });
 
+test("runSupportSearchAgent supervisor-domain runtime recovers grounded deployment sizing requirements from published deploy docs when specialist and composer both fall back", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+    LOCAL_DOCS_COM_PATH?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  const originalLocalDocsPath = mutableEnv.LOCAL_DOCS_COM_PATH;
+  const originalFetch = globalThis.fetch;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+  mutableEnv.LOCAL_DOCS_COM_PATH = "";
+
+  let observedFetchCount = 0;
+  globalThis.fetch = (async (input: string | URL | { url?: string | URL }) => {
+    const requestUrl =
+      input instanceof URL
+        ? input.toString()
+        : typeof input === "string"
+        ? input
+        : input?.url instanceof URL
+        ? input.url.toString()
+        : String(input?.url ?? "");
+
+    if (requestUrl === "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements") {
+      observedFetchCount += 1;
+      return new Response(
+        `<!doctype html>
+        <html lang="en">
+          <body>
+            <main>
+              <article>
+                <h1>ONES private deployment requirements</h1>
+                <p>This page contains the deployment sizing reference for private deployment environments.</p>
+                <h2>Per-node resource requirements</h2>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Users</th>
+                      <th>CPU</th>
+                      <th>Memory</th>
+                      <th>Disk</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>50</td>
+                      <td>4 cores</td>
+                      <td>8 GB</td>
+                      <td>200 GB</td>
+                    </tr>
+                    <tr>
+                      <td>200</td>
+                      <td>8 cores</td>
+                      <td>16 GB</td>
+                      <td>500 GB</td>
+                    </tr>
+                    <tr>
+                      <td>500+</td>
+                      <td>16 cores</td>
+                      <td>32 GB</td>
+                      <td>1 TB</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </article>
+            </main>
+          </body>
+        </html>`,
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
+
+    throw new Error(`unexpected fetch in deployment sizing recovery test: ${requestUrl}`);
+  }) as typeof globalThis.fetch;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    composeCustomerAnswer?: (
+      input: OpenClawSupportAnswerComposerInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<Omit<SupportAnswer, "mode">>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "deployment",
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: input.query,
+      answer_contract: "State the documented per-node resource requirements first.",
+      specialist_agent: "behavior-specialist",
+      routing_confidence: 0.96,
+      primary_domain: "deployment"
+    },
+    caseFrame: {
+      goal: "Understand the documented per-node resource requirements by deployment size.",
+      symptom: "Need a grounded deployment sizing answer from published docs.",
+      object: "per-node CPU, memory, and disk requirements",
+      action_type: "capability_confirmation",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["deployment node cpu memory disk requirements"],
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract: "State the documented per-node resource requirements first.",
+      routing_confidence: 0.96,
+      primary_domain: "deployment",
+      required_doc_kinds: ["deployment_runbook", "product_guide"]
+    },
+    retrievalQueries: ["deployment node cpu memory disk requirements"]
+  });
+  adapter.writeDeploymentDomainAnswer = async () => {
+    throw new Error("simulate deployment specialist timeout/fallback");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("simulate answer composer timeout/fallback");
+  };
+
+  const references: SearchReference[] = [
+    {
+      documentId: "doc:deployment-overview",
+      evidenceId: "chunk:deployment-overview",
+      title: "ONES private deployment requirements",
+      snippet: "This page contains the planning reference for private deployment environments.",
+      sourceUrl: "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements",
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      headingPath: "ONES private deployment requirements",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.58,
+      retrievedAt: "2026-04-13T10:20:00.000Z",
+      supportMetadata: {
+        product_area: "deployment",
+        deployment_model: "private_deployment",
+        evidence_kind: "constraint",
+        doc_kind: "deployment_runbook"
+      }
+    },
+    {
+      documentId: "doc:deployment-node-requirements",
+      evidenceId: "chunk:deployment-node-requirements",
+      title: "Per-node resource requirements",
+      snippet: "Sizing matrix for deployment planning across user bands.",
+      sourceUrl: "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements",
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      headingPath: "ONES private deployment requirements > Per-node resource requirements",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.82,
+      retrievedAt: "2026-04-13T10:20:00.000Z",
+      supportMetadata: {
+        product_area: "deployment",
+        deployment_model: "private_deployment",
+        evidence_kind: "constraint",
+        doc_kind: "deployment_runbook"
+      }
+    }
+  ];
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.73,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "CPU, memory, and disk requirements per node (50 / 200 / 500+ users)?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment-sizing-recovers-grounded-answer",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(observedFetchCount, 1);
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { specialist_agent?: string } } | undefined)?.route?.specialist_agent),
+      "behavior-specialist"
+    );
+    assert.equal(result.result.support_answer?.mode, "grounded");
+    assert.equal(result.result.support_answer?.render_variant, "behavior");
+    assert.equal(result.result.citations.some((item) => item.id === "chunk:deployment-node-requirements"), true);
+    assert.match(result.result.answer, /50/i);
+    assert.match(result.result.answer, /4 cores/i);
+    assert.match(result.result.answer, /8 gb/i);
+    assert.match(result.result.answer, /200 gb/i);
+    assert.match(result.result.answer, /500\+/i);
+    assert.match(result.result.answer, /1 tb/i);
+    assert.notEqual(result.result.state, "TICKET_HANDOFF_RECOMMENDED");
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+    mutableEnv.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("runSupportSearchAgent supervisor-domain runtime preserves coherent deployment dispatch without forcing an API route from lexical overlap", async () => {
   const mutableEnv = env as {
     FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;

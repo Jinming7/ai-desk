@@ -2248,11 +2248,12 @@ function buildFallbackDirectAnswerFromSupportedClaims(input: {
   supportedClaims: SupportVerificationResult["claim_to_citation_map"];
   fallback: SupportAnswer;
 }): string {
+  const maxLeadingClaims = input.supportedClaims.some((claim) => isStructuredBehaviorEvidenceFragment(claim.text)) ? 3 : 2;
   const leadingClaims = uniqueStrings(
     input.supportedClaims
       .filter((claim) => claim.kind === "verified_fact" || claim.kind === "grounded_inference")
       .map((claim) => claim.text),
-    2
+    maxLeadingClaims
   );
   const explicitVerdict = leadingClaims.find((claim) => /could not confirm|does not explicitly|not explicitly|未明确|无法确认|没有明确/i.test(claim));
   if (!leadingClaims.length || (input.mode !== "grounded" && input.mode !== "partial")) {
@@ -2690,6 +2691,7 @@ function looksLikeProcedureNote(text: string): boolean {
 
 const PUBLISHED_DOCS_EXPANSION_CACHE_TTL_MS = 10 * 60 * 1000;
 const publishedDocsExpansionCache = new Map<string, { expiresAt: number; source: string }>();
+const publishedDocsExpansionInFlight = new Map<string, Promise<string | null>>();
 
 function trimPublishedDocsExpansionCache(now = Date.now()): void {
   for (const [key, value] of publishedDocsExpansionCache.entries()) {
@@ -2716,12 +2718,29 @@ function decodeHtmlEntities(source: string): string {
     .replace(/&#([0-9]+);/g, (_, value: string) => String.fromCodePoint(parseInt(value, 10)));
 }
 
+function renderHtmlTableRows(source: string): string {
+  return source.replace(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi, (_, rowSource: string) => {
+    const cells = [...rowSource.matchAll(/<(?:td|th)\b[^>]*>([\s\S]*?)<\/(?:td|th)>/gi)]
+      .map((match) =>
+        decodeHtmlEntities(
+          String(match[1] ?? "")
+            .replace(/<br\s*\/?>/gi, " ")
+            .replace(/<[^>]+>/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+        )
+      )
+      .filter(Boolean);
+    return cells.length ? `\n${cells.join(" | ")}\n` : "\n";
+  });
+}
+
 function extractPublishedDocsArticleText(source: string): string {
   const scoped =
     source.match(/<article\b[^>]*>([\s\S]*?)<\/article>/i)?.[1] ??
     source.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1] ??
     source;
-  const normalized = scoped
+  const normalized = renderHtmlTableRows(scoped)
     .replace(/<script[\s\S]*?<\/script>/gi, "\n")
     .replace(/<style[\s\S]*?<\/style>/gi, "\n")
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, "\n")
@@ -2756,38 +2775,48 @@ async function loadPublishedDocsExpansionSource(reference: SearchReference): Pro
   if (cached && cached.expiresAt > now) {
     return cached.source;
   }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 2500);
-  if (typeof (timeout as { unref?: () => void }).unref === "function") {
-    (timeout as { unref: () => void }).unref();
+  const inFlight = publishedDocsExpansionInFlight.get(sourceUrl);
+  if (inFlight) {
+    return inFlight;
   }
 
-  try {
-    const response = await fetchWithNodeCompat(sourceUrl, {
-      headers: {
-        accept: "text/html,application/xhtml+xml"
-      },
-      signal: controller.signal
-    });
-    if (!response.ok) return null;
+  const loadingPromise = (async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2500);
+    if (typeof (timeout as { unref?: () => void }).unref === "function") {
+      (timeout as { unref: () => void }).unref();
+    }
 
-    const raw = await response.text();
-    const extracted = /<[^>]+>/.test(raw) ? extractPublishedDocsArticleText(raw) : raw.trim();
-    const normalized = extracted.trim();
-    if (!normalized) return null;
+    try {
+      const response = await fetchWithNodeCompat(sourceUrl, {
+        headers: {
+          accept: "text/html,application/xhtml+xml"
+        },
+        signal: controller.signal
+      });
+      if (!response.ok) return null;
 
-    publishedDocsExpansionCache.set(sourceUrl, {
-      expiresAt: now + PUBLISHED_DOCS_EXPANSION_CACHE_TTL_MS,
-      source: normalized.slice(0, 40_000)
-    });
-    trimPublishedDocsExpansionCache(now);
-    return normalized.slice(0, 40_000);
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
+      const raw = await response.text();
+      const extracted = /<[^>]+>/.test(raw) ? extractPublishedDocsArticleText(raw) : raw.trim();
+      const normalized = extracted.trim();
+      if (!normalized) return null;
+
+      publishedDocsExpansionCache.set(sourceUrl, {
+        expiresAt: now + PUBLISHED_DOCS_EXPANSION_CACHE_TTL_MS,
+        source: normalized.slice(0, 40_000)
+      });
+      trimPublishedDocsExpansionCache(now);
+      return normalized.slice(0, 40_000);
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timeout);
+      publishedDocsExpansionInFlight.delete(sourceUrl);
+    }
+  })();
+
+  publishedDocsExpansionInFlight.set(sourceUrl, loadingPromise);
+  return loadingPromise;
 }
 
 function scopeProcedureSourceLines(reference: SearchReference, source: string, allowHeadingScoping: boolean): string[] {
@@ -3015,10 +3044,18 @@ function normalizeBehaviorEvidenceFragment(fragment: string): string {
     .trim();
 }
 
+function isStructuredBehaviorEvidenceFragment(fragment: string): boolean {
+  const normalized = normalizeBehaviorEvidenceFragment(fragment);
+  if (!normalized) return false;
+  const labelValuePairs = normalized.match(/(?:^|[;；])\s*[^;:：|]{1,32}\s*[:：]\s*[^;；]+/g) ?? [];
+  return labelValuePairs.length >= 2;
+}
+
 function looksLikeBehaviorEvidenceFragment(fragment: string): boolean {
   const normalized = normalizeBehaviorEvidenceFragment(fragment);
-  if (!normalized || normalized.length < 12 || normalized.length > 220) return false;
+  if (!normalized || normalized.length < 12 || normalized.length > 320) return false;
   if (/^(title:|description:|slug:|sidebar_|hide_|custom_edit_url:|import )/i.test(normalized)) return false;
+  if (isStructuredBehaviorEvidenceFragment(normalized)) return true;
   return /(supports?|supported|available|only|requires?|required|recommended|must|cannot|not support|unsupported|compatible|compatibility|支持|可用|仅|只在|要求|推荐|必须|不能|不支持|兼容|环境要求|系统要求|适用)/i.test(
     normalized
   );
@@ -3026,6 +3063,117 @@ function looksLikeBehaviorEvidenceFragment(fragment: string): boolean {
 
 function isRecommendationLikeFragment(fragment: string): boolean {
   return /(recommended|recommendation|建议|推荐)/i.test(fragment);
+}
+
+function sanitizeBehaviorSourceLine(line: string): string {
+  return normalizeBehaviorEvidenceFragment(
+    String(line ?? "")
+      .replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+|[（(]?\d+[）)]\s*)/, "")
+      .replace(/^\s*#+\s*/, "")
+  );
+}
+
+function appendBehaviorHeadingContext(heading: string, fragment: string): string {
+  const normalizedHeading = sanitizeBehaviorSourceLine(heading);
+  const normalizedFragment = normalizeBehaviorEvidenceFragment(fragment);
+  if (!normalizedHeading || !normalizedFragment) return normalizedFragment;
+  if (normalizedFragment.toLowerCase().includes(normalizedHeading.toLowerCase())) return normalizedFragment;
+  return normalizeBehaviorEvidenceFragment(`${normalizedHeading}: ${normalizedFragment}`);
+}
+
+function parseBehaviorTableCells(line: string): string[] | null {
+  if (!line.includes("|")) return null;
+  const cells = line
+    .split("|")
+    .map((cell) => sanitizeBehaviorSourceLine(cell))
+    .filter(Boolean);
+  return cells.length >= 2 ? cells : null;
+}
+
+function isBehaviorTableSeparatorRow(cells: string[]): boolean {
+  return cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, "")));
+}
+
+function looksLikeBehaviorTableHeaderRow(cells: string[]): boolean {
+  return cells.length >= 2 && cells.every((cell) => cell.length <= 32) && cells.every((cell) => !/\d/.test(cell));
+}
+
+function formatBehaviorTableRowFragment(heading: string, headerCells: string[] | null, rowCells: string[]): string {
+  const pairs =
+    headerCells && headerCells.length === rowCells.length
+      ? rowCells.map((value, index) => `${headerCells[index]}: ${value}`)
+      : rowCells;
+  return appendBehaviorHeadingContext(heading, pairs.join("; "));
+}
+
+function extractBehaviorEvidenceFragmentsFromLines(reference: SearchReference, scopedLines: string[]): string[] {
+  const fragments: string[] = [];
+  let currentHeading = shortHeadingLabel(reference.headingPath) || reference.title;
+  let tableHeader: string[] | null = null;
+
+  for (const rawLine of scopedLines) {
+    const line = String(rawLine ?? "");
+    if (!line.trim() || /^\s*import\s+/.test(line) || /^\s*api:\s*/.test(line)) continue;
+
+    const headingMatch = line.match(/^\s*(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      currentHeading = sanitizeBehaviorSourceLine(headingMatch[2] ?? "") || currentHeading;
+      tableHeader = null;
+      continue;
+    }
+
+    const tableCells = parseBehaviorTableCells(line);
+    if (tableCells) {
+      if (isBehaviorTableSeparatorRow(tableCells)) continue;
+      if (looksLikeBehaviorTableHeaderRow(tableCells)) {
+        tableHeader = tableCells;
+        continue;
+      }
+      const rowFragment = formatBehaviorTableRowFragment(currentHeading, tableHeader, tableCells);
+      if (looksLikeBehaviorEvidenceFragment(rowFragment)) {
+        fragments.push(rowFragment);
+      }
+      continue;
+    }
+
+    tableHeader = null;
+    const cleaned = sanitizeBehaviorSourceLine(line);
+    if (!cleaned) continue;
+    const fragment = appendBehaviorHeadingContext(currentHeading, cleaned);
+    if (looksLikeBehaviorEvidenceFragment(fragment)) {
+      fragments.push(fragment);
+    }
+  }
+
+  return uniqueStrings(fragments, 10);
+}
+
+async function loadBehaviorSourceLinesAsync(reference: SearchReference): Promise<string[] | null> {
+  const resolvedPath = resolveLocalDocsMirrorPath(reference);
+  if (resolvedPath) {
+    try {
+      return scopeProcedureSourceLines(reference, fs.readFileSync(resolvedPath, "utf8"), true);
+    } catch {
+      return null;
+    }
+  }
+
+  const expandedSource = await loadPublishedDocsExpansionSource(reference);
+  if (!expandedSource) return null;
+  return scopeProcedureSourceLines(reference, expandedSource, true);
+}
+
+async function collectBehaviorEvidenceFragmentsAsync(reference: SearchReference): Promise<string[]> {
+  const snippetFragments = collectBehaviorEvidenceFragments(reference);
+  const canExpandFromSource =
+    reference.authority === "canonical_visible" &&
+    (Boolean(resolveLocalDocsMirrorPath(reference)) || String(reference.sourceUrl ?? "").startsWith("https://docs.ones.com/"));
+  if (!canExpandFromSource) return snippetFragments;
+
+  const scopedLines = await loadBehaviorSourceLinesAsync(reference);
+  if (!scopedLines?.length) return snippetFragments;
+
+  return uniqueStrings([...extractBehaviorEvidenceFragmentsFromLines(reference, scopedLines), ...snippetFragments], 12);
 }
 
 function collectBehaviorEvidenceFragments(reference: SearchReference): string[] {
@@ -3056,6 +3204,7 @@ function scoreBehaviorEvidenceFragment(input: {
   else if (profile.evidenceKind === "procedure" || profile.evidenceKind === "troubleshooting") score += 6;
   if (profile.productArea && profile.productArea === String(input.caseFrame.product_area ?? "").toLowerCase()) score += 10;
   if (profile.deploymentModel && profile.deploymentModel === String(input.caseFrame.deployment_model ?? "").toLowerCase()) score += 8;
+  if (isStructuredBehaviorEvidenceFragment(input.fragment)) score += 12;
   if (/(supports?|supported|available|only|requires?|required|recommended|must|cannot|not support|unsupported)/i.test(input.fragment)) score += 10;
   if (/(支持|可用|仅|只在|要求|推荐|必须|不能|不支持|兼容|环境要求|系统要求)/.test(input.fragment)) score += 10;
   if (isRecommendationLikeFragment(input.fragment)) score += 4;
@@ -3090,14 +3239,14 @@ function isDeploymentArchitectureQuestion(query: string, caseFrame: SupportCaseF
   );
 }
 
-function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
+async function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
   language: "zh" | "en";
   query: string;
   draft: SpecialistDraftAnswer;
   evidenceBundle: SupportEvidenceBundle;
   route: SupportQuestionRoute;
   caseFrame: SupportCaseFrame;
-}): SpecialistDraftAnswer | null {
+}): Promise<SpecialistDraftAnswer | null> {
   if (input.route.specialist_agent !== "behavior-specialist") return null;
   if (hasGroundedDraftClaimsInEvidence(input.draft, input.evidenceBundle)) return null;
   if (isDeploymentArchitectureQuestion(input.query, input.caseFrame)) return null;
@@ -3107,10 +3256,11 @@ function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
   );
   if (!ranked.length) return null;
 
-  const candidates = ranked
-    .flatMap((reference, index) => {
+  const analyzed = await Promise.all(
+    ranked.map(async (reference, index) => {
       const primaryBoost = index < input.evidenceBundle.primary.length ? 24 : 10;
-      return collectBehaviorEvidenceFragments(reference).map((fragment) => ({
+      const fragments = index < 2 ? await collectBehaviorEvidenceFragmentsAsync(reference) : collectBehaviorEvidenceFragments(reference);
+      return fragments.map((fragment) => ({
         fragment,
         evidenceId: resolveSearchReferenceEvidenceId(reference),
         note: isRecommendationLikeFragment(fragment),
@@ -3124,12 +3274,21 @@ function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
         })
       }));
     })
+  );
+
+  const candidates = analyzed
+    .flat()
     .sort((a, b) => b.score - a.score);
 
+  const maxSelectedFacts = candidates.some(
+    (candidate) => !candidate.note && isStructuredBehaviorEvidenceFragment(candidate.fragment)
+  )
+    ? 3
+    : 2;
   const selectedFacts = candidates
     .filter((candidate) => !candidate.note)
     .filter((candidate, index, all) => all.findIndex((item) => item.fragment === candidate.fragment) === index)
-    .slice(0, 2);
+    .slice(0, maxSelectedFacts);
   if (!selectedFacts.length) return null;
 
   const selectedNote =
@@ -4884,14 +5043,14 @@ async function runSupervisorDomainSupportSearch(input: {
   const draftSupportAnswer =
     recoveredApiDraft ??
     recoveredHowToDraft ??
-    recoverEvidenceAnchoredBehaviorCapabilityDraft({
+    (await recoverEvidenceAnchoredBehaviorCapabilityDraft({
       language: input.language,
       query: input.query,
       draft: rawDraftSupportAnswer,
       evidenceBundle,
       route,
       caseFrame
-    }) ??
+    })) ??
     recoverEvidenceAnchoredDeploymentBehaviorDraft({
       language: input.language,
       query: input.query,
@@ -6042,14 +6201,14 @@ export async function runSupportSearchAgent(input: {
   const draftSupportAnswer =
     recoveredApiDraft ??
     recoveredHowToDraft ??
-    recoverEvidenceAnchoredBehaviorCapabilityDraft({
+    (await recoverEvidenceAnchoredBehaviorCapabilityDraft({
       language: input.language,
       query: input.query,
       draft: rawDraftSupportAnswer,
       evidenceBundle,
       route,
       caseFrame
-    }) ??
+    })) ??
     recoverEvidenceAnchoredDeploymentBehaviorDraft({
       language: input.language,
       query: input.query,
