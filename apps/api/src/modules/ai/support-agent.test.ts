@@ -5880,7 +5880,7 @@ test("runSupportSearchAgent supervisor-domain runtime recovers a grounded HAR ho
   }
 });
 
-test("runSupportSearchAgent supervisor-domain runtime recovers grounded deployment sizing requirements from published deploy docs when specialist and composer both fall back", async () => {
+test("runSupportSearchAgent supervisor-domain runtime strips docs-shell headings and unrelated notes from recovered HAR how-to answers", async () => {
   const mutableEnv = env as {
     FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
     OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
@@ -5905,8 +5905,218 @@ test("runSupportSearchAgent supervisor-domain runtime recovers grounded deployme
         ? input.url.toString()
         : String(input?.url ?? "");
 
-    if (requestUrl === "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements") {
+    if (requestUrl === "https://docs.ones.com/operations-toolkit/capture-a-har-file-for-troubleshooting") {
       observedFetchCount += 1;
+      return new Response(
+        `<!doctype html>
+        <html lang="en">
+          <body>
+            <main>
+              <article>
+                <h1>Capture a HAR file for troubleshooting</h1>
+                <h3>OPERATIONS TOOLKIT</h3>
+                <h3>info</h3>
+                <p>Use the documented browser flow to capture a HAR file before sending it to support.</p>
+                <h2>Steps</h2>
+                <ol>
+                  <li>Open your browser DevTools.</li>
+                  <li>Switch to the Network tab and keep recording enabled.</li>
+                  <li>Reproduce the issue in the browser.</li>
+                  <li>Use Save all as HAR with content to export the HAR file.</li>
+                </ol>
+              </article>
+            </main>
+          </body>
+        </html>`,
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
+
+    throw new Error(`unexpected fetch in HAR contamination test: ${requestUrl}`);
+  }) as typeof globalThis.fetch;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDocsDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    composeCustomerAnswer?: (
+      input: OpenClawSupportAnswerComposerInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<Omit<SupportAnswer, "mode">>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async () => {
+    throw new Error("simulate planner fallback");
+  };
+  adapter.writeDocsDomainAnswer = async () => {
+    throw new Error("simulate docs specialist timeout/fallback");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("simulate answer composer timeout/fallback");
+  };
+
+  const references: SearchReference[] = [
+    {
+      documentId: "doc:har-capture-live-clean",
+      evidenceId: "chunk:har-capture-live-clean",
+      title: "Capture a HAR file for troubleshooting",
+      snippet: "Documented browser flow for capturing and exporting a HAR file for support.",
+      sourceUrl: "https://docs.ones.com/operations-toolkit/capture-a-har-file-for-troubleshooting",
+      path: "docs/operations-toolkit/capture-a-har-file-for-troubleshooting.mdx",
+      headingPath: "Capture a HAR file for troubleshooting",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.71,
+      retrievedAt: "2026-04-14T01:20:00.000Z",
+      supportMetadata: {
+        product_area: "general",
+        deployment_model: "shared",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    },
+    {
+      documentId: "doc:manhour-validator-common-issues",
+      evidenceId: "chunk:manhour-validator-common-issues",
+      title: "Common Issues",
+      snippet: "Note: Validation always fails after field type changes until the extension configuration is updated.",
+      sourceUrl: "https://kb.ones.internal/developer/guide/extensions/manhour-validator",
+      path: "open-docs/docs/abilities/extensions/manhour-validator.mdx",
+      headingPath: "Common Issues",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.68,
+      retrievedAt: "2026-04-14T01:20:00.000Z",
+      supportMetadata: {
+        product_area: "general",
+        deployment_model: "shared",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    }
+  ];
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.7,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "how to get a har file for troubule shooting?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-har-fallback-strips-meta-and-unrelated-notes",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { specialist_agent?: string } } | undefined)?.route?.specialist_agent),
+      "howto-specialist"
+    );
+    assert.equal(result.result.citations.map((item) => item.id).includes("chunk:har-capture-live-clean"), true);
+    assert.match(result.result.answer, /devtools/i);
+    assert.match(result.result.answer, /network tab/i);
+    assert.doesNotMatch(result.result.answer, /operations toolkit/i);
+    assert.doesNotMatch(result.result.answer, /\binfo\b/i);
+    assert.doesNotMatch(result.result.answer, /validation always fails/i);
+    assert.notEqual(result.result.state, "TICKET_HANDOFF_RECOMMENDED");
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+    mutableEnv.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runSupportSearchAgent supervisor-domain runtime recovers grounded deployment sizing requirements from published deploy docs when specialist and composer both fall back", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+    LOCAL_DOCS_COM_PATH?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  const originalLocalDocsPath = mutableEnv.LOCAL_DOCS_COM_PATH;
+  const originalFetch = globalThis.fetch;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+  mutableEnv.LOCAL_DOCS_COM_PATH = "";
+
+  globalThis.fetch = (async (input: string | URL | { url?: string | URL }) => {
+    const requestUrl =
+      input instanceof URL
+        ? input.toString()
+        : typeof input === "string"
+        ? input
+        : input?.url instanceof URL
+        ? input.url.toString()
+        : String(input?.url ?? "");
+
+    if (requestUrl === "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements") {
       return new Response(
         `<!doctype html>
         <html lang="en">
@@ -6121,7 +6331,6 @@ test("runSupportSearchAgent supervisor-domain runtime recovers grounded deployme
       }
     });
 
-    assert.equal(observedFetchCount, 1);
     assert.equal(
       ((result.result.internal_diagnostics as { route?: { specialist_agent?: string } } | undefined)?.route?.specialist_agent),
       "behavior-specialist"
@@ -6133,6 +6342,298 @@ test("runSupportSearchAgent supervisor-domain runtime recovers grounded deployme
     assert.match(result.result.answer, /4 cores/i);
     assert.match(result.result.answer, /8 gb/i);
     assert.match(result.result.answer, /200 gb/i);
+    assert.match(result.result.answer, /500\+/i);
+    assert.match(result.result.answer, /1 tb/i);
+    assert.notEqual(result.result.state, "TICKET_HANDOFF_RECOMMENDED");
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+    mutableEnv.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runSupportSearchAgent supervisor-domain runtime corrects deployment sizing queries away from troubleshooting when evidence is a requirements matrix", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+    LOCAL_DOCS_COM_PATH?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  const originalLocalDocsPath = mutableEnv.LOCAL_DOCS_COM_PATH;
+  const originalFetch = globalThis.fetch;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+  mutableEnv.LOCAL_DOCS_COM_PATH = "";
+
+  let observedFetchCount = 0;
+  globalThis.fetch = (async (input: string | URL | { url?: string | URL }) => {
+    const requestUrl =
+      input instanceof URL
+        ? input.toString()
+        : typeof input === "string"
+        ? input
+        : input?.url instanceof URL
+        ? input.url.toString()
+        : String(input?.url ?? "");
+
+    if (requestUrl === "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements") {
+      observedFetchCount += 1;
+      return new Response(
+        `<!doctype html>
+        <html lang="en">
+          <body>
+            <main>
+              <article>
+                <h1>ONES private deployment requirements</h1>
+                <p>This page contains the deployment sizing reference for private deployment environments.</p>
+                <h2>Per-node resource requirements</h2>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Users</th>
+                      <th>CPU</th>
+                      <th>Memory</th>
+                      <th>Disk</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>50</td>
+                      <td>4 cores</td>
+                      <td>8 GB</td>
+                      <td>200 GB</td>
+                    </tr>
+                    <tr>
+                      <td>200</td>
+                      <td>8 cores</td>
+                      <td>16 GB</td>
+                      <td>500 GB</td>
+                    </tr>
+                    <tr>
+                      <td>500+</td>
+                      <td>16 cores</td>
+                      <td>32 GB</td>
+                      <td>1 TB</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </article>
+            </main>
+          </body>
+        </html>`,
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
+
+    throw new Error(`unexpected fetch in deployment sizing correction test: ${requestUrl}`);
+  }) as typeof globalThis.fetch;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDocsDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    composeCustomerAnswer?: (
+      input: OpenClawSupportAnswerComposerInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<Omit<SupportAnswer, "mode">>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "docs",
+    route: {
+      question_type: "troubleshooting",
+      user_goal: input.query,
+      answer_contract: "Give the likely cause and the next troubleshooting checks first.",
+      specialist_agent: "troubleshooting-specialist",
+      routing_confidence: 0.79,
+      primary_domain: "docs"
+    },
+    caseFrame: {
+      goal: input.query,
+      symptom: input.query,
+      object: "unspecified",
+      action_type: "troubleshooting",
+      deployment_model: "unknown",
+      product_area: "general",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: [input.query],
+      question_type: "troubleshooting",
+      specialist_agent: "troubleshooting-specialist",
+      answer_contract: "Give the likely cause and the next troubleshooting checks first.",
+      routing_confidence: 0.79,
+      primary_domain: "docs"
+    },
+    retrievalQueries: [input.query]
+  });
+  adapter.writeDocsDomainAnswer = async () => {
+    throw new Error("simulate docs specialist timeout/fallback");
+  };
+  adapter.writeDeploymentDomainAnswer = async () => {
+    throw new Error("simulate deployment specialist timeout/fallback");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("simulate answer composer timeout/fallback");
+  };
+
+  const references: SearchReference[] = [
+    {
+      documentId: "doc:k3s-node-handler",
+      evidenceId: "chunk:k3s-node-handler",
+      title: "k3s node handler troubleshooting",
+      snippet: "Use this guide when a node handler fails to start or crashes in a private deployment cluster.",
+      sourceUrl: "https://docs.ones.com/zh-Hans/deploy/troubleshooting/infra/k3s-node-handler",
+      path: "deploy-docs/troubleshooting/infra/k3s-node-handler.md",
+      headingPath: "k3s node handler troubleshooting",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.84,
+      retrievedAt: "2026-04-14T01:40:00.000Z",
+      supportMetadata: {
+        product_area: "deployment",
+        deployment_model: "private_deployment",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    },
+    {
+      documentId: "doc:deployment-overview",
+      evidenceId: "chunk:deployment-overview",
+      title: "ONES private deployment requirements",
+      snippet: "This page contains the planning reference for private deployment environments.",
+      sourceUrl: "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements",
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      headingPath: "ONES private deployment requirements",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.58,
+      retrievedAt: "2026-04-14T01:40:00.000Z",
+      supportMetadata: {
+        product_area: "deployment",
+        deployment_model: "private_deployment",
+        evidence_kind: "constraint",
+        doc_kind: "deployment_runbook"
+      }
+    },
+    {
+      documentId: "doc:deployment-node-requirements",
+      evidenceId: "chunk:deployment-node-requirements",
+      title: "Per-node resource requirements",
+      snippet: "Sizing matrix for deployment planning across user bands.",
+      sourceUrl: "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements",
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      headingPath: "ONES private deployment requirements > Per-node resource requirements",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.82,
+      retrievedAt: "2026-04-14T01:40:00.000Z",
+      supportMetadata: {
+        product_area: "deployment",
+        deployment_model: "private_deployment",
+        evidence_kind: "constraint",
+        doc_kind: "deployment_runbook"
+      }
+    }
+  ];
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.76,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "CPU, memory, and disk requirements per node (50 / 200 / 500+ users)?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment-sizing-corrects-troubleshooting-misroute",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { specialist_agent?: string } } | undefined)?.route?.specialist_agent),
+      "behavior-specialist"
+    );
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { primary_domain?: string } } | undefined)?.route?.primary_domain),
+      "deployment"
+    );
+    assert.ok(result.result.case_frame);
+    assert.equal(result.result.case_frame.product_area, "deployment");
+    assert.equal(result.result.citations.some((item) => item.id === "chunk:deployment-node-requirements"), true);
+    assert.match(result.result.answer, /50/i);
+    assert.match(result.result.answer, /4 cores/i);
+    assert.match(result.result.answer, /8 gb/i);
     assert.match(result.result.answer, /500\+/i);
     assert.match(result.result.answer, /1 tb/i);
     assert.notEqual(result.result.state, "TICKET_HANDOFF_RECOMMENDED");

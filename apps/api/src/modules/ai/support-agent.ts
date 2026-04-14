@@ -230,6 +230,7 @@ type SupportQuerySignals = {
   integrationContext: boolean;
   privateDeploymentContext: boolean;
   infrastructureContext: boolean;
+  deploymentSizingContext: boolean;
   deploymentArchitectureContext: boolean;
   isolationContext: boolean;
   accountRecoveryContext: boolean;
@@ -318,9 +319,21 @@ function reconcileSupervisorRouteWithEvidence(input: {
         profile.docKind === "troubleshooting")
     );
   });
+  const deploymentSizingReferences = visibleReferences.filter((reference) => {
+    const profile = getSupportEvidenceProfile(reference);
+    const semanticText = getReferenceSemanticText(reference).toLowerCase();
+    return (
+      profile.productArea === "deployment" &&
+      (profile.evidenceKind === "constraint" || profile.evidenceKind === "capability") &&
+      /\b(cpu|memory|ram|disk|storage|node|users?|capacity|sizing|requirements?)\b|cpu|内存|磁盘|存储|节点|用户/.test(
+        semanticText
+      )
+    );
+  });
   const apiEvidenceCount = apiReferences.length;
   const bestApiScore = apiReferences[0]?.score ?? 0;
   const bestDocsActionableScore = docsActionableReferences[0]?.score ?? 0;
+  const bestDeploymentSizingScore = deploymentSizingReferences[0]?.score ?? 0;
   const shouldPreferDocsActionableRoute =
     !apiShapedQuery &&
     bestDocsActionableScore > 0 &&
@@ -329,6 +342,68 @@ function reconcileSupervisorRouteWithEvidence(input: {
       querySignals.troubleshootingContext ||
       input.caseFrame.action_type === "how_to" ||
       input.caseFrame.action_type === "troubleshooting");
+  const shouldPreferDeploymentSizingRoute =
+    querySignals.deploymentSizingContext &&
+    !apiShapedQuery &&
+    !querySignals.troubleshootingContext &&
+    bestDeploymentSizingScore > 0 &&
+    (input.route.specialist_agent === "troubleshooting-specialist" ||
+      input.caseFrame.action_type === "troubleshooting" ||
+      bestDeploymentSizingScore >= bestDocsActionableScore * 0.95);
+
+  if (shouldPreferDeploymentSizingRoute) {
+    const answer_contract = "State the documented per-node resource requirements first.";
+    return {
+      route: {
+        ...input.route,
+        question_type: "capability_confirmation",
+        specialist_agent: "behavior-specialist",
+        answer_contract,
+        primary_domain: "deployment",
+        routing_confidence: Math.max(input.route.routing_confidence, 0.88)
+      },
+      caseFrame: {
+        ...input.caseFrame,
+        object:
+          input.caseFrame.object === "unspecified"
+            ? localizedSupportLabel(input.query, "每节点 CPU、内存和磁盘要求", "per-node CPU, memory, and disk requirements")
+            : input.caseFrame.object,
+        action_type: "capability_confirmation",
+        deployment_model: "private_deployment",
+        product_area: "deployment",
+        question_type: "capability_confirmation",
+        specialist_agent: "behavior-specialist",
+        answer_contract,
+        primary_domain: "deployment",
+        required_doc_kinds: uniqueStrings(
+          [...(input.caseFrame.required_doc_kinds ?? []), "deployment_runbook", "product_guide", "rules"],
+          6
+        ),
+        retrieval_queries: uniqueStrings(
+          [
+            ...input.caseFrame.retrieval_queries,
+            "deployment sizing requirements",
+            "per node cpu memory disk requirements"
+          ],
+          8
+        ),
+        query_plan: {
+          concept_queries: uniqueStrings(
+            [...(input.caseFrame.query_plan?.concept_queries ?? []), "deployment sizing requirements", "resource requirements per node"],
+            4
+          ),
+          object_queries: uniqueStrings(
+            [...(input.caseFrame.query_plan?.object_queries ?? []), "per-node CPU, memory, and disk requirements"],
+            4
+          ),
+          behavior_queries: uniqueStrings(
+            [...(input.caseFrame.query_plan?.behavior_queries ?? []), "capability confirmation", "capacity planning"],
+            4
+          )
+        }
+      }
+    };
+  }
 
   if (shouldPreferDocsActionableRoute) {
     const question_type: SupportQuestionRoute["question_type"] = querySignals.wantsProcedure
@@ -405,6 +480,28 @@ function hasCjkText(input: string): boolean {
 function analyzeSupportQuerySignals(query: string): SupportQuerySignals {
   const normalized = query.trim();
   const lowered = normalized.toLowerCase();
+  const resourceDimensionCount = [
+    /\bcpu\b|\bprocessor\b|\bcore\b|\bcores\b|处理器|核数|核/,
+    /\bmemory\b|\bram\b|内存/,
+    /\bdisk\b|\bstorage\b|磁盘|存储/,
+    /\bnode\b|每节点|单节点|节点/,
+    /\busers?\b|\bseats?\b|用户数|用户规模|用户量/
+  ].reduce((count, pattern) => count + (pattern.test(lowered) || pattern.test(normalized) ? 1 : 0), 0);
+  const sizingIntentCount = [
+    /\brequirements?\b|\brequired\b|要求|需求/,
+    /\bresource\b|\bresources\b|资源/,
+    /\bcapacity\b|\bcapacity planning\b|容量|容量规划/,
+    /\bsizing\b|\bsize\b|\bspecs?\b|规格|配额/,
+    /\bper[- ]?node\b|每节点|单节点|节点/
+  ].reduce((count, pattern) => count + (pattern.test(lowered) || pattern.test(normalized) ? 1 : 0), 0);
+  const deploymentSizingContext = resourceDimensionCount >= 2 && sizingIntentCount >= 1;
+  const httpStatusMention =
+    /\b(401|403|404|500)\b/.test(lowered) &&
+    (/\b(http|https|status|error|errors|response|request|returned|returns|code|endpoint|api)\b/.test(lowered) ||
+      /状态码|错误码|返回码|接口|请求|响应|报错/.test(normalized));
+  const failureLanguageContext =
+    /排查|报错|错误|异常|失败|无法|不能|page not found/.test(normalized) ||
+    /\b(troubleshoot|troubleshooting|error|errors|failed|failure|cannot|unable|page not found)\b/i.test(lowered);
   return {
     apiContext: isApiShapedQuery(normalized),
     integrationContext:
@@ -414,8 +511,9 @@ function analyzeSupportQuerySignals(query: string): SupportQuerySignals {
       /私有部署|本地部署|闭网|闭域网|内网|离线|受限环境/.test(normalized) ||
       /\b(private deployment|self[- ]?hosted|selfhosted|on[- ]?prem|onprem|air[- ]?gapped|closed network|offline|restricted environment)\b/i.test(lowered),
     infrastructureContext:
-      /服务器|os层|操作系统|pod|集群|k8s|k3s|容器|运维/.test(normalized) ||
-      /\b(server|backend service|backend services|database|databases|service topology|query path|query paths|architecture|topology|os[- ]?level|operating system|pod|cluster|k8s|k3s|container|ops|operation toolkit)\b/i.test(lowered),
+      /服务器|os层|操作系统|pod|集群|k8s|k3s|容器|运维|内存|磁盘|存储|节点/.test(normalized) ||
+      /\b(server|backend service|backend services|database|databases|service topology|query path|query paths|architecture|topology|os[- ]?level|operating system|pod|cluster|k8s|k3s|container|ops|operation toolkit|memory|disk|storage|node)\b/i.test(lowered),
+    deploymentSizingContext,
     deploymentArchitectureContext:
       /部署架构|架构拓扑|服务拓扑|数据库拓扑|查询路径|隔离部署|模块隔离/.test(normalized) ||
       /\b(architecture|topology|service boundaries|service topology|database topology|shared backend|backend services|query path|query paths|monolith|unified system)\b/i.test(lowered),
@@ -428,9 +526,7 @@ function analyzeSupportQuerySignals(query: string): SupportQuerySignals {
     mailDependencyContext:
       /邮件服务|邮箱|邮件重置|外部无法直接连接|无法远程/.test(normalized) ||
       /\b(email|mail|smtp|remote access|remote operation|external connection)\b/i.test(lowered),
-    troubleshootingContext:
-      /排查|报错|错误|异常|失败|无法|不能|404|401|500|page not found/.test(normalized) ||
-      /\b(troubleshoot|troubleshooting|error|errors|failed|failure|cannot|unable|page not found|404|401|403|500)\b/i.test(lowered),
+    troubleshootingContext: failureLanguageContext || httpStatusMention,
     wantsProcedure:
       /如何|怎么|步骤|方式|能否|是否存在|可以通过/.test(normalized) ||
       /\b(how|how to|steps?|procedure|workflow|can we|is there|via server|via os)\b/i.test(lowered)
@@ -496,9 +592,16 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   const architectureQuestion =
     (signals.privateDeploymentContext || /deployment documentation|部署文档/i.test(input.query)) &&
     (signals.deploymentArchitectureContext || signals.isolationContext || signals.infrastructureContext);
+  const deploymentSizingQuestion =
+    signals.deploymentSizingContext &&
+    !signals.apiContext &&
+    !signals.troubleshootingContext;
   const deploymentModel =
     input.caseFrame.deployment_model === "unknown" || input.caseFrame.deployment_model === "shared"
-      ? signals.privateDeploymentContext || architectureQuestion || (signals.infrastructureContext && signals.mailDependencyContext)
+      ? signals.privateDeploymentContext ||
+        architectureQuestion ||
+        deploymentSizingQuestion ||
+        (signals.infrastructureContext && signals.mailDependencyContext)
         ? "private_deployment"
         : input.caseFrame.deployment_model
       : input.caseFrame.deployment_model;
@@ -507,7 +610,9 @@ function stabilizeSupportRouteAndCaseFrame(input: {
       (input.caseFrame.product_area === "openapi" &&
         !apiShaped &&
         (signals.accountRecoveryContext || signals.infrastructureContext || architectureQuestion))) &&
-    (deploymentModel === "private_deployment" || signals.infrastructureContext || architectureQuestion)
+    (deploymentModel === "private_deployment" || signals.infrastructureContext || architectureQuestion || deploymentSizingQuestion)
+      ? "deployment"
+      : (input.caseFrame.product_area === "general" || input.caseFrame.product_area === "openapi") && deploymentSizingQuestion
       ? "deployment"
       : (input.caseFrame.product_area === "general" || input.caseFrame.product_area === "openapi") &&
         signals.integrationContext &&
@@ -524,21 +629,31 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   const shouldPreserveIntegrationTroubleshooting =
     (productArea === "integrations" || input.caseFrame.product_area === "integrations" || signals.integrationContext) &&
     (input.caseFrame.action_type === "troubleshooting" || signals.troubleshootingContext);
+  const shouldPreserveDeploymentRoute =
+    (deploymentModel === "private_deployment" || productArea === "deployment" || input.caseFrame.product_area === "deployment") &&
+    (signals.accountRecoveryContext || shouldTreatAsHowTo || architectureQuestion || deploymentSizingQuestion);
   const shouldForceApiRoute =
     signals.apiContext &&
     !shouldPreserveIntegrationTroubleshooting &&
+    !shouldPreserveDeploymentRoute &&
     (input.caseFrame.product_area === "openapi" ||
       normalizedRoute.specialist_agent !== "api-specialist" ||
       !String(normalizedRoute.question_type ?? "").startsWith("api_"));
   const object =
     input.caseFrame.object === "unspecified" && signals.accountRecoveryContext
       ? localizedSupportLabel(input.query, "管理员密码重置", "administrator password reset")
+      : input.caseFrame.object === "unspecified" && deploymentSizingQuestion
+      ? localizedSupportLabel(input.query, "每节点 CPU、内存和磁盘要求", "per-node CPU, memory, and disk requirements")
       : input.caseFrame.object === "unspecified" && architectureQuestion
       ? localizedSupportLabel(input.query, "私有部署架构与隔离能力", "self-hosted deployment architecture and isolation")
       : input.caseFrame.object === "unspecified" && signals.integrationContext
       ? localizedSupportLabel(input.query, "集成授权回调", "integration authorization callback")
       : input.caseFrame.object;
-  const actionType = shouldTreatAsHowTo ? "how_to" : input.caseFrame.action_type;
+  const actionType = shouldTreatAsHowTo
+    ? "how_to"
+    : deploymentSizingQuestion
+    ? "capability_confirmation"
+    : input.caseFrame.action_type;
 
   let caseFrame: SupportCaseFrame = {
     ...input.caseFrame,
@@ -577,6 +692,8 @@ function stabilizeSupportRouteAndCaseFrame(input: {
       ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "troubleshooting", "product_guide", "rules"], 6)
       : architectureQuestion
       ? ["deployment_runbook", "product_guide", "rules", "troubleshooting"]
+      : deploymentSizingQuestion
+      ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "deployment_runbook", "product_guide", "rules"], 6)
       : shouldTreatAsHowTo
       ? uniqueStrings([...(input.caseFrame.required_doc_kinds ?? []), "deployment_runbook", "troubleshooting"], 6)
       : input.caseFrame.required_doc_kinds
@@ -598,6 +715,14 @@ function stabilizeSupportRouteAndCaseFrame(input: {
           specialist_agent: "troubleshooting-specialist",
           answer_contract: "Give the most likely integration configuration cause first, then the direct checks to run now.",
           routing_confidence: Math.max(input.route.routing_confidence, 0.84)
+        }
+      : deploymentSizingQuestion && normalizedRoute.specialist_agent !== "api-specialist"
+      ? {
+          ...normalizedRoute,
+          question_type: "capability_confirmation",
+          specialist_agent: "behavior-specialist",
+          answer_contract: "State the documented per-node resource requirements first.",
+          routing_confidence: Math.max(input.route.routing_confidence, 0.86)
         }
       : shouldTreatAsHowTo && normalizedRoute.specialist_agent === "behavior-specialist"
       ? {
@@ -631,6 +756,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
 
 function fallbackQuestionRoute(query: string): SupportQuestionRoute {
   const lowered = query.toLowerCase();
+  const signals = analyzeSupportQuerySignals(query);
   const question_type: SupportQuestionRoute["question_type"] =
     /\b(scope|oauth|token)\b/i.test(query)
       ? "api_scope_auth"
@@ -642,6 +768,8 @@ function fallbackQuestionRoute(query: string): SupportQuestionRoute {
       ? "why_behavior"
       : /如何|怎么|步骤|setup|configure|config|导出|export|\b(how|how to|steps?|procedure|workflow)\b/i.test(query)
       ? "how_to_product"
+      : signals.deploymentSizingContext && !signals.troubleshootingContext
+      ? "capability_confirmation"
       : /\b(not work|failed|failure|error|报错|异常|失败)\b/i.test(query)
       ? "troubleshooting"
       : "capability_confirmation";
@@ -664,11 +792,30 @@ function fallbackQuestionRoute(query: string): SupportQuestionRoute {
 }
 
 function fallbackSupportDispatch(query: string): OpenClawSupportDispatchOutput {
-  const route = fallbackQuestionRoute(query);
+  const signals = analyzeSupportQuerySignals(query);
+  const fallbackRoute = fallbackQuestionRoute(query);
+  const deploymentSizingQuestion =
+    signals.deploymentSizingContext &&
+    !signals.apiContext &&
+    !signals.troubleshootingContext;
+  const route: SupportQuestionRoute =
+    deploymentSizingQuestion && fallbackRoute.specialist_agent !== "api-specialist"
+      ? {
+          ...fallbackRoute,
+          question_type: "capability_confirmation",
+          specialist_agent: "behavior-specialist",
+          answer_contract: "State the documented per-node resource requirements first.",
+          routing_confidence: Math.max(fallbackRoute.routing_confidence, 0.84)
+        }
+      : fallbackRoute;
   const draftCaseFrame: SupportCaseFrame = {
     goal: query.trim() || "support question",
     symptom: query.trim() || "needs support guidance",
-    object: route.question_type.startsWith("api_") ? "api" : "unspecified",
+    object: route.question_type.startsWith("api_")
+      ? "api"
+      : deploymentSizingQuestion
+      ? "per-node CPU, memory, and disk requirements"
+      : "unspecified",
     action_type:
       route.specialist_agent === "api-specialist"
         ? "lookup"
@@ -677,15 +824,35 @@ function fallbackSupportDispatch(query: string): OpenClawSupportDispatchOutput {
         : route.specialist_agent === "behavior-specialist"
         ? "capability_confirmation"
         : "troubleshooting",
-    deployment_model: "unknown",
-    product_area: route.question_type.startsWith("api_") ? "openapi" : "general",
+    deployment_model: deploymentSizingQuestion ? "private_deployment" : "unknown",
+    product_area:
+      route.question_type.startsWith("api_")
+        ? "openapi"
+        : deploymentSizingQuestion
+        ? "deployment"
+        : "general",
     constraints: [],
     missing_critical_info: [],
-    retrieval_queries: [query].filter(Boolean),
+    retrieval_queries: uniqueStrings(
+      [
+        query,
+        deploymentSizingQuestion ? "deployment sizing requirements" : undefined,
+        deploymentSizingQuestion ? "per node cpu memory disk requirements" : undefined
+      ],
+      4
+    ),
     question_type: route.question_type,
     specialist_agent: route.specialist_agent,
     answer_contract: route.answer_contract,
-    routing_confidence: route.routing_confidence
+    routing_confidence: route.routing_confidence,
+    query_plan: deploymentSizingQuestion
+      ? {
+          concept_queries: ["deployment sizing requirements", "resource requirements per node"],
+          object_queries: ["per-node CPU, memory, and disk requirements"],
+          behavior_queries: ["capability confirmation", "capacity planning"]
+        }
+      : undefined,
+    required_doc_kinds: deploymentSizingQuestion ? ["deployment_runbook", "product_guide", "rules"] : undefined
   };
   const primaryDomain = inferSupportDomainFromRouteAndCaseFrame(route, draftCaseFrame);
   return {
@@ -698,7 +865,9 @@ function fallbackSupportDispatch(query: string): OpenClawSupportDispatchOutput {
       ...draftCaseFrame,
       primary_domain: primaryDomain
     },
-    retrievalQueries: [query].filter(Boolean)
+    retrievalQueries: deploymentSizingQuestion
+      ? uniqueStrings([query, "deployment sizing requirements", "per node cpu memory disk requirements"], 4)
+      : [query].filter(Boolean)
   };
 }
 
@@ -2668,14 +2837,14 @@ function isProcedureNoteHeading(text: string): boolean {
 function looksLikeProcedureAction(text: string): boolean {
   if (!text || text.length < 4) return false;
   if (
-    /^(先|首先|然后|再|接着|最后|执行|配置|确认|准备|提供|申请|登录|创建|设置|使用|输入|保存|安装|升级|重启|检查|联系|导出|导入|运行|开放|打通|关闭|开启|重建|重置|恢复)/.test(
+    /^(先|首先|然后|再|接着|最后|执行|配置|确认|准备|提供|申请|登录|创建|设置|使用|输入|保存|安装|升级|重启|检查|联系|导出|导入|运行|开放|打通|关闭|开启|重建|重置|恢复|进入|增加|添加|点击|切换|选择|下载|上传|复现|抓取|查看|打开|共享)/.test(
       text
     )
   ) {
     return true;
   }
   if (
-    /^(follow|run|open|configure|confirm|prepare|provide|apply|log in|create|set|use|enter|save|install|upgrade|restart|check|contact|export|import|rebuild|reset|restore)\b/i.test(
+    /^(follow|run|open|configure|confirm|prepare|provide|apply|log in|create|set|use|enter|save|install|upgrade|restart|check|contact|export|import|rebuild|reset|restore|click|switch|select|download|upload|reproduce|capture|review|share|choose|navigate)\b/i.test(
       text
     )
   ) {
@@ -2687,6 +2856,59 @@ function looksLikeProcedureAction(text: string): boolean {
 function looksLikeProcedureNote(text: string): boolean {
   if (/^(注意|说明|提示|前提|要求|限制|风险|备注|建议|必须|需|需要|推荐|校验|验证)/.test(text)) return true;
   return /^(note|warning|important|prerequisite|requirement|risk|validate|validation)\b/i.test(text);
+}
+
+function shouldPromoteProcedureHeadingAsStep(text: string): boolean {
+  const normalized = sanitizeProcedureItem(text);
+  if (!normalized || normalized.length > 80) return false;
+  if (/^(info|notice|tip|faq|overview)$/i.test(normalized)) return false;
+  if (/^[A-Z][A-Z\s/_-]{3,}$/.test(normalized)) return false;
+  return looksLikeProcedureAction(normalized) || /^\d+[.)]\s+/.test(text);
+}
+
+function procedureSupplementOverlap(
+  primary: SearchReference,
+  candidate: SearchReference,
+  query: string,
+  caseFrame: SupportCaseFrame
+): number {
+  const primaryTerms = new Set(
+    collectProcedureSemanticTerms(
+      [primary.title, primary.headingPath ?? "", getReferenceSemanticText(primary)].filter(Boolean).join(" ")
+    )
+  );
+  const candidateTerms = new Set(
+    collectProcedureSemanticTerms(
+      [candidate.title, candidate.headingPath ?? "", getReferenceSemanticText(candidate)].filter(Boolean).join(" ")
+    )
+  );
+  const focusTerms = collectProcedureSemanticTerms(
+    [query, caseFrame.object, ...(caseFrame.retrieval_queries ?? [])].filter(Boolean).join(" ")
+  );
+  let overlap = 0;
+  for (const term of focusTerms) {
+    if (!primaryTerms.has(term) || !candidateTerms.has(term)) continue;
+    overlap += 1;
+    if (overlap >= 2) return overlap;
+  }
+  return overlap;
+}
+
+function isProcedureSupplementReferenceRelevant(
+  primary: SearchReference,
+  candidate: SearchReference,
+  query: string,
+  caseFrame: SupportCaseFrame
+): boolean {
+  const primarySourceUrl = String(primary.sourceUrl ?? "").trim();
+  const candidateSourceUrl = String(candidate.sourceUrl ?? "").trim();
+  if (primarySourceUrl && candidateSourceUrl && primarySourceUrl === candidateSourceUrl) return true;
+
+  const primaryPath = canonicalDocsPath(primary.path);
+  const candidatePath = canonicalDocsPath(candidate.path);
+  if (primaryPath && candidatePath && primaryPath === candidatePath) return true;
+
+  return procedureSupplementOverlap(primary, candidate, query, caseFrame) >= 2;
 }
 
 const PUBLISHED_DOCS_EXPANSION_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -2921,7 +3143,7 @@ function extractProcedureBlocksFromLines(reference: SearchReference, scopedLines
         sectionContext = "steps";
         continue;
       }
-      if ((headingMatch[1]?.length ?? 0) >= 3 && headingText.length <= 80) {
+      if ((headingMatch[1]?.length ?? 0) >= 3 && shouldPromoteProcedureHeadingAsStep(headingText)) {
         sectionContext = "steps";
         pushProcedureItem(steps, headingText, 6);
         continue;
@@ -3386,11 +3608,13 @@ async function recoverEvidenceAnchoredHowToDraft(input: {
   const noteCandidate =
     analyzed.find(
       (item) =>
+        isProcedureSupplementReferenceRelevant(actionCandidate.reference, item.reference, input.query, input.caseFrame) &&
         resolveSearchReferenceEvidenceId(item.reference) !== resolveSearchReferenceEvidenceId(actionCandidate.reference) &&
         item.blocks.notes.length > 0
     ) ??
     analyzed.find(
       (item) =>
+        isProcedureSupplementReferenceRelevant(actionCandidate.reference, item.reference, input.query, input.caseFrame) &&
         resolveSearchReferenceEvidenceId(item.reference) !== resolveSearchReferenceEvidenceId(actionCandidate.reference) &&
         item.blocks.steps.length > 0
     ) ??
@@ -4887,16 +5111,21 @@ async function runSupervisorDomainSupportSearch(input: {
     caseFrame: initialCaseFrame,
     evidencePlan: initialEvidencePlan
   });
-  let primaryDomain = inferSupportDomainFromRouteAndCaseFrame(initialRoute, canonicalized.caseFrame);
+  const stabilized = stabilizeSupportRouteAndCaseFrame({
+    query: input.query,
+    route: initialRoute,
+    caseFrame: canonicalized.caseFrame
+  });
+  let primaryDomain = inferSupportDomainFromRouteAndCaseFrame(stabilized.route, stabilized.caseFrame);
   let route: SupportQuestionRoute = {
-    ...initialRoute,
+    ...stabilized.route,
     primary_domain: primaryDomain
   };
   let caseFrame: SupportCaseFrame = {
-    ...canonicalized.caseFrame,
+    ...stabilized.caseFrame,
     primary_domain: primaryDomain,
     retrieval_queries: uniqueStrings(
-      [...dispatch.retrievalQueries, ...canonicalized.caseFrame.retrieval_queries, input.query],
+      [...dispatch.retrievalQueries, ...stabilized.caseFrame.retrieval_queries, input.query],
       8
     )
   };
