@@ -7555,7 +7555,7 @@ test("runSupportSearchAgent supervisor-domain runtime strips generic api retriev
       object: "api",
       action_type: "how_to",
       deployment_model: "private_deployment",
-      product_area: "deployment",
+      product_area: "openapi",
       constraints: [],
       missing_critical_info: [],
       retrieval_queries: [input.query, "api", "private deployment", "deployment"],

@@ -704,7 +704,6 @@ function stabilizeSupportRouteAndCaseFrame(input: {
   const shouldStripApiRetrievalNoise =
     shouldPreserveDeploymentRoute &&
     normalizedRoute.specialist_agent !== "api-specialist" &&
-    input.caseFrame.product_area !== "openapi" &&
     shouldStripGenericApiRetrievalNoise(provisionalCaseFrame);
   const shouldForceApiRoute =
     signals.apiContext &&
