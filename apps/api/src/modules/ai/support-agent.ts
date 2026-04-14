@@ -1514,6 +1514,20 @@ function looksLikeDeploymentSizingEvidenceText(text: string): boolean {
   return analyzeSupportQuerySignals(text).deploymentSizingContext;
 }
 
+function looksLikeDeploymentMigrationPlanningText(text: string): boolean {
+  return /\b(migration|migrate|cutover|rollback|backup|current instance|target server|rehearsal|preflight|dry run)\b|迁移|回滚|备份|当前.*实例|目标服务器|实施预演|信息收集/.test(
+    text
+  );
+}
+
+function looksLikeDirectDeploymentSizingEvidenceText(text: string): boolean {
+  if (!looksLikeDeploymentSizingEvidenceText(text)) return false;
+  if (looksLikeDeploymentMigrationPlanningText(text)) return false;
+  return /\b(requirements?|resource requirements?|configuration requirements?|server requirements?|capacity|sizing|specs?|per[- ]?node)\b|要求|配置要求|环境要求|规格|准备\d+台服务器|单机版配置说明|集群版配置说明/.test(
+    text
+  );
+}
+
 function referenceLooksLikeDeploymentSizingEvidence(reference: SearchReference): boolean {
   const profile = getReferenceSupportProfile(reference);
   if (profile.objectType === "deployment_node_sizing") return true;
@@ -1521,10 +1535,33 @@ function referenceLooksLikeDeploymentSizingEvidence(reference: SearchReference):
   return looksLikeDeploymentSizingEvidenceText(getReferenceSemanticText(reference));
 }
 
+function referenceLooksLikeDirectDeploymentSizingEvidence(reference: SearchReference): boolean {
+  const profile = getReferenceSupportProfile(reference);
+  if (profile.objectType === "deployment_node_sizing") return true;
+  if (getReferenceRetrievalUnitFamily(reference) === "constraint_table_row_unit") return true;
+  return looksLikeDirectDeploymentSizingEvidenceText(getReferenceSemanticText(reference));
+}
+
+function referenceLooksLikeDeploymentMigrationPlanning(reference: SearchReference): boolean {
+  return looksLikeDeploymentMigrationPlanningText(getReferenceSemanticText(reference));
+}
+
 function fragmentLooksLikeDeploymentSizingEvidence(fragment: string): boolean {
   const normalized = normalizeBehaviorEvidenceFragment(fragment);
   if (!normalized) return false;
   return looksLikeDeploymentSizingEvidenceText(normalized);
+}
+
+function fragmentLooksLikeDirectDeploymentSizingEvidence(fragment: string): boolean {
+  const normalized = normalizeBehaviorEvidenceFragment(fragment);
+  if (!normalized) return false;
+  return looksLikeDirectDeploymentSizingEvidenceText(normalized);
+}
+
+function fragmentLooksLikeDeploymentMigrationPlanning(fragment: string): boolean {
+  const normalized = normalizeBehaviorEvidenceFragment(fragment);
+  if (!normalized) return false;
+  return looksLikeDeploymentMigrationPlanningText(normalized);
 }
 
 function referenceHasPermissionSignal(reference: SearchReference): boolean {
@@ -1810,6 +1847,8 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
       const snippet = profile.snippet;
       const semanticText = getReferenceSemanticText(reference);
       const deploymentSizingEvidence = referenceLooksLikeDeploymentSizingEvidence(reference);
+      const directDeploymentSizingEvidence = referenceLooksLikeDirectDeploymentSizingEvidence(reference);
+      const deploymentMigrationPlanning = referenceLooksLikeDeploymentMigrationPlanning(reference);
       const retrievalUnitFamily = getReferenceRetrievalUnitFamily(reference);
       let topicScore = 0;
       for (const term of focusTerms) {
@@ -1837,10 +1876,12 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
         }
       }
       if (deploymentSizingQuestion) {
-        if (deploymentSizingEvidence) topicScore += 34;
+        if (deploymentSizingEvidence) topicScore += 12;
+        if (directDeploymentSizingEvidence) topicScore += 34;
         if (profile.objectType === "deployment_node_sizing") topicScore += 18;
         if (retrievalUnitFamily === "constraint_table_row_unit") topicScore += 16;
         if (/\|/.test(String(reference.snippet ?? ""))) topicScore += 10;
+        if (deploymentMigrationPlanning && !directDeploymentSizingEvidence) topicScore -= 22;
         if (
           !deploymentSizingEvidence &&
           /\b(applicable environments?|operating system requirements?|support matrix|compatibility)\b|适用环境|操作系统要求|支持矩阵|兼容性/.test(
@@ -3668,6 +3709,8 @@ function scoreBehaviorEvidenceFragment(input: {
   const profile = getReferenceSupportProfile(input.reference);
   const deploymentSizingQuestion = isDeploymentSizingQuestion(input.query, input.caseFrame);
   const deploymentSizingFragment = fragmentLooksLikeDeploymentSizingEvidence(input.fragment);
+  const directDeploymentSizingFragment = fragmentLooksLikeDirectDeploymentSizingEvidence(input.fragment);
+  const deploymentMigrationPlanningFragment = fragmentLooksLikeDeploymentMigrationPlanning(input.fragment);
   let score = input.primaryBoost + Math.round(input.reference.score * 10);
   if (profile.evidenceKind === "capability" || profile.evidenceKind === "constraint") score += 14;
   else if (profile.evidenceKind === "procedure" || profile.evidenceKind === "troubleshooting") score += 6;
@@ -3678,8 +3721,14 @@ function scoreBehaviorEvidenceFragment(input: {
   if (/(支持|可用|仅|只在|要求|推荐|必须|不能|不支持|兼容|环境要求|系统要求)/.test(input.fragment)) score += 10;
   if (isRecommendationLikeFragment(input.fragment)) score += 4;
   if (deploymentSizingQuestion) {
-    if (referenceLooksLikeDeploymentSizingEvidence(input.reference)) score += 18;
-    if (deploymentSizingFragment) score += 26;
+    if (referenceLooksLikeDeploymentSizingEvidence(input.reference)) score += 8;
+    if (referenceLooksLikeDirectDeploymentSizingEvidence(input.reference)) score += 16;
+    if (deploymentSizingFragment) score += 10;
+    if (directDeploymentSizingFragment) score += 22;
+    if (deploymentMigrationPlanningFragment && !directDeploymentSizingFragment) score -= 22;
+    if (referenceLooksLikeDeploymentMigrationPlanning(input.reference) && !referenceLooksLikeDirectDeploymentSizingEvidence(input.reference)) {
+      score -= 18;
+    }
     if (
       !deploymentSizingFragment &&
       /\b(applicable environments?|operating system requirements?|support matrix|compatibility)\b|适用环境|操作系统要求|支持矩阵|兼容性/i.test(
@@ -3727,9 +3776,15 @@ function shouldExpandBehaviorEvidenceAsync(
   query: string,
   caseFrame: SupportCaseFrame
 ): boolean {
-  if (index < 2) return true;
-  if (!isDeploymentSizingQuestion(query, caseFrame)) return false;
-  return index < 4 || referenceLooksLikeDeploymentSizingEvidence(reference);
+  const deploymentSizingQuestion = isDeploymentSizingQuestion(query, caseFrame);
+  if (index < 2) {
+    if (deploymentSizingQuestion && referenceLooksLikeDeploymentMigrationPlanning(reference)) {
+      return referenceLooksLikeDirectDeploymentSizingEvidence(reference);
+    }
+    return true;
+  }
+  if (!deploymentSizingQuestion) return false;
+  return index < 4 ? !referenceLooksLikeDeploymentMigrationPlanning(reference) : referenceLooksLikeDirectDeploymentSizingEvidence(reference);
 }
 
 async function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {

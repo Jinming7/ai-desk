@@ -7076,6 +7076,7 @@ test("runSupportSearchAgent supervisor-domain runtime prioritizes deployment siz
   mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
   mutableEnv.LOCAL_DOCS_COM_PATH = "";
   const deploymentSizingPrioritySourceUrl = "https://docs.ones.com/zh-Hans/deploy/prepare/deployment-requirements?test=sizing-priority";
+  const dockerMigrationSourceUrl = "https://docs.ones.com/zh-Hans/deploy/data/docker-to-k3s?test=sizing-priority";
 
   globalThis.fetch = (async (input: string | URL | { url?: string | URL }) => {
     const requestUrl =
@@ -7086,6 +7087,61 @@ test("runSupportSearchAgent supervisor-domain runtime prioritizes deployment siz
         : input?.url instanceof URL
         ? input.url.toString()
         : String(input?.url ?? "");
+
+    if (requestUrl === dockerMigrationSourceUrl) {
+      return new Response(
+        `<!doctype html>
+        <html lang="zh-Hans">
+          <body>
+            <main>
+              <article>
+                <h1>Docker迁移K3S方案</h1>
+                <h2>四、迁移实施预演</h2>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>当前Docker单机实例信息</th>
+                      <th>服务器类型/操作系统</th>
+                      <th>ONES 版本</th>
+                      <th>服务器资源配置描述</th>
+                      <th>现在数据体量体积</th>
+                      <th>迁移服务器规格</th>
+                      <th>备注(外置扩展等信息)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>示例实例</td>
+                      <td>X86/ARM</td>
+                      <td>v3.14.110及以上</td>
+                      <td>CPU</td>
+                      <td>文件附件</td>
+                      <td>迁移独立服务器部署K3S / 迁移多节点K3S/K8S集群</td>
+                      <td>外接对象存储OSS / 外接MySQL数据库 / 外接Nas磁盘</td>
+                    </tr>
+                    <tr>
+                      <td>示例实例</td>
+                      <td>Centos7.9</td>
+                      <td>内存</td>
+                      <td>磁盘SSD/IO读写</td>
+                      <td>Volume占用大小</td>
+                      <td>请参考ONES规格推荐升级服务器配置</td>
+                      <td>备份包大小</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </article>
+            </main>
+          </body>
+        </html>`,
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
 
     if (requestUrl === deploymentSizingPrioritySourceUrl) {
       return new Response(
@@ -7248,7 +7304,7 @@ test("runSupportSearchAgent supervisor-domain runtime prioritizes deployment siz
       title: "Docker迁移K3S方案",
       snippet:
         "迁移准备 信息收集 当前Docker单机实例信息。若当前Docker实例服务器无法满足K3S部署实例，建议基于当前用户日活使用规模，参考ONES规格推荐，升级服务器配置。",
-      sourceUrl: "https://docs.ones.com/zh-Hans/deploy/data/docker-to-k3s",
+      sourceUrl: dockerMigrationSourceUrl,
       path: "deploy-docs/data/docker-to-k3s.cn.md",
       headingPath: "Docker迁移K3S方案 > 四、迁移实施预演",
       authority: "canonical_visible",
