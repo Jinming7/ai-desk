@@ -2866,6 +2866,24 @@ function shouldPromoteProcedureHeadingAsStep(text: string): boolean {
   return looksLikeProcedureAction(normalized) || /^\d+[.)]\s+/.test(text);
 }
 
+function isProcedureShellNoise(reference: SearchReference, text: string): boolean {
+  const normalized = sanitizeProcedureItem(text);
+  if (!normalized) return true;
+  if (/^(info|notice|tip|faq|overview)$/i.test(normalized)) return true;
+  if (/^[A-Z][A-Z\s/_-]{3,}$/.test(normalized)) return true;
+
+  const normalizedTitle = sanitizeProcedureItem(reference.title);
+  return normalized === normalizedTitle;
+}
+
+function appendProcedureDetailToLastStep(target: string[], detail: string): void {
+  const normalizedDetail = sanitizeProcedureItem(detail);
+  const last = target[target.length - 1];
+  if (!last || !normalizedDetail) return;
+  if (last.toLowerCase().includes(normalizedDetail.toLowerCase())) return;
+  target[target.length - 1] = normalizeProcedureText(`${last} (${normalizedDetail})`);
+}
+
 function procedureSupplementOverlap(
   primary: SearchReference,
   candidate: SearchReference,
@@ -3061,7 +3079,10 @@ function scopeProcedureSourceLines(reference: SearchReference, source: string, a
     }
   }
 
-  if (anchorIndex < 0) return lines.slice(0, 260);
+  if (anchorIndex < 0) {
+    const firstHeadingIndex = lines.findIndex((line) => /^\s*#{1,6}\s+/.test(line));
+    return (firstHeadingIndex >= 0 ? lines.slice(firstHeadingIndex) : lines).slice(0, 260);
+  }
 
   const scoped = [lines[anchorIndex] ?? ""];
   for (let index = anchorIndex + 1; index < lines.length && scoped.length < 260; index += 1) {
@@ -3143,7 +3164,11 @@ function extractProcedureBlocksFromLines(reference: SearchReference, scopedLines
         sectionContext = "steps";
         continue;
       }
-      if ((headingMatch[1]?.length ?? 0) >= 3 && shouldPromoteProcedureHeadingAsStep(headingText)) {
+      if (
+        (headingMatch[1]?.length ?? 0) >= 3 &&
+        shouldPromoteProcedureHeadingAsStep(headingText) &&
+        !isProcedureShellNoise(reference, headingText)
+      ) {
         sectionContext = "steps";
         pushProcedureItem(steps, headingText, 6);
         continue;
@@ -3156,10 +3181,19 @@ function extractProcedureBlocksFromLines(reference: SearchReference, scopedLines
 
     const cleaned = sanitizeProcedureItem(line);
     if (!cleaned) continue;
+    if (isProcedureShellNoise(reference, cleaned)) continue;
 
     const bulletLike = /^\s*(?:[-*+]\s+|\d+[.)]\s+|[（(]?\d+[）)]\s*)/.test(line);
     if (sectionContext === "notes" || looksLikeProcedureNote(cleaned)) {
       pushProcedureItem(notes, cleaned, 5);
+      continue;
+    }
+    if (sectionContext === "steps" && !bulletLike && !looksLikeProcedureAction(cleaned)) {
+      if (steps.length > 0) {
+        appendProcedureDetailToLastStep(steps, cleaned);
+      } else {
+        pushProcedureItem(notes, cleaned, 5);
+      }
       continue;
     }
     if (sectionContext === "steps" || bulletLike || looksLikeProcedureAction(cleaned)) {
@@ -3623,7 +3657,7 @@ async function recoverEvidenceAnchoredHowToDraft(input: {
   const noteReference = noteCandidate?.reference;
   const actionBlocks = actionCandidate.blocks;
   const noteBlocks = noteCandidate?.blocks ?? { steps: [], notes: [] };
-  const howToSteps = uniqueStrings([...actionBlocks.steps, ...noteBlocks.steps], 4);
+  const howToSteps = uniqueStrings([...actionBlocks.steps, ...noteBlocks.steps], 6);
   const supportNotes = uniqueStrings([...actionBlocks.notes, ...noteBlocks.notes], 3);
   const actionHeading = shortHeadingLabel(actionReference.headingPath) || actionReference.title;
   const noteHeading = noteReference ? shortHeadingLabel(noteReference.headingPath) || noteReference.title : "";

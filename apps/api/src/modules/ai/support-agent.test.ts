@@ -5913,17 +5913,30 @@ test("runSupportSearchAgent supervisor-domain runtime strips docs-shell headings
           <body>
             <main>
               <article>
+                <nav>
+                  <ul>
+                    <li>OPERATIONS TOOLKIT</li>
+                    <li>Capture a HAR file for troubleshooting</li>
+                  </ul>
+                </nav>
                 <h1>Capture a HAR file for troubleshooting</h1>
-                <h3>OPERATIONS TOOLKIT</h3>
-                <h3>info</h3>
                 <p>Use the documented browser flow to capture a HAR file before sending it to support.</p>
-                <h2>Steps</h2>
-                <ol>
-                  <li>Open your browser DevTools.</li>
-                  <li>Switch to the Network tab and keep recording enabled.</li>
-                  <li>Reproduce the issue in the browser.</li>
-                  <li>Use Save all as HAR with content to export the HAR file.</li>
-                </ol>
+                <h2>Steps to capture HAR file</h2>
+                <div class="alert alert--info">
+                  <div>info</div>
+                  <p>This guide uses Google Chrome as an example. Steps for other browsers may vary slightly, but the process is generally similar.</p>
+                </div>
+                <h4>1. Open the browser where the issue occurred</h4>
+                <p>Ensure you are using the same browser where the issue occurred.</p>
+                <h4>2. Prepare the necessary account, project, and issues</h4>
+                <p>Make sure you are logged into the account, project, and module where the issue occurred so you can reproduce it consistently.</p>
+                <h4>3. Reproduce the issue in inspect mode</h4>
+                <ul>
+                  <li>Open Inspect Mode in your browser.</li>
+                  <li>Perform the steps on the page to reproduce the issue.</li>
+                  <li>After reproducing the issue, export and save the HAR file.</li>
+                </ul>
+                <p>Provide the generated HAR file to ONES technical support.</p>
               </article>
             </main>
           </body>
@@ -6078,8 +6091,8 @@ test("runSupportSearchAgent supervisor-domain runtime strips docs-shell headings
       "howto-specialist"
     );
     assert.equal(result.result.citations.map((item) => item.id).includes("chunk:har-capture-live-clean"), true);
-    assert.match(result.result.answer, /devtools/i);
-    assert.match(result.result.answer, /network tab/i);
+    assert.match(result.result.answer, /inspect mode|devtools/i);
+    assert.match(result.result.answer, /network tab|export (and save )?the har file/i);
     assert.doesNotMatch(result.result.answer, /operations toolkit/i);
     assert.doesNotMatch(result.result.answer, /\binfo\b/i);
     assert.doesNotMatch(result.result.answer, /validation always fails/i);
