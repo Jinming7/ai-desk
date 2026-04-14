@@ -7461,6 +7461,228 @@ test("runSupportSearchAgent supervisor-domain runtime realigns deployment recove
   }
 });
 
+test("runSupportSearchAgent supervisor-domain runtime expands object-specific deployment how-to docs before generic no-step runbooks", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  const originalFetch = globalThis.fetch;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  globalThis.fetch = (async (input) => {
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (requestUrl === "https://docs.ones.com/private-deployment/reset-administrator-password") {
+      return new Response(
+        `<!doctype html>
+          <html>
+            <body>
+              <main>
+                <article>
+                  <h1>Reset administrator password in private deployment</h1>
+                  <h2>Procedure</h2>
+                  <ol>
+                    <li>Log in to the deployment host with operator access.</li>
+                    <li>Run the documented password reset script in the ONES pod.</li>
+                    <li>Confirm the administrator can sign in again.</li>
+                  </ol>
+                </article>
+              </main>
+            </body>
+          </html>`,
+        {
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
+    if (requestUrl === "https://docs.ones.com/private-deployment/cluster-validation") {
+      return new Response(
+        `<!doctype html>
+          <html>
+            <body>
+              <main>
+                <article>
+                  <h1>Cluster validation</h1>
+                  <p>Validate the cluster after deployment changes.</p>
+                </article>
+              </main>
+            </body>
+          </html>`,
+        {
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
+    throw new Error(`unexpected fetch in deployment how-to expansion test: ${requestUrl}`);
+  }) as typeof fetch;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    routeSupportQuestion?: (...args: unknown[]) => Promise<unknown>;
+    planSupportEvidence?: (...args: unknown[]) => Promise<unknown>;
+    planSupportCase?: (...args: unknown[]) => Promise<unknown>;
+    judgeSupportAnswer?: (...args: unknown[]) => Promise<unknown>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    composeCustomerAnswer?: (
+      input: OpenClawSupportAnswerComposerInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<Omit<SupportAnswer, "mode">>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async () => ({
+    primaryDomain: "deployment" as const,
+    route: {
+      question_type: "how_to_product",
+      user_goal: "Reset the administrator password in private deployment.",
+      answer_contract: "Provide the direct recovery steps first.",
+      specialist_agent: "howto-specialist",
+      routing_confidence: 0.95,
+      primary_domain: "deployment"
+    },
+    caseFrame: {
+      goal: "Reset the administrator password in private deployment.",
+      symptom: "Administrator password reset needs the server-side recovery path.",
+      object: "administrator password reset",
+      action_type: "how_to",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["private deployment administrator password reset"],
+      question_type: "how_to_product",
+      specialist_agent: "howto-specialist",
+      answer_contract: "Provide the direct recovery steps first.",
+      routing_confidence: 0.95,
+      primary_domain: "deployment",
+      required_doc_kinds: ["deployment_runbook", "troubleshooting"]
+    },
+    retrievalQueries: ["private deployment administrator password reset"]
+  });
+  adapter.writeDeploymentDomainAnswer = async () => {
+    throw new Error("simulate deployment specialist fallback");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("simulate answer composer fallback");
+  };
+
+  const references: SearchReference[] = [
+    {
+      documentId: "doc:cluster-validation",
+      evidenceId: "chunk:cluster-validation",
+      title: "32. KubeAPIDown",
+      snippet: "Validation",
+      sourceUrl: "https://docs.ones.com/private-deployment/cluster-validation",
+      path: "deploy-docs/troubleshooting/kubeapi-down.md",
+      headingPath: "Validation",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.66,
+      retrievedAt: "2026-04-14T05:40:00.000Z",
+      supportMetadata: {
+        product_area: "deployment",
+        deployment_model: "private_deployment",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    },
+    {
+      documentId: "doc:private-deployment-admin-reset-expanded",
+      evidenceId: "chunk:private-deployment-admin-reset-expanded",
+      title: "修改用户密码",
+      snippet: "Use the documented recovery path when token delivery is unavailable.",
+      sourceUrl: "https://docs.ones.com/private-deployment/reset-administrator-password",
+      path: "deploy-docs/configure/ops/admin-password.cn.md",
+      headingPath: "Recovery procedure",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.28,
+      retrievedAt: "2026-04-14T05:40:00.000Z",
+      supportMetadata: {
+        product_area: "deployment",
+        deployment_model: "private_deployment",
+        evidence_kind: "procedure",
+        doc_kind: "deployment_runbook"
+      }
+    }
+  ];
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.82,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "How do I reset the administrator password when token delivery is unavailable in private deployment?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment-howto-expand-specific-doc"
+    });
+
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.equal(result.result.citations.some((item) => item.id === "chunk:private-deployment-admin-reset-expanded"), true);
+    assert.equal(result.result.citations.some((item) => item.id === "chunk:cluster-validation"), false);
+    assert.match(result.result.answer, /password reset script|administrator can sign in again|reset the administrator password/i);
+    assert.equal(/validation/i.test(result.result.answer), false);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("runSupportSearchAgent supervisor-domain runtime uses the customer answer composer for grounded answers when budget is available", async () => {
   const mutableEnv = env as {
     FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;

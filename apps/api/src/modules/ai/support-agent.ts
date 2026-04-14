@@ -3637,19 +3637,22 @@ async function recoverEvidenceAnchoredHowToDraft(input: {
       };
     })
     .sort((left, right) => right.score - left.score);
-  const expansionCandidate =
-    initialAnalyzed.find(
+  const expansionCandidates = initialAnalyzed
+    .filter(
       (item) =>
-        item.blocks.steps.length === 0 &&
+        item.blocks.steps.length <= 1 &&
+        item.blocks.notes.length === 0 &&
         item.reference.authority === "canonical_visible" &&
         String(item.reference.sourceUrl ?? "").startsWith("https://docs.ones.com/") &&
         !resolveLocalDocsMirrorPath(item.reference)
-    ) ?? null;
-  const analyzed = expansionCandidate
+    )
+    .slice(0, 3);
+  const expansionCandidateIds = new Set(expansionCandidates.map((item) => resolveSearchReferenceEvidenceId(item.reference)));
+  const analyzed = expansionCandidateIds.size
     ? (
         await Promise.all(
           initialAnalyzed.map(async (item) => {
-            if (resolveSearchReferenceEvidenceId(item.reference) !== resolveSearchReferenceEvidenceId(expansionCandidate.reference)) {
+            if (!expansionCandidateIds.has(resolveSearchReferenceEvidenceId(item.reference))) {
               return item;
             }
             const blocks = await extractProcedureBlocksAsync(item.reference);
