@@ -51,6 +51,15 @@ function uniqueStrings(input: Array<string | undefined | null>, limit = 6): stri
   return values;
 }
 
+function isPlaceholderSupportRetrievalSeed(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "unspecified" || normalized === "unknown" || normalized === "general" || normalized === "shared";
+}
+
+function sanitizeSupportRetrievalSeeds(input: Array<string | undefined | null>, limit = 6): string[] {
+  return uniqueStrings(input, limit).filter((item) => !isPlaceholderSupportRetrievalSeed(item));
+}
+
 function localizedSectionTitle(language: "zh" | "en", zh: string, en: string): string {
   return language === "zh" ? zh : en;
 }
@@ -442,7 +451,7 @@ function reconcileSupervisorRouteWithEvidence(input: {
     return input;
   }
 
-  if (apiEvidenceCount === 0) {
+  if (apiEvidenceCount === 0 || !apiShapedQuery) {
     return input;
   }
 
@@ -661,14 +670,14 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     product_area: productArea,
     object,
     action_type: actionType,
-    retrieval_queries: uniqueStrings(
+    retrieval_queries: sanitizeSupportRetrievalSeeds(
       [...input.caseFrame.retrieval_queries, object, deploymentModel, productArea].map((item) =>
         String(item ?? "").replace(/[_/]+/g, " ")
       ),
       6
     ),
     query_plan: {
-      concept_queries: uniqueStrings(
+      concept_queries: sanitizeSupportRetrievalSeeds(
         [
           ...(input.caseFrame.query_plan?.concept_queries ?? []),
           productArea.replace(/[_/]+/g, " "),
@@ -676,7 +685,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
         ],
         4
       ),
-      object_queries: uniqueStrings([...(input.caseFrame.query_plan?.object_queries ?? []), object], 4),
+      object_queries: sanitizeSupportRetrievalSeeds([...(input.caseFrame.query_plan?.object_queries ?? []), object], 4),
       behavior_queries: uniqueStrings([...(input.caseFrame.query_plan?.behavior_queries ?? []), actionType], 4)
     },
     required_doc_kinds: shouldForceApiRoute
@@ -4734,7 +4743,7 @@ function normalizeSupportMainCaseFrame(
       Array.isArray(parsed.missing_critical_info) ? parsed.missing_critical_info.map((item) => String(item)) : [],
       3
     ),
-    retrieval_queries: uniqueStrings(
+    retrieval_queries: sanitizeSupportRetrievalSeeds(
       [
         ...(Array.isArray(parsed.retrieval_queries) ? parsed.retrieval_queries.map((item) => String(item)) : []),
         ...retrievalQueries,
@@ -4746,10 +4755,10 @@ function normalizeSupportMainCaseFrame(
       queryPlan
         ? {
             concept_queries: Array.isArray(queryPlan.concept_queries)
-              ? queryPlan.concept_queries.map((item) => String(item)).filter(Boolean)
+              ? sanitizeSupportRetrievalSeeds(queryPlan.concept_queries.map((item) => String(item)), 8)
               : [],
             object_queries: Array.isArray(queryPlan.object_queries)
-              ? queryPlan.object_queries.map((item) => String(item)).filter(Boolean)
+              ? sanitizeSupportRetrievalSeeds(queryPlan.object_queries.map((item) => String(item)), 8)
               : [],
             behavior_queries: Array.isArray(queryPlan.behavior_queries)
               ? queryPlan.behavior_queries.map((item) => String(item)).filter(Boolean)
@@ -4769,8 +4778,8 @@ function normalizeSupportMainCaseFrame(
 function deriveSupportMainEvidencePlan(caseFrame: SupportCaseFrame, query: string, retrievalQueries: string[]): SupportEvidencePlan {
   return {
     query_plan: caseFrame.query_plan ?? {
-      concept_queries: uniqueStrings([...retrievalQueries, query], 4),
-      object_queries: uniqueStrings([caseFrame.object, ...retrievalQueries], 4),
+      concept_queries: sanitizeSupportRetrievalSeeds([...retrievalQueries, query], 4),
+      object_queries: sanitizeSupportRetrievalSeeds([caseFrame.object, ...retrievalQueries], 4),
       behavior_queries: uniqueStrings([caseFrame.action_type, ...retrievalQueries], 4)
     },
     evidence_priority: caseFrame.evidence_priority ?? [],
@@ -5110,7 +5119,7 @@ async function runSupervisorDomainSupportSearch(input: {
     specialist_agent: normalizedRoute.specialist_agent,
     answer_contract: normalizedRoute.answer_contract,
     routing_confidence: normalizedRoute.routing_confidence,
-    retrieval_queries: uniqueStrings(
+    retrieval_queries: sanitizeSupportRetrievalSeeds(
       [...dispatch.retrievalQueries, ...dispatch.caseFrame.retrieval_queries, input.query],
       8
     )
@@ -5158,7 +5167,7 @@ async function runSupervisorDomainSupportSearch(input: {
   let caseFrame: SupportCaseFrame = {
     ...stabilized.caseFrame,
     primary_domain: primaryDomain,
-    retrieval_queries: uniqueStrings(
+    retrieval_queries: sanitizeSupportRetrievalSeeds(
       [...dispatch.retrievalQueries, ...stabilized.caseFrame.retrieval_queries, input.query],
       8
     )
@@ -5171,7 +5180,10 @@ async function runSupervisorDomainSupportSearch(input: {
 
   await reportStageProgress("retrieval_base");
   const retrievalStartedAt = performance.now();
-  const retrievalQueries = uniqueStrings([...dispatch.retrievalQueries, ...caseFrame.retrieval_queries, input.query], 8);
+  const retrievalQueries = sanitizeSupportRetrievalSeeds(
+    [...dispatch.retrievalQueries, ...caseFrame.retrieval_queries, input.query],
+    8
+  );
   const evidenceResult = await input.orchestrator
     .collectEvidence({
       queries: retrievalQueries,

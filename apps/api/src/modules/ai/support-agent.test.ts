@@ -5867,10 +5867,242 @@ test("runSupportSearchAgent supervisor-domain runtime recovers a grounded HAR ho
       ((result.result.internal_diagnostics as { route?: { specialist_agent?: string } } | undefined)?.route?.specialist_agent),
       "howto-specialist"
     );
+    const retrievalQueriesUsed =
+      (result.result.internal_diagnostics as { retrieval_queries_used?: string[] } | undefined)?.retrieval_queries_used ?? [];
+    assert.equal(retrievalQueriesUsed.includes("unspecified"), false);
+    assert.equal(retrievalQueriesUsed.includes("unknown"), false);
+    assert.equal(retrievalQueriesUsed.includes("general"), false);
     assert.equal(result.result.support_answer?.mode, "grounded");
     assert.equal(result.result.support_answer?.render_variant, "how_to");
     assert.equal(result.result.citations.some((item) => item.id === "chunk:har-capture-live"), true);
     assert.match(result.result.answer, /network tab|export the har file|save all as har/i);
+    assert.notEqual(result.result.state, "TICKET_HANDOFF_RECOMMENDED");
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+    mutableEnv.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runSupportSearchAgent supervisor-domain runtime keeps non-api HAR how-to routing on docs evidence even when openapi noise scores higher", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+    LOCAL_DOCS_COM_PATH?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  const originalLocalDocsPath = mutableEnv.LOCAL_DOCS_COM_PATH;
+  const originalFetch = globalThis.fetch;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+  mutableEnv.LOCAL_DOCS_COM_PATH = "";
+
+  globalThis.fetch = (async (input) => {
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (requestUrl === "https://docs.ones.com/operations-toolkit/capture-a-har-file-for-troubleshooting") {
+      return new Response(
+        `<!doctype html>
+          <html>
+            <body>
+              <main>
+                <article>
+                  <nav>
+                    <ul>
+                      <li>OPERATIONS TOOLKIT</li>
+                      <li>Capture a HAR file for troubleshooting</li>
+                    </ul>
+                  </nav>
+                  <h1>Capture a HAR file for troubleshooting</h1>
+                  <p>Use the browser network panel to capture a HAR file before sharing it with support.</p>
+                  <h2>Steps to capture HAR file</h2>
+                  <div class="alert alert--info">
+                    <div>info</div>
+                    <p>Google Chrome is used as the example browser.</p>
+                  </div>
+                  <h4>1. Open the browser where the issue occurred</h4>
+                  <p>Use the same browser and page where the problem happened.</p>
+                  <h4>2. Reproduce the issue in inspect mode</h4>
+                  <ul>
+                    <li>Open Inspect Mode in your browser.</li>
+                    <li>Keep the Network tab recording while reproducing the issue.</li>
+                    <li>After reproducing the issue, export and save the HAR file.</li>
+                  </ul>
+                  <p>Provide the generated HAR file to ONES technical support.</p>
+                </article>
+              </main>
+            </body>
+          </html>`,
+        {
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
+    throw new Error(`unexpected fetch in HAR routing preservation test: ${requestUrl}`);
+  }) as typeof fetch;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    routeSupportQuestion?: (...args: unknown[]) => Promise<unknown>;
+    planSupportEvidence?: (...args: unknown[]) => Promise<unknown>;
+    planSupportCase?: (...args: unknown[]) => Promise<unknown>;
+    judgeSupportAnswer?: (...args: unknown[]) => Promise<unknown>;
+    writeDocsDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    composeCustomerAnswer?: (
+      input: OpenClawSupportAnswerComposerInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<Omit<SupportAnswer, "mode">>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async () => {
+    throw new Error("simulate planner fallback");
+  };
+  adapter.writeDocsDomainAnswer = async () => {
+    throw new Error("simulate docs specialist timeout/fallback");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("simulate answer composer timeout/fallback");
+  };
+
+  const references: SearchReference[] = [
+    {
+      documentId: "doc:oauth-openapi-troubleshooting-1",
+      evidenceId: "chunk:oauth-openapi-troubleshooting-1",
+      title: "Troubleshooting",
+      snippet: "OpenAPI 403: check app.oauth.scope and token settings.",
+      sourceUrl: "https://docs.ones.com/developer/guide/getting-started/app-oauth",
+      path: "open-docs/docs/guide/getting-started/access-openapi.mdx",
+      headingPath: "Access Open API > Troubleshooting",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.5563343108504399,
+      retrievedAt: "2026-04-14T03:59:52.407Z",
+      supportMetadata: {
+        product_area: "openapi",
+        deployment_model: "shared",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    },
+    {
+      documentId: "doc:extensions-troubleshooting",
+      evidenceId: "chunk:extensions-troubleshooting",
+      title: "Troubleshooting",
+      snippet: "Common extension troubleshooting issues.",
+      sourceUrl: "https://docs.ones.com/developer/guide/getting-started/app-extensions",
+      path: "open-docs/docs/guide/getting-started/use-extensions.mdx",
+      headingPath: "Use Extensions > Troubleshooting",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.40285714285714286,
+      retrievedAt: "2026-04-14T03:59:52.407Z",
+      supportMetadata: {
+        product_area: "general",
+        deployment_model: "shared",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    },
+    {
+      documentId: "doc:har-capture-live-low-score",
+      evidenceId: "chunk:har-capture-live-low-score",
+      title: "Capture a HAR file for troubleshooting",
+      snippet: "Use the browser network panel to capture a HAR file, then export the HAR after reproducing the issue.",
+      sourceUrl: "https://docs.ones.com/operations-toolkit/capture-a-har-file-for-troubleshooting",
+      path: "docs/operations-toolkit/capture-a-har-file-for-troubleshooting.mdx",
+      headingPath: "Capture a HAR file for troubleshooting",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.452,
+      retrievedAt: "2026-04-14T03:59:52.407Z",
+      supportMetadata: {
+        product_area: "general",
+        deployment_model: "shared",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    }
+  ];
+
+  let observedQueries: string[] = [];
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      observedQueries = [...(input.queries ?? [])];
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.66,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "how to get a har file for troubule shooting?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-har-routing-resists-openapi-noise",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(observedQueries.includes("unspecified"), false);
+    assert.equal(observedQueries.includes("unknown"), false);
+    assert.equal(observedQueries.includes("general"), false);
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { specialist_agent?: string } } | undefined)?.route?.specialist_agent),
+      "howto-specialist"
+    );
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.equal(result.result.citations.some((item) => item.id === "chunk:har-capture-live-low-score"), true);
+    assert.match(result.result.answer, /browser network panel|network tab|export the har/i);
     assert.notEqual(result.result.state, "TICKET_HANDOFF_RECOMMENDED");
   } finally {
     mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
