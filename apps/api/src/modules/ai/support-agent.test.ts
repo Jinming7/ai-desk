@@ -7062,6 +7062,197 @@ test("runSupportSearchAgent supervisor-domain runtime preserves coherent deploym
   }
 });
 
+test("runSupportSearchAgent supervisor-domain fallback keeps private deployment password reset on deployment how-to despite oauth api noise", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  const originalFetch = globalThis.fetch;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  globalThis.fetch = (async (input) => {
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (requestUrl === "https://docs.ones.com/private-deployment/reset-administrator-password") {
+      return new Response(
+        `<!doctype html>
+          <html>
+            <body>
+              <main>
+                <article>
+                  <h1>Reset administrator password in private deployment</h1>
+                  <p>Use this recovery procedure when SMTP-based delivery is unavailable.</p>
+                  <h2>Procedure</h2>
+                  <ol>
+                    <li>Log in to the deployment host with operator access.</li>
+                    <li>Open the documented recovery flow for the private deployment environment.</li>
+                    <li>Reset the administrator password directly on the host-side recovery path.</li>
+                    <li>Sign in again and confirm administrator access works.</li>
+                  </ol>
+                </article>
+              </main>
+            </body>
+          </html>`,
+        {
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      );
+    }
+    throw new Error(`unexpected fetch in deployment reset fallback test: ${requestUrl}`);
+  }) as typeof fetch;
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    routeSupportQuestion?: (...args: unknown[]) => Promise<unknown>;
+    planSupportEvidence?: (...args: unknown[]) => Promise<unknown>;
+    planSupportCase?: (...args: unknown[]) => Promise<unknown>;
+    judgeSupportAnswer?: (...args: unknown[]) => Promise<unknown>;
+    writeApiSpecialistAnswer?: (...args: unknown[]) => Promise<unknown>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    composeCustomerAnswer?: (
+      input: OpenClawSupportAnswerComposerInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<Omit<SupportAnswer, "mode">>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async () => {
+    throw new Error("simulate planner fallback");
+  };
+  adapter.writeApiSpecialistAnswer = async () => {
+    throw new Error("api specialist should not run for deployment password reset");
+  };
+  adapter.writeDeploymentDomainAnswer = async () => {
+    throw new Error("simulate deployment specialist fallback");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("simulate answer composer fallback");
+  };
+
+  const references: SearchReference[] = [
+    {
+      documentId: "doc:oauth-openapi-scope",
+      evidenceId: "chunk:oauth-openapi-scope",
+      title: "GET request methods",
+      snippet: "When calling this API, ensure your app's scope declaration includes read:appcenter:user.",
+      sourceUrl: "https://docs.ones.com/developer/openapi/auth/scope",
+      path: "open-docs/docs/openapi/auth/scope.md",
+      headingPath: "GET request methods",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.56,
+      retrievedAt: "2026-04-14T04:00:51.071Z",
+      supportMetadata: {
+        product_area: "openapi",
+        deployment_model: "shared",
+        evidence_kind: "capability",
+        doc_kind: "openapi/api"
+      }
+    },
+    {
+      documentId: "doc:private-deployment-admin-reset-low-score",
+      evidenceId: "chunk:private-deployment-admin-reset-low-score",
+      title: "Reset administrator password in private deployment",
+      snippet:
+        "When SMTP-based delivery is unavailable, use the private deployment recovery procedure to reset the administrator password directly in the deployment environment.",
+      sourceUrl: "https://docs.ones.com/private-deployment/reset-administrator-password",
+      path: "docs/private-deployment/reset-administrator-password.mdx",
+      headingPath: "Recovery procedure",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 0.45,
+      retrievedAt: "2026-04-14T04:00:51.071Z",
+      supportMetadata: {
+        product_area: "deployment",
+        deployment_model: "private_deployment",
+        evidence_kind: "troubleshooting",
+        doc_kind: "troubleshooting"
+      }
+    }
+  ];
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.7,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "How do I reset the administrator password when OAuth token delivery is unavailable in private deployment?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment-admin-reset-fallback"
+    });
+
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { primary_domain?: string; specialist_agent?: string } } | undefined)?.route
+        ?.primary_domain),
+      "deployment"
+    );
+    assert.equal(
+      ((result.result.internal_diagnostics as { route?: { specialist_agent?: string } } | undefined)?.route?.specialist_agent),
+      "howto-specialist"
+    );
+    assert.equal(result.result.support_answer?.render_variant, "how_to");
+    assert.equal(result.result.citations.some((item) => item.id === "chunk:private-deployment-admin-reset-low-score"), true);
+    assert.match(result.result.answer, /reset the administrator password|recovery procedure/i);
+    assert.notEqual(result.result.state, "TICKET_HANDOFF_RECOMMENDED");
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("runSupportSearchAgent supervisor-domain runtime uses the customer answer composer for grounded answers when budget is available", async () => {
   const mutableEnv = env as {
     FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;

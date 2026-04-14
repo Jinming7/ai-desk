@@ -288,10 +288,10 @@ function inferSupportDomainFromRouteAndCaseFrame(route: SupportQuestionRoute, ca
   if (caseFrame.deployment_model === "private_deployment" || caseFrame.product_area === "deployment") {
     return "deployment";
   }
-  if (route.primary_domain === "openapi" || route.primary_domain === "deployment" || route.primary_domain === "docs") {
+  if (route.primary_domain === "deployment" || route.primary_domain === "docs") {
     return route.primary_domain;
   }
-  if (caseFrame.primary_domain === "openapi" || caseFrame.primary_domain === "deployment" || caseFrame.primary_domain === "docs") {
+  if (caseFrame.primary_domain === "deployment" || caseFrame.primary_domain === "docs") {
     return caseFrame.primary_domain;
   }
   return "docs";
@@ -451,7 +451,7 @@ function reconcileSupervisorRouteWithEvidence(input: {
     return input;
   }
 
-  if (apiEvidenceCount === 0 || !apiShapedQuery) {
+  if (apiEvidenceCount === 0 || !apiShapedQuery || input.caseFrame.product_area === "deployment") {
     return input;
   }
 
@@ -614,7 +614,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
         ? "private_deployment"
         : input.caseFrame.deployment_model
       : input.caseFrame.deployment_model;
-  const productArea =
+  const preliminaryProductArea =
     (input.caseFrame.product_area === "general" ||
       (input.caseFrame.product_area === "openapi" &&
         !apiShaped &&
@@ -636,11 +636,15 @@ function stabilizeSupportRouteAndCaseFrame(input: {
       deploymentModel === "private_deployment" &&
       normalizedRoute.question_type !== "capability_confirmation");
   const shouldPreserveIntegrationTroubleshooting =
-    (productArea === "integrations" || input.caseFrame.product_area === "integrations" || signals.integrationContext) &&
+    (preliminaryProductArea === "integrations" || input.caseFrame.product_area === "integrations" || signals.integrationContext) &&
     (input.caseFrame.action_type === "troubleshooting" || signals.troubleshootingContext);
   const shouldPreserveDeploymentRoute =
-    (deploymentModel === "private_deployment" || productArea === "deployment" || input.caseFrame.product_area === "deployment") &&
+    (deploymentModel === "private_deployment" ||
+      preliminaryProductArea === "deployment" ||
+      input.caseFrame.product_area === "deployment") &&
     (signals.accountRecoveryContext || shouldTreatAsHowTo || architectureQuestion || deploymentSizingQuestion);
+  const productArea =
+    shouldPreserveDeploymentRoute && !shouldPreserveIntegrationTroubleshooting ? "deployment" : preliminaryProductArea;
   const shouldForceApiRoute =
     signals.apiContext &&
     !shouldPreserveIntegrationTroubleshooting &&
@@ -733,7 +737,9 @@ function stabilizeSupportRouteAndCaseFrame(input: {
           answer_contract: "State the documented per-node resource requirements first.",
           routing_confidence: Math.max(input.route.routing_confidence, 0.86)
         }
-      : shouldTreatAsHowTo && normalizedRoute.specialist_agent === "behavior-specialist"
+      : shouldTreatAsHowTo &&
+        (normalizedRoute.specialist_agent === "behavior-specialist" ||
+          (shouldPreserveDeploymentRoute && normalizedRoute.specialist_agent === "api-specialist"))
       ? {
           ...normalizedRoute,
           question_type: "how_to_product",
@@ -760,7 +766,18 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     routing_confidence: route.routing_confidence
   };
 
-  return { route, caseFrame };
+  const primaryDomain = inferSupportDomainFromRouteAndCaseFrame(route, caseFrame);
+
+  return {
+    route: {
+      ...route,
+      primary_domain: primaryDomain
+    },
+    caseFrame: {
+      ...caseFrame,
+      primary_domain: primaryDomain
+    }
+  };
 }
 
 function fallbackQuestionRoute(query: string): SupportQuestionRoute {
