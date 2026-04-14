@@ -3503,11 +3503,11 @@ function extractBehaviorEvidenceFragmentsFromLines(reference: SearchReference, s
   return uniqueStrings(fragments, 10);
 }
 
-async function loadBehaviorSourceLinesAsync(reference: SearchReference): Promise<string[] | null> {
+async function loadBehaviorSourceLinesAsync(reference: SearchReference, wholeDocument = false): Promise<string[] | null> {
   const resolvedPath = resolveLocalDocsMirrorPath(reference);
   if (resolvedPath) {
     try {
-      return scopeProcedureSourceLines(reference, fs.readFileSync(resolvedPath, "utf8"), true);
+      return scopeProcedureSourceLines(reference, fs.readFileSync(resolvedPath, "utf8"), !wholeDocument);
     } catch {
       return null;
     }
@@ -3515,20 +3515,89 @@ async function loadBehaviorSourceLinesAsync(reference: SearchReference): Promise
 
   const expandedSource = await loadPublishedDocsExpansionSource(reference);
   if (!expandedSource) return null;
-  return scopeProcedureSourceLines(reference, expandedSource, true);
+  return scopeProcedureSourceLines(reference, expandedSource, !wholeDocument);
 }
 
-async function collectBehaviorEvidenceFragmentsAsync(reference: SearchReference): Promise<string[]> {
+async function collectBehaviorEvidenceFragmentsAsync(
+  reference: SearchReference,
+  options: { wholeDocument?: boolean } = {}
+): Promise<string[]> {
   const snippetFragments = collectBehaviorEvidenceFragments(reference);
   const canExpandFromSource =
     reference.authority === "canonical_visible" &&
     (Boolean(resolveLocalDocsMirrorPath(reference)) || String(reference.sourceUrl ?? "").startsWith("https://docs.ones.com/"));
   if (!canExpandFromSource) return snippetFragments;
 
-  const scopedLines = await loadBehaviorSourceLinesAsync(reference);
+  const scopedLines = await loadBehaviorSourceLinesAsync(reference, options.wholeDocument === true);
   if (!scopedLines?.length) return snippetFragments;
 
   return uniqueStrings([...extractBehaviorEvidenceFragmentsFromLines(reference, scopedLines), ...snippetFragments], 12);
+}
+
+function shouldExpandFullDocumentForDeploymentSizing(query: string, caseFrame: SupportCaseFrame, reference: SearchReference): boolean {
+  const pathValue = String(reference.path ?? "").trim();
+  const sourceUrl = String(reference.sourceUrl ?? "").trim();
+  return (
+    caseFrame.product_area === "deployment" &&
+    caseFrame.action_type === "capability_confirmation" &&
+    analyzeSupportQuerySignals(query).deploymentSizingContext &&
+    (/(^|\/)deploy-docs\//.test(pathValue) || /\/deploy\//.test(sourceUrl))
+  );
+}
+
+function countDeploymentSizingEvidenceDimensions(value: string): number {
+  return [
+    /\bcpu\b|\bprocessor\b|\bcore\b|\bcores\b|处理器|核数|核/,
+    /\bmemory\b|\bram\b|内存/,
+    /\bdisk\b|\bstorage\b|磁盘|存储/,
+    /\busers?\b|\bseats?\b|用户数|用户规模|用户量/,
+    /\bnode\b|\bserver\b|\bservers\b|每节点|单节点|节点|服务器/
+  ].reduce((count, pattern) => count + Number(pattern.test(value)), 0);
+}
+
+function isDeploymentSizingEvidenceFragment(fragment: string): boolean {
+  const normalized = normalizeBehaviorEvidenceFragment(fragment);
+  if (!normalized) return false;
+
+  const lowered = normalized.toLowerCase();
+  const dimensionCount = countDeploymentSizingEvidenceDimensions(`${lowered} ${normalized}`);
+  const hasNumericCapacity =
+    /\b\d+(?:\+\b|\b)/.test(lowered) &&
+    (/\b(?:gb|tb|mb|cores?|users?|seats?)\b/.test(lowered) || /内存|磁盘|存储|用户/.test(normalized));
+
+  if (isStructuredBehaviorEvidenceFragment(normalized)) {
+    return dimensionCount >= 3 && hasNumericCapacity;
+  }
+
+  return (
+    dimensionCount >= 3 &&
+    hasNumericCapacity &&
+    /requirements?|resource|resources|sizing|capacity|per[- ]?node|要求|资源|规格|容量|每节点/.test(lowered + normalized)
+  );
+}
+
+function isGenericDeploymentSizingOverviewFragment(fragment: string): boolean {
+  const normalized = normalizeBehaviorEvidenceFragment(fragment);
+  if (!normalized || isDeploymentSizingEvidenceFragment(normalized)) return false;
+
+  const lowered = normalized.toLowerCase();
+  const hasSizingOverviewLanguage =
+    /deployment sizing|planning reference|resource requirements|deployment requirements|private deployment requirements|环境要求|部署要求|资源要求|容量规划/.test(
+      lowered + normalized
+    );
+  const hasConcreteDimensions =
+    countDeploymentSizingEvidenceDimensions(`${lowered} ${normalized}`) >= 2 &&
+    (/\b\d+(?:\+\b|\b)/.test(lowered) || /\b(?:gb|tb|mb|cores?)\b/.test(lowered) || /内存|磁盘|存储|用户/.test(normalized));
+
+  return hasSizingOverviewLanguage && !hasConcreteDimensions;
+}
+
+function preferDeploymentSizingEvidenceFragments(fragments: string[]): string[] {
+  const sizingFacts = fragments.filter(isDeploymentSizingEvidenceFragment);
+  if (sizingFacts.length > 0) return sizingFacts;
+
+  const withoutGenericOverview = fragments.filter((fragment) => !isGenericDeploymentSizingOverviewFragment(fragment));
+  return withoutGenericOverview.length > 0 ? withoutGenericOverview : fragments;
 }
 
 function collectBehaviorEvidenceFragments(reference: SearchReference): string[] {
@@ -3562,6 +3631,11 @@ function scoreBehaviorEvidenceFragment(input: {
   if (isStructuredBehaviorEvidenceFragment(input.fragment)) score += 12;
   if (/(supports?|supported|available|only|requires?|required|recommended|must|cannot|not support|unsupported)/i.test(input.fragment)) score += 10;
   if (/(支持|可用|仅|只在|要求|推荐|必须|不能|不支持|兼容|环境要求|系统要求)/.test(input.fragment)) score += 10;
+  const querySignals = analyzeSupportQuerySignals(input.query);
+  if (querySignals.deploymentSizingContext) {
+    if (isDeploymentSizingEvidenceFragment(input.fragment)) score += 28;
+    else if (isGenericDeploymentSizingOverviewFragment(input.fragment)) score -= 18;
+  }
   if (isRecommendationLikeFragment(input.fragment)) score += 4;
   for (const term of focusTerms) {
     const normalized = term.toLowerCase();
@@ -3588,6 +3662,7 @@ function buildBehaviorRecommendation(language: "zh" | "en", fragment: string): s
 function isDeploymentArchitectureQuestion(query: string, caseFrame: SupportCaseFrame): boolean {
   if (caseFrame.product_area !== "deployment") return false;
   const signals = analyzeSupportQuerySignals(query);
+  if (signals.deploymentSizingContext) return false;
   return (
     (signals.privateDeploymentContext || /deployment documentation|部署文档/i.test(query)) &&
     (signals.deploymentArchitectureContext || signals.isolationContext || signals.infrastructureContext)
@@ -3614,8 +3689,13 @@ async function recoverEvidenceAnchoredBehaviorCapabilityDraft(input: {
   const analyzed = await Promise.all(
     ranked.map(async (reference, index) => {
       const primaryBoost = index < input.evidenceBundle.primary.length ? 24 : 10;
-      const fragments = index < 2 ? await collectBehaviorEvidenceFragmentsAsync(reference) : collectBehaviorEvidenceFragments(reference);
-      return fragments.map((fragment) => ({
+      const wholeDocumentExpansion = shouldExpandFullDocumentForDeploymentSizing(input.query, input.caseFrame, reference);
+      const fragments =
+        index < 2 || wholeDocumentExpansion
+          ? await collectBehaviorEvidenceFragmentsAsync(reference, { wholeDocument: wholeDocumentExpansion })
+          : collectBehaviorEvidenceFragments(reference);
+      const preferredFragments = wholeDocumentExpansion ? preferDeploymentSizingEvidenceFragments(fragments) : fragments;
+      return preferredFragments.map((fragment) => ({
         fragment,
         evidenceId: resolveSearchReferenceEvidenceId(reference),
         note: isRecommendationLikeFragment(fragment),
