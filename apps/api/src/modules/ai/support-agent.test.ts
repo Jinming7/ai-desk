@@ -7332,6 +7332,45 @@ test("runSupportSearchAgent supervisor-domain runtime prioritizes deployment siz
       }
     },
     {
+      documentId: "d313ecaa-9ced-5bf6-a0eb-8dc81dc4f18c",
+      evidenceId: "d313ecaa-9ced-5bf6-a0eb-8dc81dc4f18c",
+      title: "信创环境要求（可选）",
+      snippet:
+        "如需部署信创环境，CPU 核数和内存容量需为上文标准配置的 1.5 倍以上；如果采用信创芯片，CPU 核数必须为上文标准配置的 2 倍以上。",
+      sourceUrl: deploymentSizingPrioritySourceUrl,
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      headingPath: "ONES 私有部署环境要求 > 信创环境要求（可选）",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.418888888888889,
+      retrievedAt: "2026-04-14T09:41:15.302Z",
+      supportMetadata: {
+        product_area: "general",
+        evidence_kind: "capability",
+        deployment_model: "shared"
+      }
+    },
+    {
+      documentId: "61528da749f362ea68abfe269414b29a91d2c6abf8889093d4d3b5decc6e01db",
+      evidenceId: "61528da749f362ea68abfe269414b29a91d2c6abf8889093d4d3b5decc6e01db",
+      title: "ONES 私有部署环境要求",
+      snippet:
+        "1.1 ONES K3s单机版配置说明：500人以内 1台工作节点 >=16C >=48G >=100G >=1T >=100G >=50Mbps；500～2999 1台工作节点 >=32C >=64G >=100G >=2T >=200G >=100Mbps。",
+      sourceUrl: deploymentSizingPrioritySourceUrl,
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      headingPath: "ONES 私有部署环境要求 > 服务器配置要求 > 1.1 ONES K3s单机版配置说明",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.4700888152942948,
+      retrievedAt: "2026-04-14T09:41:15.302Z",
+      supportMetadata: {
+        product_area: "deployment",
+        evidence_kind: "constraint",
+        deployment_model: "private_deployment",
+        doc_kind: "rules"
+      }
+    },
+    {
       documentId: "9e9b5320-3d0b-488b-a7fb-c4f8e9b237e4",
       evidenceId: "eda702d68413bb6d1a4376dd6b71e557cfa46dc602c4ca5cb850fa2bee10b11e",
       title: "ONES 私有部署环境要求",
@@ -7416,6 +7455,7 @@ test("runSupportSearchAgent supervisor-domain runtime prioritizes deployment siz
       false
     );
     assert.match(result.result.answer, /16c|32g|500人以内|500～2999/i);
+    assert.doesNotMatch(result.result.answer, /1台工作节点|>=1t/i);
     assert.doesNotMatch(result.result.answer, /unified|colocated|applicable environments/i);
   } finally {
     mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;

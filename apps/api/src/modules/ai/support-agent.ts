@@ -1764,10 +1764,11 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
         if (structuredConstraintEvidence) topicScore += 26;
         else if (profile.evidenceKind === "capability") topicScore += 10;
         else if (profile.evidenceKind === "procedure") topicScore -= 8;
-        if (retrievalUnitFamily === "constraint_table_row_unit") topicScore += 18;
-        else if (retrievalUnitFamily === "schema_constraint_unit") topicScore += 12;
+        if (retrievalUnitFamily === "constraint_table_row_unit") topicScore += 34;
+        else if (retrievalUnitFamily === "schema_constraint_unit") topicScore += 16;
         if (/\|/.test(String(reference.snippet ?? ""))) topicScore += 8;
         if (operationalPlanReference && !structuredConstraintEvidence) topicScore -= 20;
+        if (/\b(optional|risk|warning|warnings?)\b|可选|风险|提示/.test(`${title} ${heading}`)) topicScore -= 18;
       }
       if (deploymentCapabilityQuestion) {
         const rootHeading = String(reference.headingPath ?? "").trim().toUpperCase() === "ROOT";
@@ -2193,9 +2194,14 @@ function scoreReferenceForSupportedClaim(input: {
   const semanticText = getReferenceSemanticText(input.reference).toLowerCase();
   const focusTerms = collectFocusTerms(input.query, input.caseFrame);
   const claimTerms = extractSupportSearchTerms(input.claimText);
+  const normalizedClaimText = input.claimText.toLowerCase();
+  const headingLabel = shortHeadingLabel(input.reference.headingPath).toLowerCase();
   let score = Math.round(input.reference.score * 10);
   score += scoreReferenceTopicMatch(input.reference, focusTerms);
   score += scoreSupportTextAgainstTerms(`${profile.title} ${profile.heading} ${semanticText}`, claimTerms);
+  if (headingLabel && normalizedClaimText.includes(headingLabel)) score += 28;
+  if (profile.title && normalizedClaimText.includes(profile.title)) score += 10;
+  score += scoreObjectTypeFocusFit(profile.objectType, claimTerms);
   for (const requiredDocKind of input.caseFrame.required_doc_kinds ?? []) {
     score += scoreRequiredDocKindForReference(input.reference, requiredDocKind);
   }
@@ -2274,6 +2280,20 @@ function reanchorSupportedClaimCitationIds(input: {
     })
     .filter((item): item is { evidenceId: string; score: number } => Boolean(item))
     .sort((left, right) => right.score - left.score);
+
+  const anchoredCurrentCandidate = currentCandidates.find((candidate) => {
+    const reference = input.evidenceById.get(candidate.evidenceId);
+    if (!reference) return false;
+    const headingLabel = shortHeadingLabel(reference.headingPath).toLowerCase();
+    const title = String(reference.title ?? "").trim().toLowerCase();
+    const normalizedClaimText = input.claimText.toLowerCase();
+    return Boolean(
+      (headingLabel && normalizedClaimText.includes(headingLabel)) || (title && normalizedClaimText.includes(title))
+    );
+  });
+  if (anchoredCurrentCandidate) {
+    return [anchoredCurrentCandidate.evidenceId];
+  }
 
   const currentBestScore = currentCandidates[0]?.score ?? Number.NEGATIVE_INFINITY;
   const bestOverall = scoredCandidates[0];
@@ -3588,6 +3608,7 @@ function scoreBehaviorEvidenceFragment(input: {
   const constraintFirstCapabilityCase = isConstraintFirstCapabilityCase(input.caseFrame);
   const structuredConstraintReference = referenceHasStructuredConstraintEvidence(input.reference);
   const operationalPlanFragment = fragmentLooksLikeOperationalPlan(input.fragment);
+  const retrievalUnitFamily = getReferenceRetrievalUnitFamily(input.reference);
   let score = input.primaryBoost + Math.round(input.reference.score * 10);
   if (profile.evidenceKind === "capability" || profile.evidenceKind === "constraint") score += 14;
   else if (profile.evidenceKind === "procedure" || profile.evidenceKind === "troubleshooting") score += 6;
@@ -3599,6 +3620,7 @@ function scoreBehaviorEvidenceFragment(input: {
   if (isRecommendationLikeFragment(input.fragment)) score += 4;
   if (constraintFirstCapabilityCase) {
     if (structuredConstraintReference) score += 20;
+    if (retrievalUnitFamily === "constraint_table_row_unit") score += 24;
     if (isStructuredBehaviorEvidenceFragment(input.fragment)) score += 10;
     if (referenceLooksLikeOperationalPlan(input.reference) && !structuredConstraintReference) score -= 18;
     if (operationalPlanFragment && !isStructuredBehaviorEvidenceFragment(input.fragment)) score -= 18;
