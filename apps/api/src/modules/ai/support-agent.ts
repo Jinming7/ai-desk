@@ -635,6 +635,9 @@ function stabilizeSupportRouteAndCaseFrame(input: {
     (signals.wantsProcedure &&
       deploymentModel === "private_deployment" &&
       normalizedRoute.question_type !== "capability_confirmation");
+  const shouldRealignTroubleshootingToHowTo =
+    shouldTreatAsHowTo &&
+    (signals.wantsProcedure || input.caseFrame.action_type === "how_to");
   const shouldPreserveIntegrationTroubleshooting =
     (preliminaryProductArea === "integrations" || input.caseFrame.product_area === "integrations" || signals.integrationContext) &&
     (input.caseFrame.action_type === "troubleshooting" || signals.troubleshootingContext);
@@ -739,6 +742,7 @@ function stabilizeSupportRouteAndCaseFrame(input: {
         }
       : shouldTreatAsHowTo &&
         (normalizedRoute.specialist_agent === "behavior-specialist" ||
+          (shouldRealignTroubleshootingToHowTo && normalizedRoute.specialist_agent === "troubleshooting-specialist") ||
           (shouldPreserveDeploymentRoute && normalizedRoute.specialist_agent === "api-specialist"))
       ? {
           ...normalizedRoute,
