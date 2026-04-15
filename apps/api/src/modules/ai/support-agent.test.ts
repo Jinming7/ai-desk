@@ -2692,6 +2692,132 @@ title: "ONES 私有部署环境要求"
   }
 });
 
+test("runSupportSearchAgent canonicalizes deployment sizing config-setup routes onto capability behavior", async () => {
+  const rootDir = await createFixtureRoot();
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = rootDir;
+
+  await writeFixture(
+    rootDir,
+    "deploy-docs/prepare/deployment-requirements.md",
+    `---
+title: "ONES 私有部署环境要求"
+---
+
+# ONES 私有部署环境要求
+
+## 服务器配置要求
+
+### 1.2 ONES K3s集群版配置说明
+
+#### 1.2.1 准备4台服务器
+
+| 集群规模 | 角色 | CPU | 内存 | 系统盘 | 数据盘 | 索引盘 | 网络带宽 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 500人以内 | 3台工作节点 | >=16C | >=32G | >=200G | >=300G | >=100G | >=50Mbps |
+| 500～2999 | 3台工作节点 | >=24C | >=48G | >=200G | >=500G | >=200G | >=100Mbps |
+`
+  );
+
+  const adapter = createAdapter({});
+  adapter.planSupportExecution = async () => ({
+    route: {
+      question_type: "config_setup",
+      user_goal: "Find the per-node CPU, memory, and disk requirements for a private deployment",
+      answer_contract: "Return the documented minimum/recommended per-node resource requirements for private deployment, including any caveats by component or node role.",
+      specialist_agent: "howto-specialist",
+      routing_confidence: 0.94
+    },
+    caseFrame: {
+      goal: "Find the per-node CPU, memory, and disk requirements for a private deployment",
+      symptom: "Need the documented deployment sizing baseline.",
+      object: "per-node CPU, memory, and disk requirements",
+      action_type: "how_to",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["deployment sizing requirements", "per node cpu memory disk requirements"],
+      query_plan: {
+        concept_queries: ["deployment sizing requirements", "resource requirements per node"],
+        object_queries: ["per-node CPU, memory, and disk requirements"],
+        behavior_queries: ["deployment sizing setup"]
+      },
+      question_type: "config_setup",
+      specialist_agent: "howto-specialist",
+      answer_contract:
+        "Return the documented minimum/recommended per-node resource requirements for private deployment, including any caveats by component or node role.",
+      routing_confidence: 0.94,
+      required_doc_kinds: ["deployment_runbook", "product_guide", "rules"]
+    },
+    evidencePlan: {
+      query_plan: {
+        concept_queries: ["deployment sizing requirements", "resource requirements per node"],
+        object_queries: ["per-node CPU, memory, and disk requirements"],
+        behavior_queries: ["deployment sizing setup"]
+      },
+      evidence_priority: ["deployment sizing matrix", "resource requirements"],
+      required_doc_kinds: ["deployment_runbook", "product_guide", "rules"],
+      retrieval_rounds: 1,
+      allow_refinement: false,
+      stop_after_grounded_evidence: true
+    }
+  });
+
+  let behaviorCalled = false;
+  let howtoCalled = false;
+  adapter.writeBehaviorSpecialistAnswer = async () => {
+    behaviorCalled = true;
+    return {
+      question_type: "capability_confirmation",
+      render_variant: "behavior",
+      direct_answer: "The current deployment docs define the per-node sizing matrix for cluster deployments.",
+      claims: [],
+      next_actions: [],
+      unknowns: [],
+      escalation_needed: false
+    };
+  };
+  adapter.writeHowToSpecialistAnswer = async () => {
+    howtoCalled = true;
+    return {
+      question_type: "how_to_product",
+      render_variant: "how_to",
+      direct_answer: "Use the deployment setup flow first.",
+      claims: [],
+      next_actions: [],
+      unknowns: [],
+      escalation_needed: false
+    };
+  };
+
+  try {
+    const result = await runSupportSearchAgent({
+      query: "What are the per-node CPU, memory, and disk requirements for private deployment?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-canonicalize-deployment-sizing-config-setup",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(behaviorCalled, true);
+    assert.equal(howtoCalled, false);
+    assert.equal(result.caseFrame.question_type, "capability_confirmation");
+    assert.equal(result.caseFrame.specialist_agent, "behavior-specialist");
+    assert.equal(result.result.support_answer?.render_variant, "behavior");
+    assert.match(result.result.answer, /3台工作节点|>=32G|>=200G/i);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("runSupportSearchAgent grounds free-form planner deployment taxonomy instead of tripping strict policy fallback", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
@@ -8659,6 +8785,182 @@ test("runSupportSearchAgent supervisor-domain runtime keeps deployment architect
           section.items.includes("Check whether database or storage externalization is documented for the target environment.")
       )
     );
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});
+
+test("runSupportSearchAgent supervisor-domain runtime keeps reranked deployment architecture evidence ahead of higher-score generic docs", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: { query: string; language: string; conversationHistory: Array<{ role: string; content: string }> },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("answer composer must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "deployment",
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: input.query,
+      answer_contract: "State the documented architecture first.",
+      specialist_agent: "behavior-specialist",
+      routing_confidence: 0.95,
+      primary_domain: "deployment"
+    },
+    caseFrame: {
+      goal: "Understand whether self-hosted deployment supports isolated service chains.",
+      symptom: "Need a documented architecture conclusion.",
+      object: "self-hosted deployment topology",
+      action_type: "capability_confirmation",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["self-hosted deployment architecture isolation"],
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract: "State the documented architecture first.",
+      routing_confidence: 0.95,
+      primary_domain: "deployment",
+      required_doc_kinds: ["deployment_runbook", "product_guide"]
+    },
+    retrievalQueries: ["self-hosted deployment architecture isolation"]
+  });
+  adapter.writeDeploymentDomainAnswer = async () => ({
+    question_type: "capability_confirmation",
+    render_variant: "behavior",
+    direct_answer: "",
+    claims: [],
+    next_actions: [],
+    unknowns: [],
+    escalation_needed: false
+  });
+
+  const deploymentArchitectureReference: SearchReference = {
+    documentId: "doc:deployment-architecture-reranked",
+    evidenceId: "chunk:deployment-architecture-reranked",
+    title: "Deployment architecture",
+    snippet:
+      "ONES self-hosted deployment uses a unified topology by default. Some infrastructure components can be externalized depending on the deployment plan.",
+    sourceUrl: "https://docs.ones.com/private-deployment/architecture",
+    path: "docs/private-deployment/architecture.mdx",
+    headingPath: "Topology",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.79,
+    retrievedAt: "2026-04-10T06:00:00.000Z",
+    supportMetadata: {
+      product_area: "deployment",
+      deployment_model: "private_deployment",
+      evidence_kind: "capability",
+      doc_kind: "deployment_runbook"
+    }
+  };
+
+  const genericExternalizationReference: SearchReference = {
+    documentId: "doc:externally-hosted-app",
+    evidenceId: "chunk:externally-hosted-app",
+    title: "When to Use Externally Hosted Apps",
+    snippet:
+      "This guide describes when externally hosted apps fit a self-hosted deployment and notes that some infrastructure components can be externalized separately.",
+    sourceUrl: "https://docs.ones.com/guide/externally-hosted-app",
+    path: "open-docs/docs/guide/advanced/externally-hosted-app/externally-hosted-app.mdx",
+    headingPath: "When to Use Externally Hosted Apps",
+    authority: "canonical_visible",
+    sourceType: "github_kb",
+    score: 0.97,
+    retrievedAt: "2026-04-10T06:00:00.000Z",
+    supportMetadata: {
+      product_area: "deployment",
+      deployment_model: "private_deployment",
+      evidence_kind: "capability",
+      doc_kind: "product_guide"
+    }
+  };
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence(input: { query?: string; queries?: string[] }) {
+      return {
+        query: input.query ?? input.queries?.[0] ?? "",
+        answer: "",
+        confidence: 0.99,
+        // Simulate reranked evidence bundle order where deployment architecture already wins.
+        references: [deploymentArchitectureReference, genericExternalizationReference],
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: input.queries ?? [],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "Can requirements and issues use isolated backend services in self-hosted deployment?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment-behavior-reranked-order"
+    });
+
+    assert.equal(result.caseFrame.specialist_agent, "behavior-specialist");
+    assert.equal(result.result.support_answer?.render_variant, "behavior");
+    assert.match(result.result.answer, /deployment architecture|unified or colocated architecture/i);
+    assert.doesNotMatch(result.result.answer, /externally hosted apps/i);
+    assert.equal(result.result.citations[0]?.id, "chunk:deployment-architecture-reranked");
+    assert.notEqual(result.result.citations[0]?.id, "chunk:externally-hosted-app");
+    assert.equal(result.result.references[0]?.evidenceId, "chunk:deployment-architecture-reranked");
   } finally {
     mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
     mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;

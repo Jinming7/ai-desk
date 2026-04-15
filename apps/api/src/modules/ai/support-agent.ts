@@ -637,6 +637,23 @@ function stabilizeSupportRouteAndCaseFrame(input: {
       preliminaryProductArea === "deployment" ||
       input.caseFrame.product_area === "deployment") &&
     (signals.accountRecoveryContext || shouldTreatAsHowTo || architectureQuestion);
+  const deploymentConstraintCapabilityContext =
+    !shouldTreatAsHowTo &&
+    !signals.accountRecoveryContext &&
+    (deploymentModel === "private_deployment" ||
+      preliminaryProductArea === "deployment" ||
+      input.caseFrame.product_area === "deployment") &&
+    looksLikeStructuredConstraintText(
+      [
+        input.query,
+        input.caseFrame.object,
+        ...(input.caseFrame.retrieval_queries ?? []),
+        ...(input.caseFrame.query_plan?.concept_queries ?? []),
+        ...(input.caseFrame.query_plan?.object_queries ?? [])
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
   const productArea =
     shouldPreserveDeploymentRoute && !shouldPreserveIntegrationTroubleshooting ? "deployment" : preliminaryProductArea;
   const provisionalCaseFrame: Pick<
@@ -681,7 +698,11 @@ function stabilizeSupportRouteAndCaseFrame(input: {
       : objectNeedsDeploymentRecoveryReplacement && signals.integrationContext
       ? localizedSupportLabel(input.query, "集成授权回调", "integration authorization callback")
       : input.caseFrame.object;
-  const actionType = shouldTreatAsHowTo ? "how_to" : input.caseFrame.action_type;
+  const actionType = deploymentConstraintCapabilityContext
+    ? "capability_confirmation"
+    : shouldTreatAsHowTo
+    ? "how_to"
+    : input.caseFrame.action_type;
 
   let caseFrame: SupportCaseFrame = {
     ...input.caseFrame,
@@ -741,6 +762,15 @@ function stabilizeSupportRouteAndCaseFrame(input: {
           specialist_agent: "troubleshooting-specialist",
           answer_contract: "Give the most likely integration configuration cause first, then the direct checks to run now.",
           routing_confidence: Math.max(input.route.routing_confidence, 0.84)
+        }
+      : deploymentConstraintCapabilityContext && normalizedRoute.specialist_agent !== "api-specialist"
+      ? {
+          ...normalizedRoute,
+          question_type: "capability_confirmation",
+          specialist_agent: "behavior-specialist",
+          answer_contract:
+            "State the documented requirement or support constraint first, then clarify the exact scope, node role, or caveat that applies.",
+          routing_confidence: Math.max(input.route.routing_confidence, 0.86)
         }
       : shouldTreatAsHowTo &&
         (normalizedRoute.specialist_agent === "behavior-specialist" ||
@@ -1425,6 +1455,42 @@ function referenceHasStructuredConstraintEvidence(reference: SearchReference): b
   );
 }
 
+function getReferenceHeadingDepth(headingPath?: string): number {
+  return String(headingPath ?? "")
+    .split(">")
+    .map((item) => item.trim())
+    .filter(Boolean).length;
+}
+
+function referenceLooksLikeLeafConstraintMatrix(reference: SearchReference): boolean {
+  const retrievalUnitFamily = getReferenceRetrievalUnitFamily(reference);
+  if (retrievalUnitFamily === "constraint_table_row_unit") return true;
+  if (getReferenceHeadingDepth(reference.headingPath) < 4) return false;
+  const snippet = String(reference.snippet ?? "");
+  const semanticText = getReferenceSemanticText(reference);
+  const hasResourceColumns =
+    /\b(cpu|memory|ram|disk|storage|bandwidth|node|nodes|server|servers)\b|cpu|内存|磁盘|存储|带宽|节点|服务器|系统盘|数据盘|索引盘|网络带宽/.test(
+      semanticText
+    );
+  const hasResourceValues = /(?:>=|<=|\d+\s*(?:c|g|gb|tb|mbps|台))|>=\d/i.test(snippet);
+  return /\|/.test(snippet) && hasResourceColumns && hasResourceValues;
+}
+
+function referenceLooksLikeDeploymentApplicabilityOnly(reference: SearchReference): boolean {
+  const canonicalPath = canonicalDocsPath(reference.path);
+  if (/(^|\/)deploy-docs\//.test(canonicalPath)) return false;
+  const semanticText = getReferenceSemanticText(reference);
+  const applicabilityOnly =
+    /\b(applicable environments?|supported environments?|environment availability|private deployment saas|saas)\b|适用环境|可用环境/.test(
+      semanticText
+    );
+  const hasOperationalSignals =
+    /\b(cpu|memory|ram|disk|storage|bandwidth|support matrix|compatibility|system requirements?|environment requirements?|operating system requirements?|topology|architecture|cluster|node|nodes|server|servers|install|configure|rollback|backup)\b|cpu|内存|磁盘|存储|带宽|支持矩阵|兼容性|系统要求|环境要求|操作系统要求|拓扑|架构|集群|节点|服务器|安装|配置|回滚|备份/.test(
+      semanticText
+    );
+  return applicabilityOnly && !hasOperationalSignals;
+}
+
 function referenceLooksLikeOperationalPlan(reference: SearchReference): boolean {
   return looksLikeOperationalPlanText(getReferenceSemanticText(reference));
 }
@@ -1733,6 +1799,8 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
       const semanticText = getReferenceSemanticText(reference);
       const retrievalUnitFamily = getReferenceRetrievalUnitFamily(reference);
       const structuredConstraintEvidence = referenceHasStructuredConstraintEvidence(reference);
+      const leafConstraintMatrix = referenceLooksLikeLeafConstraintMatrix(reference);
+      const deploymentApplicabilityOnly = referenceLooksLikeDeploymentApplicabilityOnly(reference);
       const operationalPlanReference = referenceLooksLikeOperationalPlan(reference);
       let topicScore = 0;
       for (const term of focusTerms) {
@@ -1766,8 +1834,10 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
         else if (profile.evidenceKind === "procedure") topicScore -= 8;
         if (retrievalUnitFamily === "constraint_table_row_unit") topicScore += 34;
         else if (retrievalUnitFamily === "schema_constraint_unit") topicScore += 16;
+        if (leafConstraintMatrix) topicScore += 28;
         if (/\|/.test(String(reference.snippet ?? ""))) topicScore += 8;
         if (operationalPlanReference && !structuredConstraintEvidence) topicScore -= 20;
+        if (deploymentApplicabilityOnly) topicScore -= 28;
         if (/\b(optional|risk|warning|warnings?)\b|可选|风险|提示/.test(`${title} ${heading}`)) topicScore -= 18;
       }
       if (deploymentCapabilityQuestion) {
@@ -1775,6 +1845,7 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
         if (profile.evidenceKind === "constraint" || profile.evidenceKind === "capability") topicScore += 22;
         if (profile.evidenceKind === "procedure") topicScore -= 10;
         if (!rootHeading) topicScore += wantsListVariant ? 16 : 12;
+        if (leafConstraintMatrix) topicScore += wantsListVariant ? 18 : 24;
         if (
           /\b(support matrix|compatibility|system requirements?|environment requirements?|operating system requirements?)\b|支持矩阵|兼容性|系统要求|环境要求|操作系统要求/.test(
             semanticText
@@ -3155,7 +3226,12 @@ async function loadPublishedDocsExpansionSource(reference: SearchReference): Pro
   return loadingPromise;
 }
 
-function scopeProcedureSourceLines(reference: SearchReference, source: string, allowHeadingScoping: boolean): string[] {
+function scopeProcedureSourceLines(
+  reference: SearchReference,
+  source: string,
+  allowHeadingScoping: boolean,
+  fallbackToSnippetOnMissingHeading = false
+): string[] {
   const lines = source.replace(/^---\s*\n[\s\S]*?\n---\s*(?:\n|$)/, "").split(/\r?\n/);
   const headingLabel = shortHeadingLabel(reference.headingPath);
   if (!allowHeadingScoping || !headingLabel || headingLabel.toUpperCase() === "ROOT") return lines.slice(0, 260);
@@ -3176,6 +3252,12 @@ function scopeProcedureSourceLines(reference: SearchReference, source: string, a
   }
 
   if (anchorIndex < 0) {
+    if (fallbackToSnippetOnMissingHeading) {
+      return String(reference.snippet ?? "")
+        .split(/\r?\n/)
+        .filter((line) => line.trim().length > 0)
+        .slice(0, 40);
+    }
     const firstHeadingIndex = lines.findIndex((line) => /^\s*#{1,6}\s+/.test(line));
     return (firstHeadingIndex >= 0 ? lines.slice(firstHeadingIndex) : lines).slice(0, 260);
   }
@@ -3564,7 +3646,7 @@ async function loadBehaviorSourceLinesAsync(reference: SearchReference): Promise
 
   const expandedSource = await loadPublishedDocsExpansionSource(reference);
   if (!expandedSource) return null;
-  return scopeProcedureSourceLines(reference, expandedSource, true);
+  return scopeProcedureSourceLines(reference, expandedSource, true, true);
 }
 
 async function collectBehaviorEvidenceFragmentsAsync(reference: SearchReference): Promise<string[]> {
@@ -3607,6 +3689,8 @@ function scoreBehaviorEvidenceFragment(input: {
   const profile = getReferenceSupportProfile(input.reference);
   const constraintFirstCapabilityCase = isConstraintFirstCapabilityCase(input.caseFrame);
   const structuredConstraintReference = referenceHasStructuredConstraintEvidence(input.reference);
+  const leafConstraintMatrix = referenceLooksLikeLeafConstraintMatrix(input.reference);
+  const deploymentApplicabilityOnly = referenceLooksLikeDeploymentApplicabilityOnly(input.reference);
   const operationalPlanFragment = fragmentLooksLikeOperationalPlan(input.fragment);
   const retrievalUnitFamily = getReferenceRetrievalUnitFamily(input.reference);
   let score = input.primaryBoost + Math.round(input.reference.score * 10);
@@ -3621,9 +3705,11 @@ function scoreBehaviorEvidenceFragment(input: {
   if (constraintFirstCapabilityCase) {
     if (structuredConstraintReference) score += 20;
     if (retrievalUnitFamily === "constraint_table_row_unit") score += 24;
+    if (leafConstraintMatrix) score += 28;
     if (isStructuredBehaviorEvidenceFragment(input.fragment)) score += 10;
     if (referenceLooksLikeOperationalPlan(input.reference) && !structuredConstraintReference) score -= 18;
     if (operationalPlanFragment && !isStructuredBehaviorEvidenceFragment(input.fragment)) score -= 18;
+    if (deploymentApplicabilityOnly) score -= 28;
   }
   for (const term of focusTerms) {
     const normalized = term.toLowerCase();
@@ -3967,9 +4053,9 @@ function recoverEvidenceAnchoredDeploymentBehaviorDraft(input: {
   if (!isDeploymentArchitectureQuestion(input.query, input.caseFrame)) return null;
   if (hasGroundedDraftClaimsInEvidence(input.draft, input.evidenceBundle)) return null;
 
-  const ranked = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental]
-    .filter((reference) => reference.authority === "canonical_visible")
-    .sort((a, b) => b.score - a.score);
+  const ranked = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].filter(
+    (reference) => reference.authority === "canonical_visible"
+  );
   if (!ranked.length) return null;
 
   const deploymentRefs = ranked.filter((reference) => {
@@ -6537,7 +6623,7 @@ export async function runSupportSearchAgent(input: {
           .catch(() => null)
       : null;
   const preRefinedEvidence = additionalEvidence
-    ? orchestrator.combineEvidenceCollections([baseEvidence, additionalEvidence])
+    ? orchestrator.combineEvidenceCollections([baseEvidence, additionalEvidence], { caseFrame })
     : baseEvidence;
   const refinementEvidence =
     allowRefinement &&
@@ -6559,7 +6645,7 @@ export async function runSupportSearchAgent(input: {
       : null;
   const evidenceCollection =
     refinementEvidence && refinementEvidence.references.length > 0
-      ? orchestrator.combineEvidenceCollections([preRefinedEvidence, refinementEvidence])
+      ? orchestrator.combineEvidenceCollections([preRefinedEvidence, refinementEvidence], { caseFrame })
       : preRefinedEvidence;
   const secondRoundQueryCount = (additionalEvidence ? additionalQueries.length : 0) + (refinementEvidence?.resolvedQueries.length ?? 0);
   const additionalTiming =

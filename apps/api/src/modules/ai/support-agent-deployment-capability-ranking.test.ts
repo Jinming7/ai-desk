@@ -379,3 +379,157 @@ test("runSupportSearchAgent prioritizes operating-system support evidence over g
     SearchOrchestrator.prototype.collectEvidence = originalCollectEvidence;
   }
 });
+
+test("runSupportSearchAgent prefers leaf deployment sizing matrix rows over higher-scoring single-node summaries", async () => {
+  const route: SupportQuestionRoute = {
+    question_type: "capability_confirmation",
+    user_goal: "Confirm the per-node CPU, memory, and disk requirements for private deployment",
+    answer_contract: "State the documented per-node resource requirements first.",
+    specialist_agent: "behavior-specialist",
+    routing_confidence: 0.95,
+    specialist_budget: 1
+  };
+  const caseFrame: SupportCaseFrame = {
+    goal: route.user_goal,
+    symptom: "Need the documented private deployment sizing baseline.",
+    object: "per-node CPU, memory, and disk requirements",
+    action_type: "capability_confirmation",
+    deployment_model: "private_deployment",
+    product_area: "deployment",
+    constraints: [],
+    missing_critical_info: [],
+    retrieval_queries: [
+      "What are the per-node CPU, memory, and disk requirements for private deployment?",
+      "deployment sizing requirements",
+      "per node cpu memory disk requirements"
+    ],
+    query_plan: {
+      concept_queries: ["deployment sizing requirements", "resource requirements per node"],
+      object_queries: ["per-node CPU, memory, and disk requirements"],
+      behavior_queries: ["capability confirmation", "capacity planning"]
+    },
+    question_type: route.question_type,
+    specialist_agent: route.specialist_agent,
+    answer_contract: route.answer_contract,
+    routing_confidence: route.routing_confidence,
+    required_doc_kinds: ["deployment_runbook", "product_guide", "rules"]
+  };
+  const evidencePlan: SupportEvidencePlan = {
+    query_plan: caseFrame.query_plan!,
+    evidence_priority: ["deployment sizing matrix", "resource requirements"],
+    required_doc_kinds: ["deployment_runbook", "product_guide", "rules"],
+    retrieval_rounds: 2,
+    allow_refinement: true,
+    stop_after_grounded_evidence: false
+  };
+
+  const adapter = createDeploymentCapabilityAdapter();
+  adapter.planSupportCase = async () => caseFrame;
+  adapter.routeSupportQuestion = async () => route;
+  adapter.planSupportEvidence = async () => evidencePlan;
+  adapter.planSupportExecution = async () => ({
+    route,
+    caseFrame,
+    evidencePlan
+  });
+
+  const originalCollectEvidence = SearchOrchestrator.prototype.collectEvidence;
+  SearchOrchestrator.prototype.collectEvidence = async function collectEvidenceStub(input) {
+    return {
+      query: input.queries[0] ?? "",
+      answer: "",
+      confidence: 0.84,
+      retrievalStatus: "grounded",
+      unresolvedReasonCode: null,
+      resolvedQueries: input.queries,
+      fallbackUsed: false,
+      references: [
+        createReference({
+          documentId: "doc-deployment-risk-optional",
+          evidenceId: "doc-deployment-risk-optional::risk",
+          title: "ONES 私有部署环境要求",
+          path: "deploy-docs/prepare/deployment-requirements.md",
+          headingPath: "ONES 私有部署环境要求 > 风险提示",
+          snippet: "若采用特殊芯片或信创环境，CPU 和内存需额外放大，属于可选扩展场景。",
+          score: 0.96,
+          supportMetadata: {
+            evidence_kind: "capability",
+            product_area: "general",
+            deployment_model: "shared"
+          }
+        }),
+        createReference({
+          documentId: "doc-deployment-single-node",
+          evidenceId: "61528da749f362ea68abfe269414b29a91d2c6abf8889093d4d3b5decc6e01db",
+          title: "ONES 私有部署环境要求",
+          path: "deploy-docs/prepare/deployment-requirements.md",
+          headingPath: "ONES 私有部署环境要求 > 服务器配置要求 > 1.1 ONES K3s单机版配置说明",
+          snippet:
+            "1.1 ONES K3s单机版配置说明：500人以内 1台工作节点 >=16C >=48G >=100G >=1T >=100G >=50Mbps；500～2999 1台工作节点 >=32C >=64G >=100G >=2T >=200G >=100Mbps。",
+          score: 0.95,
+          supportMetadata: {
+            evidence_kind: "constraint",
+            product_area: "deployment",
+            deployment_model: "private_deployment",
+            doc_kind: "rules"
+          }
+        }),
+        createReference({
+          documentId: "doc-deployment-cluster-row",
+          evidenceId: "5b4070d2-951a-5723-b1c9-27052a6c0895",
+          title: "ONES 私有部署环境要求",
+          path: "deploy-docs/prepare/deployment-requirements.md",
+          headingPath: "ONES 私有部署环境要求 > 服务器配置要求 > 1.2 ONES K3s集群版配置说明 > 1.2.1 准备4台服务器",
+          snippet:
+            "|集群规模|角色|CPU|内存|系统盘|数据盘|索引盘|网络带宽| |500人以内|3台工作节点|>=16C|>=32G|>=200G|>=300G|>=100G|>=50Mbps| |500～2999|3台工作节点|>=24C|>=48G|>=200G|>=500G|>=200G|>=100Mbps|",
+          score: 0.78,
+          supportMetadata: {
+            evidence_kind: "capability",
+            product_area: "general",
+            deployment_model: "shared"
+          }
+        }),
+        createReference({
+          documentId: "doc-form-control-applicable-envs",
+          evidenceId: "8e428fa7117c44da154dd2785f4119ba403dc84a233ba6230d2b7ad285ef7fcf",
+          title: "Form Custom Control",
+          path: "open-docs/docs/abilities/extensions/form-control.mdx",
+          headingPath: "Form Custom Control > Requirements > Applicable Environments",
+          snippet: "Private Deployment SAAS",
+          score: 0.9,
+          supportMetadata: {
+            evidence_kind: "capability",
+            product_area: "deployment",
+            deployment_model: "private_deployment"
+          }
+        })
+      ]
+    };
+  };
+
+  try {
+    const execution = await runSupportSearchAgent({
+      query: "What are the per-node CPU, memory, and disk requirements for private deployment?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      idempotencyKey: "support-agent-deployment-leaf-matrix-over-single-node-summary",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.match(execution.result.answer, /3台工作节点|>=32g|>=200g/i);
+    assert.doesNotMatch(execution.result.answer, /1台工作节点|>=1t/i);
+    assert.equal(execution.result.citations.some((item) => item.id === "5b4070d2-951a-5723-b1c9-27052a6c0895"), true);
+    assert.equal(
+      execution.result.citations.some((item) => item.id === "61528da749f362ea68abfe269414b29a91d2c6abf8889093d4d3b5decc6e01db"),
+      false
+    );
+  } finally {
+    SearchOrchestrator.prototype.collectEvidence = originalCollectEvidence;
+  }
+});

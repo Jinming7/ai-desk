@@ -8,6 +8,7 @@ import { DefaultHybridRetrievalProvider } from "./hybrid-retrieval-provider.js";
 import { buildHybridRetrievalRequest, HybridRetrievalRuntime } from "./hybrid-retrieval.js";
 import { searchLocalDocs } from "./local-docs.js";
 import { resolveSupportHybridRetrievalFlag } from "./release/service.js";
+import { getSupportEvidenceProfile } from "./support-evidence-policy.js";
 import type { SearchReference, SearchResponseEnvelope, SupportCaseFrame } from "./types.js";
 
 type SearchEvidenceCollection = SearchResponseEnvelope & {
@@ -23,8 +24,16 @@ export class SearchOrchestrator {
     )
   ) {}
 
+  private getMergedMetadata(reference: SearchReference): Record<string, unknown> {
+    return {
+      ...((reference.supportMetadata ?? {}) as Record<string, unknown>),
+      ...((reference.chunkMetadata ?? {}) as Record<string, unknown>),
+      ...((reference.docMetadata ?? {}) as Record<string, unknown>)
+    };
+  }
+
   private getMetadataList(reference: SearchReference, key: string): string[] {
-    const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
+    const metadata = this.getMergedMetadata(reference);
     const raw = metadata[key];
     return Array.isArray(raw) ? raw.map((item) => String(item ?? "").toLowerCase()).filter(Boolean) : [];
   }
@@ -42,19 +51,25 @@ export class SearchOrchestrator {
     objects: string[];
     appliesTo: string[];
   } {
-    const metadata = (reference.supportMetadata ?? {}) as Record<string, unknown>;
+    const profile = getSupportEvidenceProfile({
+      title: reference.title,
+      headingPath: reference.headingPath,
+      snippet: reference.snippet,
+      path: reference.path,
+      supportMetadata: this.getMergedMetadata(reference)
+    });
     return {
-      title: String(reference.title ?? "").toLowerCase(),
-      heading: String(reference.headingPath ?? "").toLowerCase(),
-      snippet: String(reference.snippet ?? "").toLowerCase(),
-      evidenceKind: String(metadata.evidence_kind ?? "").toLowerCase(),
-      productArea: String(metadata.product_area ?? "").toLowerCase(),
-      deploymentModel: String(metadata.deployment_model ?? "").toLowerCase(),
+      title: profile.title,
+      heading: profile.heading,
+      snippet: profile.snippet,
+      evidenceKind: profile.evidenceKind,
+      productArea: profile.productArea,
+      deploymentModel: profile.deploymentModel,
       permissions: this.getMetadataList(reference, "permissions"),
       prerequisites: this.getMetadataList(reference, "prerequisites"),
       actions: this.getMetadataList(reference, "actions"),
       objects: this.getMetadataList(reference, "objects"),
-      appliesTo: this.getMetadataList(reference, "applies_to")
+      appliesTo: profile.appliesTo.length > 0 ? profile.appliesTo : this.getMetadataList(reference, "applies_to")
     };
   }
 
@@ -202,8 +217,9 @@ export class SearchOrchestrator {
     return score;
   }
 
-  private mergeReferences(references: SearchReference[], options?: { query?: string }): SearchReference[] {
+  private mergeReferences(references: SearchReference[], options?: { query?: string; caseFrame?: SupportCaseFrame }): SearchReference[] {
     const queryTerms = this.extractQueryTerms(options?.query);
+    const caseFrame = options?.caseFrame;
     const byKey = new Map<string, SearchReference>();
     for (const item of references) {
       if (!this.hasUsableEvidence(item)) continue;
@@ -225,8 +241,51 @@ export class SearchOrchestrator {
         byKey.set(key, item);
       }
     }
-    const combinedScore = (reference: SearchReference) =>
-      this.scoreReferenceQueryMatch(reference, queryTerms) + Math.round(reference.score * 10);
+    const isConstraintFirstDeploymentCase =
+      caseFrame?.product_area === "deployment" && caseFrame.question_type === "capability_confirmation";
+    const getHeadingDepth = (headingPath?: string) =>
+      String(headingPath ?? "")
+        .split(">")
+        .map((item) => item.trim())
+        .filter(Boolean).length;
+    const referenceLooksLikeLeafConstraintMatrix = (reference: SearchReference) => {
+      if (getHeadingDepth(reference.headingPath) < 4) return false;
+      const semanticText = this.getReferenceSemanticText(reference);
+      const snippet = String(reference.snippet ?? "").toLowerCase();
+      return (
+        /\|/.test(snippet) &&
+        /(?:>=|<=|\d+\s*(?:c|g|gb|tb|mbps|台))/i.test(snippet) &&
+        /\b(cpu|memory|ram|disk|storage|bandwidth|node|nodes|server|servers)\b|cpu|内存|磁盘|存储|带宽|节点|服务器|系统盘|数据盘|索引盘|网络带宽/.test(
+          semanticText
+        )
+      );
+    };
+    const referenceLooksLikeDeploymentApplicabilityOnly = (reference: SearchReference) => {
+      const canonicalPath = this.canonicalDocsPath(reference.path);
+      if (/(^|\/)deploy-docs\//.test(canonicalPath)) return false;
+      const semanticText = this.getReferenceSemanticText(reference);
+      const applicabilityOnly =
+        /\b(applicable environments?|supported environments?|environment availability|private deployment saas|saas)\b|适用环境|可用环境/.test(
+          semanticText
+        );
+      const hasOperationalSignals =
+        /\b(cpu|memory|ram|disk|storage|bandwidth|support matrix|compatibility|system requirements?|environment requirements?|operating system requirements?|topology|architecture|cluster|node|nodes|server|servers|install|configure|rollback|backup)\b|cpu|内存|磁盘|存储|带宽|支持矩阵|兼容性|系统要求|环境要求|操作系统要求|拓扑|架构|集群|节点|服务器|安装|配置|回滚|备份/.test(
+          semanticText
+        );
+      return applicabilityOnly && !hasOperationalSignals;
+    };
+    const combinedScore = (reference: SearchReference) => {
+      let score =
+        this.scoreReferenceQueryMatch(reference, queryTerms) +
+        Math.round(reference.score * 10) +
+        this.scoreCaseFrameMatch(reference, caseFrame);
+      if (isConstraintFirstDeploymentCase) {
+        if (referenceLooksLikeLeafConstraintMatrix(reference)) score += 36;
+        if (referenceLooksLikeDeploymentApplicabilityOnly(reference)) score -= 32;
+        if (/\b(optional|risk|warning|warnings?)\b|可选|风险|提示/.test(this.getReferenceSemanticText(reference))) score -= 18;
+      }
+      return score;
+    };
     const sorted = [...byKey.values()].sort((a, b) => combinedScore(b) - combinedScore(a) || b.score - a.score);
     const topCombinedScore = sorted[0] ? combinedScore(sorted[0]) : 0;
     const scoreFloor = topCombinedScore > 0 ? Math.max(6, Math.round(topCombinedScore * 0.55)) : 0;
@@ -361,16 +420,19 @@ export class SearchOrchestrator {
     });
   }
 
-  combineEvidenceCollections(collections: SearchEvidenceCollection[]): SearchEvidenceCollection {
+  combineEvidenceCollections(collections: SearchEvidenceCollection[], options?: { caseFrame?: SupportCaseFrame }): SearchEvidenceCollection {
     const validCollections = collections.filter(Boolean);
-    const mergedReferences = this.mergeReferences(validCollections.flatMap((item) => item.references)).slice(
+    const primaryQuery = validCollections.find((item) => item.query)?.query ?? "";
+    const mergedReferences = this.mergeReferences(validCollections.flatMap((item) => item.references), {
+      query: primaryQuery,
+      caseFrame: options?.caseFrame
+    }).slice(
       0,
       env.GITHUB_KB_PROFILE_AGENT_TOPK
     );
     const confidence = Math.max(0, ...validCollections.map((item) => item.confidence));
     const fallbackUsed = validCollections.some((item) => item.fallbackUsed);
     const resolvedQueries = [...new Set(validCollections.flatMap((item) => item.resolvedQueries))];
-    const primaryQuery = validCollections.find((item) => item.query)?.query ?? "";
 
     if (!mergedReferences.length) {
       return {
@@ -409,7 +471,10 @@ export class SearchOrchestrator {
     branch?: string;
   }): Promise<SearchEvidenceCollection> {
     const normalizedBaseQuery = this.normalizeQuery(input.baseQuery);
-    const refinementQueries = this.mergeReferences(input.references)
+    const refinementQueries = this.mergeReferences(input.references, {
+      query: normalizedBaseQuery,
+      caseFrame: input.caseFrame
+    })
       .slice(0, 2)
       .map((item) => `${normalizedBaseQuery} ${item.title}`.trim())
       .filter((query) => query && query !== normalizedBaseQuery);
