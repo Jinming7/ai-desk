@@ -8966,3 +8966,218 @@ test("runSupportSearchAgent supervisor-domain runtime keeps reranked deployment 
     mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
   }
 });
+
+test("runSupportSearchAgent supervisor-domain runtime prefers deployment expansion evidence over architecture noise", async () => {
+  const mutableEnv = env as {
+    FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME?: boolean;
+    OPENCLAW_AGENT_ID_SUPPORT_MAIN?: string;
+  };
+  const originalSingleAgentRuntime = mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME;
+  const originalSupportMainAgentId = mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN;
+  mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = true;
+  mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = "support-main";
+
+  const adapter = createAdapter({}) as OpenClawAdapter & {
+    planSupportDispatch?: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<unknown>;
+    writeDeploymentDomainAnswer?: (
+      input: OpenClawSupportSpecialistInput,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<SpecialistDraftAnswer>;
+    planSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+    draftSupportMainAgent?: (...args: unknown[]) => Promise<unknown>;
+  };
+
+  adapter.planSupportMainAgent = async () => {
+    throw new Error("support-main fallback must not run when supervisor-domain runtime is available");
+  };
+  adapter.draftSupportMainAgent = async () => {
+    throw new Error("support-main draft must not run when supervisor-domain runtime is available");
+  };
+  adapter.routeSupportQuestion = async () => {
+    throw new Error("legacy router must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportEvidence = async () => {
+    throw new Error("legacy evidence planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.planSupportCase = async () => {
+    throw new Error("legacy case planner must not run when supervisor-domain runtime is available");
+  };
+  adapter.judgeSupportAnswer = async () => {
+    throw new Error("judge stage must not run in supervisor-domain runtime");
+  };
+  adapter.composeCustomerAnswer = async () => {
+    throw new Error("answer composer must not run in supervisor-domain runtime");
+  };
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "deployment",
+    route: {
+      question_type: "capability_confirmation",
+      user_goal: input.query,
+      answer_contract: "State the documented deployment architecture first.",
+      specialist_agent: "behavior-specialist",
+      routing_confidence: 0.95,
+      primary_domain: "deployment"
+    },
+    caseFrame: {
+      goal: "Understand whether self-hosted deployment supports isolated service chains.",
+      symptom: "Need a documented architecture conclusion.",
+      object: "self-hosted deployment topology",
+      action_type: "capability_confirmation",
+      deployment_model: "private_deployment",
+      product_area: "deployment",
+      constraints: [],
+      missing_critical_info: [],
+      retrieval_queries: ["self-hosted deployment architecture isolation"],
+      question_type: "capability_confirmation",
+      specialist_agent: "behavior-specialist",
+      answer_contract: "State the documented deployment architecture first.",
+      routing_confidence: 0.95,
+      primary_domain: "deployment",
+      required_doc_kinds: ["deployment_runbook", "product_guide"]
+    },
+    retrievalQueries: ["self-hosted deployment architecture isolation"]
+  });
+  adapter.writeDeploymentDomainAnswer = async () => ({
+    question_type: "capability_confirmation",
+    render_variant: "behavior",
+    direct_answer: "",
+    claims: [],
+    next_actions: [],
+    unknowns: [],
+    escalation_needed: false
+  });
+
+  const references: SearchReference[] = [
+    {
+      documentId: "preview-operating-system-requirements",
+      evidenceId: "preview-operating-system-requirements",
+      title: "操作系统要求",
+      snippet:
+        "只支持Linux 4.*以上内核的操作系统；禁止与其他服务（如数据库、中间件）共用服务器；保持操作系统的纯净。",
+      sourceUrl: "https://docs.ones.com/deploy/prepare/deployment-requirements",
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      headingPath: "ONES 私有部署环境要求 > 操作系统要求",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.4206451612903226,
+      retrievedAt: "2026-04-15T02:45:00.000Z",
+      supportMetadata: {
+        product_area: "general",
+        evidence_kind: "capability",
+        deployment_model: "shared"
+      }
+    },
+    {
+      documentId: "preview-deployment-expansion",
+      evidenceId: "preview-deployment-expansion",
+      title: "部署扩展要求",
+      snippet:
+        "ONES 默认采用内置数据库 MySQL、内置 Redis/Kafka、单机默认采用本地存储，同时支持数据库外置、中间件外置、附件存储外置为 NFS 或 OSS。",
+      sourceUrl: "https://docs.ones.com/deploy/prepare/deployment-requirements",
+      path: "deploy-docs/prepare/deployment-requirements.md",
+      headingPath: "ONES 私有部署环境要求 > 部署扩展要求",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.236122448979592,
+      retrievedAt: "2026-04-15T02:45:00.000Z",
+      supportMetadata: {
+        product_area: "general",
+        evidence_kind: "capability",
+        deployment_model: "shared"
+      }
+    },
+    {
+      documentId: "preview-externally-hosted-apps",
+      evidenceId: "preview-externally-hosted-apps",
+      title: "When to Use Externally Hosted Apps",
+      snippet:
+        "Externally hosted apps are suitable when you need custom infrastructure, private network placement, or integration with local services or databases.",
+      sourceUrl: "https://docs.ones.com/guide/externally-hosted-app",
+      path: "open-docs/docs/guide/advanced/externally-hosted-app/externally-hosted-app.mdx",
+      headingPath: "Externally Hosted App > When to Use Externally Hosted Apps",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.4725,
+      retrievedAt: "2026-04-15T02:45:00.000Z",
+      supportMetadata: {
+        product_area: "deployment",
+        evidence_kind: "procedure",
+        deployment_model: "private_deployment",
+        applies_to: ["private_deployment", "deployment"]
+      }
+    },
+    {
+      documentId: "preview-docker-to-k3s",
+      evidenceId: "preview-docker-to-k3s",
+      title: "Docker迁移K3S方案",
+      snippet:
+        "迁移准备需要先收集当前 Docker 单机实例信息，若服务器无法满足 K3S 部署实例，则建议参考规格推荐升级服务器配置。",
+      sourceUrl: "https://docs.ones.com/deploy/data/docker-to-k3s",
+      path: "deploy-docs/data/docker-to-k3s.cn.md",
+      headingPath: "Docker迁移K3S方案 > 四、迁移实施预演",
+      authority: "canonical_visible",
+      sourceType: "github_kb",
+      score: 1.4581557377049181,
+      retrievedAt: "2026-04-15T02:45:00.000Z"
+    }
+  ];
+
+  const orchestrator = {
+    normalizeQuery(query: string) {
+      return query.trim().toLowerCase();
+    },
+    async collectEvidence() {
+      return {
+        query: "self-hosted deployment architecture isolation",
+        answer: "",
+        confidence: 0.96,
+        references,
+        retrievalStatus: "grounded" as const,
+        unresolvedReasonCode: null,
+        resolvedQueries: ["self-hosted deployment architecture isolation"],
+        fallbackUsed: false
+      };
+    },
+    combineEvidenceCollections<T>(items: T[]) {
+      return items[0];
+    },
+    async refineEvidence() {
+      throw new Error("supervisor-domain runtime must not refine evidence");
+    }
+  };
+
+  try {
+    const result = await coreRunSupportSearchAgent({
+      query: "Can requirements and issues use isolated backend services in self-hosted deployment?",
+      language: "en",
+      currentRound: 0,
+      conversationHistory: [],
+      adapter,
+      orchestrator: orchestrator as never,
+      idempotencyKey: "support-supervisor-domain-deployment-architecture-noise",
+      runtime: {
+        deliveryMode: "async_job",
+        overallTimeoutMs: 240000,
+        requestStartedAtMs: Date.now()
+      }
+    });
+
+    assert.equal(result.caseFrame.specialist_agent, "behavior-specialist");
+    assert.equal(result.result.support_answer?.render_variant, "behavior");
+    assert.equal(result.result.citations[0]?.id, "preview-deployment-expansion");
+    assert.equal(result.result.references[0]?.evidenceId, "preview-deployment-expansion");
+    assert.doesNotMatch(result.result.answer, /externally hosted apps|docker迁移k3s方案|操作系统要求/i);
+  } finally {
+    mutableEnv.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME = originalSingleAgentRuntime;
+    mutableEnv.OPENCLAW_AGENT_ID_SUPPORT_MAIN = originalSupportMainAgentId;
+  }
+});

@@ -1491,6 +1491,33 @@ function referenceLooksLikeDeploymentApplicabilityOnly(reference: SearchReferenc
   return applicabilityOnly && !hasOperationalSignals;
 }
 
+function referenceLooksLikeDeploymentArchitectureEvidence(reference: SearchReference): boolean {
+  const profile = getReferenceSupportProfile(reference);
+  const titleHeading = `${profile.title} ${profile.heading}`;
+  const semanticText = getReferenceSemanticText(reference);
+  const noisyRequirementHeading =
+    /\b(operating system requirements?|client requirements?|account preparation|risk warning|optional)\b|操作系统要求|客户端要求|两类账号准备|风险提示|信创环境要求/.test(
+      titleHeading
+    );
+  if (noisyRequirementHeading) return false;
+  return (
+    /\b(topology|architecture|service boundaries|service topology|database topology|shared backend|backend services|query path|query paths|isolat(?:e|ed|ion)|separate|separable|externalized|external database|external storage|colocated|unified(?: system| topology)?|deployment expansion)\b|拓扑|架构|隔离|独立|外置|数据库外置|中间件外置|存储外置|部署扩展/.test(
+      semanticText
+    ) ||
+    ((/\b(default|built-?in)\b|默认|内置/.test(semanticText) && /\b(database|middleware|storage|mysql|redis|kafka)\b|数据库|中间件|存储/.test(semanticText)) &&
+      /\b(external|externalized|nfs|oss)\b|外置|NFS|OSS/.test(semanticText))
+  );
+}
+
+function referenceLooksLikeDeploymentArchitectureNoise(reference: SearchReference): boolean {
+  if (referenceLooksLikeDeploymentArchitectureEvidence(reference)) return false;
+  const profile = getReferenceSupportProfile(reference);
+  const titleHeading = `${profile.title} ${profile.heading}`;
+  return /\b(operating system requirements?|client requirements?|account preparation|risk warning|optional)\b|操作系统要求|客户端要求|两类账号准备|风险提示|信创环境要求/.test(
+    titleHeading
+  );
+}
+
 function referenceLooksLikeOperationalPlan(reference: SearchReference): boolean {
   return looksLikeOperationalPlanText(getReferenceSemanticText(reference));
 }
@@ -1790,6 +1817,7 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
   const constraintFirstCapabilityCase = isConstraintFirstCapabilityCase(caseFrame);
   const deploymentCapabilityQuestion =
     caseFrame.product_area === "deployment" && caseFrame.question_type === "capability_confirmation";
+  const deploymentArchitectureQuestion = isDeploymentArchitectureQuestion(query, caseFrame);
   return [...references].sort((a, b) => {
     const scoreRef = (reference: SearchReference) => {
       const profile = getReferenceSupportProfile(reference);
@@ -1801,6 +1829,8 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
       const structuredConstraintEvidence = referenceHasStructuredConstraintEvidence(reference);
       const leafConstraintMatrix = referenceLooksLikeLeafConstraintMatrix(reference);
       const deploymentApplicabilityOnly = referenceLooksLikeDeploymentApplicabilityOnly(reference);
+      const deploymentArchitectureEvidence = referenceLooksLikeDeploymentArchitectureEvidence(reference);
+      const deploymentArchitectureNoise = referenceLooksLikeDeploymentArchitectureNoise(reference);
       const operationalPlanReference = referenceLooksLikeOperationalPlan(reference);
       let topicScore = 0;
       for (const term of focusTerms) {
@@ -1827,6 +1857,13 @@ function rerankReferencesForCaseFrame(references: SearchReference[], query: stri
         if (/\b(unified|shared|external|externalized|database|storage|topology|architecture|isolation|separate|separable)\b|统一|共享|外置|数据库|存储|拓扑|架构|隔离|独立/.test(semanticText)) {
           topicScore += 14;
         }
+      }
+      if (deploymentArchitectureQuestion) {
+        if (deploymentArchitectureEvidence) topicScore += 38;
+        if (deploymentArchitectureNoise) topicScore -= 28;
+        if (profile.evidenceKind === "capability" || profile.evidenceKind === "constraint") topicScore += 18;
+        if (profile.evidenceKind === "procedure") topicScore -= 16;
+        if (operationalPlanReference) topicScore -= 22;
       }
       if (constraintFirstCapabilityCase) {
         if (structuredConstraintEvidence) topicScore += 26;
@@ -4062,9 +4099,18 @@ function recoverEvidenceAnchoredDeploymentBehaviorDraft(input: {
     const profile = getReferenceSupportProfile(reference);
     return profile.productArea === "deployment" || profile.deploymentModel === "private_deployment";
   });
-  const primary = deploymentRefs[0] ?? ranked[0];
+  const architectureRefs = deploymentRefs.filter((reference) => referenceLooksLikeDeploymentArchitectureEvidence(reference));
+  const primary = architectureRefs[0] ?? deploymentRefs[0] ?? ranked[0];
+  const primarySupportsExternalization = /外置|external|nfs|oss|database/i.test(`${primary.title} ${primary.snippet}`.toLowerCase());
   const externalizationRef =
-    deploymentRefs.find((reference) => /外置|external|nfs|oss|database/i.test(`${reference.title} ${reference.snippet}`)) ?? null;
+    primarySupportsExternalization
+      ? primary
+      : deploymentRefs.find(
+          (reference) =>
+            resolveSearchReferenceEvidenceId(reference) !== resolveSearchReferenceEvidenceId(primary) &&
+            !referenceLooksLikeOperationalPlan(reference) &&
+            /外置|external|nfs|oss|database/i.test(`${reference.title} ${reference.snippet}`)
+        ) ?? null;
 
   const primaryText = `${primary.title} ${primary.snippet}`.toLowerCase();
   const confirmsUnifiedDefault =
