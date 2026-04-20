@@ -139,8 +139,11 @@ export async function listQueue(params: QueueParams) {
       ${has("assigned_at") ? "t.assigned_at" : "t.updated_at"} AS assigned_at,
       ${has("last_customer_reply_at") ? "t.last_customer_reply_at" : "NULL::timestamptz"} AS last_customer_reply_at,
       ${has("last_agent_reply_at") ? "t.last_agent_reply_at" : "NULL::timestamptz"} AS last_agent_reply_at,
-      latest.response_json->>'reasoning_summary' AS triage_reasoning_summary,
-      latest.response_json->'evidence' AS triage_evidence,
+      COALESCE(latest.response_json->'support_insight'->>'support_summary', latest.response_json->>'reasoning_summary') AS triage_reasoning_summary,
+      COALESCE(latest.response_json->'support_insight'->'verified_evidence', latest.response_json->'evidence') AS triage_evidence,
+      latest.response_json->'support_insight' AS triage_support_insight,
+      latest.response_json->'verification_summary' AS triage_verification_summary,
+      latest.response_json->'case_frame' AS triage_case_frame,
       (latest.response_json->>'confidence')::numeric AS triage_confidence
      FROM tickets t
      LEFT JOIN LATERAL (

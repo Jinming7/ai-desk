@@ -14,6 +14,7 @@ export const ticketPrioritySchema = z.enum(["P1", "P2", "P3", "P4"]);
 export const ticketCreateSchema = z.object({
   title: z.string().min(3).max(200),
   description: z.string().min(5),
+  attachments: z.array(z.string()).default([]),
   serviceCategory: z.enum(["technical_support", "feature_consulting", "account_issue"]).optional(),
   priority: ticketPrioritySchema.default("P3"),
   onesTicketTypeKey: z.string().min(1).optional(),
@@ -33,6 +34,18 @@ export const ticketReplySchema = z.object({
   authorType: z.enum(["CUSTOMER", "AGENT"]),
   authorName: z.string().min(1),
   attachments: z.array(z.string()).default([])
+});
+
+export const imageUploadSchema = z.object({
+  filename: z.string().min(1).max(200),
+  contentType: z.string().regex(/^image\//),
+  dataUrl: z.string().min(32)
+});
+
+export const fileUploadSchema = z.object({
+  filename: z.string().min(1).max(200),
+  contentType: z.string().min(1).max(200),
+  dataUrl: z.string().min(32)
 });
 
 export const ticketListQuerySchema = z.object({
@@ -97,9 +110,16 @@ export const ticketInternalTransitionSchema = z.object({
   ])
 });
 
+export const ticketAiApplySchema = z.object({
+  traceId: z.string().min(1).optional()
+});
+
 export type TicketStatus = z.infer<typeof ticketStatusSchema>;
 export type TicketCreateInput = z.infer<typeof ticketCreateSchema>;
 export type TicketReplyInput = z.infer<typeof ticketReplySchema>;
 export type TicketAssignInput = z.infer<typeof ticketAssignSchema>;
 export type TicketInternalTransitionInput = z.infer<typeof ticketInternalTransitionSchema>;
+export type TicketAiApplyInput = z.infer<typeof ticketAiApplySchema>;
 export type TicketBulkActionInput = z.infer<typeof ticketBulkActionSchema>;
+export type ImageUploadInput = z.infer<typeof imageUploadSchema>;
+export type FileUploadInput = z.infer<typeof fileUploadSchema>;

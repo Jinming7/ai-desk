@@ -5,13 +5,15 @@ const STORAGE_KEY = "nexusflow_support_access_ok";
 
 export function AgentRouteGuard({ children, requestedPath }: { children: ReactNode; requestedPath: string }) {
   const passcode = import.meta.env.VITE_AGENT_ACCESS_CODE;
+  const requireGate = String(import.meta.env.VITE_REQUIRE_AGENT_ACCESS_CODE ?? "").toLowerCase() === "true";
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const hasGate = useMemo(() => typeof passcode === "string" && passcode.trim().length > 0, [passcode]);
+  const devBypass = import.meta.env.DEV && (!requireGate || !hasGate);
   const isVerified = useMemo(() => window.localStorage.getItem(STORAGE_KEY) === "true", []);
 
-  if (isVerified) {
+  if (devBypass || isVerified) {
     return <>{children}</>;
   }
 

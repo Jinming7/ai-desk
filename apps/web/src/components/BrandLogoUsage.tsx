@@ -7,7 +7,7 @@ interface BrandLogoUsageProps {
 export function BrandLogoUsage({ title }: BrandLogoUsageProps) {
   return (
     <Link to="/" className="inline-flex items-center gap-3 text-[#16171A]" aria-label="ONES and NexusFlow brand">
-      <img src="/ones-logo.svg" alt="ONES" className="h-6 w-auto" />
+      <img src="/ones-logo.png" alt="ONES" className="h-6 w-auto" />
       <span className="text-[#D1D5DB]" aria-hidden>
         |
       </span>

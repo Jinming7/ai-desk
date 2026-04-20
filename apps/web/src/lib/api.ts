@@ -1,12 +1,285 @@
-import type { AgentQueueTicket, AiAgentMode, AiEscalation, OnesCatalogStatus, OnesConfigHistoryItem, OnesSyncConfig, OnesTicketType, SearchResult, Ticket, TicketMessage, TicketStatus } from "./types";
+import type {
+  AgentQueueTicket,
+  AiCapabilities,
+  AiAgentMode,
+  AiEscalation,
+  DocsComEnsureResult,
+  DocsComStatusResult,
+  OnesCatalogStatus,
+  ConversationTurn,
+  OnesConfigHistoryItem,
+  ChatTicketDraft,
+  OnesProjectIssueType,
+  OnesProjectIssueTypeConfig,
+  OnesSyncConfig,
+  OnesTicketType,
+  SearchResult,
+  Ticket,
+  TicketMessage,
+  TicketStatus,
+  UploadedAttachment
+} from "./types";
+import {
+  shouldProbeRunningSupportSearchRecovery,
+  type SupportSearchJobRecoveryStatus
+} from "./support-search-job-recovery";
 
-const API = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+const API = (() => {
+  const configured = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+  if (typeof window !== "undefined" && /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname)) {
+    return "";
+  }
+  if (configured) return configured;
+  return "";
+})();
 
 function asUserError(error: unknown): Error {
   if (error instanceof TypeError) {
     return new Error("Cannot reach API server. Check deployment URL and API routing.");
   }
   return error instanceof Error ? error : new Error("Unexpected request error");
+}
+
+function asUploadError(): Error {
+  return new Error("Failed to upload attachment");
+}
+
+const inFlightRequests = new Map<string, Promise<unknown>>();
+
+function withInFlightDedup<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const existing = inFlightRequests.get(key);
+  if (existing) return existing as Promise<T>;
+  const promise = run().finally(() => {
+    if (inFlightRequests.get(key) === promise) {
+      inFlightRequests.delete(key);
+    }
+  });
+  inFlightRequests.set(key, promise);
+  return promise;
+}
+
+type SupportSearchJobStatus = SupportSearchJobRecoveryStatus;
+
+type SupportSearchJobView = {
+  id: string;
+  sessionId: string;
+  status: SupportSearchJobStatus;
+  result: SearchResult | null;
+  errorMessage: string | null;
+  updatedAt: string;
+  workerId?: string | null;
+  startedAt?: string | null;
+  stageState?: {
+    currentStage?: string;
+    lastCompletedStage?: string;
+  } | null;
+};
+
+function isTerminalSupportSearchJob(status: SupportSearchJobStatus): boolean {
+  return status === "completed" || status === "failed_terminal" || status === "cancelled";
+}
+
+function supportsEventSource(): boolean {
+  return typeof window !== "undefined" && typeof window.EventSource === "function";
+}
+
+function normalizeSupportSearchJobFailure(job: SupportSearchJobView): Error {
+  const message = job.errorMessage?.trim();
+  if (message) return new Error(message);
+  if (job.status === "cancelled") {
+    return new Error("AI support request was cancelled before completion.");
+  }
+  if (job.status === "failed_terminal") {
+    return new Error("AI support request failed before a final answer could be produced.");
+  }
+  return new Error("AI support request did not finish successfully.");
+}
+
+function unwrapCompletedSupportSearchJob(job: SupportSearchJobView): SearchResult {
+  if (job.status !== "completed" || !job.result) {
+    throw normalizeSupportSearchJobFailure(job);
+  }
+  return job.result;
+}
+
+async function submitSearchKnowledgeJob(input: {
+  query: string;
+  imageAttachments?: string[];
+  attachments?: string[];
+  sessionId?: string;
+  conversation?: ConversationTurn[];
+  answerLanguage?: "zh" | "en";
+}): Promise<SupportSearchJobView> {
+  const res = await fetch(`${API}/api/v1/ai/search/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    try {
+      const parsed = JSON.parse(errorText) as { error?: unknown };
+      const message = typeof parsed.error === "string" ? parsed.error.trim() : "";
+      throw new Error(message || "AI support request failed");
+    } catch {
+      throw new Error(errorText.trim() || "AI support request failed");
+    }
+  }
+
+  const data = (await res.json()) as { job: SupportSearchJobView };
+  return data.job;
+}
+
+async function getSearchKnowledgeJob(jobId: string): Promise<SupportSearchJobView> {
+  const res = await fetch(`${API}/api/v1/ai/search/jobs/${jobId}`).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text.trim() || "Failed to load AI support job");
+  }
+  const data = (await res.json()) as { job: SupportSearchJobView };
+  return data.job;
+}
+
+async function driveSearchKnowledgeJob(jobId: string): Promise<SupportSearchJobView> {
+  const res = await fetch(`${API}/api/v1/ai/search/jobs/${jobId}/drive`, {
+    method: "POST"
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text.trim() || "Failed to start AI support job");
+  }
+  const data = (await res.json()) as { job: SupportSearchJobView };
+  return data.job;
+}
+
+async function waitForSearchKnowledgeJobViaSse(jobId: string): Promise<SupportSearchJobView> {
+  return new Promise<SupportSearchJobView>((resolve, reject) => {
+    const eventSource = new window.EventSource(`${API}/api/v1/ai/search/jobs/${jobId}/events`);
+    let settled = false;
+    let lastSnapshot: SupportSearchJobView | null = null;
+
+    const cleanup = () => {
+      eventSource.close();
+    };
+    const finishResolve = (job: SupportSearchJobView) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(job);
+    };
+    const finishReject = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const handleSnapshotPayload = (payload: unknown) => {
+      const job = (payload as { job?: SupportSearchJobView } | null)?.job;
+      if (!job) return;
+      lastSnapshot = job;
+      if (isTerminalSupportSearchJob(job.status)) {
+        if (job.status === "completed") {
+          finishResolve(job);
+          return;
+        }
+        finishReject(normalizeSupportSearchJobFailure(job));
+      }
+    };
+
+    eventSource.addEventListener("job_snapshot", (event) => {
+      handleSnapshotPayload(JSON.parse((event as MessageEvent<string>).data));
+    });
+    eventSource.addEventListener("job_completed", (event) => {
+      handleSnapshotPayload(JSON.parse((event as MessageEvent<string>).data));
+    });
+    eventSource.addEventListener("job_failed", (event) => {
+      handleSnapshotPayload(JSON.parse((event as MessageEvent<string>).data));
+    });
+    eventSource.onerror = () => {
+      if (lastSnapshot && isTerminalSupportSearchJob(lastSnapshot.status)) {
+        if (lastSnapshot.status === "completed") {
+          finishResolve(lastSnapshot);
+          return;
+        }
+        finishReject(normalizeSupportSearchJobFailure(lastSnapshot));
+        return;
+      }
+      finishReject(new Error("SSE unavailable"));
+    };
+  });
+}
+
+async function waitForSearchKnowledgeJobViaPolling(jobId: string): Promise<SupportSearchJobView> {
+  const deadline = Date.now() + 250_000;
+  let lastUpdatedAt = "";
+  let unchangedPolls = 0;
+  let lastStageFingerprint = "";
+  let stagnantStagePolls = 0;
+  let lastDriveAt = 0;
+
+  let current = await driveSearchKnowledgeJob(jobId);
+  lastDriveAt = Date.now();
+  while (Date.now() < deadline) {
+    if (isTerminalSupportSearchJob(current.status)) {
+      return current;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    current = await getSearchKnowledgeJob(jobId);
+
+    if (isTerminalSupportSearchJob(current.status)) {
+      return current;
+    }
+
+    if (current.updatedAt === lastUpdatedAt) {
+      unchangedPolls += 1;
+    } else {
+      unchangedPolls = 0;
+      lastUpdatedAt = current.updatedAt;
+    }
+
+    const stageFingerprint = JSON.stringify({
+      status: current.status,
+      currentStage: current.stageState?.currentStage ?? null,
+      lastCompletedStage: current.stageState?.lastCompletedStage ?? null
+    });
+    if (stageFingerprint === lastStageFingerprint) {
+      stagnantStagePolls += 1;
+    } else {
+      stagnantStagePolls = 0;
+      lastStageFingerprint = stageFingerprint;
+    }
+
+    const shouldDriveQueuedJob = (current.status === "queued" || current.status === "failed_retryable") && unchangedPolls >= 3;
+    const shouldProbeRunningRecovery = shouldProbeRunningSupportSearchRecovery({
+      job: current,
+      stagnantStagePolls,
+      lastDriveAt,
+      now: Date.now()
+    });
+
+    if (shouldDriveQueuedJob || shouldProbeRunningRecovery) {
+      current = await driveSearchKnowledgeJob(jobId);
+      lastDriveAt = Date.now();
+      unchangedPolls = 0;
+      stagnantStagePolls = 0;
+      lastUpdatedAt = current.updatedAt;
+      lastStageFingerprint = JSON.stringify({
+        status: current.status,
+        currentStage: current.stageState?.currentStage ?? null,
+        lastCompletedStage: current.stageState?.lastCompletedStage ?? null
+      });
+    }
+  }
+
+  throw new Error("AI support request timed out before the async job completed.");
 }
 
 export async function listTickets(customerId?: string, status?: TicketStatus | "ALL"): Promise<Ticket[]> {
@@ -30,9 +303,33 @@ export async function getTicketDetail(id: string): Promise<{ ticket: Ticket; mes
   return res.json();
 }
 
+export async function applyAiSuggestion(ticketId: string, traceId?: string): Promise<{
+  appliedAction: "resolve" | "ask_user" | "escalate";
+  traceId?: string | null;
+  messagePosted: boolean;
+  ticket: Ticket;
+}> {
+  const res = await fetch(`${API}/api/v1/internal/tickets/${ticketId}/ai/apply`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-portal-surface": "internal"
+    },
+    body: JSON.stringify(traceId ? { traceId } : {})
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Failed to apply AI suggestion");
+  }
+  return res.json();
+}
+
 export async function createTicket(payload: {
   title: string;
   description: string;
+  attachments?: string[];
   serviceCategory?: "technical_support" | "feature_consulting" | "account_issue";
   onesTicketTypeKey?: string;
   onesFields?: Record<string, unknown>;
@@ -47,6 +344,7 @@ export async function createTicket(payload: {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ...payload,
+      attachments: payload.attachments ?? [],
       priority: "P3",
       serviceCategory: payload.serviceCategory ?? "technical_support",
       customer,
@@ -72,23 +370,103 @@ export async function createTicket(payload: {
   }>;
 }
 
-export async function searchKnowledge(query: string): Promise<SearchResult> {
-  const res = await fetch(`${API}/api/v1/ai/search`, {
+export async function searchKnowledge(input: {
+  query: string;
+  imageAttachments?: string[];
+  attachments?: string[];
+  sessionId?: string;
+  conversation?: ConversationTurn[];
+  answerLanguage?: "zh" | "en";
+}): Promise<SearchResult> {
+  return withInFlightDedup(`searchKnowledge:${JSON.stringify(input)}`, async () => {
+    const submitted = await submitSearchKnowledgeJob(input);
+    try {
+      const job = supportsEventSource()
+        ? await waitForSearchKnowledgeJobViaSse(submitted.id).catch(() => waitForSearchKnowledgeJobViaPolling(submitted.id))
+        : await waitForSearchKnowledgeJobViaPolling(submitted.id);
+      return unwrapCompletedSupportSearchJob(job);
+    } catch (error) {
+      const message = error instanceof Error ? error.message.trim() : "";
+      if (!message || message === "SSE unavailable") {
+        throw new Error("AI support request failed");
+      }
+      throw new Error(message);
+    }
+  });
+}
+
+export async function getAiCapabilities(): Promise<AiCapabilities> {
+  const res = await fetch(`${API}/api/v1/ai/capabilities`).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load AI capabilities");
+  const data = await res.json();
+  return data.capabilities;
+}
+
+export async function createChatTicketDraft(input: {
+  sessionId: string;
+  question: string;
+  conversation: ConversationTurn[];
+  retrievalTraces?: unknown[];
+}): Promise<ChatTicketDraft> {
+  const res = await fetch(`${API}/api/v1/ai/handoff/draft`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query })
+    body: JSON.stringify({
+      ...input,
+      retrievalTraces: input.retrievalTraces ?? []
+    })
   }).catch((error) => {
     throw asUserError(error);
   });
-  if (!res.ok) throw new Error("Failed to search knowledge base");
+  if (!res.ok) throw new Error("Failed to generate ticket draft");
   const data = await res.json();
-  return data.result;
+  return data.draft;
+}
+
+export async function submitChatTicketDraft(input: {
+  draftId: string;
+  customer?: { id: string; name: string; email?: string };
+  title?: string;
+  description?: string;
+  attachments?: string[];
+  serviceCategory?: "technical_support" | "feature_consulting" | "account_issue";
+  onesTicketTypeKey?: string;
+  onesFields?: Record<string, unknown>;
+}) {
+  const res = await fetch(`${API}/api/v1/ai/handoff/submit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...input,
+      attachments: input.attachments ?? [],
+      onesFields: input.onesFields ?? {}
+    })
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Failed to submit ticket draft");
+  }
+  return res.json() as Promise<{
+    ticket: Ticket;
+    triage: {
+      action: "resolve" | "ask_user" | "escalate";
+      confidence: number;
+      reply: string;
+      reasoning_summary: string;
+      evidence: string[];
+    } | null;
+    triageError: string | null;
+  }>;
 }
 
 export async function createQuickEscalation(input: {
   sessionId: string;
   question: string;
-  conversation: string[];
+  conversation: ConversationTurn[];
   reasonCode: "NO_MATCHING_KB" | "LOW_CONFIDENCE" | "KB_RETRIEVAL_UNAVAILABLE";
 }): Promise<AiEscalation> {
   const res = await fetch(`${API}/api/v1/ai/escalations`, {
@@ -116,6 +494,9 @@ export async function getAiMetricsSummary(): Promise<{
   hitRate: number;
   citationCoverage: number;
   fallbackRate: number;
+  noCitationRate: number;
+  clarificationResolutionRate: number;
+  chatToTicketConversion: number;
 }> {
   const res = await fetch(`${API}/api/v1/ai/metrics/summary`, {
     headers: { "x-portal-surface": "internal" }
@@ -127,7 +508,7 @@ export async function getAiMetricsSummary(): Promise<{
   return data.metrics;
 }
 
-export async function replyTicket(id: string, body: string) {
+export async function replyTicket(id: string, body: string, attachments: string[] = []) {
   const res = await fetch(`${API}/api/v1/tickets/${id}/replies`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -135,7 +516,7 @@ export async function replyTicket(id: string, body: string) {
       body,
       authorType: "CUSTOMER",
       authorName: "Acme User",
-      attachments: []
+      attachments
     })
   }).catch((error) => {
     throw asUserError(error);
@@ -143,7 +524,7 @@ export async function replyTicket(id: string, body: string) {
   if (!res.ok) throw new Error("Failed to send reply");
 }
 
-export async function replyTicketAsAgent(id: string, body: string, authorName = "Support Team") {
+export async function replyTicketAsAgent(id: string, body: string, authorName = "Support Team", attachments: string[] = []) {
   const res = await fetch(`${API}/api/v1/tickets/${id}/replies`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
@@ -151,12 +532,78 @@ export async function replyTicketAsAgent(id: string, body: string, authorName = 
       body,
       authorType: "AGENT",
       authorName,
-      attachments: []
+      attachments
     })
   }).catch((error) => {
     throw asUserError(error);
   });
   if (!res.ok) throw new Error("Failed to send agent reply");
+}
+
+export async function uploadImageAttachment(file: File): Promise<UploadedAttachment> {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(new Error("Failed to read image"));
+    reader.readAsDataURL(file);
+  });
+
+  const res = await fetch(`${API}/api/v1/uploads/images`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      contentType: file.type,
+      dataUrl
+    })
+  }).catch((error) => {
+    throw error instanceof Error && error.message === "Failed to read image" ? error : asUploadError();
+  });
+
+  if (!res.ok) {
+    throw asUploadError();
+  }
+
+  const data = await res.json();
+  return {
+    ...data.attachment,
+    url: data.attachment.url.startsWith("http") ? data.attachment.url : `${API}${data.attachment.url}`
+  };
+}
+
+export async function uploadAttachment(file: File): Promise<UploadedAttachment> {
+  if (file.type.startsWith("image/")) {
+    return uploadImageAttachment(file);
+  }
+
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
+
+  const res = await fetch(`${API}/api/v1/uploads/files`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      contentType: file.type || "application/octet-stream",
+      dataUrl
+    })
+  }).catch((error) => {
+    throw error instanceof Error && error.message === "Failed to read file" ? error : asUploadError();
+  });
+
+  if (!res.ok) {
+    throw asUploadError();
+  }
+
+  const data = await res.json();
+  return {
+    ...data.attachment,
+    url: data.attachment.url.startsWith("http") ? data.attachment.url : `${API}${data.attachment.url}`
+  };
 }
 
 export async function listAgentTickets(queue: "pending" | "mine" | "all", assignee?: string): Promise<AgentQueueTicket[]> {
@@ -242,6 +689,34 @@ export async function getSupportUxMetrics(): Promise<{
   });
   if (!res.ok) throw new Error("Failed to fetch support UX metrics");
   return (await res.json()).metrics;
+}
+
+export async function getDocsComKbStatus(limit = 10): Promise<DocsComStatusResult> {
+  const res = await fetch(`${API}/api/v1/internal/kb/docs-com/status?limit=${limit}`, {
+    headers: { "x-portal-surface": "internal" }
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to load docs-com KB status");
+  const data = await res.json();
+  return data.result;
+}
+
+export async function ensureDocsComKb(input?: {
+  mode?: "incremental" | "full" | "reindex";
+  actor?: string;
+  runLimit?: number;
+}): Promise<DocsComEnsureResult> {
+  const res = await fetch(`${API}/api/v1/internal/kb/docs-com/ensure`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(input ?? {})
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  if (!res.ok) throw new Error("Failed to ensure docs-com KB");
+  const data = await res.json();
+  return data.result;
 }
 
 export async function runBulkTicketAction(input: {
@@ -363,6 +838,8 @@ export async function updateOnesSyncConfig(input: {
   authHeader: string;
   authSecret?: string;
   keepExistingSecret?: boolean;
+  systemAuthSecret?: string;
+  keepExistingSystemSecret?: boolean;
   createTicketPath: string;
   listProjectsPath: string;
   listTicketTypesPath: string;
@@ -388,23 +865,34 @@ export async function updateOnesSyncConfig(input: {
   }).catch((error) => {
     throw asUserError(error);
   });
-  if (!res.ok) throw new Error("Failed to update ONES sync config");
-  const data = await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = typeof data?.error === "string" ? data.error : "Failed to update ONES sync config";
+    throw new Error(detail);
+  }
   return data.config;
 }
 
-export async function discoverOnesIssueStatuses(input?: { teamId?: string; projectKey?: string }) {
-  const params = new URLSearchParams();
-  if (input?.teamId) params.set("teamId", input.teamId);
-  if (input?.projectKey) params.set("projectKey", input.projectKey);
-  const q = params.toString() ? `?${params.toString()}` : "";
-  const res = await fetch(`${API}/api/v1/internal/configuration/statuses/discover${q}`, {
-    headers: { "x-portal-surface": "internal" }
-  }).catch((error) => {
-    throw asUserError(error);
-  });
-  if (!res.ok) throw new Error("Failed to discover ONES issue statuses");
-  return (await res.json()).statuses as Array<{ key: string; name: string; source: Record<string, unknown> }>;
+export async function discoverOnesIssueStatuses(input?: { teamId?: string; projectKey?: string; issueTypeKey?: string; signal?: AbortSignal }) {
+  const run = async () => {
+    const params = new URLSearchParams();
+    if (input?.teamId) params.set("teamId", input.teamId);
+    if (input?.projectKey) params.set("projectKey", input.projectKey);
+    if (input?.issueTypeKey) params.set("issueTypeKey", input.issueTypeKey);
+    const q = params.toString() ? `?${params.toString()}` : "";
+    const res = await fetch(`${API}/api/v1/internal/configuration/statuses/discover${q}`, {
+      headers: { "x-portal-surface": "internal" },
+      signal: input?.signal
+    }).catch((error) => {
+      throw asUserError(error);
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error ?? "Failed to discover ONES issue statuses");
+    return data.statuses as Array<{ key: string; name: string; source: Record<string, unknown> }>;
+  };
+  if (input?.signal) return run();
+  const key = `statuses:${input?.teamId ?? ""}:${input?.projectKey ?? ""}:${input?.issueTypeKey ?? ""}`;
+  return withInFlightDedup(key, run);
 }
 
 export async function getOnesConfigHistory(limit = 20): Promise<OnesConfigHistoryItem[]> {
@@ -568,11 +1056,14 @@ export async function discoverOnesProjects(input: {
   cursor?: string;
   listProjectsPath: string;
   timeoutMs: number;
+  signal?: AbortSignal;
 }) {
+  const { signal, ...body } = input;
   const res = await fetch(`${API}/api/v1/internal/configuration/projects/discover`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
-    body: JSON.stringify(input)
+    body: JSON.stringify(body),
+    signal
   }).catch((error) => {
     throw asUserError(error);
   });
@@ -584,6 +1075,108 @@ export async function discoverOnesProjects(input: {
     throw new Error(raw);
   }
   return data as { projects: Array<{ key: string; name: string }>; nextCursor: string | null };
+}
+
+export async function discoverProjectIssueTypes(input: { projectKey: string; actor?: string; signal?: AbortSignal }): Promise<OnesProjectIssueType[]> {
+  const { signal, ...body } = input;
+  const res = await fetch(`${API}/api/v1/internal/configuration/project-issue-types/discover`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(body),
+    signal
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error ?? "Failed to discover issue types");
+  return data.issueTypes as OnesProjectIssueType[];
+}
+
+export async function listProjectIssueTypes(projectKey: string): Promise<OnesProjectIssueType[]> {
+  return withInFlightDedup(`issue-types:${projectKey}`, async () => {
+    const params = new URLSearchParams({ projectKey });
+    const res = await fetch(`${API}/api/v1/internal/configuration/project-issue-types?${params.toString()}`, {
+      headers: { "x-portal-surface": "internal" }
+    }).catch((error) => {
+      throw asUserError(error);
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error ?? "Failed to load issue types");
+    return data.issueTypes as OnesProjectIssueType[];
+  });
+}
+
+export async function setProjectIssueTypeExposure(input: {
+  projectKey: string;
+  issueTypeKey: string;
+  issueTypeName?: string;
+  enabledForCustomer: boolean;
+  actor?: string;
+}) {
+  const { issueTypeKey, ...body } = input;
+  const res = await fetch(`${API}/api/v1/internal/configuration/project-issue-types/${encodeURIComponent(issueTypeKey)}/exposure`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(body)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error ?? "Failed to update exposure");
+  return data.config;
+}
+
+export async function getProjectIssueTypeFields(projectKey: string, issueTypeKey: string, signal?: AbortSignal) {
+  const run = async () => {
+    const params = new URLSearchParams({ projectKey });
+    const res = await fetch(
+      `${API}/api/v1/internal/configuration/project-issue-types/${encodeURIComponent(issueTypeKey)}/fields?${params.toString()}`,
+      { headers: { "x-portal-surface": "internal" }, signal }
+    ).catch((error) => {
+      throw asUserError(error);
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error ?? "Failed to load issue fields");
+    return data.fields as OnesProjectIssueTypeConfig["fieldSchema"];
+  };
+  if (signal) return run();
+  return withInFlightDedup(`issue-fields:${projectKey}:${issueTypeKey}`, run);
+}
+
+export async function getProjectIssueTypeConfig(projectKey: string, issueTypeKey: string): Promise<OnesProjectIssueTypeConfig> {
+  return withInFlightDedup(`issue-type-config:${projectKey}:${issueTypeKey}`, async () => {
+    const params = new URLSearchParams({ projectKey });
+    const res = await fetch(
+      `${API}/api/v1/internal/configuration/project-issue-types/${encodeURIComponent(issueTypeKey)}/config?${params.toString()}`,
+      { headers: { "x-portal-surface": "internal" } }
+    ).catch((error) => {
+      throw asUserError(error);
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error ?? "Failed to load issue type config");
+    return data.config as OnesProjectIssueTypeConfig;
+  });
+}
+
+export async function saveProjectIssueTypeConfig(input: {
+  projectKey: string;
+  issueTypeKey: string;
+  issueTypeName?: string;
+  fieldSchema: OnesProjectIssueTypeConfig["fieldSchema"];
+  statusMapping: Record<string, string>;
+  actor?: string;
+}) {
+  const { issueTypeKey, ...body } = input;
+  const res = await fetch(`${API}/api/v1/internal/configuration/project-issue-types/${encodeURIComponent(issueTypeKey)}/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "x-portal-surface": "internal" },
+    body: JSON.stringify(body)
+  }).catch((error) => {
+    throw asUserError(error);
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error ?? "Failed to save issue type config");
+  return data.config;
 }
 
 export async function testIntegrationEndpoint(input: {

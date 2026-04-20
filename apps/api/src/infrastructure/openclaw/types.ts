@@ -1,3 +1,21 @@
+import type {
+  DraftSupportAnswer,
+  SupportClaimKind,
+  SupportDomain,
+  SearchReference,
+  SpecialistDraftAnswer,
+  SupportAnswer,
+  SupportCaseFrame,
+  SupportEvidencePlan,
+  SupportEvidenceBundle,
+  SupportEvidenceSelection,
+  SupportQuestionRoute,
+  SupportRenderVariant,
+  SupportVerificationClaim,
+  SupportVerificationResult,
+  TriageSupportInsight
+} from "../../modules/ai/types.js";
+
 export type OpenClawDecisionAction = "resolve" | "ask_user" | "escalate" | "none";
 
 export interface OpenClawAnalyzeInput {
@@ -6,6 +24,7 @@ export interface OpenClawAnalyzeInput {
   description: string;
   priority: string;
   customer_meta: Record<string, unknown>;
+  attachments?: string[];
   history: Array<{
     author: string;
     body: string;
@@ -26,6 +45,7 @@ export interface OpenClawSearchInput {
   query: string;
   topK: number;
   index: string;
+  attachments?: string[];
 }
 
 export interface OpenClawSearchResultItem {
@@ -41,8 +61,441 @@ export interface OpenClawSearchOutput {
   hits: OpenClawSearchResultItem[];
 }
 
+export interface OpenClawSearchAnswerInput {
+  query: string;
+  language: "zh" | "en";
+  routeHint?:
+    | "openapi_doc"
+    | "infra_runbook"
+    | "integration_diagnosis"
+    | "product_diagnosis"
+    | "kb_guidance"
+    | "clarification";
+  grounded: boolean;
+  references: Array<{
+    title: string;
+    snippet: string;
+    sourceUrl: string;
+    path?: string;
+  }>;
+  draftAnswer?: {
+    answer: string;
+    style?: "kb_answer" | "diagnosis" | "clarification";
+    summary: string;
+    assessment?: string;
+    steps: string[];
+    validation: string[];
+    required_inputs?: string[];
+  };
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+  attachments?: string[];
+}
+
+export interface OpenClawSearchAnswerOutput {
+  answer: string;
+  style?: "kb_answer" | "diagnosis" | "clarification";
+  summary: string;
+  assessment?: string;
+  steps: string[];
+  validation: string[];
+  required_inputs?: string[];
+  suggested_next_step?: "self_serve" | "submit_ticket";
+}
+
+export interface OpenClawRuntimeContext {
+  agentId?: string;
+  sessionKey?: string;
+  model?: string;
+  intent?: "retrieval" | "clarify" | "execution";
+  deliveryMode?: "interactive" | "async_job";
+  stage?:
+    | "support-main"
+    | "router"
+    | "evidence-planner"
+    | "support-evidence-selector"
+    | "api-specialist"
+    | "howto-specialist"
+    | "behavior-specialist"
+    | "troubleshooting-specialist"
+    | "evidence-judge"
+    | "citation-curator"
+    | "answer-composer"
+    | "planner"
+    | "support-writer"
+    | "support-verifier"
+    | "support-citation-binder"
+    | "support-citation-selector"
+    | "support-answer-composer"
+    | "triage-writer"
+    | "triage-verifier";
+  timeoutMs?: number;
+  overallTimeoutMs?: number;
+  requestStartedAtMs?: number;
+  disableLocalDocs?: boolean;
+  allowMultiPassRetrieval?: boolean;
+  allowRefinement?: boolean;
+  kbTopK?: number;
+  queryLimit?: number;
+}
+
+export interface OpenClawHealthCheckInput {
+  agentIds?: string[];
+}
+
+export interface OpenClawHealthCheckResult {
+  ok: boolean;
+  mode: "ws" | "mock";
+  detail?: string;
+  configuredAgents?: string[];
+  reachableAgents?: string[];
+  unreachableAgents?: Array<{
+    agentId: string;
+    detail: string;
+  }>;
+}
+
+export interface OpenClawClassifyIntentInput {
+  query: string;
+  language: "zh" | "en";
+  conversationContext?: string[];
+}
+
+export interface OpenClawClassifyIntentOutput {
+  intent: "api_operation" | "feature_usage" | "troubleshooting" | "concept_explanation" | "configuration" | "general";
+  route: "openapi_doc" | "infra_runbook" | "integration_diagnosis" | "product_diagnosis" | "kb_guidance" | "clarification";
+  confidence: number;
+  reasoning: string;
+}
+
+export interface OpenClawSupportPlannerInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+  ticketContext?: {
+    priority: string;
+    customerMeta: Record<string, unknown>;
+    history: Array<{ author: string; body: string; at: string }>;
+  };
+}
+
+export interface OpenClawSupportExecutionPlannerInput extends OpenClawSupportPlannerInput {}
+
+export interface OpenClawSupportExecutionPlannerOutput {
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  evidencePlan: SupportEvidencePlan;
+}
+
+export interface OpenClawSupportRouterInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+}
+
+export interface OpenClawSupportEvidencePlannerInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  route: SupportQuestionRoute;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+}
+
+export interface OpenClawSupportWriterInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+  ticketContext?: {
+    priority: string;
+    customerMeta: Record<string, unknown>;
+    history: Array<{ author: string; body: string; at: string }>;
+  };
+}
+
+export interface OpenClawSupportSpecialistInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+}
+
+export interface OpenClawSupportVerifierInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  draftSupportAnswer?: DraftSupportAnswer;
+  triageInsight?: TriageSupportInsight;
+}
+
+export interface OpenClawSupportEvidenceSelectorInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  caseFrame: SupportCaseFrame;
+  references: SearchReference[];
+}
+
+export interface OpenClawSupportMainPlanInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
+  ticketContext?: {
+    priority: string;
+    customerMeta: Record<string, unknown>;
+    history: Array<{ author: string; body: string; at: string }>;
+  };
+  knowledgeScope?: {
+    knowledgeSpace?: string;
+    repoId?: string;
+    branch?: string;
+  };
+}
+
+export interface OpenClawSupportMainProvidedEvidence {
+  reference_id: string;
+  evidence_id: string;
+  title: string;
+  snippet: string;
+  sourceUrl: string;
+  path?: string;
+  headingPath?: string;
+  repoSourceUrl?: string;
+  authority?: SearchReference["authority"];
+  sourceType?: SearchReference["sourceType"];
+  metadata?: Record<string, unknown>;
+}
+
+export interface OpenClawSupportMainDraftInput extends OpenClawSupportMainPlanInput {
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  providedEvidence: OpenClawSupportMainProvidedEvidence[];
+}
+
+export interface OpenClawSupportMainDraftClaim {
+  text: string;
+  kind: SupportClaimKind;
+  reference_ids: string[];
+  authority: "canonical" | "assistive";
+}
+
+export interface OpenClawSupportMainDraftAnswer {
+  question_type: SupportQuestionRoute["question_type"];
+  render_variant: SupportRenderVariant;
+  direct_answer: string;
+  claims: OpenClawSupportMainDraftClaim[];
+  next_actions: string[];
+  unknowns: string[];
+  escalation_needed: boolean;
+  api_method?: string;
+  api_path?: string;
+  required_params?: string[];
+  auth_scope?: string[];
+  response_field_hint?: string;
+  important_note?: string;
+  related_variant?: string;
+  steps?: string[];
+  prerequisites?: string[];
+  limits_or_notes?: string[];
+  most_likely_explanation?: string;
+  confirmed_facts?: string[];
+  what_to_check_next?: string[];
+  most_likely_causes?: string[];
+  recommended_checks?: string[];
+  required_followup_info?: string[];
+  when_to_handoff?: string;
+}
+
+export interface OpenClawSupportMainPlanOutput {
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  retrievalQueries: string[];
+}
+
+export interface OpenClawSupportDispatchOutput {
+  primaryDomain: SupportDomain;
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  retrievalQueries: string[];
+}
+
+export interface OpenClawSupportMainDraftOutput {
+  draftAnswer: OpenClawSupportMainDraftAnswer;
+}
+
+export interface OpenClawSupportCitationSelectorInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  caseFrame: SupportCaseFrame;
+  evidenceBundle: SupportEvidenceBundle;
+  supportedClaims: SupportVerificationClaim[];
+}
+
+export interface OpenClawSupportAnswerComposerInput {
+  contextType: "search" | "triage";
+  language: "zh" | "en";
+  query: string;
+  mode: SupportAnswer["mode"];
+  route: SupportQuestionRoute;
+  caseFrame: SupportCaseFrame;
+  draftSupportAnswer?: SpecialistDraftAnswer;
+  supportedClaims: SupportVerificationClaim[];
+  nextActions: string[];
+  unknowns: string[];
+}
+
 export interface OpenClawAdapter {
-  analyzeTicket(input: OpenClawAnalyzeInput, idempotencyKey: string): Promise<OpenClawAnalyzeOutput>;
-  searchKnowledge(input: OpenClawSearchInput, idempotencyKey: string): Promise<OpenClawSearchOutput>;
-  healthCheck(): Promise<{ ok: boolean; mode: "ws" | "mock"; detail?: string }>;
+  analyzeTicket(input: OpenClawAnalyzeInput, idempotencyKey: string, runtime?: OpenClawRuntimeContext): Promise<OpenClawAnalyzeOutput>;
+  searchKnowledge(input: OpenClawSearchInput, idempotencyKey: string, runtime?: OpenClawRuntimeContext): Promise<OpenClawSearchOutput>;
+  answerSearchQuery(
+    input: OpenClawSearchAnswerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSearchAnswerOutput>;
+  classifyIntent?(
+    input: OpenClawClassifyIntentInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawClassifyIntentOutput>;
+  planSupportExecution?(
+    input: OpenClawSupportExecutionPlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportExecutionPlannerOutput>;
+  planSupportDispatch?(
+    input: OpenClawSupportPlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportDispatchOutput>;
+  planSupportMainAgent?(
+    input: OpenClawSupportMainPlanInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportMainPlanOutput>;
+  draftSupportMainAgent?(
+    input: OpenClawSupportMainDraftInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<OpenClawSupportMainDraftOutput>;
+  planSupportCase(
+    input: OpenClawSupportPlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportCaseFrame>;
+  routeSupportQuestion(
+    input: OpenClawSupportRouterInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportQuestionRoute>;
+  planSupportEvidence(
+    input: OpenClawSupportEvidencePlannerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportEvidencePlan>;
+  selectSupportEvidence(
+    input: OpenClawSupportEvidenceSelectorInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportEvidenceSelection>;
+  writeApiSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeOpenApiDomainAnswer?(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeHowToSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeDeploymentDomainAnswer?(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeBehaviorSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeDocsDomainAnswer?(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeTroubleshootingSpecialistAnswer(
+    input: OpenClawSupportSpecialistInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SpecialistDraftAnswer>;
+  writeSupportAnswer(
+    input: OpenClawSupportWriterInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<DraftSupportAnswer>;
+  judgeSupportAnswer(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult>;
+  verifySupportAnswer(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult>;
+  curateSupportCitations(
+    input: OpenClawSupportCitationSelectorInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<{ display_citation_ids: string[] }>;
+  bindSupportCitations(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult>;
+  selectDisplayCitations(
+    input: OpenClawSupportCitationSelectorInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<{ display_citation_ids: string[] }>;
+  composeSupportAnswer(
+    input: OpenClawSupportAnswerComposerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<{
+    direct_answer: string;
+    why: string[];
+    what_to_do_now: string[];
+    still_need_to_confirm: string[];
+  }>;
+  composeCustomerAnswer(
+    input: OpenClawSupportAnswerComposerInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<Omit<SupportAnswer, "mode">>;
+  writeTriageInsight(
+    input: OpenClawSupportWriterInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<TriageSupportInsight>;
+  verifyTriageInsight(
+    input: OpenClawSupportVerifierInput,
+    idempotencyKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<SupportVerificationResult>;
+  healthCheck(input?: OpenClawHealthCheckInput): Promise<OpenClawHealthCheckResult>;
 }

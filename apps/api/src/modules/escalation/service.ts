@@ -3,8 +3,9 @@ import { env } from "../../config/env.js";
 import { pool } from "../../db/client.js";
 import type { OpenClawAdapter } from "../../infrastructure/openclaw/types.js";
 import * as aiRepo from "../ai/repository.js";
+import { buildSearchRuntime } from "../ai/agent-router.js";
 import { SearchOrchestrator } from "../ai/search-orchestrator.js";
-import type { SearchReference } from "../ai/types.js";
+import type { ConversationTurn, SearchReference } from "../ai/types.js";
 import * as ticketService from "../tickets/service.js";
 
 type EscalationStatus = "ESCALATED" | "DEEP_RETRIEVING" | "RESOLVED_BY_AI" | "TICKET_CREATED";
@@ -55,7 +56,7 @@ async function getEscalationBySession(sessionId: string): Promise<EscalationReco
 export async function createOrGetEscalation(input: {
   sessionId: string;
   question: string;
-  conversation: string[];
+  conversation: ConversationTurn[];
   reasonCode: "NO_MATCHING_KB" | "LOW_CONFIDENCE" | "KB_RETRIEVAL_UNAVAILABLE";
   adapter: OpenClawAdapter;
 }) {
@@ -131,6 +132,7 @@ async function processEscalation(escalationId: string, adapter: OpenClawAdapter)
     });
 
     const orchestrator = new SearchOrchestrator(adapter);
+    const runtime = buildSearchRuntime({ intent: "retrieval", sessionId: escalation.session_id });
     let bestConfidence = 0;
     let bestAnswer = "";
     let bestRefs: SearchReference[] = [];
@@ -139,7 +141,7 @@ async function processEscalation(escalationId: string, adapter: OpenClawAdapter)
     const queries = [escalation.question, `${escalation.question} troubleshooting`, `${escalation.question} root cause`];
     for (let i = 0; i < Math.min(env.OPENCLAW_DEEP_SEARCH_MAX_ROUNDS, queries.length); i += 1) {
       attempts += 1;
-      const response = await orchestrator.search(queries[i], `${escalation.id}-round-${i + 1}`);
+      const response = await orchestrator.search(queries[i], `${escalation.id}-round-${i + 1}`, runtime);
       if (response.confidence > bestConfidence) {
         bestConfidence = response.confidence;
         bestAnswer = response.answer;
@@ -167,6 +169,7 @@ async function processEscalation(escalationId: string, adapter: OpenClawAdapter)
     const ticket = await ticketService.createTicket({
       title: `[AI Escalation] ${escalation.question.slice(0, 100)}`,
       description: `${escalation.question}\n\nReason: ${escalation.reason_code}\nDeep retrieval confidence: ${bestConfidence.toFixed(3)}`,
+      attachments: [],
       serviceCategory: "technical_support",
       priority: "P2",
       customer: {

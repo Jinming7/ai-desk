@@ -1,12 +1,13 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "installCommand": "npm install",
-  "buildCommand": "npm run build -w apps/web",
+  "buildCommand": "npm run build",
   "outputDirectory": "apps/web/dist",
   "functions": {
     "api/index.ts": {
       "regions": ["hkg1"],
-      "maxDuration": 30
+      "maxDuration": 300,
+      "includeFiles": "apps/api/dist/**"
     }
   },
   "rewrites": [

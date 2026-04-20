@@ -58,6 +58,17 @@ export interface TicketMessage {
   created_at: string;
 }
 
+export interface LatestAiRunResponse {
+  action?: string;
+  confidence?: number;
+  reasoning_summary?: string;
+  evidence?: string[];
+  support_insight?: Record<string, unknown>;
+  verification_summary?: Record<string, unknown>;
+  case_frame?: Record<string, unknown>;
+  evidence_bundle_digest?: string | null;
+}
+
 function ticketNumber(): string {
   return `T-${Date.now().toString().slice(-8)}`;
 }
@@ -101,7 +112,7 @@ export async function createTicket(input: TicketCreateInput): Promise<TicketReco
     authorType: "CUSTOMER",
     authorName: input.customer.name,
     body: input.description,
-    attachments: [],
+    attachments: input.attachments ?? [],
     isAiGenerated: false,
     aiConfidence: null
   });
@@ -147,6 +158,18 @@ export async function listTicketMessages(ticketId: string): Promise<TicketMessag
     [ticketId]
   );
   return result.rows;
+}
+
+export async function getLatestCompletedAiRunResponse(ticketId: string): Promise<LatestAiRunResponse | null> {
+  const result = await pool.query<{ response_json: LatestAiRunResponse }>(
+    `SELECT response_json
+     FROM ai_runs
+     WHERE ticket_id = $1 AND status = 'completed'
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [ticketId]
+  );
+  return result.rows[0]?.response_json ?? null;
 }
 
 export async function addMessage(input: {

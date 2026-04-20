@@ -1,6 +1,7 @@
 import { AlertTriangle, Bot, CheckCircle2, Clock3, Loader2, MessageCircleReply, Sparkles, Ticket } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import {
+  applyAiSuggestion as applyAiSuggestionRequest,
   assignTicket,
   getAiAgentMode,
   getSupportQueueCounts,
@@ -61,6 +62,12 @@ function getSlaPill(due: string | null | undefined) {
     return { text: formatRemaining(due), textClass: "text-amber-700", dotClass: "bg-amber-500", dotDuration: "1.8s" };
   }
   return { text: formatRemaining(due), textClass: "text-slate-700", dotClass: "bg-slate-500", dotDuration: "2.5s" };
+}
+
+function buildInsightHeadline(ticket: TicketDetail | null, row: AgentQueueTicket | null | undefined) {
+  const insight = ticket?.triage_support_insight ?? row?.triage_support_insight;
+  if (insight?.direct_answer?.trim()) return insight.direct_answer.trim();
+  return row?.triage_reasoning_summary || "AI insight is not available yet. Open detail to process manually.";
 }
 
 export function AgentDashboardPage() {
@@ -257,14 +264,20 @@ export function AgentDashboardPage() {
   };
 
   const applyAiSuggestion = async () => {
-    if (!ticketDetail?.ai_last_action) return;
-    if (ticketDetail.ai_last_action === "resolve") {
-      await runAction("resolve");
-    } else if (ticketDetail.ai_last_action === "escalate") {
-      await runAction("escalate");
-    } else {
-      setReplyBody((prev) => prev || "Thanks for contacting support. Please share exact reproduction steps, expected result, actual result, and screenshots/logs.");
-      await refreshAfterAction("ai_suggestion_applied", { applied: "template" });
+    if (!selectedTicketId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const applied = await applyAiSuggestionRequest(selectedTicketId, ticketDetail?.ai_last_trace_id ?? undefined);
+      await refreshAfterAction("ai_suggestion_applied", {
+        applied: applied.appliedAction,
+        traceId: applied.traceId,
+        messagePosted: applied.messagePosted
+      });
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -425,7 +438,7 @@ export function AgentDashboardPage() {
                 </div>
                 <p className="mt-2 flex items-start gap-1.5 text-sm leading-6 text-[#4B5563]">
                   <Sparkles size={14} className="mt-1 shrink-0 text-brand-600" />
-                  <span>{row.triage_reasoning_summary || "AI summary is not available yet. Open detail to process manually."}</span>
+                  <span>{buildInsightHeadline(null, row)}</span>
                 </p>
                 <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
                   <span>{row.ticket_no}</span>
@@ -477,10 +490,54 @@ export function AgentDashboardPage() {
               <div className="rounded-lg border border-[#BFDBFE] bg-[#EFF6FF] p-4 shadow-sm">
                 <p className="mb-1 flex items-center gap-2 text-xs font-semibold uppercase text-brand-700">
                   <Bot size={16} />
-                  AI Insight & Suggestion
+                  AI Support Insight
                 </p>
-                <p className="text-sm leading-6 text-slate-700">{selectedRow?.triage_reasoning_summary || "No AI summary available."}</p>
-                <p className="mt-1 text-xs text-slate-600">Confidence: {ticketDetail.ai_last_confidence ?? selectedRow?.triage_confidence ?? "-"} | Trace: {ticketDetail.ai_last_trace_id ?? "-"}</p>
+                <p className="text-sm leading-6 text-slate-700">{buildInsightHeadline(ticketDetail, selectedRow)}</p>
+                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                  <div className="rounded-xl border border-[#CFE0FF] bg-white/80 p-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Recommended action</p>
+                    <p className="mt-1 text-sm font-medium text-slate-900">
+                      {ticketDetail.triage_support_insight?.recommended_action ?? ticketDetail.ai_last_action ?? "-"}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-[#CFE0FF] bg-white/80 p-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Confidence</p>
+                    <p className="mt-1 text-sm font-medium text-slate-900">
+                      {ticketDetail.ai_last_confidence ?? selectedRow?.triage_confidence ?? "-"}
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                  <div className="rounded-xl border border-[#CFE0FF] bg-white/80 p-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Verified evidence</p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {(ticketDetail.triage_support_insight?.verified_evidence?.length
+                        ? ticketDetail.triage_support_insight.verified_evidence
+                        : selectedRow?.triage_evidence ?? []
+                      ).map((evidence) => (
+                        <span key={evidence} className="rounded-full border border-[#BFDBFE] bg-white px-2.5 py-1 text-xs text-brand-700">
+                          {evidence}
+                        </span>
+                      ))}
+                      {!(ticketDetail.triage_support_insight?.verified_evidence?.length || selectedRow?.triage_evidence?.length) && (
+                        <span className="text-xs text-slate-500">No verified evidence captured.</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-[#CFE0FF] bg-white/80 p-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Trace</p>
+                    <p className="mt-1 break-all text-xs text-slate-700">{ticketDetail.ai_last_trace_id ?? "-"}</p>
+                    {ticketDetail.triage_verification_summary?.summary && (
+                      <p className="mt-2 text-xs leading-5 text-slate-600">{ticketDetail.triage_verification_summary.summary}</p>
+                    )}
+                  </div>
+                </div>
+                {!!ticketDetail.triage_support_insight?.customer_reply && (
+                  <div className="mt-3 rounded-xl border border-[#CFE0FF] bg-white/80 p-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Customer reply</p>
+                    <p className="mt-1 text-sm leading-6 text-slate-800">{ticketDetail.triage_support_insight.customer_reply}</p>
+                  </div>
+                )}
                 <div className="mt-2 flex gap-2">
                   <button className="rounded border border-[#93C5FD] bg-white px-2 py-1 text-xs text-[#1D4ED8]" onClick={() => void applyAiSuggestion()}>
                     ✨ One-click Apply
@@ -488,19 +545,6 @@ export function AgentDashboardPage() {
                   <button className="rounded border border-slate-300 bg-white px-2 py-1 text-xs" onClick={() => void overrideAiSuggestion()}>
                     Manual Override
                   </button>
-                </div>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {(selectedRow?.triage_evidence ?? []).map((evidence) => {
-                    const value = String(evidence);
-                    const href = value.startsWith("http")
-                      ? value
-                      : `https://ones.com/search?q=${encodeURIComponent(value)}`;
-                    return (
-                      <a key={value} className="rounded bg-white px-2 py-1 text-xs text-brand-600 underline" href={href} target="_blank" rel="noreferrer">
-                        {value}
-                      </a>
-                    );
-                  })}
                 </div>
               </div>
 

@@ -7,6 +7,6 @@ test("customer route map excludes internal portal paths", () => {
 });
 
 test("internal route map is isolated from customer routes", () => {
-  assert.deepEqual(internalRoutePaths, ["/support", "/support/tickets/:id", "/support/admin/ones-sync"]);
+  assert.deepEqual(internalRoutePaths, ["/support", "/support/tickets/:id", "/support/admin/configuration"]);
   assert.equal(internalRoutePaths.some((p) => p === "/" || p.startsWith("/requests") || p.startsWith("/tickets")), false);
 });

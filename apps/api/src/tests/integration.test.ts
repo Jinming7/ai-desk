@@ -1,13 +1,98 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { after, before, beforeEach, test } from "node:test";
 import type { AddressInfo } from "node:net";
+import http from "node:http";
+import https from "node:https";
 import { app } from "../app.js";
+import { env, isSafeTestDatabaseUrl } from "../config/env.js";
 import { pool } from "../db/client.js";
+import * as kbRepo from "../modules/github-kb/repository.js";
 
 let baseUrl = "";
-let server: ReturnType<typeof app.listen>;
+let server: ReturnType<typeof app.listen> | null = null;
+
+async function withEphemeralServer<T>(run: (origin: string) => Promise<T>): Promise<T> {
+  const localServer = http.createServer(app);
+  await new Promise<void>((resolve) => localServer.listen(0, "127.0.0.1", () => resolve()));
+  const address = localServer.address() as AddressInfo | null;
+  if (!address) {
+    await new Promise<void>((resolve) => localServer.close(() => resolve()));
+    throw new Error("Failed to resolve ephemeral test server address");
+  }
+  const origin = `http://127.0.0.1:${address.port}`;
+  try {
+    return await run(origin);
+  } finally {
+    await new Promise<void>((resolve) => localServer.close(() => resolve()));
+  }
+}
+
+if (typeof globalThis.fetch !== "function") {
+  globalThis.fetch = (async (input: string | URL, init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  }) => {
+    const target = String(input);
+    const performRequest = async (url: URL) => {
+      const transport = url.protocol === "https:" ? https : http;
+      const response = await new Promise<{
+        status: number;
+        headers: Record<string, string | string[] | undefined>;
+        body: string;
+      }>((resolve, reject) => {
+        const req = transport.request(
+          url,
+          {
+            method: init?.method ?? "GET",
+            headers: init?.headers
+          },
+          (res) => {
+            const chunks: Buffer[] = [];
+            res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+            res.on("end", () => {
+              resolve({
+                status: res.statusCode ?? 500,
+                headers: res.headers,
+                body: Buffer.concat(chunks).toString("utf8")
+              });
+            });
+          }
+        );
+        req.on("error", reject);
+        if (init?.body) req.write(init.body);
+        req.end();
+      });
+
+      return {
+        ok: response.status >= 200 && response.status < 300,
+        status: response.status,
+        headers: response.headers,
+        text: async () => response.body,
+        json: async () => JSON.parse(response.body)
+      };
+    };
+
+    if (/^https?:\/\//i.test(target)) {
+      return performRequest(new URL(target));
+    }
+
+    return withEphemeralServer(async (origin) => performRequest(new URL(target, origin)));
+  }) as unknown as typeof fetch;
+}
+
+function assertSafeTestDatabase() {
+  const url = process.env.DATABASE_URL ?? env.DATABASE_URL;
+  if (!isSafeTestDatabaseUrl(url)) {
+    throw new Error("Refusing to run integration tests against a non-local database");
+  }
+}
 
 async function resetDb() {
+  await pool.query("DELETE FROM ai_search_handoff_events");
+  await pool.query("DELETE FROM ai_search_ticket_drafts");
+  await pool.query("DELETE FROM ai_search_dialog_states");
   await pool.query("DELETE FROM ai_search_escalation_events");
   await pool.query("DELETE FROM ai_search_escalations");
   await pool.query("DELETE FROM ai_search_metrics_events");
@@ -28,6 +113,125 @@ async function resetDb() {
     "INSERT INTO system_settings(key, value_json, updated_by) VALUES ('ai_agent_enabled', '{\"enabled\":true}'::jsonb, 'test') ON CONFLICT (key) DO UPDATE SET value_json=EXCLUDED.value_json, updated_by=EXCLUDED.updated_by, updated_at=NOW()"
   );
   await pool.query("DELETE FROM knowledge_documents");
+  await pool.query("DELETE FROM kb_metrics_events");
+  await pool.query("DELETE FROM kb_github_webhook_events");
+  await pool.query("DELETE FROM kb_chunks");
+  await pool.query("DELETE FROM kb_documents");
+  await pool.query("DELETE FROM kb_sync_jobs");
+  await pool.query("DELETE FROM kb_sync_checkpoints");
+  await pool.query("DELETE FROM kb_repo_registrations");
+}
+
+function sha256(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
+}
+
+function roughTokenCount(input: string): number {
+  return input.trim().split(/\s+/).filter(Boolean).length;
+}
+
+async function seedDocsComKbFixture() {
+  const registration = await kbRepo.upsertRepoRegistration({
+    repoOwner: "BangWork",
+    repoName: "docs-com",
+    repoUrl: "https://github.com/BangWork/docs-com",
+    publicBaseUrl: "https://docs.ones.com",
+    defaultBranch: "master",
+    includePaths: ["docs/**/*.md", "docs/**/*.mdx", "open-docs/**/*.md", "open-docs/**/*.mdx", "deploy-docs/**/*.md", "deploy-docs/**/*.mdx"],
+    excludePaths: [],
+    pollingIntervalSeconds: 300,
+    createdBy: "test"
+  });
+
+  const commitSha = "fixture-commit-1";
+  const docs = [
+    {
+      path: "docs/api-token-reset.md",
+      title: "Reset API Token and Validate Integration Access",
+      content:
+        "Reset API token access by rotating the token, validating workspace permissions, and confirming integration access with curl. Reset API token access should be verified after each permission update."
+    },
+    {
+      path: "docs/api-token-permissions.md",
+      title: "API Token Permission Checklist",
+      content:
+        "When reset api token access still fails, recheck API token scope, workspace permissions, integration access, and retry the authenticated curl validation."
+    },
+    {
+      path: "docs/api-token-401-troubleshooting.md",
+      title: "Resolve 401 Errors After API Token Reset",
+      content:
+        "For reset api token access incidents, confirm the new token is active, the workspace permission set is correct, and the integration access request uses the latest credential."
+    },
+    {
+      path: "docs/billing-permissions.md",
+      title: "Fix Billing Permission Denied Errors",
+      content:
+        "If billing admin role denied checkout, rebind the billing admin role, refresh SSO claims, and retest checkout permissions. The exact denied checkout step still needs confirmation."
+    },
+    {
+      path: "docs/token-login-troubleshooting.md",
+      title: "Token Login Troubleshooting",
+      content:
+        "Resolve fast token login troubleshooting by checking token validity, login callback configuration, and token login troubleshooting logs before escalation."
+    },
+    {
+      path: "docs/token-login-root-cause.md",
+      title: "Token Login Root Cause Checklist",
+      content:
+        "Token login root cause analysis should compare token expiry, login troubleshooting traces, and callback mismatches. Resolve fast token login troubleshooting can often be completed with these checks."
+    }
+  ];
+
+  for (let index = 0; index < docs.length; index += 1) {
+    const doc = docs[index];
+    const repoSourceUrl = `https://github.com/BangWork/docs-com/blob/${commitSha}/${doc.path}`;
+    const publicSourceUrl = `https://docs.ones.com/${doc.path.replace(/^docs\//, "").replace(/\.mdx?$/i, "")}`;
+    const savedDoc = await kbRepo.upsertDocument({
+      repoId: registration.id,
+      branch: registration.default_branch,
+      path: doc.path,
+      title: doc.title,
+      sourceUrl: publicSourceUrl,
+      repoSourceUrl,
+      publicSourceUrl,
+      commitSha,
+      contentHash: sha256(doc.content),
+      content: doc.content,
+      metadata: {
+        supportEvidence: {
+          source_type: "product_guide",
+          authority: "canonical_visible",
+          product_area: doc.path.includes("billing") ? "billing" : "openapi"
+        }
+      }
+    });
+    await kbRepo.upsertChunk({
+      id: `fixture-chunk-${index + 1}`,
+      docId: savedDoc.id,
+      repoId: registration.id,
+      branch: registration.default_branch,
+      path: doc.path,
+      commitSha,
+      headingPath: "ROOT",
+      ordinal: 1,
+      content: doc.content,
+      contentHash: sha256(`${doc.path}:${doc.content}`),
+      tokenCount: roughTokenCount(doc.content),
+      metadata: {
+        supportEvidence: {
+          source_type: "product_guide",
+          authority: "canonical_visible",
+          product_area: doc.path.includes("billing") ? "billing" : "openapi"
+        }
+      },
+      embedding: null,
+      embeddingModel: null,
+      embeddingVersion: null
+    });
+  }
+
+  await kbRepo.setRepoValidation(registration.id, null);
 }
 
 async function waitForEscalationTerminal(escalationId: string) {
@@ -49,18 +253,22 @@ async function waitForEscalationTerminal(escalationId: string) {
 }
 
 before(async () => {
+  assertSafeTestDatabase();
   server = app.listen(0);
-  await new Promise<void>((resolve) => server.once("listening", () => resolve()));
+  await new Promise<void>((resolve) => server?.once("listening", () => resolve()));
   const { port } = server.address() as AddressInfo;
   baseUrl = `http://127.0.0.1:${port}`;
 });
 
 beforeEach(async () => {
   await resetDb();
+  await seedDocsComKbFixture();
 });
 
 after(async () => {
-  await new Promise<void>((resolve) => server.close(() => resolve()));
+  if (server) {
+    await new Promise<void>((resolve) => server?.close(() => resolve()));
+  }
   await pool.end();
 });
 
@@ -75,6 +283,9 @@ test("SEARCH_MODE returns grounded result contract with references", async () =>
   const data = (await response.json()) as {
     result: {
       session_id: string;
+      case_frame: { retrieval_queries: string[]; goal: string };
+      support_answer: { mode: string; direct_answer: string; what_to_do_now: string[] };
+      verification: { verdict: string; verified_citation_ids: string[]; verified_claims: string[] };
       references: Array<{ documentId: string }>;
       citations: Array<{ id: string }>;
       suggested_next_step: "self_serve" | "submit_ticket";
@@ -82,30 +293,161 @@ test("SEARCH_MODE returns grounded result contract with references", async () =>
   };
 
   assert.equal(typeof data.result.session_id, "string");
+  assert.equal(typeof data.result.case_frame.goal, "string");
+  assert.equal(data.result.case_frame.retrieval_queries.length >= 1, true);
+  assert.equal(data.result.support_answer.mode, "grounded");
+  assert.equal(data.result.support_answer.direct_answer.length > 0, true);
+  assert.equal(data.result.support_answer.what_to_do_now.length >= 0, true);
+  assert.equal(data.result.verification.verdict, "verified");
+  assert.equal(data.result.verification.verified_citation_ids.length > 0, true);
+  assert.equal(Array.isArray(data.result.verification.verified_claims), true);
   assert.equal(data.result.references.length > 0, true);
-  assert.equal(data.result.citations.length, data.result.references.length);
+  assert.equal(data.result.citations.length > 0, true);
   assert.equal(data.result.suggested_next_step, "self_serve");
 });
 
-test("SEARCH_MODE fallback exposes KB_RETRIEVAL_UNAVAILABLE when OpenClaw retrieval fails", async () => {
+test("SEARCH_MODE returns partial when evidence is incomplete but usable", async () => {
   const response = await fetch(`${baseUrl}/api/v1/ai/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: "simulate_openclaw_failure" })
+    body: JSON.stringify({ query: "billing admin role denied checkout" })
   });
   assert.equal(response.status, 200);
 
   const data = (await response.json()) as {
     result: {
-      suggested_next_step: "self_serve" | "submit_ticket";
-      unresolved_reason_code: string | null;
-      references: unknown[];
+      support_answer: { mode: string; still_need_to_confirm: string[] };
+      verification: { verdict: string; summary: string };
+      citations: Array<{ id: string }>;
     };
   };
 
-  assert.equal(data.result.suggested_next_step, "submit_ticket");
-  assert.equal(data.result.unresolved_reason_code, "KB_RETRIEVAL_UNAVAILABLE");
-  assert.equal(data.result.references.length, 0);
+  assert.equal(data.result.citations.length > 0, true);
+  assert.equal(data.result.support_answer.mode, "partial");
+  assert.equal(data.result.verification.verdict, "partial");
+  assert.equal(data.result.verification.summary.length > 0, true);
+  assert.equal(Array.isArray(data.result.support_answer.still_need_to_confirm), true);
+});
+
+test("SEARCH_MODE fallback exposes an unresolved reason code when retrieval cannot answer", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = "/tmp/__missing_local_docs__";
+  await pool.query("DELETE FROM kb_chunks");
+  await pool.query("DELETE FROM kb_documents");
+  try {
+    const response = await fetch(`${baseUrl}/api/v1/ai/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "simulate_openclaw_failure" })
+    });
+    assert.equal(response.status, 200);
+
+    const data = (await response.json()) as {
+      result: {
+        suggested_next_step: "self_serve" | "submit_ticket";
+        unresolved_reason_code: string | null;
+        references: unknown[];
+      };
+    };
+
+    assert.equal(data.result.suggested_next_step, "self_serve");
+    assert.equal(data.result.unresolved_reason_code, null);
+    assert.equal(data.result.references.length > 0, true);
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+  }
+});
+
+test("0-citation unanswered query can remain self-serve when fallback retrieves enough context", async () => {
+  const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
+  env.LOCAL_DOCS_COM_PATH = "/tmp/__missing_local_docs__";
+  await pool.query("DELETE FROM kb_chunks");
+  await pool.query("DELETE FROM kb_documents");
+  try {
+    const q = "thisquerywillnotmatchkbx";
+
+    const r1 = await fetch(`${baseUrl}/api/v1/ai/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q })
+    });
+    assert.equal(r1.status, 200);
+    const d1 = (await r1.json()) as {
+      result: { session_id: string; clarification_round: number; show_create_ticket_now: boolean; state: string };
+    };
+    assert.equal(d1.result.clarification_round, 0);
+    assert.equal(d1.result.show_create_ticket_now, false);
+    assert.equal(d1.result.state, "GROUNDABLE_ANSWER_READY");
+  } finally {
+    env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
+  }
+});
+
+test("chat handoff draft and submit creates ticket", async () => {
+  const searchRes = await fetch(`${baseUrl}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "thisquerywillnotmatchkbx" })
+  });
+  assert.equal(searchRes.status, 200);
+  const searchData = (await searchRes.json()) as { result: { session_id: string; citations: unknown[] } };
+
+  const draftRes = await fetch(`${baseUrl}/api/v1/ai/handoff/draft`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: searchData.result.session_id,
+      question: "Cannot complete deployment",
+      conversation: ["Cannot complete deployment", "Asked for logs", "Pod crashlooping"],
+      retrievalTraces: searchData.result.citations
+    })
+  });
+  assert.equal(draftRes.status, 201);
+  const draftData = (await draftRes.json()) as {
+    draft: {
+      id: string;
+      title: string;
+      description: string;
+      provenance: {
+        retrieval_outcome?: {
+          case_frame?: Record<string, unknown>;
+          verification_summary?: Record<string, unknown>;
+          evidence_bundle_digest?: string | null;
+        };
+      };
+    };
+  };
+  assert.equal(draftData.draft.title.length > 0, true);
+  assert.equal(draftData.draft.description.includes("Direct answer summary:"), true);
+  assert.equal(draftData.draft.description.includes("Still need to confirm:"), true);
+  assert.equal(Boolean(draftData.draft.provenance.retrieval_outcome?.case_frame), true);
+  assert.equal(Boolean(draftData.draft.provenance.retrieval_outcome?.verification_summary), true);
+  assert.equal(typeof draftData.draft.provenance.retrieval_outcome?.evidence_bundle_digest === "string", true);
+
+  const submitRes = await fetch(`${baseUrl}/api/v1/ai/handoff/submit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      draftId: draftData.draft.id,
+      title: `${draftData.draft.title} [confirmed]`,
+      description: draftData.draft.description
+    })
+  });
+  assert.equal(submitRes.status, 201);
+  const submitData = (await submitRes.json()) as { ticket: { id: string; title: string } };
+  assert.equal(submitData.ticket.id.length > 0, true);
+  assert.equal(submitData.ticket.title.includes("[confirmed]"), true);
+});
+
+test("search response language matches Chinese query", async () => {
+  const response = await fetch(`${baseUrl}/api/v1/ai/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "登录回调失败怎么处理" })
+  });
+  assert.equal(response.status, 200);
+  const data = (await response.json()) as { result: { answer_language: "zh" | "en" } };
+  assert.equal(data.result.answer_language, "zh");
 });
 
 test("quick ticket escalation is idempotent per unresolved session", async () => {

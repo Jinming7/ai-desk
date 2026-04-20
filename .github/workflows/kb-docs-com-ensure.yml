@@ -1,0 +1,52 @@
+name: Ensure Docs-Com KB
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: kb-docs-com-ensure
+  cancel-in-progress: false
+
+jobs:
+  ensure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check automation config
+        id: config
+        run: |
+          if [ -z "${{ vars.KB_AUTOMATION_BASE_URL }}" ] || [ -z "${{ secrets.INTERNAL_OPS_TOKEN }}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "KB automation skipped because KB_AUTOMATION_BASE_URL or INTERNAL_OPS_TOKEN is missing."
+            exit 0
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Drain docs-com sync lanes
+        if: steps.config.outputs.configured == 'true'
+        env:
+          KB_AUTOMATION_BASE_URL: ${{ vars.KB_AUTOMATION_BASE_URL }}
+          INTERNAL_OPS_TOKEN: ${{ secrets.INTERNAL_OPS_TOKEN }}
+        run: |
+          set -euo pipefail
+          base="${KB_AUTOMATION_BASE_URL%/}"
+
+          for lane in lane-a lane-b lane-c poll; do
+            echo "[kb-drain] hitting ${lane}"
+            curl -fsS --max-time 60 \
+              -H "Authorization: Bearer ${INTERNAL_OPS_TOKEN}" \
+              "${base}/api/v1/internal/kb/sync/cron/${lane}"
+            echo
+          done

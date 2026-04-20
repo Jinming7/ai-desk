@@ -5,11 +5,20 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json && node scripts/copy-support-runtime-contracts.mjs",
+    "start": "../../scripts/restart-api-safe.sh",
+    "start:raw": "node dist/index.js",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed:mock": "tsx src/db/seed-mock.ts",
-    "test:integration": "NODE_ENV=test tsx --test src/tests/integration.test.ts"
+    "test:ai-support-agent:smoke": "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/nexusflow NODE_ENV=test tsx src/tests/ai-support-agent.smoke.ts",
+    "test:ai-support-agent:evals:unit": "tsx --test src/tests/evals/evaluation-framework.test.ts",
+    "test:ai-support-agent:business": "tsx src/tests/ai-support-agent.business-eval.ts",
+    "test:ai-support-agent:business:real": "tsx src/tests/ai-support-agent.business-eval.ts",
+    "test:ai-support-agent:business:mock": "NODE_ENV=test tsx src/tests/ai-support-agent.business-eval.ts",
+    "test:integration": "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/nexusflow NODE_ENV=test tsx --test src/tests/integration.test.ts",
+    "test:github-kb": "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/nexusflow NODE_ENV=test tsx --test --test-concurrency=1 src/tests/github-kb.integration.test.ts",
+    "kb:worker": "tsx src/modules/github-kb/worker.ts",
+    "kb:eval": "tsx src/modules/github-kb/eval.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

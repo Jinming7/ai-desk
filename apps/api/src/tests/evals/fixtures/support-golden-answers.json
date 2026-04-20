@@ -1,0 +1,44 @@
+{
+  "version": "2026-04-01",
+  "cases": [
+    {
+      "id": "golden_api_scope",
+      "query": "What scope is required to create an issue comment via OpenAPI?",
+      "answerLanguage": "en",
+      "expectedAnswerType": "api",
+      "requiredClaims": ["scope", "issue comment"],
+      "minimumNextSteps": ["Confirm the token scope before retrying."],
+      "minimumCitationCount": 1,
+      "requiredCitationTargets": ["openapi", "comment"],
+      "forbiddenHallucinations": ["admin:all"],
+      "requireDirectAnswer": true,
+      "maximumStillNeedToConfirm": 1
+    },
+    {
+      "id": "golden_callback_troubleshooting",
+      "query": "GitHub 集成授权后回调页面显示 page not found，怎么排查？",
+      "answerLanguage": "zh",
+      "expectedAnswerType": "troubleshooting",
+      "requiredClaims": ["回调", "404"],
+      "minimumNextSteps": ["检查 Redirect URI 与回调域名配置。"],
+      "minimumCitationCount": 1,
+      "requiredCitationTargets": ["callback", "github"],
+      "forbiddenHallucinations": ["无需检查任何配置"],
+      "requireDirectAnswer": true,
+      "maximumStillNeedToConfirm": 2
+    },
+    {
+      "id": "golden_onesql_behavior",
+      "query": "Does ONESQL support ORDER BY and GROUP BY?",
+      "answerLanguage": "en",
+      "expectedAnswerType": "behavior",
+      "requiredClaims": ["onesql", "order by", "group by"],
+      "minimumNextSteps": ["Validate the query against the documented ONESQL syntax."],
+      "minimumCitationCount": 1,
+      "requiredCitationTargets": ["onesql"],
+      "forbiddenHallucinations": ["admin-only clause"],
+      "requireDirectAnswer": true,
+      "maximumStillNeedToConfirm": 1
+    }
+  ]
+}

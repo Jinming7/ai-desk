@@ -1,0 +1,65 @@
+{
+  "version": "2026-04-01",
+  "cases": [
+    {
+      "id": "eval-build-clean",
+      "knowledgeSpace": "support-eval",
+      "repoId": "docs-com",
+      "branch": "master",
+      "buildVersion": "build-clean",
+      "buildStatus": "validated",
+      "buildSuccess": true,
+      "validationPassed": true,
+      "duplicateActivePathCount": 0,
+      "artifactCountsByFamily": {
+        "doc_page": 120,
+        "openapi_spec": 8,
+        "code_file": 16,
+        "config_file": 6
+      },
+      "citationCount": 340,
+      "memoryEntryCount": 180,
+      "crossBuildReferenceViolationCount": 0,
+      "embeddingEnabledFamilies": ["doc_page", "openapi_spec"],
+      "missingEmbeddingCount": 0,
+      "previousArtifactCountsByFamily": {
+        "doc_page": 118,
+        "openapi_spec": 8,
+        "code_file": 16,
+        "config_file": 6
+      },
+      "previousCitationCount": 332,
+      "previousMemoryEntryCount": 177
+    },
+    {
+      "id": "eval-build-regression",
+      "knowledgeSpace": "support-eval",
+      "repoId": "docs-com",
+      "branch": "master",
+      "buildVersion": "build-regression",
+      "buildStatus": "failed",
+      "buildSuccess": false,
+      "validationPassed": false,
+      "duplicateActivePathCount": 4,
+      "artifactCountsByFamily": {
+        "doc_page": 111,
+        "openapi_spec": 8,
+        "code_file": 15,
+        "config_file": 6
+      },
+      "citationCount": 301,
+      "memoryEntryCount": 145,
+      "crossBuildReferenceViolationCount": 2,
+      "embeddingEnabledFamilies": ["doc_page", "openapi_spec"],
+      "missingEmbeddingCount": 1,
+      "previousArtifactCountsByFamily": {
+        "doc_page": 120,
+        "openapi_spec": 8,
+        "code_file": 16,
+        "config_file": 6
+      },
+      "previousCitationCount": 340,
+      "previousMemoryEntryCount": 180
+    }
+  ]
+}
