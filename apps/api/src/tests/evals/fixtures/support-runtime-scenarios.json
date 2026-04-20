@@ -1,5 +1,5 @@
 {
-  "version": "2026-04-01",
+  "version": "2026-04-16",
   "cases": [
     {
       "id": "runtime_callback_troubleshooting",
@@ -15,9 +15,9 @@
       "expectedSpecialistFamily": "troubleshooting",
       "expectClarification": false,
       "expectedAnswerMode": "grounded",
-      "requiredStages": ["route", "evidence_plan", "retrieval", "verification", "answer_composition"],
+      "requiredStages": ["domain_dispatch", "retrieval", "evidence_selection", "verification", "answer_composition"],
       "forbiddenStages": [],
-      "allowedFallbackStages": ["citation_selection"]
+      "allowedFallbackStages": []
     },
     {
       "id": "runtime_api_scope",
@@ -28,9 +28,9 @@
       "expectedSpecialistFamily": "api",
       "expectClarification": false,
       "expectedAnswerMode": "grounded",
-      "requiredStages": ["route", "evidence_plan", "retrieval", "verification", "answer_composition"],
+      "requiredStages": ["domain_dispatch", "retrieval", "evidence_selection", "verification", "answer_composition"],
       "forbiddenStages": [],
-      "allowedFallbackStages": ["citation_selection"]
+      "allowedFallbackStages": []
     },
     {
       "id": "runtime_minimum_clarification",
@@ -40,9 +40,9 @@
       "expectedSpecialistFamily": "troubleshooting",
       "expectClarification": true,
       "expectedAnswerMode": "clarification",
-      "requiredStages": ["route", "answer_composition"],
+      "requiredStages": ["domain_dispatch", "answer_composition"],
       "forbiddenStages": [],
-      "allowedFallbackStages": ["route", "verification"]
+      "allowedFallbackStages": ["domain_dispatch", "verification"]
     }
   ]
 }

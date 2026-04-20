@@ -161,6 +161,30 @@ function createDeploymentCapabilityAdapter(): OpenClawAdapter {
     async planSupportEvidence(_input: OpenClawSupportEvidencePlannerInput): Promise<SupportEvidencePlan> {
       return evidencePlan;
     },
+    async planSupportDispatch(input) {
+      const primaryDomain = "deployment" as const;
+      return {
+        primaryDomain,
+        route: {
+          ...route,
+          primary_domain: primaryDomain
+        },
+        caseFrame: {
+          ...caseFrame,
+          primary_domain: primaryDomain,
+          required_doc_kinds: caseFrame.required_doc_kinds ?? evidencePlan.required_doc_kinds
+        },
+        retrievalQueries: Array.from(
+          new Set([
+            input.query,
+            ...(caseFrame.retrieval_queries ?? []),
+            ...(evidencePlan.query_plan?.concept_queries ?? []),
+            ...(evidencePlan.query_plan?.object_queries ?? []),
+            ...(evidencePlan.query_plan?.behavior_queries ?? [])
+          ])
+        )
+      };
+    },
     async planSupportExecution() {
       return {
         route,
@@ -187,11 +211,37 @@ function createDeploymentCapabilityAdapter(): OpenClawAdapter {
       throw new Error("howto specialist should not be used");
     },
     async writeBehaviorSpecialistAnswer(_input: OpenClawSupportSpecialistInput): Promise<SpecialistDraftAnswer> {
+      const preferred =
+        _input.evidenceBundle.primary.find((item) =>
+          /ubuntu|red hat|centos/i.test(String(item.snippet ?? ""))
+        ) ??
+        _input.evidenceBundle.primary.find((item) => {
+          const snippet = String(item.snippet ?? "");
+          return /\|/.test(snippet) && /台工作节点/.test(snippet) && />=/.test(snippet);
+        }) ??
+        _input.evidenceBundle.primary.find((item) =>
+          /3台工作节点/i.test(String(item.snippet ?? ""))
+        ) ??
+        _input.evidenceBundle.primary[0];
+      const primaryEvidenceId =
+        preferred?.evidenceId ??
+        preferred?.documentId ??
+        "";
+      const primarySnippet = preferred?.snippet ?? "当前文档说明了私有化部署的环境要求。";
       return {
         question_type: "capability_confirmation",
         render_variant: "behavior",
-        direct_answer: "当前文档说明了私有化部署的环境要求。",
-        claims: [],
+        direct_answer: primarySnippet,
+        claims: primaryEvidenceId
+          ? [
+              {
+                text: primarySnippet,
+                kind: "verified_fact",
+                evidence_ids: [primaryEvidenceId],
+                authority: "canonical"
+              }
+            ]
+          : [],
         next_actions: [],
         unknowns: [],
         escalation_needed: false
@@ -432,6 +482,27 @@ test("runSupportSearchAgent prefers leaf deployment sizing matrix rows over high
     caseFrame,
     evidencePlan
   });
+  adapter.planSupportDispatch = async (input) => ({
+    primaryDomain: "deployment",
+    route: {
+      ...route,
+      primary_domain: "deployment"
+    },
+    caseFrame: {
+      ...caseFrame,
+      primary_domain: "deployment",
+      required_doc_kinds: caseFrame.required_doc_kinds ?? evidencePlan.required_doc_kinds
+    },
+    retrievalQueries: Array.from(
+      new Set([
+        input.query,
+        ...(caseFrame.retrieval_queries ?? []),
+        ...(evidencePlan.query_plan?.concept_queries ?? []),
+        ...(evidencePlan.query_plan?.object_queries ?? []),
+        ...(evidencePlan.query_plan?.behavior_queries ?? [])
+      ])
+    )
+  });
 
   const originalCollectEvidence = SearchOrchestrator.prototype.collectEvidence;
   SearchOrchestrator.prototype.collectEvidence = async function collectEvidenceStub(input) {
@@ -484,9 +555,11 @@ test("runSupportSearchAgent prefers leaf deployment sizing matrix rows over high
             "|集群规模|角色|CPU|内存|系统盘|数据盘|索引盘|网络带宽| |500人以内|3台工作节点|>=16C|>=32G|>=200G|>=300G|>=100G|>=50Mbps| |500～2999|3台工作节点|>=24C|>=48G|>=200G|>=500G|>=200G|>=100Mbps|",
           score: 0.78,
           supportMetadata: {
-            evidence_kind: "capability",
-            product_area: "general",
-            deployment_model: "shared"
+            evidence_kind: "constraint",
+            product_area: "deployment",
+            deployment_model: "private_deployment",
+            retrieval_unit_family: "constraint_table_row_unit",
+            doc_kind: "rules"
           }
         }),
         createReference({

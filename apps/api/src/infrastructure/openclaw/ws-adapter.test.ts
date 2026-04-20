@@ -110,6 +110,7 @@ test("startChatRun preserves explicit stage runtime timeout above default env ca
   const originalNow = Date.now;
   const fixedNow = 300_000;
   let observedTimeoutMs = -1;
+  let observedParams: Record<string, unknown> | null = null;
 
   Date.now = () => fixedNow;
   adapter.resolveAgentRuntime = () => ({
@@ -117,7 +118,8 @@ test("startChatRun preserves explicit stage runtime timeout above default env ca
     sessionKey: "agent:support-behavior-specialist:test"
   });
   adapter.buildChatAttachments = async () => [];
-  adapter.callMethod = async (_method, _params, timeoutMs) => {
+  adapter.callMethod = async (_method, params, timeoutMs) => {
+    observedParams = params;
     observedTimeoutMs = timeoutMs ?? -1;
     return { runId: "run-chat-2", status: "ok" };
   };
@@ -140,6 +142,49 @@ test("startChatRun preserves explicit stage runtime timeout above default env ca
   }
 
   assert.equal(observedTimeoutMs, 45_000);
+  assert.equal((observedParams as Record<string, unknown> | null)?.deliver, true);
+});
+
+test("runJsonPrompt still reads assistant JSON when agent.wait times out", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    runJsonPrompt: (
+      message: string,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext,
+      attachmentUrls?: string[],
+      stage?: string
+    ) => Promise<unknown>;
+    createRunScopedSessionKey: (
+      runtime: OpenClawRuntimeContext | undefined,
+      idempotencyKey: string,
+      stage: string
+    ) => string;
+    startChatRun: (
+      message: string,
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext,
+      attachmentUrls?: string[],
+      sessionKey?: string
+    ) => Promise<string>;
+    waitAgentRun: (runId: string, sessionKey?: string, runtime?: OpenClawRuntimeContext) => Promise<void>;
+    fetchLatestAssistantText: (sessionKey: string) => Promise<string>;
+  };
+  let fetchedSessionKey = "";
+
+  adapter.createRunScopedSessionKey = () => "agent:support-planner:test";
+  adapter.startChatRun = async () => "run-chat-timeout";
+  adapter.waitAgentRun = async () => {
+    throw new Error("OpenClaw agent.wait timeout");
+  };
+  adapter.fetchLatestAssistantText = async (sessionKey) => {
+    fetchedSessionKey = sessionKey;
+    return '{"ok":true}';
+  };
+
+  const parsed = await adapter.runJsonPrompt("{}", "json-timeout-fallback", undefined, undefined, "planner");
+
+  assert.deepEqual(parsed, { ok: true });
+  assert.equal(fetchedSessionKey, "agent:support-planner:test");
 });
 
 test("waitAgentRun caps both agent.wait timeout fields to the remaining overall runtime budget", async () => {
@@ -403,7 +448,8 @@ test("planSupportMainAgent parses route, case frame, and retrieval queries witho
         user_goal: "Find the required scope for the issue comment API.",
         answer_contract: "Return the exact scope first.",
         specialist_agent: "api-specialist",
-        routing_confidence: 0.94
+        routing_confidence: 0.94,
+        primary_domain: "openapi"
       },
       case_frame: {
         goal: "Find the required scope for the issue comment API.",
@@ -473,7 +519,8 @@ test("planSupportDispatch parses primary domain, route, case frame, and retrieva
         user_goal: "Reset the administrator password in a private deployment.",
         answer_contract: "Give the direct recovery steps first.",
         specialist_agent: "howto-specialist",
-        routing_confidence: 0.93
+        routing_confidence: 0.93,
+        primary_domain: "deployment"
       },
       case_frame: {
         goal: "Reset the administrator password in a private deployment.",
@@ -502,11 +549,93 @@ test("planSupportDispatch parses primary domain, route, case frame, and retrieva
 
   assert.match(capturedPrompt, /primary_domain/);
   assert.match(capturedPrompt, /retrieval_queries/);
-  assert.match(capturedPrompt, /Do not draft the customer answer/i);
+  assert.match(capturedPrompt, /do not:\s*[\s\S]*draft the answer/i);
   assert.equal(result.primaryDomain, "deployment");
   assert.equal(result.route.question_type, "config_setup");
   assert.equal(result.caseFrame.product_area, "deployment");
   assert.deepEqual(result.retrievalQueries, ["private deployment administrator password reset"]);
+});
+
+test("planSupportExecution loads the external supervisor contract and preserves integrations domain framing", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    planSupportExecution: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{
+      route: {
+        question_type: string;
+        primary_domain?: string;
+      };
+      caseFrame: {
+        product_area: string;
+        primary_domain?: string;
+      };
+      evidencePlan: {
+        required_doc_kinds: string[];
+      };
+    }>;
+    runJsonPrompt: (prompt: string) => Promise<unknown>;
+  };
+  let capturedPrompt = "";
+
+  adapter.runJsonPrompt = async (prompt) => {
+    capturedPrompt = prompt;
+    return {
+      primary_domain: "integrations",
+      route: {
+        question_type: "troubleshooting",
+        user_goal: "Diagnose the failing GitHub callback flow.",
+        answer_contract: "Start with the likely cause and the checks to run now.",
+        specialist_agent: "troubleshooting-specialist",
+        routing_confidence: 0.92,
+        primary_domain: "integrations"
+      },
+      case_frame: {
+        goal: "Diagnose the failing GitHub callback flow.",
+        symptom: "GitHub callback returns page not found after setup.",
+        object: "GitHub callback",
+        action_type: "troubleshooting",
+        deployment_model: "shared",
+        product_area: "integrations",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: ["github callback page not found"],
+        required_doc_kinds: ["troubleshooting", "product_guide"]
+      },
+      evidence_plan: {
+        query_plan: {
+          concept_queries: ["github callback"],
+          object_queries: ["redirect uri"],
+          behavior_queries: ["page not found"]
+        },
+        evidence_priority: ["integration_troubleshooting", "callback_config"],
+        required_doc_kinds: ["troubleshooting", "product_guide"],
+        retrieval_rounds: 1,
+        allow_refinement: false,
+        stop_after_grounded_evidence: true
+      }
+    };
+  };
+
+  const result = await adapter.planSupportExecution(
+    {
+      contextType: "search",
+      language: "en",
+      query: "GitHub OAuth callback returns page not found after setup"
+    },
+    "ws-adapter:support-execution-contracts"
+  );
+
+  assert.match(capturedPrompt, /Support Supervisor Contract/);
+  assert.match(capturedPrompt, /primary_domain/);
+  assert.equal(result.route.primary_domain, "integrations");
+  assert.equal(result.caseFrame.primary_domain, "integrations");
+  assert.deepEqual(result.evidencePlan.required_doc_kinds, ["troubleshooting", "product_guide"]);
 });
 
 test("draftSupportMainAgent parses claim reference ids from provided evidence without triggering retrieval", async () => {
@@ -813,8 +942,9 @@ test("writeDeploymentDomainAnswer routes deployment capability questions through
   assert.match(capturedPrompt, /most_likely_explanation/);
   assert.match(capturedPrompt, /confirmed_facts/);
   assert.match(capturedPrompt, /what_to_check_next/);
-  assert.match(capturedPrompt, /deployment capability, architecture, isolation, or expected behavior/i);
-  assert.match(capturedIdempotencyKey, /behavior-specialist$/);
+  assert.match(capturedPrompt, /Support Deploy Docs Agent Contract/);
+  assert.match(capturedPrompt, /deployment architecture, topology, isolation, externalization/i);
+  assert.match(capturedIdempotencyKey, /behavior-specialist(?::schema-attempt-\d+)?$/);
   assert.equal(result.render_variant, "behavior");
   assert.deepEqual(result.claims[0]?.evidence_ids, ["chunk:deployment-topology"]);
   assert.equal(
@@ -940,6 +1070,265 @@ test("writeDocsDomainAnswer supports troubleshooting fields from provided eviden
   assert.deepEqual(result.required_followup_info, ["The exact redirect URI configured in ONES and in the provider console."]);
 });
 
+test("writeDocsDomainAnswer loads the integrations contract when the routed domain is integrations", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    writeDocsDomainAnswer: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        route: {
+          question_type: string;
+          user_goal: string;
+          answer_contract: string;
+          specialist_agent: "api-specialist" | "howto-specialist" | "behavior-specialist" | "troubleshooting-specialist";
+          routing_confidence: number;
+          primary_domain?: string;
+        };
+        caseFrame: Record<string, unknown>;
+        evidenceBundle: Record<string, unknown>;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{
+      render_variant: string;
+      claims: Array<{ evidence_ids: string[] }>;
+    }>;
+    runJsonPrompt: (prompt: string) => Promise<unknown>;
+  };
+  let capturedPrompt = "";
+
+  adapter.runJsonPrompt = async (prompt) => {
+    capturedPrompt = prompt;
+    return {
+      question_type: "troubleshooting",
+      render_variant: "troubleshooting",
+      direct_answer: "The most likely documented cause is a callback URL mismatch.",
+      claims: [
+        {
+          text: "The callback troubleshooting guide states that callback URL mismatch causes the integration to fail.",
+          kind: "verified_fact",
+          evidence_ids: ["chunk:callback-mismatch"],
+          authority: "canonical"
+        }
+      ],
+      next_actions: ["Compare the redirect URI in ONES with the callback URL registered in the provider."],
+      unknowns: [],
+      escalation_needed: false
+    };
+  };
+
+  const result = await adapter.writeDocsDomainAnswer(
+    {
+      contextType: "search",
+      language: "en",
+      query: "GitHub callback keeps failing after OAuth setup",
+      route: {
+        question_type: "troubleshooting",
+        user_goal: "Diagnose the failing callback flow.",
+        answer_contract: "Start with the most likely documented cause and the checks to run now.",
+        specialist_agent: "troubleshooting-specialist",
+        routing_confidence: 0.91,
+        primary_domain: "integrations"
+      },
+      caseFrame: {
+        goal: "Diagnose the failing callback flow.",
+        symptom: "GitHub callback returns an error after setup.",
+        object: "GitHub callback",
+        action_type: "troubleshooting",
+        deployment_model: "shared",
+        product_area: "integrations",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: ["github callback troubleshooting"],
+        question_type: "troubleshooting",
+        specialist_agent: "troubleshooting-specialist",
+        primary_domain: "integrations"
+      },
+      evidenceBundle: {
+        primary: [
+          {
+            documentId: "doc:callback-troubleshooting",
+            evidenceId: "chunk:callback-mismatch",
+            title: "GitHub callback troubleshooting",
+            snippet: "Callback URL mismatch causes the integration to fail.",
+            sourceUrl: "https://docs.ones.com/integrations/github/callback-troubleshooting",
+            path: "docs/integrations/github/callback-troubleshooting.mdx",
+            headingPath: "Most common cause",
+            authority: "canonical_visible",
+            sourceType: "github_kb",
+            score: 0.99,
+            retrievedAt: "2026-04-10T02:00:00.000Z"
+          }
+        ],
+        supplemental: []
+      }
+    },
+    "ws-adapter:integrations-domain-contract"
+  );
+
+  assert.match(capturedPrompt, /Support Integrations Agent Contract/);
+  assert.equal(result.render_variant, "troubleshooting");
+  assert.deepEqual(result.claims[0]?.evidence_ids, ["chunk:callback-mismatch"]);
+});
+
+test("judgeSupportAnswer loads the external evidence judge contract", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    judgeSupportAnswer: (
+      input: {
+        contextType: "search" | "triage";
+        language: "zh" | "en";
+        query: string;
+        caseFrame: Record<string, unknown>;
+        evidenceBundle: Record<string, unknown>;
+        draftSupportAnswer?: Record<string, unknown>;
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{
+      verdict: string;
+    }>;
+    runJsonPrompt: (prompt: string) => Promise<unknown>;
+    parseVerificationResult: (input: unknown) => { verdict: string };
+  };
+  let capturedPrompt = "";
+
+  adapter.runJsonPrompt = async (prompt) => {
+    capturedPrompt = prompt;
+    return {
+      verdict: "verified",
+      summary: "verified",
+      unsupported_claims: [],
+      missing_info: [],
+      verified_citation_ids: ["chunk:callback-mismatch"],
+      display_citation_ids: ["chunk:callback-mismatch"],
+      verified_claims: ["Callback URL mismatch causes the integration to fail."],
+      claim_to_citation_map: []
+    };
+  };
+  adapter.parseVerificationResult = (input) => input as { verdict: string };
+
+  const result = await adapter.judgeSupportAnswer(
+    {
+      contextType: "search",
+      language: "en",
+      query: "GitHub callback keeps failing after OAuth setup",
+      caseFrame: {
+        goal: "Diagnose the failing callback flow.",
+        symptom: "GitHub callback returns an error after setup.",
+        object: "GitHub callback",
+        action_type: "troubleshooting",
+        deployment_model: "shared",
+        product_area: "integrations",
+        constraints: [],
+        missing_critical_info: [],
+        retrieval_queries: ["github callback troubleshooting"],
+        question_type: "troubleshooting",
+        specialist_agent: "troubleshooting-specialist",
+        primary_domain: "integrations"
+      },
+      evidenceBundle: {
+        primary: [],
+        supplemental: [],
+        confidence: 0.98,
+        fallbackUsed: false,
+        resolvedQueries: ["github callback troubleshooting"],
+        evidence_gaps: []
+      },
+      draftSupportAnswer: {
+        direct_answer: "The most likely documented cause is a callback URL mismatch.",
+        claims: [],
+        next_actions: [],
+        unknowns: [],
+        escalation_needed: false
+      }
+    },
+    "ws-adapter:evidence-judge-contract"
+  );
+
+  assert.match(capturedPrompt, /Support Evidence Judge Contract/);
+  assert.equal(result.verdict, "verified");
+});
+
+test("composeCustomerAnswer loads the external answer composer contract", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    composeCustomerAnswer: (
+      input: {
+        language: "zh" | "en";
+        mode: "grounded" | "partial" | "clarification" | "handoff";
+        query: string;
+        route: Record<string, unknown>;
+        caseFrame: Record<string, unknown>;
+        draftSupportAnswer: Record<string, unknown>;
+        supportedClaims: Array<{ text: string; kind: string }>;
+        nextActions: string[];
+        unknowns: string[];
+      },
+      idempotencyKey: string,
+      runtime?: OpenClawRuntimeContext
+    ) => Promise<{
+      direct_answer: string;
+      sections: unknown[];
+      why: string[];
+      what_to_do_now: string[];
+      still_need_to_confirm: string[];
+    }>;
+    runJsonPrompt: (prompt: string) => Promise<unknown>;
+  };
+  let capturedPrompt = "";
+
+  adapter.runJsonPrompt = async (prompt) => {
+    capturedPrompt = prompt;
+    return {
+      question_type: "troubleshooting",
+      render_variant: "troubleshooting",
+      direct_answer: "The most likely documented cause is a callback URL mismatch.",
+      sections: [],
+      why: ["The troubleshooting guide explicitly points to callback URL mismatch."],
+      what_to_do_now: ["Compare the redirect URI in ONES with the provider callback URL."],
+      still_need_to_confirm: []
+    };
+  };
+
+  const result = await adapter.composeCustomerAnswer(
+    {
+      language: "en",
+      mode: "grounded",
+      query: "GitHub callback keeps failing after OAuth setup",
+      route: {
+        question_type: "troubleshooting",
+        specialist_agent: "troubleshooting-specialist",
+        primary_domain: "integrations"
+      },
+      caseFrame: {
+        product_area: "integrations",
+        primary_domain: "integrations"
+      },
+      draftSupportAnswer: {
+        question_type: "troubleshooting",
+        render_variant: "troubleshooting",
+        direct_answer: "The most likely documented cause is a callback URL mismatch.",
+        claims: [],
+        next_actions: ["Compare the redirect URI in ONES with the provider callback URL."],
+        unknowns: [],
+        escalation_needed: false
+      },
+      supportedClaims: [
+        {
+          text: "The troubleshooting guide explicitly points to callback URL mismatch.",
+          kind: "verified_fact"
+        }
+      ],
+      nextActions: ["Compare the redirect URI in ONES with the provider callback URL."],
+      unknowns: []
+    },
+    "ws-adapter:answer-composer-contract"
+  );
+
+  assert.match(capturedPrompt, /Support Answer Composer/);
+  assert.equal(result.direct_answer, "The most likely documented cause is a callback URL mismatch.");
+});
+
 test("buildConnectParams includes a nonce-signed device payload for the live gateway", () => {
   const adapter = new WsOpenClawAdapter() as never as {
     buildConnectParams: (input: {
@@ -1053,6 +1442,63 @@ test("connectOnly retries once without device-token auth after a stale device to
     attempts.push(options.preferDeviceToken);
     if (options.preferDeviceToken) {
       throw new Error("OpenClaw health connect failed: unauthorized: device token mismatch (rotate/reissue device token)");
+    }
+  };
+  adapter.clearStoredDeviceToken = () => {
+    cleared += 1;
+  };
+
+  await adapter.connectOnly();
+
+  assert.deepEqual(attempts, [true, false]);
+  assert.equal(cleared, 1);
+});
+
+test("callMethod retries once without device-token auth when gateway returns 403", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    callMethod: (method: string, params: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
+    callMethodOnce: (
+      method: string,
+      params: Record<string, unknown>,
+      timeoutMs: number,
+      options: { preferDeviceToken: boolean }
+    ) => Promise<unknown>;
+    clearStoredDeviceToken: () => void;
+  };
+  const attempts: boolean[] = [];
+  let cleared = 0;
+
+  adapter.callMethodOnce = async (_method, _params, _timeoutMs, options) => {
+    attempts.push(options.preferDeviceToken);
+    if (options.preferDeviceToken) {
+      throw new Error("OpenClaw agent.run failed: 403 status code (no body)");
+    }
+    return { ok: true };
+  };
+  adapter.clearStoredDeviceToken = () => {
+    cleared += 1;
+  };
+
+  const result = await adapter.callMethod("agent.run", {}, 2_000);
+
+  assert.deepEqual(attempts, [true, false]);
+  assert.equal(cleared, 1);
+  assert.deepEqual(result, { ok: true });
+});
+
+test("connectOnly retries once without device-token auth when gateway returns forbidden", async () => {
+  const adapter = new WsOpenClawAdapter() as never as {
+    connectOnly: () => Promise<void>;
+    connectOnlyOnce: (options: { preferDeviceToken: boolean }) => Promise<void>;
+    clearStoredDeviceToken: () => void;
+  };
+  const attempts: boolean[] = [];
+  let cleared = 0;
+
+  adapter.connectOnlyOnce = async (options) => {
+    attempts.push(options.preferDeviceToken);
+    if (options.preferDeviceToken) {
+      throw new Error("OpenClaw health connect failed: forbidden");
     }
   };
   adapter.clearStoredDeviceToken = () => {

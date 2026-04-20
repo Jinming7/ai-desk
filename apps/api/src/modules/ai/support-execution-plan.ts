@@ -1,4 +1,4 @@
-import type { SupportCaseFrame, SupportEvidencePlan, SupportQuestionRoute } from "./types.js";
+import type { SupportCaseFrame, SupportDomain, SupportEvidencePlan, SupportQuestionRoute } from "./types.js";
 
 export type PlannerStageStatus =
   | "completed"
@@ -51,137 +51,39 @@ function uniqueStrings(values: Array<string | null | undefined>, limit = 8): str
   return result;
 }
 
-function normalizeLookup(value: unknown): string {
-  return String(value ?? "").trim().toLowerCase();
-}
-
-function collectPlannerSemanticText(input: {
-  query: string;
-  route: SupportQuestionRoute;
-  caseFrame: SupportCaseFrame;
-  evidencePlan: SupportEvidencePlan;
-}): string {
-  return uniqueStrings(
-    [
-      input.query,
-      input.route.user_goal,
-      input.caseFrame.goal,
-      input.caseFrame.symptom,
-      input.caseFrame.object,
-      input.caseFrame.action_type,
-      input.caseFrame.product_area,
-      input.caseFrame.deployment_model,
-      ...(input.caseFrame.constraints ?? []),
-      ...(input.caseFrame.retrieval_queries ?? []),
-      ...(input.caseFrame.required_doc_kinds ?? []),
-      ...(input.caseFrame.query_plan?.concept_queries ?? []),
-      ...(input.caseFrame.query_plan?.object_queries ?? []),
-      ...(input.caseFrame.query_plan?.behavior_queries ?? []),
-      ...(input.evidencePlan.evidence_priority ?? []),
-      ...(input.evidencePlan.required_doc_kinds ?? []),
-      ...(input.evidencePlan.query_plan?.concept_queries ?? []),
-      ...(input.evidencePlan.query_plan?.object_queries ?? []),
-      ...(input.evidencePlan.query_plan?.behavior_queries ?? [])
-    ],
-    64
-  )
-    .join(" ")
-    .toLowerCase();
-}
-
 function normalizeStageStatus<T>(result: PlannerStageResult<T>): PlannerStageStatus {
   return result.status;
 }
 
-function analyzePlanSignals(query: string) {
-  const lowered = query.toLowerCase();
-  const linuxDistributionContext =
-    /linux|发行版|操作系统/.test(lowered) &&
-    (/\bdistribution\b/.test(lowered) ||
-      /\bdistributions\b/.test(lowered) ||
-      /\boperating system\b/.test(lowered) ||
-      /\bos\b/.test(lowered) ||
-      /发行版|操作系统/.test(lowered));
-  const environmentRequirementsContext =
-    linuxDistributionContext ||
-    /\bsystem requirements?\b/.test(lowered) ||
-    /\bdeployment requirements?\b/.test(lowered) ||
-    /\bsupported operating systems?\b/.test(lowered) ||
-    /\bserver os\b/.test(lowered) ||
-    /系统要求|环境要求|兼容性|支持矩阵|操作系统要求/.test(lowered);
-
-  return {
-    linuxDistributionContext,
-    environmentRequirementsContext
-  };
-}
-
-function inferActionType(route: SupportQuestionRoute): string {
-  switch (route.question_type) {
-    case "how_to_product":
-    case "config_setup":
-      return "how_to";
-    case "troubleshooting":
-      return "troubleshooting";
-    case "api_endpoint_lookup":
-    case "api_field_lookup":
-    case "api_scope_auth":
-      return "api_lookup";
-    default:
-      return "capability_confirmation";
-  }
-}
-
 function synthesizeCaseFrame(query: string, route: SupportQuestionRoute): SupportCaseFrame {
-  const signals = analyzePlanSignals(query);
-  const deploymentScoped = signals.environmentRequirementsContext;
-  const object = signals.linuxDistributionContext ? "linux distributions" : route.user_goal || query;
-  const conceptQueries = deploymentScoped
-    ? ["supported operating systems", "deployment environment requirements", "system requirements"]
-    : [route.user_goal || query];
-  const objectQueries = signals.linuxDistributionContext
-    ? ["linux distributions", "linux operating systems", "server os"]
-    : [object];
-  const behaviorQueries =
-    route.question_type === "capability_confirmation"
-      ? ["officially supported", "support matrix", "compatibility policy"]
-      : [route.question_type.replace(/_/g, " ")];
+  const goal = route.user_goal || query;
+  const actionType = String(route.question_type ?? "").trim() || "unknown";
 
   return {
-    goal: route.user_goal || query,
-    symptom: route.user_goal || query,
-    object,
-    action_type: inferActionType(route),
-    deployment_model: deploymentScoped ? "private_deployment" : "unknown",
-    product_area: deploymentScoped ? "deployment" : "general",
+    goal,
+    symptom: goal,
+    object: goal,
+    action_type: actionType,
+    deployment_model: "unknown",
+    product_area: "general",
     constraints: [],
     missing_critical_info: [],
-    retrieval_queries: uniqueStrings(
-      deploymentScoped
-        ? [
-            `${query} deployment`,
-            "supported operating systems",
-            "deployment environment requirements",
-            "system requirements linux distributions"
-          ]
-        : [query, route.user_goal],
-      6
-    ),
+    retrieval_queries: uniqueStrings([query, route.user_goal], 4),
     query_plan: {
-      concept_queries: uniqueStrings(conceptQueries, 4),
-      object_queries: uniqueStrings(objectQueries, 4),
-      behavior_queries: uniqueStrings(behaviorQueries, 4)
+      concept_queries: uniqueStrings([query], 4),
+      object_queries: uniqueStrings([goal], 4),
+      behavior_queries: uniqueStrings([actionType], 4)
     },
     question_type: route.question_type,
     specialist_agent: route.specialist_agent,
     answer_contract: route.answer_contract,
     routing_confidence: route.routing_confidence,
-    required_doc_kinds: deploymentScoped ? ["product_guide", "rules", "troubleshooting"] : []
+    required_doc_kinds: []
   };
 }
 
 function synthesizeEvidencePlan(query: string, route: SupportQuestionRoute, caseFrame: SupportCaseFrame): SupportEvidencePlan {
-  const signals = analyzePlanSignals(query);
+  void route;
   const conceptQueries = caseFrame.query_plan?.concept_queries ?? [query];
   const objectQueries = caseFrame.query_plan?.object_queries ?? [caseFrame.object];
   const behaviorQueries = caseFrame.query_plan?.behavior_queries ?? [caseFrame.action_type];
@@ -191,131 +93,12 @@ function synthesizeEvidencePlan(query: string, route: SupportQuestionRoute, case
       object_queries: uniqueStrings(objectQueries, 4),
       behavior_queries: uniqueStrings(behaviorQueries, 4)
     },
-    evidence_priority: signals.environmentRequirementsContext
-      ? ["platform/system requirements", "support matrix", "deployment guide"]
-      : [route.question_type.replace(/_/g, " ")],
-    required_doc_kinds:
-      caseFrame.required_doc_kinds && caseFrame.required_doc_kinds.length > 0
-        ? caseFrame.required_doc_kinds
-        : signals.environmentRequirementsContext
-        ? ["product_guide", "rules", "troubleshooting"]
-        : [],
-    retrieval_rounds: 2,
-    allow_refinement: true,
+    evidence_priority: uniqueStrings(caseFrame.required_doc_kinds ?? [], 6),
+    required_doc_kinds: uniqueStrings(caseFrame.required_doc_kinds ?? [], 6),
+    retrieval_rounds: 1,
+    allow_refinement: false,
     stop_after_grounded_evidence: false
   };
-}
-
-function canonicalizeProductArea(input: {
-  query: string;
-  route: SupportQuestionRoute;
-  caseFrame: SupportCaseFrame;
-  evidencePlan: SupportEvidencePlan;
-}): string {
-  const explicit = normalizeLookup(input.caseFrame.product_area);
-  if (explicit === "deployment" || explicit === "deployment_environment" || explicit.startsWith("deployment_")) {
-    return "deployment";
-  }
-  if (explicit === "openapi") return "openapi";
-  if (explicit === "integrations" || explicit === "integration") return "integrations";
-
-  const semanticText = collectPlannerSemanticText(input);
-  if (String(input.route.question_type ?? "").startsWith("api_")) {
-    return "openapi";
-  }
-  if (/(部署|安装|环境要求|系统要求|支持矩阵|兼容性|private deployment|self-hosted|self hosted|on-prem|on prem|operating system|supported operating systems|deployment requirements|system requirements)/.test(semanticText)) {
-    return "deployment";
-  }
-  if (/(集成|回调|重定向|integration|callback|redirect|webhook|oauth app)/.test(semanticText)) {
-    return "integrations";
-  }
-  if (/(openapi|api|接口|scope|oauth|token)/.test(semanticText)) {
-    return "openapi";
-  }
-  return explicit && explicit !== "general" && explicit !== "unknown" ? "general" : input.caseFrame.product_area;
-}
-
-function canonicalizeRequiredDocKinds(values: string[], canonicalProductArea: string): string[] {
-  const canonical = uniqueStrings(
-    values.flatMap((value) => {
-      const normalized = normalizeLookup(value);
-      if (!normalized) return [];
-      const result: string[] = [];
-      if (normalized === "deployment_runbook" || /部署|安装|runbook/.test(normalized)) {
-        result.push("deployment_runbook");
-      }
-      if (
-        normalized === "product_guide" ||
-        /product.?guide|系统要求|环境要求|安装指南|部署文档|官方部署安装文档|guide/.test(normalized)
-      ) {
-        result.push("product_guide");
-      }
-      if (
-        normalized === "rules" ||
-        /rules?|constraint|compatibility|support matrix|版本(?:发布)?说明|限制|规则|支持矩阵|兼容性/.test(normalized)
-      ) {
-        result.push("rules");
-      }
-      if (normalized === "troubleshooting" || /故障|排查|troubleshooting/.test(normalized)) {
-        result.push("troubleshooting");
-      }
-      if (normalized === "openapi/api" || /openapi|api|接口/.test(normalized)) {
-        result.push("openapi/api");
-      }
-      if (normalized === "permissions" || /permission|scope|oauth|token|鉴权|授权|权限/.test(normalized)) {
-        result.push("permissions");
-      }
-      return result;
-    }),
-    6
-  );
-
-  if (canonical.length > 0) return canonical;
-  if (canonicalProductArea === "deployment") return ["deployment_runbook", "product_guide", "rules"];
-  if (canonicalProductArea === "openapi") return ["openapi/api"];
-  return [];
-}
-
-function canonicalizeObject(input: {
-  query: string;
-  caseFrame: SupportCaseFrame;
-  evidencePlan: SupportEvidencePlan;
-}): string {
-  const semanticText = uniqueStrings(
-    [
-      input.query,
-      input.caseFrame.object,
-      ...(input.caseFrame.retrieval_queries ?? []),
-      ...(input.caseFrame.query_plan?.object_queries ?? []),
-      ...(input.evidencePlan.query_plan?.object_queries ?? [])
-    ],
-    24
-  )
-    .join(" ")
-    .toLowerCase();
-
-  if (/linux/.test(semanticText) && (/distribution/.test(semanticText) || /发行版|操作系统/.test(semanticText))) {
-    return "linux distributions";
-  }
-
-  return input.caseFrame.object;
-}
-
-function canonicalizeActionType(actionType: string, route: SupportQuestionRoute): string {
-  const normalized = normalizeLookup(actionType);
-  if (normalized === "how_to" || normalized === "troubleshooting" || normalized === "api_lookup" || normalized === "capability_confirmation") {
-    return normalized;
-  }
-  if (/support[_ ]?matrix|compatibility|发行版|操作系统|system requirements?|environment requirements?/.test(normalized)) {
-    return "capability_confirmation";
-  }
-  if (/how|步骤|安装|配置|setup|configure/.test(normalized)) {
-    return "how_to";
-  }
-  if (/故障|排查|error|failed|troubleshoot/.test(normalized)) {
-    return "troubleshooting";
-  }
-  return inferActionType(route);
 }
 
 function normalizePlannerOutput(input: {
@@ -324,20 +107,57 @@ function normalizePlannerOutput(input: {
   caseFrame: SupportCaseFrame;
   evidencePlan: SupportEvidencePlan;
 }): { caseFrame: SupportCaseFrame; evidencePlan: SupportEvidencePlan } {
-  const productArea = canonicalizeProductArea(input);
-  const requiredDocKinds = canonicalizeRequiredDocKinds(
+  const requiredDocKinds = uniqueStrings(
     [...(input.caseFrame.required_doc_kinds ?? []), ...(input.evidencePlan.required_doc_kinds ?? [])],
-    productArea
+    6
   );
   const caseFrame: SupportCaseFrame = {
     ...input.caseFrame,
-    product_area: productArea,
-    object: canonicalizeObject(input),
-    action_type: canonicalizeActionType(input.caseFrame.action_type, input.route),
+    product_area: String(input.caseFrame.product_area ?? "").trim() || "general",
+    object: String(input.caseFrame.object ?? "").trim() || input.query,
+    action_type: String(input.caseFrame.action_type ?? "").trim() || "unknown",
+    retrieval_queries: uniqueStrings(
+      [...(input.caseFrame.retrieval_queries ?? []), input.query],
+      8
+    ),
+    query_plan: {
+      concept_queries: uniqueStrings(input.caseFrame.query_plan?.concept_queries?.length ? input.caseFrame.query_plan.concept_queries : [input.query], 4),
+      object_queries: uniqueStrings(
+        input.caseFrame.query_plan?.object_queries?.length
+          ? input.caseFrame.query_plan.object_queries
+          : [String(input.caseFrame.object ?? "").trim() || input.query],
+        4
+      ),
+      behavior_queries: uniqueStrings(
+        input.caseFrame.query_plan?.behavior_queries?.length
+          ? input.caseFrame.query_plan.behavior_queries
+          : [String(input.caseFrame.action_type ?? "").trim() || "unknown"],
+        4
+      )
+    },
     required_doc_kinds: requiredDocKinds.length > 0 ? requiredDocKinds : input.caseFrame.required_doc_kinds
   };
   const evidencePlan: SupportEvidencePlan = {
     ...input.evidencePlan,
+    query_plan: {
+      concept_queries: uniqueStrings(
+        input.evidencePlan.query_plan?.concept_queries?.length ? input.evidencePlan.query_plan.concept_queries : caseFrame.query_plan?.concept_queries ?? [input.query],
+        4
+      ),
+      object_queries: uniqueStrings(
+        input.evidencePlan.query_plan?.object_queries?.length
+          ? input.evidencePlan.query_plan.object_queries
+          : caseFrame.query_plan?.object_queries ?? [String(caseFrame.object ?? "").trim() || input.query],
+        4
+      ),
+      behavior_queries: uniqueStrings(
+        input.evidencePlan.query_plan?.behavior_queries?.length
+          ? input.evidencePlan.query_plan.behavior_queries
+          : caseFrame.query_plan?.behavior_queries ?? [String(caseFrame.action_type ?? "").trim() || "unknown"],
+        4
+      )
+    },
+    evidence_priority: uniqueStrings(input.evidencePlan.evidence_priority ?? [], 6),
     required_doc_kinds: requiredDocKinds.length > 0 ? requiredDocKinds : input.evidencePlan.required_doc_kinds
   };
   return {
@@ -356,16 +176,14 @@ export function canonicalizeSupportPlannerArtifacts(input: {
 }
 
 function buildRetrievalPlan(query: string, caseFrame: SupportCaseFrame, evidencePlan: SupportEvidencePlan) {
+  void evidencePlan;
   const baseQueries = uniqueStrings(
     [
       ...caseFrame.retrieval_queries,
-      ...(evidencePlan.query_plan?.concept_queries ?? []),
-      ...(evidencePlan.query_plan?.object_queries ?? []),
-      ...(evidencePlan.query_plan?.behavior_queries ?? []),
       query
     ],
     8
-  ).filter((item) => !/unspecified|general|shared|troubleshooting/i.test(item));
+  );
 
   return { baseQueries };
 }

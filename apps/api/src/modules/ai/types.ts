@@ -47,7 +47,7 @@ export type SupportQuestionType =
   | "capability_confirmation"
   | "data_export_reporting";
 
-export type SupportDomain = "openapi" | "deployment" | "docs";
+export type SupportDomain = "openapi" | "deployment" | "integrations" | "product" | "troubleshooting" | "docs";
 
 export type SupportSpecialistAgent =
   | "api-specialist"

@@ -52,6 +52,14 @@ import type {
   TriageSupportInsight
 } from "../../modules/ai/types.js";
 import { resolveSearchReferenceEvidenceId } from "../../modules/ai/types.js";
+import {
+  resolveAnswerComposerContract,
+  resolveDomainContract,
+  resolveEvidenceSelectorContract,
+  resolveEvidenceJudgeContract,
+  resolveSupportWriterContract,
+  resolveSupervisorContract
+} from "../../modules/ai/support-contracts.js";
 import { resolveStageSpecificAgent } from "../../modules/ai/agent-router.js";
 import { assertRuntimeBudgetAvailable, capRuntimeTimeoutMs } from "../../modules/ai/runtime-budget.js";
 
@@ -113,9 +121,18 @@ type ManagedRunSession = {
 };
 
 const managedRunSessions = new Map<string, ManagedRunSession>();
+const SUPPORT_RUNTIME_DOMAIN_ENUM = "openapi|deployment|integrations|product|troubleshooting";
+const SUPPORT_RUNTIME_QUESTION_TYPE_ENUM =
+  "api_endpoint_lookup|api_field_lookup|api_scope_auth|how_to_product|why_behavior|troubleshooting|config_setup|capability_confirmation|data_export_reporting";
+const SUPPORT_RUNTIME_SPECIALIST_AGENT_ENUM =
+  "api-specialist|howto-specialist|behavior-specialist|troubleshooting-specialist";
 
 function sanitizeSessionPart(input: string): string {
   return input.replace(/[^a-zA-Z0-9:_-]/g, "_").slice(0, 180);
+}
+
+function buildSupportContractPrompt(contractText: string, lines: string[]): string {
+  return [contractText.trim(), "", ...lines].join("\n");
 }
 
 function compactSupportMetadata(metadata: unknown): Record<string, unknown> | undefined {
@@ -245,7 +262,7 @@ function compactSpecialistDraftAnswer(answer?: SpecialistDraftAnswer) {
   };
 }
 
-function normalizeQuestionType(value: unknown): SupportQuestionRoute["question_type"] {
+function normalizeQuestionType(value: unknown): SupportQuestionRoute["question_type"] | null {
   switch (value) {
     case "api_endpoint_lookup":
     case "api_field_lookup":
@@ -258,53 +275,30 @@ function normalizeQuestionType(value: unknown): SupportQuestionRoute["question_t
     case "data_export_reporting":
       return value;
     default:
-      return "troubleshooting";
+      return null;
   }
 }
 
-function inferSupportDomain(input: {
-  explicit?: unknown;
-  questionType?: SupportQuestionRoute["question_type"];
-  productArea?: string;
-  deploymentModel?: string;
-}): SupportDomain {
-  if (input.explicit === "openapi" || input.explicit === "deployment" || input.explicit === "docs") {
-    return input.explicit;
-  }
-  if (String(input.questionType ?? "").startsWith("api_")) {
-    return "openapi";
-  }
-
-  const productArea = String(input.productArea ?? "").toLowerCase();
-  const deploymentModel = String(input.deploymentModel ?? "").toLowerCase();
+function normalizeSupportDomain(value: unknown): SupportDomain | null {
   if (
-    productArea.includes("deploy") ||
-    productArea.includes("ops") ||
-    productArea.includes("运维") ||
-    deploymentModel === "private_deployment"
+    value === "openapi" ||
+    value === "deployment" ||
+    value === "integrations" ||
+    value === "product" ||
+    value === "troubleshooting"
   ) {
-    return "deployment";
+    return value;
   }
-
-  return "docs";
+  if (value === "docs") return "product";
+  return null;
 }
 
-function specialistFromQuestionType(questionType: SupportQuestionRoute["question_type"]): SupportQuestionRoute["specialist_agent"] {
-  switch (questionType) {
-    case "api_endpoint_lookup":
-    case "api_field_lookup":
-    case "api_scope_auth":
-      return "api-specialist";
-    case "how_to_product":
-    case "config_setup":
-    case "data_export_reporting":
-      return "howto-specialist";
-    case "why_behavior":
-    case "capability_confirmation":
-      return "behavior-specialist";
-    default:
-      return "troubleshooting-specialist";
+function resolveDeclaredSupportDomain(...values: unknown[]): SupportDomain | null {
+  for (const value of values) {
+    const normalized = normalizeSupportDomain(value);
+    if (normalized) return normalized;
   }
+  return null;
 }
 
 function isLowSignalMissingInfo(item: string): boolean {
@@ -353,22 +347,29 @@ function normalizeSupportRenderVariant(
 
 function normalizeSupportRouteOutput(parsed: Record<string, unknown>, fallbackQuery: string): SupportQuestionRoute {
   const question_type = normalizeQuestionType(parsed.question_type);
+  if (!question_type) {
+    throw new Error("support route contract violation: question_type");
+  }
+  if (
+    parsed.specialist_agent !== "api-specialist" &&
+    parsed.specialist_agent !== "howto-specialist" &&
+    parsed.specialist_agent !== "behavior-specialist" &&
+    parsed.specialist_agent !== "troubleshooting-specialist"
+  ) {
+    throw new Error("support route contract violation: specialist_agent");
+  }
+  if (typeof parsed.answer_contract !== "string" || !parsed.answer_contract.trim()) {
+    throw new Error("support route contract violation: answer_contract");
+  }
+  const declaredDomain = normalizeSupportDomain(parsed.primary_domain);
+  if (!declaredDomain) {
+    throw new Error("support route contract violation: primary_domain");
+  }
   return {
     question_type,
     user_goal: typeof parsed.user_goal === "string" ? parsed.user_goal : fallbackQuery,
-    answer_contract:
-      typeof parsed.answer_contract === "string"
-        ? parsed.answer_contract
-        : question_type.startsWith("api_")
-        ? "Provide the exact API endpoint details first."
-        : "Provide the most useful support answer first.",
-    specialist_agent:
-      parsed.specialist_agent === "api-specialist" ||
-      parsed.specialist_agent === "howto-specialist" ||
-      parsed.specialist_agent === "behavior-specialist" ||
-      parsed.specialist_agent === "troubleshooting-specialist"
-        ? parsed.specialist_agent
-        : specialistFromQuestionType(question_type),
+    answer_contract: parsed.answer_contract.trim(),
+    specialist_agent: parsed.specialist_agent,
     routing_confidence:
       typeof parsed.routing_confidence === "number" && Number.isFinite(parsed.routing_confidence)
         ? Math.max(0, Math.min(1, parsed.routing_confidence))
@@ -377,15 +378,13 @@ function normalizeSupportRouteOutput(parsed: Record<string, unknown>, fallbackQu
       typeof parsed.specialist_budget === "number" && Number.isFinite(parsed.specialist_budget)
         ? Math.max(0, Math.round(parsed.specialist_budget))
         : undefined,
-    primary_domain: inferSupportDomain({
-      explicit: parsed.primary_domain,
-      questionType: question_type
-    })
+    primary_domain: declaredDomain
   };
 }
 
 function normalizeSupportCaseFrameOutput(parsed: Partial<SupportCaseFrame>, fallbackQuery: string): SupportCaseFrame {
   const queryPlan = (parsed.query_plan as unknown as Record<string, unknown> | undefined) ?? undefined;
+  const questionType = normalizeQuestionType(parsed.question_type);
   return {
     goal: typeof parsed.goal === "string" ? parsed.goal : fallbackQuery,
     symptom: typeof parsed.symptom === "string" ? parsed.symptom : fallbackQuery,
@@ -414,7 +413,7 @@ function normalizeSupportCaseFrameOutput(parsed: Partial<SupportCaseFrame>, fall
               : []
           }
         : undefined,
-    question_type: normalizeQuestionType(parsed.question_type),
+    question_type: questionType ?? undefined,
     specialist_agent:
       parsed.specialist_agent === "api-specialist" ||
       parsed.specialist_agent === "howto-specialist" ||
@@ -430,12 +429,7 @@ function normalizeSupportCaseFrameOutput(parsed: Partial<SupportCaseFrame>, fall
     required_doc_kinds: Array.isArray(parsed.required_doc_kinds)
       ? parsed.required_doc_kinds.map((item) => String(item)).filter(Boolean)
       : undefined,
-    primary_domain: inferSupportDomain({
-      explicit: parsed.primary_domain,
-      questionType: normalizeQuestionType(parsed.question_type),
-      productArea: typeof parsed.product_area === "string" ? parsed.product_area : undefined,
-      deploymentModel: typeof parsed.deployment_model === "string" ? parsed.deployment_model : undefined
-    })
+    primary_domain: normalizeSupportDomain(parsed.primary_domain) ?? undefined
   };
 }
 
@@ -467,6 +461,50 @@ function normalizeSupportEvidencePlanOutput(parsed: Record<string, unknown>): Su
     stop_after_grounded_evidence:
       typeof parsed.stop_after_grounded_evidence === "boolean" ? parsed.stop_after_grounded_evidence : undefined
   };
+}
+
+function assertArrayOfStrings(value: unknown, field: string): void {
+  if (!Array.isArray(value)) {
+    throw new Error(`contract violation: ${field} must be string[]`);
+  }
+  if (value.some((item) => typeof item !== "string")) {
+    throw new Error(`contract violation: ${field} must be string[]`);
+  }
+}
+
+function assertSupportComposerOutput(candidate: Record<string, unknown>): void {
+  if (typeof candidate.direct_answer !== "string") {
+    throw new Error("contract violation: direct_answer");
+  }
+  assertArrayOfStrings(candidate.why, "why");
+  assertArrayOfStrings(candidate.what_to_do_now, "what_to_do_now");
+  assertArrayOfStrings(candidate.still_need_to_confirm, "still_need_to_confirm");
+}
+
+function assertSpecialistDraftOutput(candidate: Record<string, unknown>): void {
+  if (!normalizeQuestionType(candidate.question_type)) {
+    throw new Error("contract violation: question_type");
+  }
+  if (typeof candidate.direct_answer !== "string") {
+    throw new Error("contract violation: direct_answer");
+  }
+}
+
+function assertVerificationOutput(candidate: Record<string, unknown>): void {
+  if (candidate.verdict !== "verified" && candidate.verdict !== "partial" && candidate.verdict !== "unsupported") {
+    throw new Error("contract violation: verdict");
+  }
+  if (typeof candidate.summary !== "string") {
+    throw new Error("contract violation: summary");
+  }
+  assertArrayOfStrings(candidate.unsupported_claims, "unsupported_claims");
+  assertArrayOfStrings(candidate.missing_info, "missing_info");
+  assertArrayOfStrings(candidate.verified_citation_ids, "verified_citation_ids");
+  assertArrayOfStrings(candidate.display_citation_ids, "display_citation_ids");
+  assertArrayOfStrings(candidate.verified_claims, "verified_claims");
+  if (!Array.isArray(candidate.claim_to_citation_map)) {
+    throw new Error("contract violation: claim_to_citation_map");
+  }
 }
 
 function compactTriageInsightForVerification(insight?: TriageSupportInsight) {
@@ -625,7 +663,15 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
   }
 
   private shouldRetryWithoutDeviceToken(error: unknown): boolean {
-    return error instanceof Error && error.message.toLowerCase().includes("device token mismatch");
+    if (!(error instanceof Error)) return false;
+    const message = error.message.toLowerCase();
+    return (
+      message.includes("device token mismatch") ||
+      message.includes("401 status code") ||
+      message.includes("403 status code") ||
+      message.includes("unauthorized") ||
+      message.includes("forbidden")
+    );
   }
 
   private buildConnectParams(input: {
@@ -834,8 +880,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
       const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "search-answer");
       const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments, sessionKey);
-      await this.waitAgentRun(runId, sessionKey, runtime);
-      const text = await this.fetchLatestAssistantText(sessionKey);
+      const text = await this.waitForChatAssistantText(runId, sessionKey, runtime);
       const parsed = this.parseFirstJson(text) as Partial<OpenClawSearchAnswerOutput>;
       return {
         answer: typeof parsed.answer === "string" ? parsed.answer : typeof parsed.summary === "string" ? parsed.summary : "",
@@ -896,23 +941,17 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawSupportExecutionPlannerOutput> {
-    const prompt = [
-      "You are the canonical schema-first support execution planner for ONES.",
+    const prompt = buildSupportContractPrompt(resolveSupervisorContract(), [
       "Return ONLY valid JSON with keys:",
-      "route({question_type,user_goal,answer_contract,specialist_agent,routing_confidence,specialist_budget}),",
-      "case_frame({goal,symptom,object,action_type,deployment_model,product_area,constraints(string[]),missing_critical_info(string[]),retrieval_queries(string[]),query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),required_doc_kinds(string[])}),",
+      `primary_domain(${SUPPORT_RUNTIME_DOMAIN_ENUM}),`,
+      "route({question_type,user_goal,answer_contract,specialist_agent,routing_confidence,specialist_budget,primary_domain}),",
+      "case_frame({goal,symptom,object,action_type,deployment_model,product_area,constraints(string[]),missing_critical_info(string[]),retrieval_queries(string[]),query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),required_doc_kinds(string[]),primary_domain}),",
       "evidence_plan({query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),evidence_priority(string[]),required_doc_kinds(string[]),retrieval_rounds(number),allow_refinement(boolean),stop_after_grounded_evidence(boolean)})",
-      "Rules:",
-      "- This is the single canonical planner output for the support pipeline. Keep all three sections mutually consistent.",
-      "- question_type must be one of: api_endpoint_lookup, api_field_lookup, api_scope_auth, how_to_product, why_behavior, troubleshooting, config_setup, capability_confirmation, data_export_reporting.",
-      "- specialist_agent must be one of: api-specialist, howto-specialist, behavior-specialist, troubleshooting-specialist.",
-      "- Keep user_goal concise and customer-oriented.",
-      "- Prefer a specific object and product_area over generic placeholders when the query already makes them clear.",
-      "- For private deployment, on-prem, OS/server-side, or ops-toolkit questions, set deployment_model=private_deployment unless the user explicitly says public cloud.",
-      "- Only put genuinely blocking items into missing_critical_info. If a best-effort grounded answer is possible, leave it empty.",
-      "- query_plan must optimize retrieval for documentation, not for generic web search.",
-      "- evidence_plan.required_doc_kinds must agree with the case frame and the routed question type.",
-      "- retrieval_rounds should be 1 or 2. allow_refinement should be true only when a second pass is useful.",
+      `route.question_type must be one of: ${SUPPORT_RUNTIME_QUESTION_TYPE_ENUM}.`,
+      `route.specialist_agent must be one of: ${SUPPORT_RUNTIME_SPECIALIST_AGENT_ENUM}.`,
+      "route.specialist_budget must be an integer number or omitted; do not output strings like low/medium/high.",
+      `route.primary_domain and top-level primary_domain must be one of: ${SUPPORT_RUNTIME_DOMAIN_ENUM}.`,
+      "Do not invent enum labels.",
       `context_type: ${input.contextType}`,
       `language: ${input.language}`,
       `user_query: ${input.query}`,
@@ -926,23 +965,46 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
             `ticket_history: ${JSON.stringify(input.ticketContext.history.slice(-6))}`
           ]
         : [])
-    ].join("\n");
+    ]);
 
-    const parsed = (await this.runJsonPrompt(prompt, `${idempotencyKey}:planner`, runtime, undefined, "planner")) as Record<string, unknown>;
+    const parsed = await this.runJsonPromptWithSchemaRepair({
+      prompt,
+      idempotencyKey: `${idempotencyKey}:planner`,
+      runtime,
+      stage: "planner",
+      validate: (candidate) => {
+        const routeCandidate = (candidate.route as Record<string, unknown> | undefined) ?? {};
+        normalizeSupportRouteOutput(routeCandidate, input.query);
+      }
+    });
     const route = normalizeSupportRouteOutput(((parsed.route as Record<string, unknown> | undefined) ?? {}), input.query);
     const rawCaseFrame = normalizeSupportCaseFrameOutput(
       (((parsed.case_frame as Partial<SupportCaseFrame> | undefined) ?? {}) as Partial<SupportCaseFrame>),
       input.query
     );
     const rawEvidencePlan = normalizeSupportEvidencePlanOutput(((parsed.evidence_plan as Record<string, unknown> | undefined) ?? {}));
+    const primaryDomain = resolveDeclaredSupportDomain(
+      parsed.primary_domain,
+      (parsed.route as Record<string, unknown> | undefined)?.primary_domain,
+      (parsed.case_frame as Record<string, unknown> | undefined)?.primary_domain,
+      route.primary_domain,
+      rawCaseFrame.primary_domain
+    );
+    if (!primaryDomain) {
+      throw new Error("support execution contract violation: primary_domain");
+    }
     return {
-      route,
+      route: {
+        ...route,
+        primary_domain: primaryDomain
+      },
       caseFrame: {
         ...rawCaseFrame,
         question_type: route.question_type,
         specialist_agent: route.specialist_agent,
         answer_contract: route.answer_contract,
         routing_confidence: route.routing_confidence,
+        primary_domain: primaryDomain,
         required_doc_kinds:
           rawCaseFrame.required_doc_kinds && rawCaseFrame.required_doc_kinds.length > 0
             ? rawCaseFrame.required_doc_kinds
@@ -963,27 +1025,17 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawSupportDispatchOutput> {
-    const prompt = [
-      "You are the supervisor dispatcher for the ONES customer-facing support runtime.",
+    const prompt = buildSupportContractPrompt(resolveSupervisorContract(), [
       "Return ONLY valid JSON with keys:",
-      "primary_domain(openapi|deployment|docs),",
+      `primary_domain(${SUPPORT_RUNTIME_DOMAIN_ENUM}),`,
       "route({question_type,user_goal,answer_contract,specialist_agent,routing_confidence,specialist_budget,primary_domain}),",
       "case_frame({goal,symptom,object,action_type,deployment_model,product_area,constraints(string[]),missing_critical_info(string[]),retrieval_queries(string[]),query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),required_doc_kinds(string[]),primary_domain}),",
       "retrieval_queries(string[])",
-      "Rules:",
-      "- Do not draft the customer answer.",
-      "- Do not retrieve. Produce retrieval_queries only for backend published-KB retrieval.",
-      "- primary_domain must be one of: openapi, deployment, docs.",
-      "- route.question_type must be one of: api_endpoint_lookup, api_field_lookup, api_scope_auth, how_to_product, why_behavior, troubleshooting, config_setup, capability_confirmation, data_export_reporting.",
-      "- route.specialist_agent must be one of: api-specialist, howto-specialist, behavior-specialist, troubleshooting-specialist.",
-      "- case_frame.product_area must be one of: openapi, deployment, integrations, general.",
-      "- case_frame.required_doc_kinds must use only: deployment_runbook, product_guide, rules, troubleshooting, openapi/api, permissions.",
-      "- openapi: OpenAPI, OAuth, token, scope, endpoint, method, schema, request/response fields.",
-      "- deployment: private deployment, self-hosted, server-side recovery, OS or host operations, admin recovery, SMTP blocked reset, architecture and capacity questions tied to deployment.",
-      "- docs: product behavior, capability, workflow, configuration, reporting, general how-to questions answered from published docs.",
-      "- Keep route, case_frame, primary_domain, and retrieval_queries mutually consistent.",
-      "- Retrieval must stay single-pass. Make retrieval_queries specific and object-aware.",
-      "- Only ask for missing_critical_info when the answer truly cannot proceed without it.",
+      `route.question_type must be one of: ${SUPPORT_RUNTIME_QUESTION_TYPE_ENUM}.`,
+      `route.specialist_agent must be one of: ${SUPPORT_RUNTIME_SPECIALIST_AGENT_ENUM}.`,
+      "route.specialist_budget must be an integer number or omitted; do not output strings like low/medium/high.",
+      `route.primary_domain and top-level primary_domain must be one of: ${SUPPORT_RUNTIME_DOMAIN_ENUM}.`,
+      "Do not invent enum labels.",
       `context_type: ${input.contextType}`,
       `language: ${input.language}`,
       `user_query: ${input.query}`,
@@ -997,26 +1049,33 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
             `ticket_history: ${JSON.stringify(input.ticketContext.history.slice(-6))}`
           ]
         : [])
-    ].join("\n");
+    ]);
 
-    const parsed = (await this.runJsonPrompt(
+    const parsed = await this.runJsonPromptWithSchemaRepair({
       prompt,
-      `${idempotencyKey}:support-dispatch`,
+      idempotencyKey: `${idempotencyKey}:support-dispatch`,
       runtime,
-      undefined,
-      "planner"
-    )) as Record<string, unknown>;
+      stage: "planner",
+      validate: (candidate) => {
+        const routeCandidate = (candidate.route as Record<string, unknown> | undefined) ?? {};
+        normalizeSupportRouteOutput(routeCandidate, input.query);
+      }
+    });
     const route = normalizeSupportRouteOutput(((parsed.route as Record<string, unknown> | undefined) ?? {}), input.query);
     const rawCaseFrame = normalizeSupportCaseFrameOutput(
       (((parsed.case_frame as Partial<SupportCaseFrame> | undefined) ?? {}) as Partial<SupportCaseFrame>),
       input.query
     );
-    const primaryDomain = inferSupportDomain({
-      explicit: parsed.primary_domain,
-      questionType: route.question_type,
-      productArea: rawCaseFrame.product_area,
-      deploymentModel: rawCaseFrame.deployment_model
-    });
+    const primaryDomain = resolveDeclaredSupportDomain(
+      parsed.primary_domain,
+      (parsed.route as Record<string, unknown> | undefined)?.primary_domain,
+      (parsed.case_frame as Record<string, unknown> | undefined)?.primary_domain,
+      route.primary_domain,
+      rawCaseFrame.primary_domain
+    );
+    if (!primaryDomain) {
+      throw new Error("support dispatch contract violation: primary_domain");
+    }
     const retrievalQueries = Array.isArray(parsed.retrieval_queries)
       ? parsed.retrieval_queries.map((item) => String(item)).filter(Boolean)
       : rawCaseFrame.retrieval_queries;
@@ -1048,9 +1107,13 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       "You are the single support-main agent for the ONES customer-facing support runtime.",
       "Stage: plan.",
       "Return ONLY valid JSON with keys:",
-      "route({question_type,user_goal,answer_contract,specialist_agent,routing_confidence,specialist_budget}),",
-      "case_frame({goal,symptom,object,action_type,deployment_model,product_area,constraints(string[]),missing_critical_info(string[]),retrieval_queries(string[]),query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),required_doc_kinds(string[])}),",
+      `route({question_type,user_goal,answer_contract,specialist_agent,routing_confidence,specialist_budget,primary_domain(${SUPPORT_RUNTIME_DOMAIN_ENUM})}),`,
+      `case_frame({goal,symptom,object,action_type,deployment_model,product_area,constraints(string[]),missing_critical_info(string[]),retrieval_queries(string[]),query_plan({concept_queries:string[],object_queries:string[],behavior_queries:string[]}),required_doc_kinds(string[]),primary_domain(${SUPPORT_RUNTIME_DOMAIN_ENUM})}),`,
       "retrieval_queries(string[])",
+      `route.question_type must be one of: ${SUPPORT_RUNTIME_QUESTION_TYPE_ENUM}.`,
+      `route.specialist_agent must be one of: ${SUPPORT_RUNTIME_SPECIALIST_AGENT_ENUM}.`,
+      "route.specialist_budget must be an integer number or omitted; do not output strings like low/medium/high.",
+      "Do not invent enum labels.",
       "Rules:",
       "- Do not draft the customer answer in this stage.",
       "- Do not retrieve inside this run. Produce retrieval queries only for the backend published-KB retrieval step.",
@@ -1074,13 +1137,16 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         : [])
     ].join("\n");
 
-    const parsed = (await this.runJsonPrompt(
+    const parsed = await this.runJsonPromptWithSchemaRepair({
       prompt,
-      `${idempotencyKey}:support-main:plan`,
+      idempotencyKey: `${idempotencyKey}:support-main:plan`,
       runtime,
-      undefined,
-      "support-main"
-    )) as Record<string, unknown>;
+      stage: "support-main",
+      validate: (candidate) => {
+        const routeCandidate = (candidate.route as Record<string, unknown> | undefined) ?? {};
+        normalizeSupportRouteOutput(routeCandidate, input.query);
+      }
+    });
     const route = normalizeSupportRouteOutput(((parsed.route as Record<string, unknown> | undefined) ?? {}), input.query);
     const rawCaseFrame = normalizeSupportCaseFrameOutput(
       (((parsed.case_frame as Partial<SupportCaseFrame> | undefined) ?? {}) as Partial<SupportCaseFrame>),
@@ -1097,7 +1163,8 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         question_type: route.question_type,
         specialist_agent: route.specialist_agent,
         answer_contract: route.answer_contract,
-        routing_confidence: route.routing_confidence
+        routing_confidence: route.routing_confidence,
+        primary_domain: rawCaseFrame.primary_domain ?? route.primary_domain
       },
       retrievalQueries
     };
@@ -1164,7 +1231,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
     return {
       draftAnswer: {
-        question_type: normalizeQuestionType(draft.question_type ?? input.route.question_type),
+        question_type: normalizeQuestionType(draft.question_type ?? input.route.question_type) ?? input.route.question_type,
         render_variant: normalizeSupportRenderVariant(draft.render_variant, input.route.question_type),
         direct_answer: typeof draft.direct_answer === "string" ? draft.direct_answer : "",
         claims: Array.isArray(draft.claims)
@@ -1231,16 +1298,13 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     return this.runDomainSpecialistPrompt(
       "api-specialist",
       [
-        "You are the OpenAPI domain specialist for ONES customer-facing support.",
+        resolveDomainContract("openapi"),
         "Return ONLY valid JSON with keys:",
         "question_type, render_variant, direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean), api_method, api_path, required_params(string[]), auth_scope(string[]), response_field_hint, important_note, related_variant",
         "Rules:",
         "- Use ONLY provided_evidence. Do not retrieve.",
-        "- Answer the likely primary API conclusion first.",
-        "- If the question implies changing or reading an issue/project/comment/field object and the evidence contains a matching method/path, treat that operation as the primary answer.",
-        "- If the evidence already contains a plausible exact operation doc, do not fall back to a generic handoff or clarification.",
-        "- If the question mentions assignee, owner, status, field, UUID, or request payload, surface the exact documented operation and the relevant request/response fact when evidence supports it.",
-        "- Convert supported endpoint, field, parameter, scope, and auth facts into narrow claims with evidence_ids.",
+        "- Answer the user's actual question directly first.",
+        "- Keep every factual claim narrow and grounded.",
         "- Do not mention internal routing or reasoning."
       ],
       input,
@@ -1261,17 +1325,14 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         ? "behavior-specialist"
         : "howto-specialist",
       [
-        "You are the deployment domain specialist for ONES customer-facing support.",
+        resolveDomainContract("deployment"),
         "Return ONLY valid JSON with keys:",
         "question_type, render_variant, direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean), steps(string[]), prerequisites(string[]), limits_or_notes(string[]), most_likely_explanation, confirmed_facts(string[]), what_to_check_next(string[]), most_likely_causes(string[]), recommended_checks(string[]), required_followup_info(string[]), when_to_handoff",
         "Rules:",
         "- Use ONLY provided_evidence. Do not retrieve.",
-        "- Focus on private deployment, recovery, host-side operations, architecture, and deployment constraints.",
-        "- When the question is procedural, prefer direct steps and prerequisites.",
-        "- When the question is about deployment capability, architecture, isolation, or expected behavior, answer the documented architecture conclusion first and fill most_likely_explanation, confirmed_facts, and what_to_check_next.",
-        "- When the question is diagnostic, prefer the most likely causes and immediate checks.",
-        "- For deployment behavior questions, keep claims narrow and grounded in the deployment docs that explicitly describe topology, supported isolation, or component externalization.",
-        "- Keep unknowns narrow and operational."
+        "- Answer the user's actual question directly first.",
+        "- Match the routed specialist intent when choosing which optional fields to fill.",
+        "- Keep every factual claim narrow and grounded."
       ],
       input,
       idempotencyKey,
@@ -1284,6 +1345,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SpecialistDraftAnswer> {
+    const promptDomain = resolveDeclaredSupportDomain(input.route.primary_domain, input.caseFrame.primary_domain) ?? "product";
     return this.runDomainSpecialistPrompt(
       input.route.specialist_agent === "howto-specialist"
         ? "howto-specialist"
@@ -1291,19 +1353,14 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         ? "troubleshooting-specialist"
         : "behavior-specialist",
       [
-        "You are the product-docs domain specialist for ONES customer-facing support.",
+        resolveDomainContract(promptDomain),
         "Return ONLY valid JSON with keys:",
         "question_type, render_variant, direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean), steps(string[]), prerequisites(string[]), limits_or_notes(string[]), most_likely_explanation, confirmed_facts(string[]), what_to_check_next(string[]), most_likely_causes(string[]), recommended_checks(string[]), required_followup_info(string[]), when_to_handoff",
         "Rules:",
         "- Use ONLY provided_evidence. Do not retrieve.",
-        "- Answer from published product documentation, behavior notes, capability descriptions, and how-to guidance.",
-        "- Prefer a direct product conclusion before extra context.",
-        "- Do not turn endpoint, request-field, scope, or auth lookup questions into generic product navigation or generic behavior language.",
-        "- If the route indicates how-to, keep the answer procedural. If the route indicates behavior, keep the answer explanatory. If the route indicates troubleshooting, keep the answer diagnostic.",
-        "- For docs-domain troubleshooting, fill most_likely_causes, recommended_checks, and required_followup_info whenever the provided evidence supports them. Use when_to_handoff only for a narrow escalation condition.",
-        "- For docs-domain troubleshooting, prefer the most likely documented cause first, then the direct checks the customer can run now.",
-        "- When the provided evidence does not support a docs-domain answer, keep unknowns narrow instead of inventing broad unsupported guidance.",
-        "- Keep the wording concise and support-engineer style."
+        "- Answer the user's actual question directly first.",
+        "- Match the routed specialist intent when choosing which optional fields to fill.",
+        "- Keep every factual claim narrow and grounded."
       ],
       input,
       idempotencyKey,
@@ -1316,18 +1373,13 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportQuestionRoute> {
-    const prompt = [
-      "You are the Router Agent for a support engineer system.",
-      "Return ONLY valid JSON with keys: question_type, user_goal, answer_contract, specialist_agent, routing_confidence",
-      "question_type must be one of: api_endpoint_lookup, api_field_lookup, api_scope_auth, how_to_product, why_behavior, troubleshooting, config_setup, capability_confirmation, data_export_reporting.",
-      "specialist_agent must be one of: api-specialist, howto-specialist, behavior-specialist, troubleshooting-specialist.",
+    const prompt = buildSupportContractPrompt(resolveSupervisorContract(), [
+      "Return ONLY valid JSON with keys: question_type, user_goal, answer_contract, specialist_agent, routing_confidence, specialist_budget, primary_domain",
+      `question_type must be one of: ${SUPPORT_RUNTIME_QUESTION_TYPE_ENUM}.`,
+      `specialist_agent must be one of: ${SUPPORT_RUNTIME_SPECIALIST_AGENT_ENUM}.`,
+      "specialist_budget must be an integer number or omitted; do not output strings like low/medium/high.",
       "answer_contract should be a concise description of what a useful customer-facing answer must contain for this question.",
       "Rules:",
-      "- API endpoint/path/field/scope questions must route to an API specialist.",
-      "- How-to/setup/export workflow questions must route to a How-To specialist.",
-      "- Private deployment operational recovery questions, including server-side password reset or access recovery, should usually route to How-To instead of Behavior.",
-      "- Questions asking why, expected behavior, rules, or whether behavior is intended must route to a Behavior specialist.",
-      "- Error, failure, or not-working questions must route to a Troubleshooting specialist unless they are clearly endpoint lookup questions.",
       "- Keep user_goal concise and customer-oriented.",
       `context_type: ${input.contextType}`,
       `language: ${input.language}`,
@@ -1335,9 +1387,17 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       ...(input.conversationHistory?.length
         ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
         : [])
-    ].join("\n");
+    ]);
 
-    const parsed = (await this.runJsonPrompt(prompt, `${idempotencyKey}:router`, runtime, undefined, "router")) as Record<string, unknown>;
+    const parsed = await this.runJsonPromptWithSchemaRepair({
+      prompt,
+      idempotencyKey: `${idempotencyKey}:router`,
+      runtime,
+      stage: "router",
+      validate: (candidate) => {
+        normalizeSupportRouteOutput(candidate, input.query);
+      }
+    });
     return normalizeSupportRouteOutput(parsed, input.query);
   }
 
@@ -1499,38 +1559,29 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       sourceType: reference.sourceType,
       supportMetadata: compactSupportMetadata(reference.supportMetadata)
     }));
-    const prompt = [
-      "You are an evidence selector for a support engineer agent.",
+    const prompt = buildSupportContractPrompt(resolveEvidenceSelectorContract(), [
       "Return ONLY valid JSON with keys: primary_ids(string[]), supplemental_ids(string[]), rejected_ids(string[])",
-      "Rules:",
-      "- Select only documentation chunks that directly help answer the user's question.",
-      "- Prioritize sources that explicitly discuss the queried object, rule, syntax, API, scope, or behavior.",
-      "- Follow case_frame.required_doc_kinds strictly when strong matches exist.",
-      "- For how_to_product, config_setup, and data_export_reporting: if both product guides and deployment runbooks are present, choose the document that gives the most direct executable procedure for the user’s stated task as primary.",
-      "- For how_to_product, config_setup, and data_export_reporting: keep deployment/private_deployment troubleshooting docs as primary only when the user question itself is clearly infra/deployment-oriented or the candidate directly matches the reported symptom; otherwise keep them supplemental.",
-      "- Use supportMetadata.deployment_model, product_area, evidence_kind, prerequisites, and limitations when deciding which evidence is the best fit.",
-      "- For api_field_lookup, prefer the operation that returns the current object details; list or enum endpoints should be supplemental unless the question explicitly asks for the list.",
-      "- For capability_confirmation and why_behavior about syntax or operators, prefer syntax/reference docs before general product guides.",
-      "- Reject tangential sources even if they are from the same product area.",
-      "- primary_ids should contain the strongest 1 to 3 evidence ids.",
-      "- supplemental_ids may contain up to 2 additional evidence ids that add useful context.",
-      "- Do not include the same id in multiple arrays.",
-      "- When you output ids, copy the exact evidenceId strings from candidate_evidence.evidenceId. Never output documentId as a substitute.",
       `context_type: ${input.contextType}`,
       `language: ${input.language}`,
       `user_query: ${input.query}`,
       `query_focus_terms: ${JSON.stringify(extractQueryFocusTerms({ query: input.query, caseFrame: input.caseFrame }))}`,
       `case_frame: ${JSON.stringify(input.caseFrame)}`,
       `candidate_evidence: ${JSON.stringify(candidates)}`
-    ].join("\n");
+    ]);
 
-    const parsed = (await this.runJsonPrompt(
+    const parsed = (await this.runJsonPromptWithSchemaRepair({
       prompt,
-      `${idempotencyKey}:support-evidence-selector`,
+      idempotencyKey: `${idempotencyKey}:support-evidence-selector`,
       runtime,
-      undefined,
-      "support-evidence-selector"
-    )) as Partial<SupportEvidenceSelection>;
+      stage: "support-evidence-selector",
+      validate: (candidate) => {
+        assertArrayOfStrings(candidate.primary_ids, "primary_ids");
+        assertArrayOfStrings(candidate.supplemental_ids, "supplemental_ids");
+        if (candidate.rejected_ids !== undefined) {
+          assertArrayOfStrings(candidate.rejected_ids, "rejected_ids");
+        }
+      }
+    })) as Partial<SupportEvidenceSelection>;
     const primaryIds = Array.isArray(parsed.primary_ids) ? parsed.primary_ids.map((item) => String(item)).filter(Boolean) : [];
     const supplementalIds = Array.isArray(parsed.supplemental_ids)
       ? parsed.supplemental_ids.map((item) => String(item)).filter(Boolean)
@@ -1557,25 +1608,9 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       supplementalLimit: 2,
       snippetMax: String(input.caseFrame.question_type ?? "").startsWith("api_") ? 900 : 260
     });
-    const prompt = [
-      "You are a support engineer agent for ONES.",
+    const prompt = buildSupportContractPrompt(resolveSupportWriterContract(), [
       "Return ONLY valid JSON:",
       "direct_answer, claims([{text, kind(verified_fact|grounded_inference|operational_advice|unknown), evidence_ids(string[]), authority(canonical|assistive)}]), next_actions(string[]), unknowns(string[]), escalation_needed(boolean)",
-      "Rules:",
-      "- Answer the user's actual question first in a support engineer style.",
-      "- Organize your answer as: direct answer, why you think so, what to do now, and what is still unconfirmed.",
-      "- Use polite, professional, and measured wording.",
-      "- Be helpful and respectful. Do not sound abrupt, dismissive, or overly certain.",
-      "- Do not output framework words like verification or evidence gap.",
-      "- Claims about APIs, parameters, scopes, permissions, limits, deployment, and versions must be grounded in evidence.",
-      "- Every verified_fact or grounded_inference claim MUST include evidence_ids from the evidence bundle.",
-      "- If you conclude that a syntax clause, API capability, or query behavior is supported or documented, attach the exact evidence_ids that mention it.",
-      "- If you cannot attach evidence_ids for a factual capability claim, do not state that claim as fact.",
-      "- When you output evidence_ids, copy the exact evidenceId strings from evidence_bundle.primary or evidence_bundle.supplemental. Never invent path-based ids or rewrite them.",
-      "- Use grounded_inference only when multiple canonical snippets strongly imply the conclusion.",
-      "- Use operational_advice for safe next-step guidance.",
-      "- unknown is for unresolved items that still need confirmation.",
-      "- Never say 'refer to the doc' or 'follow the documentation'. State the relevant content directly.",
       `context_type: ${input.contextType}`,
       `language: ${input.language}`,
       `user_query: ${input.query}`,
@@ -1585,15 +1620,24 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       ...(input.conversationHistory?.length
         ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
         : [])
-    ].join("\n");
+    ]);
 
-    const parsed = (await this.runJsonPrompt(
+    const parsed = (await this.runJsonPromptWithSchemaRepair({
       prompt,
-      `${idempotencyKey}:support-writer`,
+      idempotencyKey: `${idempotencyKey}:support-writer`,
       runtime,
-      undefined,
-      "support-writer"
-    )) as Partial<DraftSupportAnswer>;
+      stage: "support-writer",
+      validate: (candidate) => {
+        if (typeof candidate.direct_answer !== "string") {
+          throw new Error("contract violation: direct_answer");
+        }
+        assertArrayOfStrings(candidate.next_actions, "next_actions");
+        assertArrayOfStrings(candidate.unknowns, "unknowns");
+        if (!Array.isArray(candidate.claims)) {
+          throw new Error("contract violation: claims");
+        }
+      }
+    })) as Partial<DraftSupportAnswer>;
     return {
       direct_answer: typeof parsed.direct_answer === "string" ? parsed.direct_answer : "",
       claims: Array.isArray(parsed.claims)
@@ -1630,8 +1674,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       supplementalLimit: 2,
       snippetMax: String(input.caseFrame.question_type ?? "").startsWith("api_") ? 900 : 220
     });
-    const prompt = [
-      "You are the Evidence Judge Agent for a support engineer system.",
+    const prompt = buildSupportContractPrompt(resolveEvidenceJudgeContract(), [
       "Return ONLY valid JSON:",
       "verdict(verified|partial|unsupported), summary, unsupported_claims(string[]), missing_info(string[]), verified_citation_ids(string[]), display_citation_ids(string[]), verified_claims(string[]), claim_to_citation_map([{text, kind, verdict(verified|supported_inference|unsupported), citation_ids(string[])}])",
       "Rules:",
@@ -1649,10 +1692,15 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `case_frame: ${JSON.stringify(input.caseFrame)}`,
       `evidence_bundle: ${JSON.stringify(compactBundle)}`,
       `draft_support_answer: ${JSON.stringify(compactSpecialistDraftAnswer(input.draftSupportAnswer as SpecialistDraftAnswer | undefined))}`
-    ].join("\n");
-    return this.parseVerificationResult(
-      await this.runJsonPrompt(prompt, `${idempotencyKey}:evidence-judge`, runtime, undefined, "evidence-judge")
-    );
+    ]);
+    const parsed = await this.runJsonPromptWithSchemaRepair({
+      prompt,
+      idempotencyKey: `${idempotencyKey}:evidence-judge`,
+      runtime,
+      stage: "evidence-judge",
+      validate: assertVerificationOutput
+    });
+    return this.parseVerificationResult(parsed);
   }
 
   async verifySupportAnswer(
@@ -1665,7 +1713,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       supplementalLimit: 2,
       snippetMax: String(input.caseFrame.question_type ?? "").startsWith("api_") ? 900 : 220
     });
-    const prompt = [
+    const prompt = buildSupportContractPrompt(resolveEvidenceJudgeContract(), [
       "Verify whether the support answer is supported by the evidence.",
       "Return ONLY valid JSON:",
       "verdict(verified|partial|unsupported), summary, unsupported_claims(string[]), missing_info(string[]), verified_citation_ids(string[]), display_citation_ids(string[]), verified_claims(string[]), claim_to_citation_map([{text, kind, verdict(verified|supported_inference|unsupported), citation_ids(string[])}])",
@@ -1688,11 +1736,16 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `case_frame: ${JSON.stringify(input.caseFrame)}`,
       `evidence_bundle: ${JSON.stringify(compactBundle)}`,
       `draft_support_answer: ${JSON.stringify(compactDraftSupportAnswerForVerification(input.draftSupportAnswer))}`
-    ].join("\n");
+    ]);
 
-    return this.parseVerificationResult(
-      await this.runJsonPrompt(prompt, `${idempotencyKey}:support-verifier`, runtime, undefined, "support-verifier")
-    );
+    const parsed = await this.runJsonPromptWithSchemaRepair({
+      prompt,
+      idempotencyKey: `${idempotencyKey}:support-verifier`,
+      runtime,
+      stage: "support-verifier",
+      validate: assertVerificationOutput
+    });
+    return this.parseVerificationResult(parsed);
   }
 
   async bindSupportCitations(
@@ -1705,7 +1758,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       supplementalLimit: 2,
       snippetMax: String(input.caseFrame.question_type ?? "").startsWith("api_") ? 900 : 220
     });
-    const prompt = [
+    const prompt = buildSupportContractPrompt(resolveEvidenceJudgeContract(), [
       "You are a citation binder for a support engineer agent.",
       "Return ONLY valid JSON:",
       "verdict(verified|partial|unsupported), summary, unsupported_claims(string[]), missing_info(string[]), verified_citation_ids(string[]), display_citation_ids(string[]), verified_claims(string[]), claim_to_citation_map([{text, kind, verdict(verified|supported_inference|unsupported), citation_ids(string[])}])",
@@ -1723,11 +1776,16 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `case_frame: ${JSON.stringify(input.caseFrame)}`,
       `evidence_bundle: ${JSON.stringify(compactBundle)}`,
       `draft_support_answer: ${JSON.stringify(compactDraftSupportAnswerForVerification(input.draftSupportAnswer))}`
-    ].join("\n");
+    ]);
 
-    return this.parseVerificationResult(
-      await this.runJsonPrompt(prompt, `${idempotencyKey}:support-citation-binder`, runtime, undefined, "support-citation-binder")
-    );
+    const parsed = await this.runJsonPromptWithSchemaRepair({
+      prompt,
+      idempotencyKey: `${idempotencyKey}:support-citation-binder`,
+      runtime,
+      stage: "support-citation-binder",
+      validate: assertVerificationOutput
+    });
+    return this.parseVerificationResult(parsed);
   }
 
   async selectDisplayCitations(
@@ -1763,13 +1821,15 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `evidence_bundle: ${JSON.stringify(compactBundle)}`
     ].join("\n");
 
-    const parsed = (await this.runJsonPrompt(
+    const parsed = (await this.runJsonPromptWithSchemaRepair({
       prompt,
-      `${idempotencyKey}:support-citation-selector`,
+      idempotencyKey: `${idempotencyKey}:support-citation-selector`,
       runtime,
-      undefined,
-      "support-citation-selector"
-    )) as { display_citation_ids?: unknown };
+      stage: "support-citation-selector",
+      validate: (candidate) => {
+        assertArrayOfStrings(candidate.display_citation_ids, "display_citation_ids");
+      }
+    })) as { display_citation_ids?: unknown };
     return {
       display_citation_ids: Array.isArray(parsed.display_citation_ids)
         ? parsed.display_citation_ids.map((item) => String(item)).filter(Boolean).slice(0, 3)
@@ -1807,13 +1867,15 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       `supported_claims: ${JSON.stringify(supportedClaims)}`,
       `evidence_bundle: ${JSON.stringify(compactBundle)}`
     ].join("\n");
-    const parsed = (await this.runJsonPrompt(
+    const parsed = (await this.runJsonPromptWithSchemaRepair({
       prompt,
-      `${idempotencyKey}:citation-curator`,
+      idempotencyKey: `${idempotencyKey}:citation-curator`,
       runtime,
-      undefined,
-      "citation-curator"
-    )) as { display_citation_ids?: unknown };
+      stage: "citation-curator",
+      validate: (candidate) => {
+        assertArrayOfStrings(candidate.display_citation_ids, "display_citation_ids");
+      }
+    })) as { display_citation_ids?: unknown };
     return {
       display_citation_ids: Array.isArray(parsed.display_citation_ids)
         ? parsed.display_citation_ids.map((item) => String(item)).filter(Boolean).slice(0, 3)
@@ -1831,7 +1893,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     what_to_do_now: string[];
     still_need_to_confirm: string[];
   }> {
-    const prompt = [
+    const prompt = buildSupportContractPrompt(resolveAnswerComposerContract(), [
       "You are a polite support engineer for ONES.",
       "Return ONLY valid JSON with keys: direct_answer, why(string[]), what_to_do_now(string[]), still_need_to_confirm(string[])",
       "Rules:",
@@ -1859,15 +1921,15 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       )}`,
       `next_actions: ${JSON.stringify(input.nextActions)}`,
       `unknowns: ${JSON.stringify(input.unknowns)}`
-    ].join("\n");
+    ]);
 
-    const parsed = (await this.runJsonPrompt(
+    const parsed = await this.runJsonPromptWithSchemaRepair({
       prompt,
-      `${idempotencyKey}:support-answer-composer`,
+      idempotencyKey: `${idempotencyKey}:support-answer-composer`,
       runtime,
-      undefined,
-      "support-answer-composer"
-    )) as Record<string, unknown>;
+      stage: "support-answer-composer",
+      validate: assertSupportComposerOutput
+    });
     return {
       direct_answer: typeof parsed.direct_answer === "string" ? parsed.direct_answer : "",
       why: Array.isArray(parsed.why) ? parsed.why.map((item) => String(item)).filter(Boolean) : [],
@@ -1885,7 +1947,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<Omit<SupportAnswer, "mode">> {
-    const prompt = [
+    const prompt = buildSupportContractPrompt(resolveAnswerComposerContract(), [
       "You are the Answer Composer Agent for a customer-facing support engineer system.",
       "Return ONLY valid JSON with keys: question_type, render_variant, direct_answer, sections([{kind,title,body?,items?,code?,language?,method?,path?,required_params?,auth_scope?,response_field_hint?,important_note?,related_variant?}]), why(string[]), what_to_do_now(string[]), still_need_to_confirm(string[])",
       "Rules:",
@@ -1928,16 +1990,24 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
       )}`,
       `next_actions: ${JSON.stringify(input.nextActions)}`,
       `unknowns: ${JSON.stringify(input.unknowns)}`
-    ].join("\n");
-    const parsed = (await this.runJsonPrompt(
+    ]);
+    const parsed = await this.runJsonPromptWithSchemaRepair({
       prompt,
-      `${idempotencyKey}:answer-composer`,
+      idempotencyKey: `${idempotencyKey}:answer-composer`,
       runtime,
-      undefined,
-      "answer-composer"
-    )) as Record<string, unknown>;
+      stage: "answer-composer",
+      validate: (candidate) => {
+        assertSupportComposerOutput(candidate);
+        if (!normalizeQuestionType(candidate.question_type ?? input.route.question_type)) {
+          throw new Error("contract violation: question_type");
+        }
+        if (!Array.isArray(candidate.sections)) {
+          throw new Error("contract violation: sections");
+        }
+      }
+    });
     return {
-      question_type: normalizeQuestionType(parsed.question_type ?? input.route.question_type),
+      question_type: normalizeQuestionType(parsed.question_type ?? input.route.question_type) ?? input.route.question_type,
       render_variant:
         parsed.render_variant === "api" ||
         parsed.render_variant === "how_to" ||
@@ -2132,8 +2202,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
     const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "classify");
     const runId = await this.startChatRun(prompt, idempotencyKey, runtime, undefined, sessionKey);
-    await this.waitAgentRun(runId, sessionKey, runtime);
-    const text = await this.fetchLatestAssistantText(sessionKey);
+    const text = await this.waitForChatAssistantText(runId, sessionKey, runtime);
     const parsed = this.parseFirstJson(text) as Partial<OpenClawClassifyIntentOutput>;
 
     const validIntents = ["api_operation", "feature_usage", "troubleshooting", "concept_explanation", "configuration", "general"];
@@ -2172,9 +2241,15 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
         : [])
     ].join("\n");
-    const parsed = (await this.runJsonPrompt(prompt, `${idempotencyKey}:${stage}`, runtime, undefined, stage)) as Record<string, unknown>;
+    const parsed = await this.runJsonPromptWithSchemaRepair({
+      prompt,
+      idempotencyKey: `${idempotencyKey}:${stage}`,
+      runtime,
+      stage,
+      validate: assertSpecialistDraftOutput
+    });
     return {
-      question_type: normalizeQuestionType(parsed.question_type ?? input.route.question_type),
+      question_type: normalizeQuestionType(parsed.question_type ?? input.route.question_type) ?? input.route.question_type,
       render_variant:
         parsed.render_variant === "api" ||
         parsed.render_variant === "how_to" ||
@@ -2259,9 +2334,15 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
         ? ["conversation_history:", ...input.conversationHistory.slice(-6).map((item) => `- [${item.role}] ${item.content}`)]
         : [])
     ].join("\n");
-    const parsed = (await this.runJsonPrompt(prompt, `${idempotencyKey}:${stage}`, runtime, undefined, stage)) as Record<string, unknown>;
+    const parsed = await this.runJsonPromptWithSchemaRepair({
+      prompt,
+      idempotencyKey: `${idempotencyKey}:${stage}`,
+      runtime,
+      stage,
+      validate: assertSpecialistDraftOutput
+    });
     return {
-      question_type: normalizeQuestionType(parsed.question_type ?? input.route.question_type),
+      question_type: normalizeQuestionType(parsed.question_type ?? input.route.question_type) ?? input.route.question_type,
       render_variant: normalizeSupportRenderVariant(parsed.render_variant, input.route.question_type),
       direct_answer: typeof parsed.direct_answer === "string" ? parsed.direct_answer : "",
       claims: Array.isArray(parsed.claims)
@@ -2335,8 +2416,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
     const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "ticket-analyze");
     const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments, sessionKey);
-    await this.waitAgentRun(runId, sessionKey, runtime);
-    const text = await this.fetchLatestAssistantText(sessionKey);
+    const text = await this.waitForChatAssistantText(runId, sessionKey, runtime);
     const parsed = this.parseFirstJson(text) as Partial<OpenClawAnalyzeOutput>;
     const reply = typeof parsed.reply === "string" ? parsed.reply : "";
     return {
@@ -2366,8 +2446,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
 
     const sessionKey = this.createRunScopedSessionKey(runtime, idempotencyKey, "kb-search");
     const runId = await this.startChatRun(prompt, idempotencyKey, runtime, input.attachments, sessionKey);
-    await this.waitAgentRun(runId, sessionKey, runtime);
-    const text = await this.fetchLatestAssistantText(sessionKey);
+    const text = await this.waitForChatAssistantText(runId, sessionKey, runtime);
     const parsed = this.parseFirstJson(text) as Record<string, unknown>;
     const rawHits = Array.isArray(parsed.hits) ? parsed.hits : [];
     const hits = rawHits.map((item, index) => {
@@ -2452,7 +2531,7 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const payload = (await this.callMethod("chat.send", {
       sessionKey: sessionKey ?? agentRuntime.sessionKey,
       message,
-      deliver: false,
+      deliver: true,
       idempotencyKey,
       ...(agentRuntime.model ? { model: agentRuntime.model } : {}),
       ...(attachments.length ? { attachments } : {})
@@ -2498,21 +2577,94 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     const sendStartedAt = performance.now();
     const runId = await this.startChatRun(message, idempotencyKey, runtime, attachmentUrls, sessionKey);
     const sendMs = roundMs(performance.now() - sendStartedAt);
-    const waitStartedAt = performance.now();
-    await this.waitAgentRun(runId, sessionKey, runtime);
-    const waitMs = roundMs(performance.now() - waitStartedAt);
-    const historyStartedAt = performance.now();
-    const text = await this.fetchLatestAssistantText(sessionKey);
-    const historyMs = roundMs(performance.now() - historyStartedAt);
+    const waitAndHistoryStartedAt = performance.now();
+    const text = await this.waitForChatAssistantText(runId, sessionKey, runtime);
+    const waitAndHistoryMs = roundMs(performance.now() - waitAndHistoryStartedAt);
     const parseStartedAt = performance.now();
     const parsed = this.parseFirstJson(text);
     const parseMs = roundMs(performance.now() - parseStartedAt);
     if (env.OPENCLAW_DEBUG_STAGE_TIMINGS) {
       console.info(
-        `[openclaw-stage] stage=${stage} prompt_chars=${message.length} response_chars=${text.length} send_ms=${sendMs} wait_ms=${waitMs} history_ms=${historyMs} parse_ms=${parseMs} total_ms=${roundMs(performance.now() - startedAt)}`
+        `[openclaw-stage] stage=${stage} prompt_chars=${message.length} response_chars=${text.length} send_ms=${sendMs} wait_history_ms=${waitAndHistoryMs} parse_ms=${parseMs} total_ms=${roundMs(performance.now() - startedAt)}`
       );
     }
     return parsed;
+  }
+
+  private async runJsonPromptWithSchemaRepair(
+    input: {
+      prompt: string;
+      idempotencyKey: string;
+      runtime?: OpenClawRuntimeContext;
+      stage: SessionLifecycleStage;
+      validate: (parsed: Record<string, unknown>) => void;
+      maxAttempts?: number;
+    }
+  ): Promise<Record<string, unknown>> {
+    const maxAttempts = Math.max(1, input.maxAttempts ?? 3);
+    let prompt = input.prompt;
+    let lastError: unknown = null;
+    let lastOutput: unknown = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const parsed = (await this.runJsonPrompt(
+          prompt,
+          `${input.idempotencyKey}:schema-attempt-${attempt}`,
+          input.runtime,
+          undefined,
+          input.stage
+        )) as Record<string, unknown>;
+        lastOutput = parsed;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("contract violation: output must be a JSON object");
+        }
+        input.validate(parsed);
+        return parsed;
+      } catch (error) {
+        lastError = error;
+        if (attempt >= maxAttempts) {
+          break;
+        }
+        const errorText = error instanceof Error ? error.message : String(error);
+        const previousOutput =
+          lastOutput && typeof lastOutput === "object" ? JSON.stringify(lastOutput) : "unavailable";
+        prompt = [
+          input.prompt.trim(),
+          "",
+          "Your previous output violated the required JSON contract.",
+          `validation_error: ${errorText}`,
+          `previous_output_json: ${previousOutput}`,
+          "Regenerate from scratch.",
+          "Return ONLY valid JSON and use EXACT allowed enum values; do not invent labels."
+        ].join("\n");
+      }
+    }
+
+    const errorText = lastError instanceof Error ? lastError.message : String(lastError);
+    throw new Error(`supervisor schema repair exhausted: ${errorText}`);
+  }
+
+  private async waitForChatAssistantText(
+    runId: string,
+    sessionKey: string,
+    runtime?: OpenClawRuntimeContext
+  ): Promise<string> {
+    let waitError: unknown;
+    try {
+      await this.waitAgentRun(runId, sessionKey, runtime);
+    } catch (error) {
+      waitError = error;
+    }
+
+    try {
+      return await this.fetchLatestAssistantText(sessionKey, runtime);
+    } catch (historyError) {
+      if (waitError) {
+        throw waitError;
+      }
+      throw historyError;
+    }
   }
 
   private async waitAgentRun(runId: string, sessionKey?: string, runtime?: OpenClawRuntimeContext): Promise<void> {
@@ -2540,29 +2692,44 @@ export class WsOpenClawAdapter implements OpenClawAdapter {
     }
   }
 
-  private async fetchLatestAssistantText(sessionKey: string): Promise<string> {
-    try {
-      const history = (await this.callMethod("chat.history", {
-        sessionKey,
-        limit: 4
-      })) as { messages?: Array<Record<string, unknown>> };
+  private async fetchLatestAssistantText(sessionKey: string, runtime?: OpenClawRuntimeContext): Promise<string> {
+    const pollBudgetMs = Math.min(Math.max(500, Math.round(resolveRuntimeTimeoutMs(runtime) / 4)), 3_000);
+    const deadline = Date.now() + pollBudgetMs;
+    let lastError: Error = new Error("OpenClaw agent returned no assistant text");
 
-      const messages = Array.isArray(history?.messages) ? history.messages : [];
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        const msg = messages[i];
-        if (msg.role !== "assistant") continue;
-        const blocks = Array.isArray(msg.content) ? (msg.content as Array<Record<string, unknown>>) : [];
-        const text = blocks
-          .filter((b) => b.type === "text" && typeof b.text === "string")
-          .map((b) => String(b.text))
-          .join("\n")
-          .trim();
-        if (text) return text;
-        if (typeof msg.errorMessage === "string" && msg.errorMessage) {
-          throw new Error(msg.errorMessage);
+    try {
+      while (Date.now() <= deadline) {
+        try {
+          const history = (await this.callMethod("chat.history", {
+            sessionKey,
+            limit: 4
+          })) as { messages?: Array<Record<string, unknown>> };
+
+          const messages = Array.isArray(history?.messages) ? history.messages : [];
+          for (let i = messages.length - 1; i >= 0; i -= 1) {
+            const msg = messages[i];
+            if (msg.role !== "assistant") continue;
+            const blocks = Array.isArray(msg.content) ? (msg.content as Array<Record<string, unknown>>) : [];
+            const text = blocks
+              .filter((b) => b.type === "text" && typeof b.text === "string")
+              .map((b) => String(b.text))
+              .join("\n")
+              .trim();
+            if (text) return text;
+            if (typeof msg.errorMessage === "string" && msg.errorMessage) {
+              throw new Error(msg.errorMessage);
+            }
+          }
+          lastError = new Error("OpenClaw agent returned no assistant text");
+        } catch (error) {
+          lastError = error as Error;
         }
+
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(200, remainingMs)));
       }
-      throw new Error("OpenClaw agent returned no assistant text");
+      throw lastError;
     } finally {
       this.markManagedSessionEnded(sessionKey);
     }

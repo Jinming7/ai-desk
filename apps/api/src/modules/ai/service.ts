@@ -2052,60 +2052,6 @@ export async function runSearchMode(
   } catch (error) {
     console.error("[support-agent] runSearchMode infrastructure handoff:", error instanceof Error ? error.message : error);
 
-    const kbFallback = await buildKbFallbackSearchResult({
-      sessionId,
-      query: multimodalQuery,
-      language,
-      currentRound
-    });
-    if (kbFallback) {
-      if (!options?.sessionId || !previousDialog) {
-        await aiRepo.createSearchSession({
-          sessionId,
-          query: multimodalQuery,
-          answer: kbFallback.answer,
-          confidence: kbFallback.confidence,
-          retrievalStatus: kbFallback.retrieval_status,
-          unresolvedReasonCode: kbFallback.unresolved_reason_code,
-          suggestedNextStep: kbFallback.suggested_next_step
-        });
-      } else {
-        await aiRepo.updateSearchSession({
-          sessionId,
-          answer: kbFallback.answer,
-          confidence: kbFallback.confidence,
-          retrievalStatus: kbFallback.retrieval_status,
-          unresolvedReasonCode: kbFallback.unresolved_reason_code,
-          suggestedNextStep: kbFallback.suggested_next_step
-        });
-      }
-
-      await aiRepo.saveSearchReferences(sessionId, kbFallback.references);
-      const transcript = mergeTranscript(previousDialog?.transcript, multimodalQuery, kbFallback.answer, options?.conversation ?? []);
-      await aiRepo.upsertDialogState({
-        sessionId,
-        state: kbFallback.state,
-        clarificationRound: kbFallback.clarification_round,
-        showCreateTicketNow: kbFallback.show_create_ticket_now,
-        answerLanguage: language,
-        followUpQuestion: kbFallback.follow_up_question,
-        transcript,
-        retrievalOutcome: {
-          retrievalStatus: kbFallback.retrieval_status,
-          unresolvedReasonCode: kbFallback.unresolved_reason_code,
-          confidence: kbFallback.confidence,
-          references: kbFallback.references.length,
-          verification: kbFallback.verification,
-          supportAnswer: kbFallback.support_answer,
-          diagnostics: {
-            infrastructure_failure: true,
-            fallback_mode: "kb_direct"
-          }
-        }
-      });
-      return kbFallback;
-    }
-
     const failureDirectAnswer =
       language === "zh"
         ? "当前暂时无法完成自动诊断，建议直接创建工单，我们会自动预填你已提供的上下文。"

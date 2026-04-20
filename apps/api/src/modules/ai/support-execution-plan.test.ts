@@ -42,7 +42,7 @@ test("preserves successful route semantics when evidence and case planning time 
   assert.equal(plan.plannerDiagnostics.synthesized, true);
 });
 
-test("synthesizes a deployment-scoped case frame instead of collapsing to generic fallback markers", () => {
+test("synthesizes a conservative generic case frame when downstream planners time out", () => {
   const route: SupportQuestionRoute = {
     question_type: "capability_confirmation",
     user_goal: "Confirm which Linux distributions are officially supported.",
@@ -60,15 +60,13 @@ test("synthesizes a deployment-scoped case frame instead of collapsing to generi
     casePlanResult: timedOut<SupportCaseFrame>()
   });
 
-  assert.equal(plan.caseFrame.product_area, "deployment");
-  assert.equal(plan.caseFrame.deployment_model, "private_deployment");
-  assert.equal(plan.caseFrame.object, "linux distributions");
-  assert.notEqual(plan.caseFrame.product_area, "general");
-  assert.notEqual(plan.caseFrame.deployment_model, "shared");
-  assert.notEqual(plan.caseFrame.object, "unspecified");
+  assert.equal(plan.caseFrame.product_area, "general");
+  assert.equal(plan.caseFrame.deployment_model, "unknown");
+  assert.equal(plan.caseFrame.object, "Confirm which Linux distributions are officially supported.");
+  assert.equal(plan.caseFrame.action_type, "capability_confirmation");
 });
 
-test("builds retrieval queries from the unified plan without generic fallback terms", () => {
+test("builds retrieval queries from the unified plan without placeholder fallback terms", () => {
   const route: SupportQuestionRoute = {
     question_type: "capability_confirmation",
     user_goal: "Confirm which Linux distributions are officially supported.",
@@ -93,15 +91,13 @@ test("builds retrieval queries from the unified plan without generic fallback te
     ),
     false
   );
-  assert.equal(
-    plan.retrievalPlan.baseQueries.some((query) =>
-      /linux distributions|supported operating systems|deployment environment requirements/i.test(query)
-    ),
-    true
-  );
+  assert.deepEqual(plan.retrievalPlan.baseQueries, [
+    "Which Linux distributions are officially supported?",
+    "Confirm which Linux distributions are officially supported."
+  ]);
 });
 
-test("canonicalizes free-form planner taxonomy onto the retrieval schema before strict evidence policy runs", () => {
+test("preserves planner-owned taxonomy instead of reinterpreting it locally", () => {
   const route: SupportQuestionRoute = {
     question_type: "capability_confirmation",
     user_goal: "确认 ONES 支持的 Linux 发行版范围",
@@ -147,8 +143,8 @@ test("canonicalizes free-form planner taxonomy onto the retrieval schema before 
     })
   });
 
-  assert.equal(plan.caseFrame.product_area, "deployment");
-  assert.equal(plan.caseFrame.object, "linux distributions");
-  assert.equal(plan.caseFrame.action_type, "capability_confirmation");
-  assert.deepEqual(plan.evidencePlan.required_doc_kinds, ["deployment_runbook", "product_guide", "rules"]);
+  assert.equal(plan.caseFrame.product_area, "部署安装与系统兼容性");
+  assert.equal(plan.caseFrame.object, "Linux 发行版支持列表");
+  assert.equal(plan.caseFrame.action_type, "support_matrix_lookup");
+  assert.deepEqual(plan.evidencePlan.required_doc_kinds, ["产品部署文档", "安装指南", "系统要求/环境要求", "兼容性或支持矩阵"]);
 });

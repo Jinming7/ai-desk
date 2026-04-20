@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-support-runtime-contracts.mjs",
     "start": "../../scripts/restart-api-safe.sh",
     "start:raw": "node dist/index.js",
     "db:migrate": "tsx src/db/migrate.ts",

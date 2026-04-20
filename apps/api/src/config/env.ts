@@ -108,7 +108,7 @@ const envSchema = z.object({
   FEATURE_SUPPORT_AGENT_HYBRID_RETRIEVAL: envBoolean(true),
   FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME: envBoolean(false),
   FEATURE_SUPPORT_AGENT_RUNTIME_TIGHTENING: envBoolean(false),
-  AI_SUPPORT_INTERACTIVE_TIMEOUT_MS: z.coerce.number().int().min(5000).max(300000).default(22000),
+  AI_SUPPORT_INTERACTIVE_TIMEOUT_MS: z.coerce.number().int().min(5000).max(300000).default(240000),
   AI_SUPPORT_JOB_TIMEOUT_MS: z.coerce.number().int().min(10000).max(300000).default(240000),
   AI_SUPPORT_JOB_LEASE_MS: z.coerce.number().int().min(1000).max(300000).default(60000),
   AI_SUPPORT_JOB_WORKER_INTERVAL_MS: z.coerce.number().int().min(500).max(60000).default(3000),

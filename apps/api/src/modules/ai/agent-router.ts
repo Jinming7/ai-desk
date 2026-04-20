@@ -374,7 +374,7 @@ export function buildSearchRuntime(input: {
           allowMultiPassRetrieval: true,
           allowRefinement: true,
           kbTopK: 8,
-          queryLimit: asyncJobDelivery ? 4 : 2
+          queryLimit: 4
         }
       : {
           overallTimeoutMs: asyncJobDelivery ? env.AI_SUPPORT_JOB_TIMEOUT_MS : 90000,

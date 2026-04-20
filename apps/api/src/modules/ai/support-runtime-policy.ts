@@ -1,4 +1,5 @@
 import { env } from "../../config/env.js";
+import { isServerlessRuntime } from "../../config/runtime-env.js";
 import type { OpenClawRuntimeContext } from "../../infrastructure/openclaw/types.js";
 
 export interface SupportRuntimePolicy {
@@ -22,6 +23,16 @@ export function resolveSupportRuntimePolicy(runtime?: OpenClawRuntimeContext): S
   }
 
   if (deliveryMode === "async_job") {
+    return {
+      deliveryMode,
+      tighteningEnabled,
+      fastPathAllowed: false,
+      profile: "quality_optimized"
+    };
+  }
+
+  // On serverless interactive requests (especially preview/prod), prioritize answer quality over latency.
+  if (isServerlessRuntime()) {
     return {
       deliveryMode,
       tighteningEnabled,

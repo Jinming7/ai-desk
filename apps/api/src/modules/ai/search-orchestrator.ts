@@ -574,6 +574,7 @@ export class SearchOrchestrator {
       return this.buildNoResults("", false);
     }
 
+    let hybridNoResults: SearchEvidenceCollection | null = null;
     if (resolveSupportHybridRetrievalFlag()) {
       const hybrid = await this.hybridRuntime.retrieve(
         buildHybridRetrievalRequest({
@@ -588,12 +589,24 @@ export class SearchOrchestrator {
           topK
         })
       );
-      return {
+      if (hybrid.retrievalStatus !== "no_results" || hybrid.references.length > 0) {
+        return {
+          query: hybrid.query,
+          answer: "",
+          confidence: hybrid.confidence,
+          references: hybrid.references,
+          retrievalStatus: hybrid.retrievalStatus,
+          unresolvedReasonCode: hybrid.unresolvedReasonCode,
+          resolvedQueries: hybrid.diagnostics.rewrites,
+          fallbackUsed: false
+        };
+      }
+      hybridNoResults = {
         query: hybrid.query,
         answer: "",
         confidence: hybrid.confidence,
-        references: hybrid.references,
-        retrievalStatus: hybrid.retrievalStatus,
+        references: [],
+        retrievalStatus: "no_results",
         unresolvedReasonCode: hybrid.unresolvedReasonCode,
         resolvedQueries: hybrid.diagnostics.rewrites,
         fallbackUsed: false
@@ -783,6 +796,13 @@ export class SearchOrchestrator {
     const resolvedQueries = [...new Set(firstRound.flatMap((item) => item.resolvedQueries))];
 
     if (!merged.length) {
+      if (hybridNoResults) {
+        const mergedResolvedQueries = [...new Set([...hybridNoResults.resolvedQueries, ...resolvedQueries])];
+        return {
+          ...hybridNoResults,
+          resolvedQueries: mergedResolvedQueries.length > 0 ? mergedResolvedQueries : hybridNoResults.resolvedQueries
+        };
+      }
       return this.buildNoResults(normalizedQueries[0], fallbackUsed, resolvedQueries);
     }
 

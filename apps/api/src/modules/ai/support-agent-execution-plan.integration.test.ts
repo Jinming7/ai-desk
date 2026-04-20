@@ -101,6 +101,51 @@ function createPlannerFailureAdapter(): OpenClawAdapter {
     async planSupportCase(_input: OpenClawSupportPlannerInput): Promise<never> {
       throw new Error("simulated case planner timeout");
     },
+    async planSupportDispatch(input: Parameters<NonNullable<OpenClawAdapter["planSupportDispatch"]>>[0]) {
+      const route = await this.routeSupportQuestion(
+        {
+          contextType: input.contextType,
+          language: input.language,
+          query: input.query,
+          conversationHistory: input.conversationHistory
+        },
+        "",
+        undefined
+      );
+      const primaryDomain =
+        route.primary_domain ??
+        ((route.question_type.startsWith("api_") ? "openapi" : "product") as "openapi" | "product");
+      return {
+        primaryDomain,
+        route: {
+          ...route,
+          primary_domain: primaryDomain
+        },
+        caseFrame: {
+          goal: input.query,
+          symptom: input.query,
+          object: input.query,
+          action_type: "capability_confirmation",
+          deployment_model: "unknown",
+          product_area: "general",
+          constraints: [],
+          missing_critical_info: [],
+          retrieval_queries: [input.query],
+          query_plan: {
+            concept_queries: [input.query],
+            object_queries: [input.query],
+            behavior_queries: ["capability_confirmation"]
+          },
+          question_type: route.question_type,
+          specialist_agent: route.specialist_agent,
+          answer_contract: route.answer_contract,
+          routing_confidence: route.routing_confidence,
+          required_doc_kinds: [],
+          primary_domain: primaryDomain
+        },
+        retrievalQueries: [input.query]
+      };
+    },
     async selectSupportEvidence(_input: OpenClawSupportEvidenceSelectorInput) {
       return { primary_ids: [], supplemental_ids: [], rejected_ids: [] };
     },
@@ -187,6 +232,7 @@ function createPlannerFailureAdapter(): OpenClawAdapter {
 function createUnifiedPlannerAdapter() {
   const adapter = createPlannerFailureAdapter() as OpenClawAdapter & {
     legacyCalls: string[];
+    observedDispatchTimeoutMs?: number;
     planSupportExecution: (
       input: OpenClawSupportPlannerInput,
       idempotencyKey: string,
@@ -240,6 +286,32 @@ function createUnifiedPlannerAdapter() {
   adapter.planSupportCase = async (_input: OpenClawSupportPlannerInput): Promise<never> => {
     adapter.legacyCalls.push("case");
     throw new Error("legacy case planner should not be called when unified planner is available");
+  };
+  adapter.planSupportDispatch = async (input, _idempotencyKey, runtime) => {
+    adapter.observedDispatchTimeoutMs = runtime?.timeoutMs;
+    const unified = await adapter.planSupportExecution(input, _idempotencyKey, runtime);
+    const primaryDomain = "deployment" as const;
+    return {
+      primaryDomain,
+      route: {
+        ...unified.route,
+        primary_domain: primaryDomain
+      },
+      caseFrame: {
+        ...unified.caseFrame,
+        primary_domain: primaryDomain,
+        required_doc_kinds: unified.evidencePlan.required_doc_kinds
+      },
+      retrievalQueries: Array.from(
+        new Set([
+          input.query,
+          ...(unified.caseFrame.retrieval_queries ?? []),
+          ...(unified.evidencePlan.query_plan?.concept_queries ?? []),
+          ...(unified.evidencePlan.query_plan?.object_queries ?? []),
+          ...(unified.evidencePlan.query_plan?.behavior_queries ?? [])
+        ])
+      )
+    };
   };
   adapter.planSupportExecution = async (): Promise<{
     route: SupportQuestionRoute;
@@ -378,17 +450,7 @@ test("runSupportSearchAgent gives the unified planner a larger async-job timeout
 
   try {
     const adapter = createUnifiedPlannerAdapter() as OpenClawAdapter & {
-      observedTimeoutMs?: number;
-      planSupportExecution: (
-        input: OpenClawSupportPlannerInput,
-        idempotencyKey: string,
-        runtime?: OpenClawRuntimeContext
-      ) => Promise<OpenClawSupportExecutionPlannerOutput>;
-    };
-    const originalUnifiedPlanner = adapter.planSupportExecution.bind(adapter);
-    adapter.planSupportExecution = async (input, idempotencyKey, runtime) => {
-      adapter.observedTimeoutMs = runtime?.timeoutMs;
-      return originalUnifiedPlanner(input, idempotencyKey, runtime);
+      observedDispatchTimeoutMs?: number;
     };
 
     await runSupportSearchAgent({
@@ -405,8 +467,8 @@ test("runSupportSearchAgent gives the unified planner a larger async-job timeout
       idempotencyKey: "support-execution-plan-async-timeout"
     });
 
-    assert.equal(typeof adapter.observedTimeoutMs, "number");
-    assert.equal((adapter.observedTimeoutMs ?? 0) > 14_000, true);
+    assert.equal(typeof adapter.observedDispatchTimeoutMs, "number");
+    assert.equal((adapter.observedDispatchTimeoutMs ?? 0) > 14_000, true);
   } finally {
     SearchOrchestrator.prototype.collectEvidence = originalCollectEvidence;
   }

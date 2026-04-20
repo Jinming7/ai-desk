@@ -15,6 +15,9 @@ function makeTempDir(prefix: string): string {
 
 afterEach(() => {
   delete process.env.TEST_WORKTREE_ENV_VALUE;
+  delete process.env.TEST_FALLBACK_ENV_VALUE;
+  delete process.env.TEST_EMPTY_IN_ENV_TEST;
+  delete process.env.OPENCLAW_ALLOW_SELF_SIGNED;
 });
 
 test("resolveDotenvCandidatePaths includes main repo env for git worktrees", () => {
@@ -124,6 +127,72 @@ test("resolveDotenvCandidatePaths handles relative gitdir targets", () => {
     path.join(worktreeRoot, ".env"),
     path.join(repoRoot, ".env")
   ]);
+});
+
+test("resolveDotenvCandidatePaths includes .env fallback when loading .env.test", () => {
+  const repoRoot = makeTempDir("dotenv-main-repo-");
+  mkdirSync(path.join(repoRoot, ".git", "worktrees", "wt-6"), { recursive: true });
+
+  const worktreeRoot = makeTempDir("dotenv-worktree-");
+  writeFileSync(
+    path.join(worktreeRoot, ".git"),
+    `gitdir: ${path.join(repoRoot, ".git", "worktrees", "wt-6")}\n`,
+    "utf8"
+  );
+
+  assert.deepEqual(resolveDotenvCandidatePaths(worktreeRoot, ".env.test"), [
+    path.join(worktreeRoot, ".env.test"),
+    path.join(repoRoot, ".env.test"),
+    path.join(worktreeRoot, ".env"),
+    path.join(repoRoot, ".env")
+  ]);
+});
+
+test("loadDotenvFiles backfills missing .env.test keys from .env", () => {
+  const repoRoot = makeTempDir("dotenv-main-repo-");
+  mkdirSync(path.join(repoRoot, ".git", "worktrees", "wt-7"), { recursive: true });
+  writeFileSync(path.join(repoRoot, ".env.test"), "TEST_WORKTREE_ENV_VALUE=from-env-test\n", "utf8");
+  writeFileSync(
+    path.join(repoRoot, ".env"),
+    "TEST_FALLBACK_ENV_VALUE=from-env\nTEST_EMPTY_IN_ENV_TEST=from-env-fallback\n",
+    "utf8"
+  );
+
+  const worktreeRoot = makeTempDir("dotenv-worktree-");
+  writeFileSync(
+    path.join(worktreeRoot, ".git"),
+    `gitdir: ${path.join(repoRoot, ".git", "worktrees", "wt-7")}\n`,
+    "utf8"
+  );
+
+  delete process.env.TEST_WORKTREE_ENV_VALUE;
+  delete process.env.TEST_FALLBACK_ENV_VALUE;
+  delete process.env.TEST_EMPTY_IN_ENV_TEST;
+  writeFileSync(path.join(worktreeRoot, ".env.test"), "TEST_EMPTY_IN_ENV_TEST=\n", "utf8");
+  loadDotenvFiles({ cwd: worktreeRoot, envFile: ".env.test" });
+
+  assert.equal(process.env.TEST_WORKTREE_ENV_VALUE, "from-env-test");
+  assert.equal(process.env.TEST_FALLBACK_ENV_VALUE, "from-env");
+  assert.equal(process.env.TEST_EMPTY_IN_ENV_TEST, "from-env-fallback");
+});
+
+test("loadDotenvFiles promotes OPENCLAW_ALLOW_SELF_SIGNED from .env when .env.test disables it", () => {
+  const repoRoot = makeTempDir("dotenv-main-repo-");
+  mkdirSync(path.join(repoRoot, ".git", "worktrees", "wt-8"), { recursive: true });
+  writeFileSync(path.join(repoRoot, ".env.test"), "OPENCLAW_ALLOW_SELF_SIGNED=false\n", "utf8");
+  writeFileSync(path.join(repoRoot, ".env"), "OPENCLAW_ALLOW_SELF_SIGNED=true\n", "utf8");
+
+  const worktreeRoot = makeTempDir("dotenv-worktree-");
+  writeFileSync(
+    path.join(worktreeRoot, ".git"),
+    `gitdir: ${path.join(repoRoot, ".git", "worktrees", "wt-8")}\n`,
+    "utf8"
+  );
+
+  delete process.env.OPENCLAW_ALLOW_SELF_SIGNED;
+  loadDotenvFiles({ cwd: worktreeRoot, envFile: ".env.test" });
+
+  assert.equal(process.env.OPENCLAW_ALLOW_SELF_SIGNED, "true");
 });
 
 process.on("exit", () => {

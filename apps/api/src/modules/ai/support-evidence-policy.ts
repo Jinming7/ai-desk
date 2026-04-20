@@ -54,23 +54,24 @@ function uniqueStrings(input: Array<string | null | undefined>, limit = 12): str
   return values;
 }
 
-function hasSpecificProductArea(value: string): boolean {
-  return value !== "" && value !== "general" && value !== "unknown";
-}
-
-function hasSpecificDeploymentModel(value: string): boolean {
-  return value === "private_deployment" || value === "public_cloud";
-}
-
-function expandProductAreaAliases(value: string): string[] {
-  const normalized = normalizeString(value);
-  if (!normalized) return [];
-  const aliases = new Set<string>([normalized]);
-  if (normalized === "deployment" || normalized === "deployment_environment" || normalized.startsWith("deployment_")) {
-    aliases.add("deployment");
-    aliases.add("deployment_environment");
+function normalizeExplicitDomain(value: unknown): string {
+  switch (value) {
+    case "openapi":
+    case "deployment":
+    case "integrations":
+    case "product":
+    case "troubleshooting":
+    case "docs":
+      return value;
+    default:
+      return "";
   }
-  return [...aliases];
+}
+
+function resolvePolicyDomain(caseFrame: SupportCaseFrame): string {
+  const explicitDomain = normalizeExplicitDomain(caseFrame.primary_domain);
+  if (explicitDomain === "docs") return "product";
+  return explicitDomain;
 }
 
 function expandEvidenceKindAliases(value: string): string[] {
@@ -111,107 +112,8 @@ function normalizeDocsPath(pathValue: string): string {
     .replace(/^i18n\/[^/]+\/docusaurus-plugin-content-docs\/current\//, "docs/");
 }
 
-function inferPathProductArea(pathValue: string): string {
-  if (/(^|\/)deploy-docs\//.test(pathValue)) return "deployment";
-  if (/(^|\/)(docs|open-docs\/docs)\/openapi\//.test(pathValue) || /\.api\.(md|mdx)$/i.test(pathValue)) return "openapi";
-  if (/(^|\/)integrations?\//.test(pathValue)) return "integrations";
-  if (/(^|\/)docs\/ones-wiki\//.test(pathValue)) return "wiki";
-  return "";
-}
-
-function inferProductAreaFallback(input: {
-  path: string;
-  title: string;
-  heading: string;
-  snippet: string;
-}): string {
-  const pathArea = inferPathProductArea(input.path);
-  if (pathArea) return pathArea;
-  const semanticText = `${input.path} ${input.title} ${input.heading} ${input.snippet}`;
-  if (
-    /deploy|deployment|self-hosted|on-prem|kubernetes|cluster|database|storage|topology|architecture|私有部署|本地部署|系统要求|环境要求|操作系统要求|支持矩阵|兼容性/.test(
-      semanticText
-    )
-  ) {
-    return "deployment";
-  }
-  if (/<methodendpoint|<paramsitem|<schemaitem|openapi|oauth|scope|token|credential|api_path/.test(semanticText)) {
-    return "openapi";
-  }
-  if (/oauth|sso|webhook|github|gitlab|slack|teams|integration|redirect uri|callback/.test(semanticText)) {
-    return "integrations";
-  }
-  if (/wiki|space|page group/.test(semanticText)) return "wiki";
-  if (/issue|project|sprint|field|comment|attachment/.test(semanticText)) return "project_management";
-  return "";
-}
-
-function inferDeploymentModelFallback(input: { path: string; title: string; heading: string; snippet: string }): string {
-  const semanticText = `${input.path} ${input.title} ${input.heading} ${input.snippet}`;
-  if (/(^|\/)deploy-docs\//.test(input.path)) return "private_deployment";
-  if (/private deployment|self-hosted|私有部署|本地部署|on-prem|air-gapped|closed network|offline|闭网|离线/.test(semanticText)) {
-    return "private_deployment";
-  }
-  if (/public cloud|公有云|saas/.test(semanticText)) return "public_cloud";
-  return "";
-}
-
-function inferEvidenceKindFallback(input: {
-  path: string;
-  title: string;
-  heading: string;
-  snippet: string;
-  currentEvidenceKind: string;
-}): string {
-  const semanticText = `${input.path} ${input.title} ${input.heading} ${input.snippet}`;
-  if (/troubleshoot|troubleshooting|排查|故障/.test(semanticText)) return "troubleshooting";
-  if (
-    /support matrix|compatibility|system requirements?|environment requirements?|operating system requirements?|requirements?|not support|unsupported|不支持|限制|兼容性|支持矩阵|系统要求|环境要求|操作系统要求/.test(
-      semanticText
-    )
-  ) {
-    return "constraint";
-  }
-  if (
-    /\b(migration|migrate|cutover|rollback|backup|rehearsal|preflight|dry run|rollout plan|runbook rehearsal)\b|迁移|切换|回滚|备份|实施预演|预演|演练|信息收集/.test(
-      semanticText
-    )
-  ) {
-    return "procedure";
-  }
-  if (
-    input.currentEvidenceKind === "" &&
-    /guide|quick start|setup|configure|install|deployment flow|部署说明|安装步骤|配置步骤|操作步骤/.test(semanticText)
-  ) {
-    return "procedure";
-  }
-  return "";
-}
-
-function evidenceKindPriority(value: string): number {
-  switch (value) {
-    case "api_operation":
-      return 5;
-    case "troubleshooting":
-      return 4;
-    case "constraint":
-      return 3;
-    case "procedure":
-      return 2;
-    case "capability":
-      return 1;
-    default:
-      return 0;
-  }
-}
-
-function preferEvidenceKind(primary: string, fallback: string): string {
-  return evidenceKindPriority(primary) >= evidenceKindPriority(fallback) ? primary || fallback : fallback;
-}
-
 function inferDocKind(input: {
   explicitDocKind: string;
-  path: string;
   productArea: string;
   evidenceKind: string;
 }): string {
@@ -219,9 +121,28 @@ function inferDocKind(input: {
   if (input.evidenceKind === "api_operation") return "openapi/api";
   if (input.evidenceKind === "troubleshooting") return "troubleshooting";
   if (input.evidenceKind === "constraint") return "rules";
-  if (input.productArea === "deployment" || /(^|\/)deploy-docs\//.test(input.path)) return "deployment_runbook";
+  if (input.productArea === "deployment") return "deployment_runbook";
   if (input.evidenceKind === "procedure" || input.evidenceKind === "capability") return "product_guide";
   return "";
+}
+
+function normalizePolicyProductArea(value: string): string {
+  switch (normalizeString(value)) {
+    case "integration":
+      return "integrations";
+    case "deployment_environment":
+      return "deployment";
+    case "docs":
+      return "product";
+    default:
+      return normalizeString(value);
+  }
+}
+
+function normalizePolicyEvidenceKind(value: string): string {
+  const normalized = normalizeString(value);
+  if (normalized === "integration_guidance") return "procedure";
+  return normalized;
 }
 
 export function getSupportEvidenceProfile(input: SupportEvidenceLike): SupportEvidenceProfile {
@@ -230,25 +151,14 @@ export function getSupportEvidenceProfile(input: SupportEvidenceLike): SupportEv
   const heading = normalizeString(input.headingPath);
   const snippet = normalizeString(input.snippet);
   const path = normalizeDocsPath(normalizeString(input.path));
-  const baseEvidenceKind = normalizeString(input.evidenceKind ?? metadata.evidence_kind ?? metadata.source_family);
-  const evidenceKind = preferEvidenceKind(
-    baseEvidenceKind,
-    inferEvidenceKindFallback({ path, title, heading, snippet, currentEvidenceKind: baseEvidenceKind })
+  const evidenceKind = normalizePolicyEvidenceKind(
+    String(input.evidenceKind ?? metadata.evidence_kind ?? metadata.source_family ?? "")
   );
-  const baseProductArea = normalizeString(input.productArea ?? metadata.product_area);
-  const productArea =
-    hasSpecificProductArea(baseProductArea)
-      ? baseProductArea
-      : inferProductAreaFallback({ path, title, heading, snippet }) || baseProductArea;
-  const baseDeploymentModel = normalizeString(input.deploymentModel ?? metadata.deployment_model);
-  const deploymentModel =
-    hasSpecificDeploymentModel(baseDeploymentModel)
-      ? baseDeploymentModel
-      : inferDeploymentModelFallback({ path, title, heading, snippet }) || baseDeploymentModel;
+  const productArea = normalizePolicyProductArea(String(input.productArea ?? metadata.product_area ?? ""));
+  const deploymentModel = normalizeString(input.deploymentModel ?? metadata.deployment_model);
   const explicitDocKind = normalizeString(input.docKind ?? metadata.doc_kind);
   const docKind = inferDocKind({
     explicitDocKind,
-    path,
     productArea,
     evidenceKind
   });
@@ -256,8 +166,8 @@ export function getSupportEvidenceProfile(input: SupportEvidenceLike): SupportEv
     normalizeString(input.objectType ?? metadata.object_type) || getMetadataList(metadata, "objects")[0] || "";
   const appliesTo = uniqueStrings([
     ...getMetadataList(metadata, "applies_to"),
-    hasSpecificDeploymentModel(deploymentModel) ? deploymentModel : "",
-    hasSpecificProductArea(productArea) ? productArea : ""
+    deploymentModel,
+    productArea
   ]);
   return {
     title,
@@ -279,9 +189,6 @@ export function getSupportEvidenceProfile(input: SupportEvidenceLike): SupportEv
 function hasPermissionSignal(profile: SupportEvidenceProfile): boolean {
   if (profile.permissions.length > 0) return true;
   const semanticText = [
-    profile.title,
-    profile.heading,
-    profile.snippet,
     ...profile.permissions,
     ...profile.prerequisites,
     ...profile.actions
@@ -292,7 +199,11 @@ function hasPermissionSignal(profile: SupportEvidenceProfile): boolean {
 }
 
 export function buildSupportEvidencePolicy(caseFrame: SupportCaseFrame): SupportEvidencePolicy | null {
-  if (String(caseFrame.question_type ?? "").startsWith("api_")) {
+  const questionType = String(caseFrame.question_type ?? "");
+  const domain = resolvePolicyDomain(caseFrame);
+  const deploymentModel = normalizeString(caseFrame.deployment_model);
+
+  if (domain === "openapi") {
     if (caseFrame.question_type === "api_scope_auth") {
       return {
         strict: true,
@@ -304,19 +215,17 @@ export function buildSupportEvidencePolicy(caseFrame: SupportCaseFrame): Support
     return {
       strict: true,
       allowedProductAreas: ["openapi"],
-      allowedEvidenceKinds: ["api_operation"]
+      allowedEvidenceKinds:
+        questionType === "troubleshooting"
+          ? ["api_operation", "troubleshooting", "procedure", "constraint", "capability"]
+          : ["api_operation", "capability", "constraint", "procedure"]
     };
   }
 
-  const questionType = String(caseFrame.question_type ?? "");
-  const productArea = normalizeString(caseFrame.product_area);
-  const deploymentModel = normalizeString(caseFrame.deployment_model);
-  const deploymentScoped = expandProductAreaAliases(productArea).includes("deployment");
-
-  if (deploymentScoped) {
+  if (domain === "deployment") {
     return {
       strict: true,
-      allowedProductAreas: expandProductAreaAliases(productArea),
+      allowedProductAreas: ["deployment"],
       allowedEvidenceKinds:
         questionType === "how_to_product" || questionType === "config_setup"
           ? ["procedure", "troubleshooting", "constraint", "capability"]
@@ -325,18 +234,7 @@ export function buildSupportEvidencePolicy(caseFrame: SupportCaseFrame): Support
     };
   }
 
-  if (productArea === "openapi") {
-    return {
-      strict: true,
-      allowedProductAreas: ["openapi"],
-      allowedEvidenceKinds:
-        questionType === "troubleshooting"
-          ? ["api_operation", "troubleshooting", "procedure", "constraint", "capability"]
-          : ["api_operation", "capability", "constraint", "procedure"]
-    };
-  }
-
-  if (productArea === "integrations") {
+  if (domain === "integrations") {
     return {
       strict: true,
       allowedProductAreas: ["integrations"],
@@ -347,18 +245,22 @@ export function buildSupportEvidencePolicy(caseFrame: SupportCaseFrame): Support
     };
   }
 
+  if (!domain) {
+    return null;
+  }
+
   if (questionType === "how_to_product" || questionType === "config_setup" || questionType === "data_export_reporting") {
     return {
-      strict: hasSpecificProductArea(productArea),
-      allowedProductAreas: hasSpecificProductArea(productArea) ? expandProductAreaAliases(productArea) : [],
+      strict: true,
+      allowedProductAreas: [domain],
       allowedEvidenceKinds: ["procedure", "capability", "constraint", "troubleshooting"]
     };
   }
 
   if (questionType === "why_behavior" || questionType === "capability_confirmation" || questionType === "troubleshooting") {
     return {
-      strict: hasSpecificProductArea(productArea),
-      allowedProductAreas: hasSpecificProductArea(productArea) ? expandProductAreaAliases(productArea) : [],
+      strict: true,
+      allowedProductAreas: [domain],
       allowedEvidenceKinds: ["capability", "constraint", "procedure", "troubleshooting"]
     };
   }
@@ -371,8 +273,8 @@ export function matchesSupportEvidencePolicy(input: SupportEvidenceLike, caseFra
   if (!policy) return true;
 
   const profile = getSupportEvidenceProfile(input);
-  const allowedProductAreas = new Set(policy.allowedProductAreas.flatMap((item) => expandProductAreaAliases(item)));
-  const candidateProductAreas = expandProductAreaAliases(profile.productArea);
+  const allowedProductAreas = new Set(policy.allowedProductAreas.map((item) => normalizeString(item)).filter(Boolean));
+  const candidateProductAreas = [normalizeString(profile.productArea)].filter(Boolean);
   const productMatched =
     !policy.allowedProductAreas.length ||
     !candidateProductAreas.length ||

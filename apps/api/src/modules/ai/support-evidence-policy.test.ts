@@ -20,7 +20,8 @@ function createDeploymentCapabilityCaseFrame(): SupportCaseFrame {
     missing_critical_info: [],
     retrieval_queries: ["supported operating systems", "deployment requirements"],
     required_doc_kinds: ["deployment_runbook", "product_guide", "rules"],
-    question_type: "capability_confirmation"
+    question_type: "capability_confirmation",
+    primary_domain: "deployment"
   };
 }
 
@@ -36,7 +37,8 @@ function createOpenApiCapabilityCaseFrame(): SupportCaseFrame {
     missing_critical_info: [],
     retrieval_queries: ["ORDER BY GROUP BY ONESQL"],
     required_doc_kinds: ["openapi/api", "product_guide"],
-    question_type: "capability_confirmation"
+    question_type: "capability_confirmation",
+    primary_domain: "openapi"
   };
 }
 
@@ -52,7 +54,8 @@ function createPrivateDeploymentIntegrationCaseFrame(): SupportCaseFrame {
     missing_critical_info: [],
     retrieval_queries: ["Azure AD integration ONES.com Cloud private deployment"],
     required_doc_kinds: ["product_guide", "rules"],
-    question_type: "capability_confirmation"
+    question_type: "capability_confirmation",
+    primary_domain: "integrations"
   };
 }
 
@@ -60,7 +63,7 @@ test("buildSupportEvidencePolicy marks deployment capability questions as strict
   const policy = buildSupportEvidencePolicy(createDeploymentCapabilityCaseFrame());
 
   assert.equal(policy?.strict, true);
-  assert.deepEqual(policy?.allowedProductAreas, ["deployment", "deployment_environment"]);
+  assert.deepEqual(policy?.allowedProductAreas, ["deployment"]);
   assert.deepEqual(policy?.allowedDeploymentModels, ["private_deployment"]);
 });
 
@@ -159,7 +162,7 @@ test("matchesSupportEvidencePolicy accepts integration guidance evidence for pri
   );
 });
 
-test("matchesSupportEvidencePolicy falls back to deploy-docs path semantics when chunk metadata is degraded", () => {
+test("matchesSupportEvidencePolicy does not infer deployment semantics from degraded path-only evidence", () => {
   const caseFrame = createDeploymentCapabilityCaseFrame();
 
   assert.equal(
@@ -177,11 +180,11 @@ test("matchesSupportEvidencePolicy falls back to deploy-docs path semantics when
       },
       caseFrame
     ),
-    true
+    false
   );
 });
 
-test("getSupportEvidenceProfile reclassifies deployment migration rehearsal content as procedure evidence", () => {
+test("getSupportEvidenceProfile preserves explicit evidence metadata instead of reclassifying snippet prose", () => {
   const profile = getSupportEvidenceProfile({
     path: "deploy-docs/data/docker-to-k3s.cn.md",
     title: "Docker迁移K3S方案",
@@ -196,6 +199,6 @@ test("getSupportEvidenceProfile reclassifies deployment migration rehearsal cont
 
   assert.equal(profile.productArea, "deployment");
   assert.equal(profile.deploymentModel, "private_deployment");
-  assert.equal(profile.evidenceKind, "procedure");
+  assert.equal(profile.evidenceKind, "capability");
   assert.equal(profile.docKind, "deployment_runbook");
 });

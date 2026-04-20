@@ -1,0 +1,52 @@
+{
+  "version": "2026-04-15",
+  "contracts": {
+    "supervisor": "docs/agents/support-runtime/support-supervisor.md",
+    "evidence_judge": "docs/agents/support-runtime/support-evidence-judge.md",
+    "answer_composer": "docs/agents/support-answer-composer.md",
+    "evidence_selector": "docs/agents/support-runtime/support-evidence-selector.md",
+    "support_writer": "docs/agents/support-runtime/support-writer.md"
+  },
+  "domains": [
+    {
+      "id": "openapi",
+      "contract_path": "docs/agents/support-runtime/support-openapi-agent.md",
+      "owned_product_areas": ["openapi"],
+      "owned_source_families": ["openapi_spec", "doc_page"],
+      "preferred_doc_kinds": ["openapi/api", "permissions", "rules"],
+      "exact_signal_types": ["http_method", "route_path", "operation_id", "scope", "field_name", "oauth_token"]
+    },
+    {
+      "id": "deployment",
+      "contract_path": "docs/agents/support-runtime/support-deploy-docs-agent.md",
+      "owned_product_areas": ["deployment"],
+      "owned_source_families": ["runbook_file", "doc_page", "config_file"],
+      "preferred_doc_kinds": ["deployment_runbook", "product_guide", "rules", "troubleshooting"],
+      "exact_signal_types": ["component_name", "topology_term", "config_key", "environment_requirement", "deployment_model"]
+    },
+    {
+      "id": "integrations",
+      "contract_path": "docs/agents/support-runtime/support-integrations-agent.md",
+      "owned_product_areas": ["integrations"],
+      "owned_source_families": ["doc_page", "runbook_file", "config_file", "code_file"],
+      "preferred_doc_kinds": ["product_guide", "troubleshooting", "rules"],
+      "exact_signal_types": ["callback_url", "redirect_uri", "webhook_route", "provider_name", "base_url", "oauth_app"]
+    },
+    {
+      "id": "product",
+      "contract_path": "docs/agents/support-runtime/support-product-behavior-agent.md",
+      "owned_product_areas": ["project_management", "wiki", "general"],
+      "owned_source_families": ["doc_page", "schema_file", "test_file"],
+      "preferred_doc_kinds": ["rules", "product_guide"],
+      "exact_signal_types": ["feature_name", "object_name", "rule_term", "schema_term", "behavior_key"]
+    },
+    {
+      "id": "troubleshooting",
+      "contract_path": "docs/agents/support-runtime/support-troubleshooting-agent.md",
+      "owned_product_areas": ["general", "integrations", "deployment", "project_management"],
+      "owned_source_families": ["doc_page", "runbook_file", "code_file", "config_file", "test_file"],
+      "preferred_doc_kinds": ["troubleshooting", "deployment_runbook", "rules"],
+      "exact_signal_types": ["error_code", "error_text", "failing_object", "callback_error", "config_key", "version_term"]
+    }
+  ]
+}

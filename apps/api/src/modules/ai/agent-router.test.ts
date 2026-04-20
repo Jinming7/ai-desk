@@ -15,7 +15,7 @@ test("buildSearchRuntime keeps serverless retrieval on github kb path but allows
     assert.equal(runtime.allowMultiPassRetrieval, true);
     assert.equal(runtime.allowRefinement, true);
     assert.equal(runtime.kbTopK, 8);
-    assert.equal(runtime.queryLimit, 2);
+    assert.equal(runtime.queryLimit, 4);
   } finally {
     if (originalVercel === undefined) delete process.env.VERCEL;
     else process.env.VERCEL = originalVercel;
@@ -57,7 +57,8 @@ test("buildSearchRuntime gives async job delivery a larger serverless budget tha
     });
 
     assert.equal(interactive.overallTimeoutMs! < asyncJob.overallTimeoutMs!, true);
-    assert.equal(interactive.queryLimit! < asyncJob.queryLimit!, true);
+    assert.equal(interactive.queryLimit, 4);
+    assert.equal(asyncJob.queryLimit, 4);
     assert.equal(asyncJob.allowRefinement, true);
     assert.equal(interactive.deliveryMode, "interactive");
     assert.equal(asyncJob.deliveryMode, "async_job");
