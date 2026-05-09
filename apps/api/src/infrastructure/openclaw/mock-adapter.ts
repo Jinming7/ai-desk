@@ -4,13 +4,8 @@ import type {
   OpenClawAnalyzeOutput,
   OpenClawHealthCheckInput,
   OpenClawHealthCheckResult,
-  OpenClawSupportMainDraftInput,
-  OpenClawSupportMainDraftOutput,
-  OpenClawSupportMainPlanInput,
-  OpenClawSupportMainPlanOutput,
   OpenClawSupportEvidencePlannerInput,
   OpenClawSupportAnswerComposerInput,
-  OpenClawSupportCitationSelectorInput,
   OpenClawSupportEvidenceSelectorInput,
   OpenClawSupportPlannerInput,
   OpenClawSupportRouterInput,
@@ -27,7 +22,6 @@ import type {
   DraftSupportAnswer,
   SpecialistDraftAnswer,
   SupportCaseFrame,
-  SupportDomain,
   SupportEvidencePlan,
   SupportEvidenceSelection,
   SupportQuestionRoute,
@@ -183,125 +177,6 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
       steps: [],
       validation: [],
       suggested_next_step: "submit_ticket"
-    };
-  }
-
-  async planSupportMainAgent(
-    input: OpenClawSupportMainPlanInput,
-    _idempotencyKey: string,
-    _runtime?: OpenClawRuntimeContext
-  ): Promise<OpenClawSupportMainPlanOutput> {
-    const route = await this.routeSupportQuestion({
-      contextType: input.contextType,
-      language: input.language,
-      query: input.query,
-      conversationHistory: input.conversationHistory
-    }, `${input.query}:support-main:route`);
-    const caseFrame = await this.planSupportCase({
-      contextType: input.contextType,
-      language: input.language,
-      query: input.query,
-      conversationHistory: input.conversationHistory,
-      ticketContext: input.ticketContext
-    }, `${input.query}:support-main:case`);
-
-    return {
-      route,
-      caseFrame: {
-        ...caseFrame,
-        question_type: route.question_type,
-        specialist_agent: route.specialist_agent,
-        answer_contract: route.answer_contract,
-        routing_confidence: route.routing_confidence
-      },
-      retrievalQueries: [input.query]
-    };
-  }
-
-  async planSupportDispatch(
-    input: OpenClawSupportPlannerInput,
-    _idempotencyKey: string,
-    _runtime?: OpenClawRuntimeContext
-  ) {
-    const route = await this.routeSupportQuestion(
-      {
-        contextType: input.contextType,
-        language: input.language,
-        query: input.query,
-        conversationHistory: input.conversationHistory
-      },
-      `${input.query}:support-dispatch:route`
-    );
-    const caseFrame = await this.planSupportCase(
-      {
-        contextType: input.contextType,
-        language: input.language,
-        query: input.query,
-        conversationHistory: input.conversationHistory,
-        ticketContext: input.ticketContext
-      },
-      `${input.query}:support-dispatch:case`
-    );
-    const primaryDomain: SupportDomain =
-      route.question_type.startsWith("api_")
-        ? "openapi"
-        : caseFrame.deployment_model === "private_deployment" || caseFrame.product_area === "deployment"
-        ? "deployment"
-        : "docs";
-
-    return {
-      primaryDomain,
-      route: {
-        ...route,
-        primary_domain: primaryDomain
-      },
-      caseFrame: {
-        ...caseFrame,
-        question_type: route.question_type,
-        specialist_agent: route.specialist_agent,
-        answer_contract: route.answer_contract,
-        routing_confidence: route.routing_confidence,
-        primary_domain: primaryDomain
-      },
-      retrievalQueries: [input.query]
-    };
-  }
-
-  async draftSupportMainAgent(
-    input: OpenClawSupportMainDraftInput,
-    _idempotencyKey: string,
-    _runtime?: OpenClawRuntimeContext
-  ): Promise<OpenClawSupportMainDraftOutput> {
-    const primaryReference = input.providedEvidence[0];
-
-    return {
-      draftAnswer: {
-        question_type: input.route.question_type,
-        render_variant:
-          input.route.specialist_agent === "api-specialist"
-            ? "api"
-            : input.route.specialist_agent === "howto-specialist"
-            ? "how_to"
-            : input.route.specialist_agent === "behavior-specialist"
-            ? "behavior"
-            : "troubleshooting",
-        direct_answer:
-          primaryReference?.snippet ??
-          (input.language === "zh" ? "当前没有找到可验证的支持证据。" : "I could not verify the answer from support evidence yet."),
-        claims: primaryReference
-          ? [
-              {
-                text: primaryReference.snippet,
-                kind: "verified_fact",
-                reference_ids: [primaryReference.reference_id],
-                authority: "canonical"
-              }
-            ]
-          : [],
-        next_actions: [],
-        unknowns: input.caseFrame.missing_critical_info.slice(0, 3),
-        escalation_needed: false
-      }
     };
   }
 
@@ -487,14 +362,6 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  async writeOpenApiDomainAnswer(
-    input: OpenClawSupportSpecialistInput,
-    _idempotencyKey: string,
-    _runtime?: OpenClawRuntimeContext
-  ): Promise<SpecialistDraftAnswer> {
-    return this.writeApiSpecialistAnswer(input, _idempotencyKey, _runtime);
-  }
-
   async writeHowToSpecialistAnswer(
     input: OpenClawSupportSpecialistInput,
     _idempotencyKey: string,
@@ -517,16 +384,6 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  async writeDeploymentDomainAnswer(
-    input: OpenClawSupportSpecialistInput,
-    _idempotencyKey: string,
-    _runtime?: OpenClawRuntimeContext
-  ): Promise<SpecialistDraftAnswer> {
-    return input.route.specialist_agent === "troubleshooting-specialist"
-      ? this.writeTroubleshootingSpecialistAnswer(input, _idempotencyKey, _runtime)
-      : this.writeHowToSpecialistAnswer(input, _idempotencyKey, _runtime);
-  }
-
   async writeBehaviorSpecialistAnswer(
     input: OpenClawSupportSpecialistInput,
     _idempotencyKey: string,
@@ -536,7 +393,9 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     return {
       question_type: input.route.question_type,
       render_variant: "behavior",
-      direct_answer: primary ? "The documentation supports a likely explanation, but not every detail is explicit." : "I could not confirm the behavior from the current evidence.",
+      direct_answer: primary
+        ? "The documentation supports a likely explanation, but not every detail is explicit."
+        : "I could not confirm the behavior from the current evidence.",
       claims: primary
         ? [{ text: primary.snippet, kind: "grounded_inference", evidence_ids: [primary.documentId], authority: "canonical" }]
         : [],
@@ -549,17 +408,6 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     };
   }
 
-  async writeDocsDomainAnswer(
-    input: OpenClawSupportSpecialistInput,
-    _idempotencyKey: string,
-    _runtime?: OpenClawRuntimeContext
-  ): Promise<SpecialistDraftAnswer> {
-    return input.route.specialist_agent === "howto-specialist"
-      ? this.writeHowToSpecialistAnswer(input, _idempotencyKey, _runtime)
-      : input.route.specialist_agent === "troubleshooting-specialist"
-      ? this.writeTroubleshootingSpecialistAnswer(input, _idempotencyKey, _runtime)
-      : this.writeBehaviorSpecialistAnswer(input, _idempotencyKey, _runtime);
-  }
 
   async writeTroubleshootingSpecialistAnswer(
     input: OpenClawSupportSpecialistInput,
@@ -674,84 +522,6 @@ export class MockOpenClawAdapter implements OpenClawAdapter {
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportVerificationResult> {
     return this.verifySupportAnswer(input, idempotencyKey, runtime);
-  }
-
-  async bindSupportCitations(
-    input: OpenClawSupportVerifierInput,
-    _idempotencyKey: string,
-    _runtime?: OpenClawRuntimeContext
-  ): Promise<SupportVerificationResult> {
-    const citationIds = [...input.evidenceBundle.primary, ...input.evidenceBundle.supplemental].map((item) => item.documentId);
-    const claimMap =
-      input.draftSupportAnswer?.claims.map((item) => {
-        const boundIds = item.evidence_ids.length ? item.evidence_ids.slice(0, 2) : citationIds.slice(0, 2);
-        return {
-          text: item.text,
-          kind: item.kind,
-          verdict:
-            boundIds.length === 0
-              ? ("unsupported" as const)
-              : item.kind === "grounded_inference"
-              ? ("supported_inference" as const)
-              : ("verified" as const),
-          citation_ids: boundIds
-        };
-      }) ?? [];
-    const displayCitationIds = Array.from(new Set(claimMap.flatMap((item) => item.citation_ids))).slice(0, 3);
-    return {
-      verdict: displayCitationIds.length ? "partial" : "unsupported",
-      summary: displayCitationIds.length
-        ? "Claims were rebound to the strongest available evidence."
-        : "No claim could be rebound to the available evidence.",
-      unsupported_claims: [],
-      missing_info: [],
-      verified_citation_ids: displayCitationIds,
-      display_citation_ids: displayCitationIds,
-      verified_claims: claimMap.filter((item) => item.citation_ids.length > 0).map((item) => item.text),
-      claim_to_citation_map: claimMap
-    };
-  }
-
-  async selectDisplayCitations(
-    input: OpenClawSupportCitationSelectorInput,
-    _idempotencyKey: string,
-    _runtime?: OpenClawRuntimeContext
-  ): Promise<{ display_citation_ids: string[] }> {
-    return {
-      display_citation_ids: Array.from(new Set(input.supportedClaims.flatMap((item) => item.citation_ids))).slice(0, 3)
-    };
-  }
-
-  async curateSupportCitations(
-    input: OpenClawSupportCitationSelectorInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<{ display_citation_ids: string[] }> {
-    return this.selectDisplayCitations(input, idempotencyKey, runtime);
-  }
-
-  async composeSupportAnswer(
-    input: OpenClawSupportAnswerComposerInput,
-    _idempotencyKey: string,
-    _runtime?: OpenClawRuntimeContext
-  ): Promise<{
-    direct_answer: string;
-    why: string[];
-    what_to_do_now: string[];
-    still_need_to_confirm: string[];
-  }> {
-    const facts = input.supportedClaims.map((item) => item.text);
-    const direct_answer =
-      facts[0] ??
-      (input.mode === "partial"
-        ? "I can confirm part of the answer, but some details are still unconfirmed."
-        : "The available documentation supports this answer.");
-    return {
-      direct_answer,
-      why: facts.slice(0, 3),
-      what_to_do_now: input.nextActions.slice(0, 4),
-      still_need_to_confirm: input.unknowns.slice(0, 4)
-    };
   }
 
   async composeCustomerAnswer(

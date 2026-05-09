@@ -15,9 +15,11 @@
 
 ## Shared Answer Contract
 - `direct_answer`: one concise, support-engineer-style answer to the actual question.
-- `sections`: 2-3 scenario-appropriate structured sections.
+- `sections`: dynamic scenario-appropriate structured sections (usually 1-3; do not force fixed counts).
 - `what_to_do_now`: short executable actions only.
 - `still_need_to_confirm`: minimum unresolved items only.
+- `suppress_still_need_to_confirm`: boolean delivery signal from composer to runtime (typed contract, no runtime semantic guessing).
+- For `grounded` or executable `partial` answers, `still_need_to_confirm` should be empty.
 
 ## Scenario Templates
 
@@ -77,4 +79,4 @@
 - Prefer short sentences and short sections.
 - Do not repeat the same conclusion in every field.
 - If commands or scripts are genuinely useful, prefer a structured `code_block` section over burying them in prose.
-- Structure by scenario, not by random free-form essay flow.
+- Structure by scenario and execution value, not fixed template order.

@@ -66,10 +66,14 @@ Internal-only APIs require header `x-portal-surface: internal`:
 
 Required Vercel Environment Variables:
 - `DATABASE_URL`
+- `AI_AGENT_PROVIDER` (`openclaw` default, set `hermes` to enable Hermes adapter)
+- `HERMES_RUNTIME_MODE` (`bridge` default; `native` reserved for phase-2 runtime)
 - `OPENCLAW_WS_URL`
 - `OPENCLAW_BASIC_USER`
 - `OPENCLAW_BASIC_PASS`
 - `OPENCLAW_GATEWAY_TOKEN` or `OPENCLAW_BASIC_PASS` as gateway auth fallback
+
+Note: when `AI_AGENT_PROVIDER=hermes` and `HERMES_RUNTIME_MODE=bridge`, Hermes still depends on OpenClaw gateway credentials during this migration stage.
 - `OPENCLAW_REQUEST_SCOPES` (comma-separated, default includes `operator.admin`)
 - `OPENCLAW_ALLOW_SELF_SIGNED` (set `true` only when OpenClaw uses self-signed cert)
 - `OPENCLAW_CONNECT_TIMEOUT_MS`

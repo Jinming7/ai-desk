@@ -56,13 +56,13 @@ import * as supportUxService from "./modules/support-ux/service.js";
 import * as githubKbService from "./modules/github-kb/service.js";
 import * as kbCleanupService from "./modules/github-kb/cleanup/service.js";
 import * as kbReleaseService from "./modules/github-kb/release/service.js";
-import { getAiRuntimeReadinessProfile, getAiTopology } from "./modules/ai/agent-router.js";
+import { getAiTopology } from "./modules/ai/agent-router.js";
 import { preloadLocalDocsIndex } from "./modules/ai/local-docs.js";
 import { getAiCapabilities } from "./modules/ai/multimodal.js";
 import { streamSearchModeJob } from "./modules/ai/support-search-stream.js";
 import { hasOpenClawGatewayAuthConfigured } from "./infrastructure/openclaw/device-auth.js";
-import { MockOpenClawAdapter } from "./infrastructure/openclaw/mock-adapter.js";
-import { WsOpenClawAdapter } from "./infrastructure/openclaw/ws-adapter.js";
+import { createAiAdapter, resolveAiRuntimeProvider } from "./infrastructure/ai/adapter-factory.js";
+import { evaluateAiGatewayAuth, resolveHermesRuntimeMode } from "./infrastructure/ai/auth-policy.js";
 import { env } from "./config/env.js";
 import { shouldStartBackgroundLoops } from "./config/runtime-env.js";
 import { asyncHandler } from "./utils/http.js";
@@ -76,46 +76,56 @@ const imagesUploadRoot = path.join(uploadsRoot, "images");
 const filesUploadRoot = path.join(uploadsRoot, "files");
 app.use("/uploads", express.static(uploadsRoot));
 
-const aiAdapter =
-  env.NODE_ENV === "test"
-    ? new MockOpenClawAdapter()
-    : new WsOpenClawAdapter();
+const aiProvider = resolveAiRuntimeProvider(env.AI_AGENT_PROVIDER);
+const hermesRuntimeMode = resolveHermesRuntimeMode(env.HERMES_RUNTIME_MODE);
+const aiAdapter = createAiAdapter({
+  nodeEnv: env.NODE_ENV,
+  provider: aiProvider,
+  hermesMode: hermesRuntimeMode
+});
 
 function currentAiTopology() {
   return getAiTopology();
 }
 
-function currentAiRuntimeReadiness() {
-  return getAiRuntimeReadinessProfile({
-    supervisorDomainAvailable: Boolean(aiAdapter.planSupportDispatch),
-    supportMainAvailable: Boolean(aiAdapter.planSupportMainAgent) && Boolean(aiAdapter.draftSupportMainAgent),
-    customerAnswerComposerAvailable: true
+function evaluateCurrentAiGatewayAuth() {
+  return evaluateAiGatewayAuth({
+    provider: aiProvider,
+    openClawAuthConfigured: hasOpenClawGatewayAuthConfigured(),
+    hermesMode: hermesRuntimeMode,
+    hermesNativeConfigured: Boolean(env.HERMES_LLM_API_KEY?.trim())
   });
 }
 
-function hasOpenClawGatewayAuth(): boolean {
-  return hasOpenClawGatewayAuthConfigured();
+function ensureAiGatewayAuthForRequest(res: express.Response): boolean {
+  if (env.NODE_ENV === "test") return true;
+  const gatewayAuth = evaluateCurrentAiGatewayAuth();
+  if (!gatewayAuth.ok) {
+    res.status(503).json({ error: gatewayAuth.message });
+    return false;
+  }
+  return true;
 }
 
 export async function ensureAiRuntimeReady() {
   if (env.NODE_ENV === "test") return;
-  if (!hasOpenClawGatewayAuth()) {
-    throw new Error("OpenClaw gateway auth is not configured");
+  const gatewayAuth = evaluateCurrentAiGatewayAuth();
+  if (!gatewayAuth.ok) {
+    throw new Error(gatewayAuth.message);
   }
   const topology = currentAiTopology();
-  const readiness = currentAiRuntimeReadiness();
   if (!topology.multiAgentReady) {
     throw new Error(`AI topology conflicts: ${topology.conflicts.map((item) => item.detail).join("; ")}`);
   }
   const health = await aiAdapter.healthCheck({
-    agentIds: readiness.requiredAgents
+    agentIds: topology.configuredAgents
   });
   if (!health.ok || (health.unreachableAgents?.length ?? 0) > 0) {
     const detail =
       health.unreachableAgents?.map((item) => `${item.agentId}: ${item.detail}`).join("; ") ||
       health.detail ||
-      "Unknown OpenClaw health failure";
-    throw new Error(`OpenClaw multi-agent topology is not ready: ${detail}`);
+      "Unknown AI runtime health failure";
+    throw new Error(`AI multi-agent topology is not ready: ${detail}`);
   }
 }
 
@@ -198,20 +208,18 @@ app.get(
   "/api/v1/health",
   asyncHandler(async (_req, res) => {
     const topology = currentAiTopology();
-    const readiness = currentAiRuntimeReadiness();
     const health = await aiAdapter.healthCheck({
-      agentIds: readiness.requiredAgents
+      agentIds: topology.configuredAgents
     });
     res.json({
       ok: topology.multiAgentReady && health.ok,
       service: "nexusflow-api",
       openclaw: health.mode,
+      aiProvider,
       multiAgentReady: topology.multiAgentReady && health.ok,
       topologyHash: topology.topologyHash,
       aiTopology: topology,
       configuredAgents: topology.configuredAgents,
-      healthCheckedAgents: readiness.requiredAgents,
-      optionalAgents: readiness.optionalAgents,
       reachableAgents: health.reachableAgents ?? [],
       unreachableAgents: health.unreachableAgents ?? [],
       conflicts: topology.conflicts
@@ -227,9 +235,8 @@ app.get(
   "/api/v1/integrations/openclaw/health",
   asyncHandler(async (_req, res) => {
     const topology = currentAiTopology();
-    const readiness = currentAiRuntimeReadiness();
     const health = await aiAdapter.healthCheck({
-      agentIds: readiness.requiredAgents
+      agentIds: topology.configuredAgents
     });
     const ok = topology.multiAgentReady && health.ok;
     res.status(ok ? 200 : 503).json({
@@ -237,8 +244,6 @@ app.get(
       multiAgentReady: ok,
       topologyHash: topology.topologyHash,
       configuredAgents: topology.configuredAgents,
-      healthCheckedAgents: readiness.requiredAgents,
-      optionalAgents: readiness.optionalAgents,
       conflicts: topology.conflicts
     });
   })
@@ -343,8 +348,7 @@ app.post(
 app.post(
   "/api/v1/ai/search",
   asyncHandler(async (req, res) => {
-    if (env.NODE_ENV !== "test" && !hasOpenClawGatewayAuth()) {
-      res.status(503).json({ error: "OpenClaw gateway auth is not configured" });
+    if (!ensureAiGatewayAuthForRequest(res)) {
       return;
     }
     const body = aiSearchRequestSchema.parse(req.body);
@@ -362,8 +366,7 @@ app.post(
 app.post(
   "/api/v1/ai/search/jobs",
   asyncHandler(async (req, res) => {
-    if (env.NODE_ENV !== "test" && !hasOpenClawGatewayAuth()) {
-      res.status(503).json({ error: "OpenClaw gateway auth is not configured" });
+    if (!ensureAiGatewayAuthForRequest(res)) {
       return;
     }
     const body = aiSearchRequestSchema.parse(req.body);
@@ -394,8 +397,7 @@ app.get(
 app.post(
   "/api/v1/ai/search/jobs/:id/drive",
   asyncHandler(async (req, res) => {
-    if (env.NODE_ENV !== "test" && !hasOpenClawGatewayAuth()) {
-      res.status(503).json({ error: "OpenClaw gateway auth is not configured" });
+    if (!ensureAiGatewayAuthForRequest(res)) {
       return;
     }
     const id = z.string().uuid().parse(req.params.id);
@@ -411,8 +413,7 @@ app.post(
 app.get(
   "/api/v1/ai/search/jobs/:id/events",
   asyncHandler(async (req, res) => {
-    if (env.NODE_ENV !== "test" && !hasOpenClawGatewayAuth()) {
-      res.status(503).json({ error: "OpenClaw gateway auth is not configured" });
+    if (!ensureAiGatewayAuthForRequest(res)) {
       return;
     }
     const id = z.string().uuid().parse(req.params.id);

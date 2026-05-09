@@ -15,7 +15,6 @@ function buildAgentScopedSessionKey(agentId: string, mainKey: string): string {
 
 type SupportStage = NonNullable<OpenClawRuntimeContext["stage"]>;
 type RoutedSupportStage =
-  | "support-main"
   | "router"
   | "evidence-planner"
   | "planner"
@@ -25,9 +24,6 @@ type RoutedSupportStage =
   | "behavior-specialist"
   | "troubleshooting-specialist"
   | "evidence-judge"
-  | "support-citation-binder"
-  | "citation-curator"
-  | "support-citation-selector"
   | "answer-composer";
 
 type StageBinding = {
@@ -79,7 +75,6 @@ const DEFAULT_SEARCH_AGENT_IDS = {
 } as const;
 
 const DEFAULT_SUPPORT_STAGE_AGENT_IDS: Record<RoutedSupportStage, string> = {
-  "support-main": "support-main",
   router: "support-router",
   "evidence-planner": "support-evidence-planner",
   planner: "support-planner",
@@ -89,19 +84,8 @@ const DEFAULT_SUPPORT_STAGE_AGENT_IDS: Record<RoutedSupportStage, string> = {
   "behavior-specialist": "support-behavior-specialist",
   "troubleshooting-specialist": "support-troubleshooting-specialist",
   "evidence-judge": "support-evidence-judge",
-  "support-citation-binder": "support-citation-curator",
-  "citation-curator": "support-citation-curator",
-  "support-citation-selector": "support-citation-selector",
   "answer-composer": "support-answer-composer"
 };
-
-function citationBinderFallbackAgentId() {
-  return env.OPENCLAW_AGENT_ID_CITATION_CURATOR.trim() || DEFAULT_SUPPORT_STAGE_AGENT_IDS["citation-curator"];
-}
-
-function citationBinderFallbackModel() {
-  return env.OPENCLAW_AGENT_MODEL_CITATION_CURATOR.trim() || globalDefaultModel();
-}
 
 function globalDefaultAgentId() {
   return env.OPENCLAW_AGENT_ID.trim() || "main";
@@ -117,10 +101,6 @@ function executionFallbackAgentId() {
 
 function executionFallbackModel() {
   return env.OPENCLAW_AGENT_MODEL_EXECUTION.trim() || env.OPENCLAW_AGENT_MODEL.trim() || undefined;
-}
-
-export function isSupportMainRuntimeEnabled(): boolean {
-  return env.FEATURE_SUPPORT_AGENT_SINGLE_AGENT_RUNTIME || Boolean(env.OPENCLAW_AGENT_ID_SUPPORT_MAIN.trim());
 }
 
 function resolveSearchStageBinding(stage: SearchStage): SearchStageBinding {
@@ -165,11 +145,6 @@ export function resolveStageSpecificAgent(stage: SupportStage, runtime?: OpenCla
 
   const stageBinding = (() => {
     switch (stage) {
-      case "support-main":
-        return {
-          agentId: env.OPENCLAW_AGENT_ID_SUPPORT_MAIN.trim(),
-          model: env.OPENCLAW_AGENT_MODEL_SUPPORT_MAIN.trim()
-        };
       case "router":
         return {
           agentId: env.OPENCLAW_AGENT_ID_ROUTER.trim(),
@@ -215,21 +190,6 @@ export function resolveStageSpecificAgent(stage: SupportStage, runtime?: OpenCla
           agentId: env.OPENCLAW_AGENT_ID_EVIDENCE_JUDGE.trim(),
           model: env.OPENCLAW_AGENT_MODEL_EVIDENCE_JUDGE.trim()
         };
-      case "support-citation-binder":
-        return {
-          agentId: env.OPENCLAW_AGENT_ID_SUPPORT_CITATION_BINDER.trim(),
-          model: env.OPENCLAW_AGENT_MODEL_SUPPORT_CITATION_BINDER.trim()
-        };
-      case "citation-curator":
-        return {
-          agentId: env.OPENCLAW_AGENT_ID_CITATION_CURATOR.trim(),
-          model: env.OPENCLAW_AGENT_MODEL_CITATION_CURATOR.trim()
-        };
-      case "support-citation-selector":
-        return {
-          agentId: env.OPENCLAW_AGENT_ID_SUPPORT_CITATION_SELECTOR.trim(),
-          model: env.OPENCLAW_AGENT_MODEL_SUPPORT_CITATION_SELECTOR.trim()
-        };
       case "answer-composer":
         return {
           agentId: env.OPENCLAW_AGENT_ID_ANSWER_COMPOSER.trim(),
@@ -244,19 +204,15 @@ export function resolveStageSpecificAgent(stage: SupportStage, runtime?: OpenCla
   })();
 
   const defaultTopologyAgentId = stage in DEFAULT_SUPPORT_STAGE_AGENT_IDS ? DEFAULT_SUPPORT_STAGE_AGENT_IDS[stage as RoutedSupportStage] : "";
-  const stageLevelFallbackAgentId = stage === "support-citation-binder" ? citationBinderFallbackAgentId() : "";
-  const stageLevelFallbackModel = stage === "support-citation-binder" ? citationBinderFallbackModel() : undefined;
   return {
-    agentId: stageBinding.agentId || explicitRuntimeAgentId || stageLevelFallbackAgentId || defaultTopologyAgentId || globalDefaultAgentId(),
-    model: stageBinding.model || explicitRuntimeModel || stageLevelFallbackModel || globalDefaultModel()
+    agentId: stageBinding.agentId || explicitRuntimeAgentId || defaultTopologyAgentId || globalDefaultAgentId(),
+    model: stageBinding.model || explicitRuntimeModel || globalDefaultModel()
   };
 }
 
 function resolveStageBinding(stage: RoutedSupportStage): StageBinding {
   const envAgentId = (() => {
     switch (stage) {
-      case "support-main":
-        return env.OPENCLAW_AGENT_ID_SUPPORT_MAIN.trim();
       case "router":
         return env.OPENCLAW_AGENT_ID_ROUTER.trim();
       case "evidence-planner":
@@ -275,20 +231,12 @@ function resolveStageBinding(stage: RoutedSupportStage): StageBinding {
         return env.OPENCLAW_AGENT_ID_TROUBLESHOOTING_SPECIALIST.trim();
       case "evidence-judge":
         return env.OPENCLAW_AGENT_ID_EVIDENCE_JUDGE.trim();
-      case "support-citation-binder":
-        return env.OPENCLAW_AGENT_ID_SUPPORT_CITATION_BINDER.trim();
-      case "citation-curator":
-        return env.OPENCLAW_AGENT_ID_CITATION_CURATOR.trim();
-      case "support-citation-selector":
-        return env.OPENCLAW_AGENT_ID_SUPPORT_CITATION_SELECTOR.trim();
       case "answer-composer":
         return env.OPENCLAW_AGENT_ID_ANSWER_COMPOSER.trim();
     }
   })();
   const envModel = (() => {
     switch (stage) {
-      case "support-main":
-        return env.OPENCLAW_AGENT_MODEL_SUPPORT_MAIN.trim();
       case "router":
         return env.OPENCLAW_AGENT_MODEL_ROUTER.trim();
       case "evidence-planner":
@@ -307,26 +255,11 @@ function resolveStageBinding(stage: RoutedSupportStage): StageBinding {
         return env.OPENCLAW_AGENT_MODEL_TROUBLESHOOTING_SPECIALIST.trim();
       case "evidence-judge":
         return env.OPENCLAW_AGENT_MODEL_EVIDENCE_JUDGE.trim();
-      case "support-citation-binder":
-        return env.OPENCLAW_AGENT_MODEL_SUPPORT_CITATION_BINDER.trim();
-      case "citation-curator":
-        return env.OPENCLAW_AGENT_MODEL_CITATION_CURATOR.trim();
-      case "support-citation-selector":
-        return env.OPENCLAW_AGENT_MODEL_SUPPORT_CITATION_SELECTOR.trim();
       case "answer-composer":
         return env.OPENCLAW_AGENT_MODEL_ANSWER_COMPOSER.trim();
     }
   })();
   const runtime = resolveStageSpecificAgent(stage);
-  if (stage === "support-citation-binder" && !envAgentId) {
-    return {
-      stage,
-      agentId: runtime.agentId,
-      model: runtime.model ?? envModel ?? citationBinderFallbackModel() ?? null,
-      dedicated: false,
-      fallback: "stage_level_fallback"
-    };
-  }
   const defaultAgentId = DEFAULT_SUPPORT_STAGE_AGENT_IDS[stage];
   const dedicated = runtime.agentId !== executionFallbackAgentId();
   const fallback: StageBinding["fallback"] = envAgentId
@@ -447,10 +380,10 @@ function buildTopologyHash(searchStages: SearchStageBinding[], supportStages: St
 
 export function getAiTopology(): AiTopologySnapshot {
   const supportStages = [
-    ...(isSupportMainRuntimeEnabled() ? [resolveStageBinding("support-main")] : []),
     resolveStageBinding("router"),
     resolveStageBinding("evidence-planner"),
     resolveStageBinding("planner"),
+    resolveStageBinding("support-evidence-selector"),
     resolveStageBinding("api-specialist"),
     resolveStageBinding("howto-specialist"),
     resolveStageBinding("behavior-specialist"),
@@ -482,64 +415,27 @@ function uniqueAgentIds(bindings: Array<{ agentId: string }>): string[] {
   return [...new Set(bindings.map((binding) => binding.agentId.trim()).filter(Boolean))];
 }
 
-export function getAiRuntimeReadinessProfile(input?: {
-  supervisorDomainAvailable?: boolean;
-  supportMainAvailable?: boolean;
-  customerAnswerComposerAvailable?: boolean;
-}): AiRuntimeReadinessProfile {
+export function getAiRuntimeReadinessProfile(): AiRuntimeReadinessProfile {
   const searchStages = [
     resolveSearchStageBinding("retrieval"),
     resolveSearchStageBinding("clarify"),
     resolveSearchStageBinding("execution")
   ];
-  const supervisorBindings = [
-    resolveStageBinding("planner"),
-    resolveStageBinding("api-specialist"),
-    resolveStageBinding("howto-specialist"),
-    resolveStageBinding("behavior-specialist"),
-    resolveStageBinding("troubleshooting-specialist")
-  ];
-  const supportMainBindings = [resolveStageBinding("support-main")];
-  const legacyBindings = [
+  const supportBindings = [
     resolveStageBinding("router"),
     resolveStageBinding("evidence-planner"),
     resolveStageBinding("planner"),
+    resolveStageBinding("support-evidence-selector"),
     resolveStageBinding("api-specialist"),
     resolveStageBinding("howto-specialist"),
     resolveStageBinding("behavior-specialist"),
     resolveStageBinding("troubleshooting-specialist"),
-    resolveStageBinding("evidence-judge")
+    resolveStageBinding("evidence-judge"),
+    resolveStageBinding("answer-composer")
   ];
 
-  const requiredSupportBindings = input?.supervisorDomainAvailable
-    ? supervisorBindings
-    : input?.supportMainAvailable
-    ? supportMainBindings
-    : legacyBindings;
-
-  const optionalSupportBindings = input?.supervisorDomainAvailable
-    ? [
-        ...(input.supportMainAvailable ? supportMainBindings : []),
-        resolveStageBinding("router"),
-        resolveStageBinding("evidence-planner"),
-        resolveStageBinding("evidence-judge"),
-        ...(input.customerAnswerComposerAvailable ? [resolveStageBinding("answer-composer")] : [])
-      ]
-    : input?.supportMainAvailable
-    ? [
-        resolveStageBinding("planner"),
-        resolveStageBinding("api-specialist"),
-        resolveStageBinding("howto-specialist"),
-        resolveStageBinding("behavior-specialist"),
-        resolveStageBinding("troubleshooting-specialist"),
-        ...(input.customerAnswerComposerAvailable ? [resolveStageBinding("answer-composer")] : [])
-      ]
-    : input?.customerAnswerComposerAvailable
-    ? [resolveStageBinding("answer-composer")]
-    : [];
-
   return {
-    requiredAgents: uniqueAgentIds([...searchStages, ...requiredSupportBindings]),
-    optionalAgents: uniqueAgentIds(optionalSupportBindings)
+    requiredAgents: uniqueAgentIds([...searchStages, ...supportBindings]),
+    optionalAgents: []
   };
 }

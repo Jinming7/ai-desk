@@ -16,7 +16,6 @@ import type {
   OpenClawSearchAnswerOutput,
   OpenClawSearchInput,
   OpenClawSearchOutput,
-  OpenClawSupportCitationSelectorInput,
   OpenClawSupportEvidencePlannerInput,
   OpenClawSupportEvidenceSelectorInput,
   OpenClawSupportPlannerInput,
@@ -26,6 +25,7 @@ import type {
   OpenClawSupportWriterInput
 } from "../../infrastructure/openclaw/types.js";
 import { runSupportSearchAgent } from "./support-agent.js";
+import { SearchOrchestrator } from "./search-orchestrator.js";
 import type {
   DraftSupportAnswer,
   SpecialistDraftAnswer,
@@ -55,8 +55,6 @@ async function writeFixture(rootDir: string, relativePath: string, content: stri
 function createBudgetProbeAdapter(observedTimeoutMs: {
   evidenceSelection?: number;
   specialist?: number;
-  citationBinding?: number;
-  citationSelection?: number;
   answerComposer?: number;
 }): OpenClawAdapter {
   const verifiedClaim = "可以通过迁移工具执行 rebuild indexes 任务来重建索引。";
@@ -213,40 +211,6 @@ function createBudgetProbeAdapter(observedTimeoutMs: {
     async verifySupportAnswer(_input: OpenClawSupportVerifierInput): Promise<SupportVerificationResult> {
       return verifiedResult;
     },
-    async bindSupportCitations(
-      _input: OpenClawSupportVerifierInput,
-      _idempotencyKey: string,
-      runtime?: OpenClawRuntimeContext
-    ): Promise<SupportVerificationResult> {
-      observedTimeoutMs.citationBinding = runtime?.timeoutMs;
-      return verifiedResult;
-    },
-    async selectDisplayCitations(input: OpenClawSupportCitationSelectorInput): Promise<{ display_citation_ids: string[] }> {
-      return {
-        display_citation_ids: Array.from(new Set(input.supportedClaims.flatMap((item) => item.citation_ids))).slice(0, 3)
-      };
-    },
-    async curateSupportCitations(
-      input: OpenClawSupportCitationSelectorInput,
-      _idempotencyKey: string,
-      runtime?: OpenClawRuntimeContext
-    ): Promise<{ display_citation_ids: string[] }> {
-      observedTimeoutMs.citationSelection = runtime?.timeoutMs;
-      return {
-        display_citation_ids: Array.from(new Set(input.supportedClaims.flatMap((item) => item.citation_ids))).slice(0, 3)
-      };
-    },
-    async composeSupportAnswer() {
-      return {
-        question_type: "how_to_product" as const,
-        render_variant: "how_to" as const,
-        direct_answer: verifiedClaim,
-        sections: [],
-        why: [],
-        what_to_do_now: specialistDraft.next_actions,
-        still_need_to_confirm: []
-      };
-    },
     async composeCustomerAnswer(input, _idempotencyKey: string, runtime?: OpenClawRuntimeContext) {
       observedTimeoutMs.answerComposer = runtime?.timeoutMs;
       return {
@@ -286,7 +250,7 @@ function createBudgetProbeAdapter(observedTimeoutMs: {
   };
 }
 
-test("runSupportSearchAgent gives async jobs wider specialist budgets while retired citation stages stay local", async () => {
+test("runSupportSearchAgent gives async jobs wider specialist budgets while the active selector stays within its local cap", async () => {
   const rootDir = await createFixtureRoot();
   const originalLocalDocsPath = env.LOCAL_DOCS_COM_PATH;
   env.LOCAL_DOCS_COM_PATH = rootDir;
@@ -308,18 +272,64 @@ title: "Rebuild indexes after migration"
   const observedTimeoutMs: {
     evidenceSelection?: number;
     specialist?: number;
-    citationBinding?: number;
-    citationSelection?: number;
     answerComposer?: number;
   } = {};
 
   try {
+    class FixedEvidenceOrchestrator extends SearchOrchestrator {
+      override async collectEvidence(_input: {
+        queries: string[];
+        idempotencyKey: string;
+        runtime?: OpenClawRuntimeContext;
+        answerLanguage?: "zh" | "en";
+        attachments?: string[];
+        caseFrame?: SupportCaseFrame;
+        repoId?: string;
+        branch?: string;
+      }) {
+        const retrievedAt = new Date().toISOString();
+        return {
+          query: "怎么重建索引",
+          answer: "",
+          confidence: 0.93,
+          references: [
+            {
+              documentId: "local:docs/import-data-into-ones/rebuild-indexes-after-migration.mdx:root",
+              title: "Rebuild indexes after migration",
+              snippet: "Run the rebuild indexes task after migration.",
+              sourceUrl: "https://docs.ones.com/import-data-into-ones/rebuild-indexes-after-migration",
+              repoSourceUrl:
+                "https://github.com/BangWork/docs-com/blob/main/docs/import-data-into-ones/rebuild-indexes-after-migration.mdx",
+              repo: "BangWork/docs-com",
+              branch: "main",
+              path: "docs/import-data-into-ones/rebuild-indexes-after-migration.mdx",
+              commitSha: "fixture",
+              headingPath: "ROOT",
+              supportMetadata: {
+                authority: "canonical_visible",
+                source_type: "local_docs"
+              },
+              authority: "canonical_visible" as const,
+              sourceType: "local_docs" as const,
+              score: 0.93,
+              retrievedAt
+            }
+          ],
+          retrievalStatus: "grounded" as const,
+          unresolvedReasonCode: null,
+          resolvedQueries: ["怎么重建索引"],
+          fallbackUsed: false
+        };
+      }
+    }
+    const adapter = createBudgetProbeAdapter(observedTimeoutMs);
     await runSupportSearchAgent({
       query: "怎么重建索引",
       language: "zh",
       currentRound: 0,
       conversationHistory: [],
-      adapter: createBudgetProbeAdapter(observedTimeoutMs),
+      adapter,
+      orchestrator: new FixedEvidenceOrchestrator(adapter, {} as never),
       idempotencyKey: "support-agent-async-job-stage-budgets",
       runtime: {
         deliveryMode: "async_job",
@@ -329,9 +339,8 @@ title: "Rebuild indexes after migration"
     });
 
     const observedSummary = JSON.stringify(observedTimeoutMs);
-    assert.equal((observedTimeoutMs.specialist ?? 0) > 18_000, true, observedSummary);
-    assert.equal(observedTimeoutMs.evidenceSelection, undefined, observedSummary);
-    assert.equal(observedTimeoutMs.citationBinding, undefined, observedSummary);
+    assert.equal((observedTimeoutMs.specialist ?? 0) >= 18_000, true, observedSummary);
+    assert.equal(observedTimeoutMs.evidenceSelection, 12_000, observedSummary);
   } finally {
     env.LOCAL_DOCS_COM_PATH = originalLocalDocsPath;
     await rm(rootDir, { recursive: true, force: true });

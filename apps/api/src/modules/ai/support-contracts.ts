@@ -133,8 +133,6 @@ export function canonicalizeSupportDomain(value: unknown): RuntimeSupportDomain 
       return "product";
     case "troubleshooting":
       return "troubleshooting";
-    case "docs":
-      return "product";
     default:
       return null;
   }
@@ -166,7 +164,10 @@ export function resolveDomainContractPath(domain: SupportDomain | string): strin
 }
 
 export function resolveSupportDomainRegistryEntry(domain: SupportDomain | string): SupportContractRegistryDomainEntry {
-  const canonicalDomain = canonicalizeSupportDomain(domain) ?? "product";
+  const canonicalDomain = canonicalizeSupportDomain(domain);
+  if (!canonicalDomain) {
+    throw new Error(`Invalid support runtime domain: ${String(domain ?? "")}`);
+  }
   const registry = loadSupportContractRegistry();
   const entry = registry.domains.find((item) => item.id === canonicalDomain);
   if (!entry) {

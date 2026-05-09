@@ -1,7 +1,5 @@
 import type {
   DraftSupportAnswer,
-  SupportClaimKind,
-  SupportDomain,
   SearchReference,
   SpecialistDraftAnswer,
   SupportAnswer,
@@ -10,7 +8,6 @@ import type {
   SupportEvidenceBundle,
   SupportEvidenceSelection,
   SupportQuestionRoute,
-  SupportRenderVariant,
   SupportVerificationClaim,
   SupportVerificationResult,
   TriageSupportInsight
@@ -109,7 +106,6 @@ export interface OpenClawRuntimeContext {
   intent?: "retrieval" | "clarify" | "execution";
   deliveryMode?: "interactive" | "async_job";
   stage?:
-    | "support-main"
     | "router"
     | "evidence-planner"
     | "support-evidence-selector"
@@ -118,14 +114,10 @@ export interface OpenClawRuntimeContext {
     | "behavior-specialist"
     | "troubleshooting-specialist"
     | "evidence-judge"
-    | "citation-curator"
     | "answer-composer"
     | "planner"
     | "support-writer"
     | "support-verifier"
-    | "support-citation-binder"
-    | "support-citation-selector"
-    | "support-answer-composer"
     | "triage-writer"
     | "triage-verifier";
   timeoutMs?: number;
@@ -144,7 +136,7 @@ export interface OpenClawHealthCheckInput {
 
 export interface OpenClawHealthCheckResult {
   ok: boolean;
-  mode: "ws" | "mock";
+  mode: "ws" | "mock" | "native" | "hermes";
   detail?: string;
   configuredAgents?: string[];
   reachableAgents?: string[];
@@ -177,14 +169,6 @@ export interface OpenClawSupportPlannerInput {
     customerMeta: Record<string, unknown>;
     history: Array<{ author: string; body: string; at: string }>;
   };
-}
-
-export interface OpenClawSupportExecutionPlannerInput extends OpenClawSupportPlannerInput {}
-
-export interface OpenClawSupportExecutionPlannerOutput {
-  route: SupportQuestionRoute;
-  caseFrame: SupportCaseFrame;
-  evidencePlan: SupportEvidencePlan;
 }
 
 export interface OpenClawSupportRouterInput {
@@ -244,103 +228,6 @@ export interface OpenClawSupportEvidenceSelectorInput {
   references: SearchReference[];
 }
 
-export interface OpenClawSupportMainPlanInput {
-  contextType: "search" | "triage";
-  language: "zh" | "en";
-  query: string;
-  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
-  ticketContext?: {
-    priority: string;
-    customerMeta: Record<string, unknown>;
-    history: Array<{ author: string; body: string; at: string }>;
-  };
-  knowledgeScope?: {
-    knowledgeSpace?: string;
-    repoId?: string;
-    branch?: string;
-  };
-}
-
-export interface OpenClawSupportMainProvidedEvidence {
-  reference_id: string;
-  evidence_id: string;
-  title: string;
-  snippet: string;
-  sourceUrl: string;
-  path?: string;
-  headingPath?: string;
-  repoSourceUrl?: string;
-  authority?: SearchReference["authority"];
-  sourceType?: SearchReference["sourceType"];
-  metadata?: Record<string, unknown>;
-}
-
-export interface OpenClawSupportMainDraftInput extends OpenClawSupportMainPlanInput {
-  route: SupportQuestionRoute;
-  caseFrame: SupportCaseFrame;
-  providedEvidence: OpenClawSupportMainProvidedEvidence[];
-}
-
-export interface OpenClawSupportMainDraftClaim {
-  text: string;
-  kind: SupportClaimKind;
-  reference_ids: string[];
-  authority: "canonical" | "assistive";
-}
-
-export interface OpenClawSupportMainDraftAnswer {
-  question_type: SupportQuestionRoute["question_type"];
-  render_variant: SupportRenderVariant;
-  direct_answer: string;
-  claims: OpenClawSupportMainDraftClaim[];
-  next_actions: string[];
-  unknowns: string[];
-  escalation_needed: boolean;
-  api_method?: string;
-  api_path?: string;
-  required_params?: string[];
-  auth_scope?: string[];
-  response_field_hint?: string;
-  important_note?: string;
-  related_variant?: string;
-  steps?: string[];
-  prerequisites?: string[];
-  limits_or_notes?: string[];
-  most_likely_explanation?: string;
-  confirmed_facts?: string[];
-  what_to_check_next?: string[];
-  most_likely_causes?: string[];
-  recommended_checks?: string[];
-  required_followup_info?: string[];
-  when_to_handoff?: string;
-}
-
-export interface OpenClawSupportMainPlanOutput {
-  route: SupportQuestionRoute;
-  caseFrame: SupportCaseFrame;
-  retrievalQueries: string[];
-}
-
-export interface OpenClawSupportDispatchOutput {
-  primaryDomain: SupportDomain;
-  route: SupportQuestionRoute;
-  caseFrame: SupportCaseFrame;
-  retrievalQueries: string[];
-}
-
-export interface OpenClawSupportMainDraftOutput {
-  draftAnswer: OpenClawSupportMainDraftAnswer;
-}
-
-export interface OpenClawSupportCitationSelectorInput {
-  contextType: "search" | "triage";
-  language: "zh" | "en";
-  query: string;
-  caseFrame: SupportCaseFrame;
-  evidenceBundle: SupportEvidenceBundle;
-  supportedClaims: SupportVerificationClaim[];
-}
-
 export interface OpenClawSupportAnswerComposerInput {
   contextType: "search" | "triage";
   language: "zh" | "en";
@@ -367,26 +254,6 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<OpenClawClassifyIntentOutput>;
-  planSupportExecution?(
-    input: OpenClawSupportExecutionPlannerInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<OpenClawSupportExecutionPlannerOutput>;
-  planSupportDispatch?(
-    input: OpenClawSupportPlannerInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<OpenClawSupportDispatchOutput>;
-  planSupportMainAgent?(
-    input: OpenClawSupportMainPlanInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<OpenClawSupportMainPlanOutput>;
-  draftSupportMainAgent?(
-    input: OpenClawSupportMainDraftInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<OpenClawSupportMainDraftOutput>;
   planSupportCase(
     input: OpenClawSupportPlannerInput,
     idempotencyKey: string,
@@ -412,27 +279,12 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SpecialistDraftAnswer>;
-  writeOpenApiDomainAnswer?(
-    input: OpenClawSupportSpecialistInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<SpecialistDraftAnswer>;
   writeHowToSpecialistAnswer(
     input: OpenClawSupportSpecialistInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SpecialistDraftAnswer>;
-  writeDeploymentDomainAnswer?(
-    input: OpenClawSupportSpecialistInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<SpecialistDraftAnswer>;
   writeBehaviorSpecialistAnswer(
-    input: OpenClawSupportSpecialistInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<SpecialistDraftAnswer>;
-  writeDocsDomainAnswer?(
     input: OpenClawSupportSpecialistInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
@@ -457,36 +309,15 @@ export interface OpenClawAdapter {
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
   ): Promise<SupportVerificationResult>;
-  curateSupportCitations(
-    input: OpenClawSupportCitationSelectorInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<{ display_citation_ids: string[] }>;
-  bindSupportCitations(
-    input: OpenClawSupportVerifierInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<SupportVerificationResult>;
-  selectDisplayCitations(
-    input: OpenClawSupportCitationSelectorInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<{ display_citation_ids: string[] }>;
-  composeSupportAnswer(
-    input: OpenClawSupportAnswerComposerInput,
-    idempotencyKey: string,
-    runtime?: OpenClawRuntimeContext
-  ): Promise<{
-    direct_answer: string;
-    why: string[];
-    what_to_do_now: string[];
-    still_need_to_confirm: string[];
-  }>;
   composeCustomerAnswer(
     input: OpenClawSupportAnswerComposerInput,
     idempotencyKey: string,
     runtime?: OpenClawRuntimeContext
-  ): Promise<Omit<SupportAnswer, "mode">>;
+  ): Promise<
+    Omit<SupportAnswer, "mode"> & {
+      suppress_still_need_to_confirm?: boolean;
+    }
+  >;
   writeTriageInsight(
     input: OpenClawSupportWriterInput,
     idempotencyKey: string,
